@@ -6,8 +6,18 @@ Reverse-engineering of the Parhelia programmable vertex shader (the WARP-class
 RTTI intact — navigation is by typeinfo-name → vtable → method). Evidence tags:
 [GL]=proven from disasm, [HW?]=needs hardware capture.
 
-This is a work in progress; three passes are filling the opcode table, the
-operand encoding, and worked examples. Sections marked *(pending)* are in flight.
+**Headline:** the vertex microcode is a **DirectX vs_1_1-shaped token stream**
+carrying Parhelia-native opcodes. A program is literally
+`[0xFFFE0101] + instruction tokens + [0x0000FFFF]` — the D3D version header and
+END token bracket a stream of `[opcode][dest][src…]` instructions — and it is
+uploaded to the engine as a **verbatim memcpy** (no relocation). This is the
+single most useful fact for writing a Parhelia vertex-shader assembler: it is
+"D3D vs.1.1 bytecode with Matrox extended opcodes."
+
+All three passes (opcode table, operand encoding, serialization + a worked
+program) completed and **cross-validate**. Two small fields — the per-source
+negate modifier and the temp-register bank code — plus the declaration-stream
+entry layout are the only residual items.
 
 ## Program model [GL, established]
 
@@ -34,38 +44,156 @@ word2..word(1+Nsrc) = source operands
 So Mov (1 src) = 3 words, a 2-source op (Add/Mul/Dot4/…) = 4 words, Madd (3 src)
 = 5 words.
 
-### Operand word fields (partial — being finalised)
+### Operand word fields [GL, complete]
 
-Common bits [GL]: **bit31 = valid/used**, **bit24 = destination flag**,
-**swizzle in bits[23:16]** (2 bits/component, identity `0xE4` = w3 z2 y1 x0),
-**write-mask in bits[19:16]** (4 bits, `0xF` = all). Destination also carries a
-**shape** field in two 2-bit groups [27:26] and [23:22]: scalar/vector/matrix =
-`1/2/3` → dest bit patterns `0x04400000 / 0x08800000 / 0x0CC00000`.
+The encoders (`0x16cc10` source, `0x16cc30` dest) just OR pre-built fields, so
+the operand word layout *is* those fields:
 
-The **register selector** (class + index) is pre-encoded into the operand's
-low bits, and per-source **modifier** bits (negate/sign/bank) come from
-instruction control words. Exact bit split: *(pending — operand-encoding pass)*.
+**Destination operand:**
 
-## Opcode table
+| Bits | Field |
+|---|---|
+| 31 | valid/used |
+| 30:28 | register bank (see below) |
+| 27:26 + 23:22 | shape size, two copies: `01`/`10`/`11` = scalar/vector/matrix (1/2/4 comp) |
+| 24 | destination flag |
+| 19:16 | **write-mask** X,Y,Z,W (1 bit/component; `0xF`=all) |
+| 7:0 | register index |
 
-Word0 opcode constants per instruction. Each `GLVSInstruction` subclass sets its
-opcode in its constructor (one confirmed value so far: `0x60`).
+**Source operand:**
 
-*(pending — opcode-table pass; the instruction set from RTTI is: Mov, Add, Sub,
-Mul, Madd, Dot3, Dot4, Cross, Min, Max, Clamp, Floor, Frac, Round, Exp2, Log2,
-Power, Recip, RecipSqrt, MatrixMultiply, Negate, SetGE, SetLT, ExtractComponent,
-InsertComponent, Swizzle, WriteMask, Index.)*
+| Bits | Field |
+|---|---|
+| 31 | valid/used |
+| 30:28 | register bank |
+| 23:16 | **swizzle**, 2 bits/component (comp0=[17:16]…comp3=[22:23]); `0/1/2/3 = X/Y/Z/W`; identity `0xE4` |
+| 7:0 | register index |
 
-## Register-selector / class encoding
+Proven decisively by the `GL_SCALAR_EXT` declaration path (`0x1703d9`): a scalar
+bound to component `c` builds swizzle = `c` replicated across all four 2-bit
+groups, write-mask = `1<<(16+c)`.
 
-*(pending — operand-encoding pass: how input(16)/temp(256)/const(256)/output(12)
-map to bank codes + index ranges in the operand selector field.)*
+## Opcode table [GL, complete]
 
-## Worked example + microcode blob layout
+`word0` is a **plain opcode index in the low ~7 bits** (max `0x63`); no
+modifier/control bits are packed there (saturate/negate/mask live in the operand
+descriptors, not word0). All 28 `GLVSInstruction` classes resolved:
 
-*(pending — the fixed-function T&L generator emits a real program, e.g.
-`position = MVP · inputPos`; that gives concrete (opcode, dest, src) tuples to
-validate the encoding, plus the serialised blob header/stream format.)*
+| Instr | word0 | #src | | Instr | word0 | #src |
+|---|---|---|---|---|---|---|
+| Mov | `0x01` | 1 | | Max | `0x0b` | 2 |
+| Negate | `0x01` | 1 | | SetLT | `0x0c` | 2 |
+| WriteMask | `0x01` | 1 | | SetGE | `0x0d` | 2 |
+| Swizzle | `0x01` | 1 | | Power | `0x55` | 2 |
+| Add | `0x02` | 2 | | Clamp | `0x56` | 3 |
+| Sub | `0x02` | 2 | | Cross | `0x57` | 2 |
+| Madd | `0x04` | 3 | | Round | `0x58` | 1 |
+| Mul | `0x05` | 2 | | Floor | `0x59` | 1 |
+| Recip | `0x06` | 1 | | InsertComponent | `0x5a` | 1 |
+| RecipSqrt | `0x07` | 1 | | ExtractComponent | `0x5b` | 1 |
+| Dot4 | `0x09` | 2 | | Log2 | `0x5e` | 1 |
+| Min | `0x0a` | 2 | | Exp2 | `0x5f` | 1 |
+| | | | | MatrixMultiply | `0x60` | 2 |
+| | | | | Frac | `0x61` | 1 |
+| | | | | Index | `0x62` | 2 |
+| | | | | Dot3 | `0x63` | 2 |
+
+**Shared opcodes** differ only by an operand modifier, not word0: Mov/Negate =
+`0x01` (Negate = Mov + source-negate); Add/Sub = `0x02` (Sub = Add + src1-negate).
+Unused/reserved: `0x00, 0x03, 0x08, 0x0e–0x54, 0x5c, 0x5d`.
+
+**No DX→native opcode LUT exists** — translation is structural: the shader
+parser instantiates the matching `GLVSInstruction_*` C++ subclass, each of which
+hardcodes its native word0 in its constructor (stored to object +0x20; the
+`emit` virtual pushes it as word0).
+
+### Emitted word stream
+
+```
+word0 = opcode (from object +0x20)
+word1 = dest operand descriptor (dest reg + write-mask)
+word2 = src0 descriptor | default-mask
+word3 = src1 descriptor | default-mask   (if #src >= 2)
+word4 = src2 descriptor | default-mask   (if #src == 3)
+```
+So Mov/transcendentals = 3 words, 2-source ALU = 4 words, Madd/Clamp = 5 words.
+Object layout: +0x08 family tag `0x8799`, +0x10 dest ptr, +0x1c aux template,
++0x20 opcode, +0x28/+0x30/+0x38 source ptrs, +0x40/+0x44/+0x48 default masks.
+
+## Register files / bank encoding [GL]
+
+Register bank in operand bits **[30:28]**, index in **[7:0]**:
+
+| File | Capacity | Bank code [30:28] |
+|---|---|---|
+| output | 12 | `000` (0x00000000) |
+| input | 16 | `001` (0x10000000) |
+| constant | 256 | `010` (0x20000000) |
+| temp | 256 | unconfirmed (likely `000` disambiguated by index range, or set in the lazy allocator) |
+
+The constant file is **dual-ended**: user constants (`c#`) grow up from index 0,
+driver-generated constants grow down from the top — worth knowing when allocating
+uniform slots. Temps are allocated lazily at emit time (resolver `0x170100`).
+
+**Two residual items** (flagged for hardware capture):
+- **Per-source negate/abs/sign modifiers** — the active source encoder ORs only
+  regsel|swizzle|valid, injecting no modifier bits. Negate (which distinguishes
+  Negate from Mov and Sub from Add) is applied during symbol→operand lowering
+  elsewhere, or via the high-level swizzle node's 6-bit-per-component codes
+  (which carry sign/ZERO/ONE); its exact landing bit wasn't pinned. Capture a
+  shader using a negated source and diff the source word.
+- **Temp bank code** [30:28] — not located.
+
+## Program format & serialization [GL, complete]
+
+A compiled program is a self-contained D3D-style token stream:
+
+```
+0xFFFE0101                 ; header: vs_1_1 (written in the FunctionDX ctor)
+<instruction tokens...>    ; [opcode][dest][src0|mod]...  per instruction
+0x0000FFFF                 ; END token (D3D terminator)
+```
+
+Assembled two-pass (`Assemble` @0x16fda0): pass 1 sums each instruction's token
+count (2+Nsrc) and reserves `sum + 8`; pass 2 calls each instruction's Serialize
+(vtable slot 0), appending its tokens. The register allocator (`0x170100`)
+resolves every operand's register token during Serialize, so the finished stream
+is **final** — the DMA upload (`key=0x45/0x46`) is a plain memcpy of
+`GetCode()` / `GetCodeSizeBytes()`, no relocation. Instruction/resource counts
+are validated against the 16/256/256/12 (+512-instruction) caps before upload.
+
+There is a **second, independent token stream** for declarations/constants
+(`GLVertexShaderDeclarationDX`, at object +0x68/+0x70, its own GetCode
+interface) — D3D `dcl`/`def`-style tokens binding input attributes to registers
+and defining constants. Its per-entry bit layout is the one item not fully
+decoded.
+
+### Worked example — fixed-function position transform
+
+`oPos = MVP · iPos` compiles to a **single native instruction** (MatrixMultiply
+is not expanded into 4× dp4):
+
+```
+0xFFFE0101                        ; vs_1_1 header
+0x00000060                        ; MatrixMultiply (native opcode 0x60)
+0x80000000 | dest(oPos, wmask)    ; word1
+0x80000000 | src (c[MVP], swizzle); word2  -- constant register (MVP base)
+0x80000000 | src (v[iPos], swizzle); word3 -- input register (position)
+0x0000FFFF                        ; END
+```
+
+That a 4×4 transform is one opcode (not four dot products) is a real hardware
+capability worth exploiting in a driver's T&L codegen.
+
+## D3D vs_1_1 correspondence
+
+Opcodes `0x01–0x0D` are exactly the D3D vs_1_1 numbering (mov/add/mad/mul/rcp/
+rsq/dp4/min/max/slt/sge). Opcodes `0x55–0x63` are **Matrox-native extensions**
+emitted verbatim as single instructions: MatrixMultiply `0x60`, Dot3 `0x63`,
+Cross `0x57`, Clamp `0x56`, Power `0x55`, Log2 `0x5e`, Exp2 `0x5f`, Frac `0x61`,
+Index `0x62`, Round/Floor `0x58`/`0x59`, Insert/ExtractComponent `0x5a`/`0x5b`.
+(Note Dot3 and Log2 do **not** use the D3D dp3/log numbers — Parhelia has its own
+extended encoding above 0x54.)
 
 ## Relationship to G400/G550 WARP
 
