@@ -122,27 +122,34 @@ Object layout: +0x08 family tag `0x8799`, +0x10 dest ptr, +0x1c aux template,
 
 ## Register files / bank encoding [GL]
 
-Register bank in operand bits **[30:28]**, index in **[7:0]**:
+Register bank in operand bits **[30:28]** (one bit per file — one-hot), index in
+**[7:0]**:
 
-| File | Capacity | Bank code [30:28] |
+| File | Capacity | Bank bit |
 |---|---|---|
-| output | 12 | `000` (0x00000000) |
-| input | 16 | `001` (0x10000000) |
-| constant | 256 | `010` (0x20000000) |
-| temp | 256 | unconfirmed (likely `000` disambiguated by index range, or set in the lazy allocator) |
+| output | 12 | `000` (none) |
+| input | 16 | bit28 `0x10000000` |
+| constant | 256 | bit29 `0x20000000` |
+| temp | 256 | bit30 `0x40000000` |
+
+**Per-source negate** modifier = **bit 24** (`0x01000000`) — exactly the D3D
+vs_1_1 `D3DSPSM_NEG` source-modifier position, consistent with the D3D-shaped
+ISA. This is how Negate differs from Mov and Sub from Add (bit24 is free in a
+*source* word; it is the destination flag only in a *dest* word).
 
 The constant file is **dual-ended**: user constants (`c#`) grow up from index 0,
 driver-generated constants grow down from the top — worth knowing when allocating
 uniform slots. Temps are allocated lazily at emit time (resolver `0x170100`).
 
-**Two residual items** (flagged for hardware capture):
-- **Per-source negate/abs/sign modifiers** — the active source encoder ORs only
-  regsel|swizzle|valid, injecting no modifier bits. Negate (which distinguishes
-  Negate from Mov and Sub from Add) is applied during symbol→operand lowering
-  elsewhere, or via the high-level swizzle node's 6-bit-per-component codes
-  (which carry sign/ZERO/ONE); its exact landing bit wasn't pinned. Capture a
-  shader using a negated source and diff the source word.
-- **Temp bank code** [30:28] — not located.
+Component selectors in the high-level swizzle node (base `0x87d5` = GL_X_EXT)
+carry a class field at bits [25:24]: `00`=plain swizzle, `01`=negated,
+`10`=constant (ZERO/ONE) — the negate lowers to source bit 24 above.
+
+**One residual item:** the declaration/constant stream (`dcl`/`def`) per-entry
+bit layout binding input attributes to registers — best closed by capturing an
+uploaded declaration blob (`key=0x45/0x46`) and diffing against a known
+`dcl`/`def`. (The negate bit and temp bank code, previously open, are resolved
+above.)
 
 ## Program format & serialization [GL, complete]
 

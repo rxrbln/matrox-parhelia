@@ -92,7 +92,7 @@ iterated colour, no texture bound [DRV, proven]:
 0x1264 = 0x00000000                        # pass-through pixel shader: in=0, slot=0
 0x126c = 0x00400400                        # output reg 4, enable bit
 0x101c = 0                                 # depth test off
-0x12a0 = 0                                 # blend enable-mask off
+0x12a0 = 0xf                               # glColorMask: RGBA write-enable (0 blanks output!)
 0x103c = 0                                 # alpha test off
 ```
 

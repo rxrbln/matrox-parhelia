@@ -76,7 +76,10 @@ opcode 6-vs-7 (likely smooth vs flat shading).
 | glStencilFunc/Op | 0x10d0-0x10ec | 8 regs [GL] |
 | glAlphaFunc | 0x103c / 0x1064 | enable / func |
 | glBlendEquation | 0x12ac | ADD/SUB/REVSUB/MIN/MAX = 1..5 [GL] |
-| glBlend enable | 0x12a0 | per-RT mask |
+| glColorMask | 0x12a0 | **4-bit RGBA write-enable** (bit0=R…bit3=A; 0xf=all). NB: writing 0 blanks output. |
+| glCullFace + enable | 0x1058 | 1=off, 2/3=cull a winding |
+| glFrontFace | 0x1014 | 2=CW, 3=CCW |
+| glPolygonMode | 0x1020 | 1=point, 2=line, 3=fill |
 | glBlendFunc factors | bank 0x5 idx 0x09-0x0c | enum→code table below; **bank base = capture** |
 | glCullFace | 0x1024 | (main bank) |
 | glScissor / glViewport | 0x1280 / 0x1284 | `(Y<<16)|X` per corner, NDC×1024, guard band ±1024 |
@@ -85,6 +88,12 @@ opcode 6-vs-7 (likely smooth vs flat shading).
 glDepthRange + viewport scale/bias are **CPU-applied** in the fixed-function
 path — no dedicated engine registers (a hardware-VS path may use VS constants;
 capture 0x1268/0x126c/0x1298 on glDepthRange to confirm/deny).
+
+**Software-handled (no register)** [DRV]: fog (per-vertex factor computed on the
+CPU, `0xf96f0`, GL_EXP/EXP2/LINEAR), point size, line width (points/lines drawn
+as CPU-expanded triangles), and polygon offset (depth bias in triangle setup). A
+master 3D pipeline-control bitfield lives at **0x1000**/0x1004 (highest write
+fan-out; full bit decode incomplete).
 
 **Register banks** [GL]: libGL emits state as `(key, index, value)` packets;
 `key` selects a register bank. **key=0xc = main bank** (`reg = 0x1000 + index*4`,
@@ -98,13 +107,18 @@ absolute base is not static — a GL driver resolves it with one capture (watch 
 DST_COLOR=9, 1-DST_COLOR=0xa, SRC_ALPHA_SATURATE=0xb, CONSTANT_COLOR=0xe,
 1-CONSTANT_COLOR=0xf, CONSTANT_ALPHA=0x10, 1-CONSTANT_ALPHA=0x11.
 
-## Fragment / texenv — DONE (encoding proven)
+## Fragment / pixel shader — DONE (a DX8 ps.1.x-shaped ISA)
 
-Pixel shader: pass-through stage `0x1264 = (in<<5)&0x3e0 | slot`,
-`0x126c = (out<<20)&0xf00000 | 0x400`; identity = `0x1264=0`, `0x126c=0x400400`.
-Colour-matrix coeffs `0x1278-0x1284`, signed-11-bit ×1024, two per reg. Combiner
-`0x11c0-0x11e8`: MODULATE `0x33f9e7ff`, REPLACE `0x10f9e7ff` (op in bits[29:24]).
-Texture pipes `0x1200-0x120c`: active `0x00040101`, idle `0x00010000`.
+The pixel shader is a programmable two-phase combiner (`GL_MTX_fragment_shader`),
+reverse-engineered in full — see **`parhelia-fragment-isa.md`**. Opcode set
+MOV/ADD/SUB/MUL/DP3/DP4/MAD/LRP/CND/CMV/CMP (0–10); input selectors tex0-3=0-3,
+temp0/output=4, temp1=5, constant=0xE, **iterated primary colour=0x10**,
+secondary=0x11; DX8 ps.1.x modifiers (Scale/Saturate, per-arg Convert/Replicate).
+Stage words: `0x1264` = input selectors + control | slot, `0x126c` = output
+(bits[23:20]) + opcode-base; pass-through identity = `0x1264=0`, `0x126c=0x400400`.
+Colour-matrix coeffs `0x1278-0x1284` (signed-11-bit ×1024, two per reg). Texture
+pipes `0x1200-0x120c`: active `0x00040101`, idle `0x00010000`. (The one residual:
+the concrete opcode-base bits per ALU op are packed by the kernel module.)
 
 ## Texturing — DONE (linear); wrap modes TBD [DRV]
 
