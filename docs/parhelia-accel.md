@@ -132,6 +132,55 @@ doorbell in `Subsequent*`. DWGCTL is always preceded by an idle load of `0x707`.
 8×8 pattern fill, solid lines (HorVert + TwoPoint), ScreenToScreenCopy/BitBlt,
 CPUToScreenColorExpandFill, Read/WritePixmap. No EXA path exists in this driver.
 
+### Precise XAA op specs [DRV: `ParhlXAA*` in `xserver/7_4_0/mtx_drv.so`]
+
+The `Setup*` functions build a **base DWGCTL** and cache FCOL/BCOL/PLNWT/surface
+into a DrawContext shadow; the flush (`HwThread2d::SetupHardware`) streams them as
+tag+data packets. A packet is one **tag dword** (4 register-index bytes, LE order;
+`0x21` = filler) followed by up to 4 data dwords. DWGCTL always gets a `0x707`
+idle prewrite. Register indices used: DWGCTL 0xC0, LINE_START 0xC1, DSTXY 0xC2,
+LINE_END 0xE2, LEN 0xE3, FCOL 0xC5, BCOL 0xC6, PLNWT 0xB0. A direct-MMIO driver
+reimplements each by writing `0x1000+idx*4` in the same order; the final geometry
+write (LEN, or LINE_END for lines) triggers the op — **no DMA doorbell needed**
+(the vendor's `[MMIO+0x3050]=1` only kicks its pushbuffer ring).
+
+**base DWGCTL** (all ops): `dstSlot | (srcSlot>>2) | ((BopTable[rop]<<4)&0xF0) |
+(clip ? 0x800000 : 0)`. BOP = `g_adwParhlXaaBopTable[rop]` (4-bit-reversed GXrop).
+The `0x800000` clip-enable is added iff a clip rect is armed (`[priv+0x10]!=0`).
+
+| Op | DWGCTL adds | Geometry writes | Source |
+|---|---|---|---|
+| **SolidFill** | — | DSTXY=(y<<16)\|x, LEN=(h<<16)\|w; FCOL=colour, PLNWT=mask | @0x536e0 / @0x539c0 |
+| **ScreenToScreenCopy** | `0x2` blit \| src-slot \| `0x1000`(xdir<0) \| `0x2000`(ydir<0) \| `0x400000`(trans≠−1) | reverse walk starts at far edge (x+=w−1 / y+=h−1); LINE_START(0xC1)=src (y<<16)\|x, DSTXY=dst, LEN | @0x551e0 / @0x55530 |
+| **SolidLine HorVert** | — (1-px fill) | DSTXY=(y<<16)\|x, LEN=`(1<<16)\|len`(horiz) / `(len<<16)\|1`(vert) | @0x55c00 / @0x55ed0 |
+| **SolidLine TwoPoint** | `0x700001`, or `0x300001` when bias flag bit0 set | LINE_START=(y1<<16)\|x1, LINE_END(0xE2)=(y2<<16)\|x2 | @0x560f0 |
+| **Mono8x8Pattern** | `0x2000`(opaque) / `0x3000`(bg==−1, transparent); per-rect `\|(patx<<14 &0x1C000)\|(paty<<17 &0xE0000)` | DSTXY, LEN; FCOL=fg, BCOL=bg, PLNWT=mask | @0x53be0 / @0x53f10 |
+| **CPUToScreenColorExpand** | `0x800303`(opaque) \| `0x1000`(transparent, bg==−1) | host mono bits CPU-copied into a mapped scratch surface, then colour-expand blitted | @0x54220 / flush @0x54570 |
+| **Set/DisableClipping** | sets/clears `0x800000` in shadow + `[priv+0x10]` flag | SCISSOR_MIN=(y1<<16)\|x1, SCISSOR_MAX=(y2<<16)\|x2; Disable → (0,0)/(0xfff,0xfff) | @0x535e0 / @0x53660 |
+
+**Clip semantics:** `SetClippingRectangle` writes the scissor MIN/MAX (0x1328/
+0x132c) and arms the flag; every armed `Setup*` ORs `0x800000` so the scissor
+bounds it. `DisableClipping` resets the scissor to full and clears the flag —
+which is exactly why an unconditional `0x800000` without a programmed scissor
+clips against garbage (the earlier crash).
+
+**Host-data ops are MMIO-feasible, no busmaster DMA** [DRV]: `memWriteDword`
+(@0x589a7) is a plain store, `MmHostAperture::Lock` (@0x72e20) returns a CPU
+pointer to a mapped BAR window. ColorExpand streams the mono bitmap by CPU stores
+into a mapped scratch/aperture surface then blits (`XferNativeToVid` @0x574a0 for
+WritePixmap; `XferVidToNative` @0x56a50 reads back for ReadPixmap). Mono 8×8
+pattern is a **hardware offscreen pattern** — patx/paty are its VRAM origin (not
+8×8 data dwords), so the pattern bitmap must be pre-placed in VRAM.
+
+### Implementation status in `src/parhelia_xaa.c`
+
+Implemented by direct MMIO (recovered specs above): **solid fill, screen-to-
+screen copy (all directions), hor/vert + two-point lines, hardware clipping.**
+Deferred to software pending a scratch-VRAM allocator + on-hardware iteration:
+**colour expand, mono 8×8 pattern fill, image up/download** — all RE-complete
+above, each needs an offscreen surface and the reverse-direction/pattern-origin
+details validated on the card first.
+
 ## DPS — the "2D via 3D pixel shader" engine
 
 Parhelia does colour-conversion and scaled blits (video, and what would be
