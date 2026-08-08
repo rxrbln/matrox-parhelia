@@ -112,9 +112,15 @@ DC blocks are the route to the additional heads and are the larger follow-on.
 
 Four PLLs, **reg = 0x0E10 + index×4**. Reference **27 MHz**.
 
+The pixel clock is a **four-field divider** (hardware-confirmed on 0x0528, all
+standard modes locking cold):
+
 ```
-Fvco = N * 27 MHz         within the PLL's VCO window
-Fout = Fvco / X           within [50, 400] MHz   -- the pixel clock
+Fout = 27 MHz * N * P / X / B3        (two truncating divides: /X then /B3)
+  VCO1 = 27 MHz * N        in [600, 1200] MHz   (PLL0 to 1600)
+  tap  = 27 MHz * N / X    in [50, 400] MHz
+  VCO2 = 27 MHz * N * P / X in [600, 1200] MHz
+  B3 = output post-divider, even
 ```
 
 | PLL | Reg | VCO | Out |
@@ -122,36 +128,70 @@ Fout = Fvco / X           within [50, 400] MHz   -- the pixel clock
 | 0 | 0x0E10 | 600–**1600** MHz | 50–400 MHz |
 | 1–3 | 0x0E14–0x1C | 600–1200 MHz | 50–400 MHz |
 
-PLL0 is the only one reaching 1600 MHz VCO, so it is the pixel PLL.
+The DC head is driven by **PLL2 (0x0E18)** on the original Parhelia (not PLL0).
 
-> **Correction to the divider word.** The VBIOS-only note had the feedback value
-> in the low byte and called the post-divider *P*. The driver shows the internal
-> search word is 4 bytes, `(N<<24)|(P<<16)|(X<<8)|L`: the feedback **N** is the
-> top byte, the output post-divider is the **middle byte X**, `P` is a
-> loop-consistency divider that does *not* set the output, and the low byte `L`
-> is an auxiliary field absent from the frequency math. The frequency *relation*
-> (`Fout = feedback × 27 MHz ÷ post-divider`) is unchanged from our model.
-
-**Register encoding** [DRV: encoder `mtx2056` @0xa7e10] — each divider is stored
-negated and masked (Matrox's traditional PLL encoding):
+**Register encoding** [DRV encoder + VBIOS `SetPixelClock`@ROM 0x7018, hardware
+diff] — four fields stored negated & masked:
 
 ```
-N -> reg bits 0-5    ((N-1) & 0x20) | ((-N) & 0x1f)
-P -> reg bits 6-10   ((-P) & 0x1f) << 6
-X -> reg bits 11-15  ((-X) & 0x1f) << 11
-bit 31 = programming strobe
+N  -> reg bits  0-5   ((N-1) & 0x20) | ((-N) & 0x1f)
+P  -> reg bits  6-10  ((-P)  & 0x1f) << 6
+X  -> reg bits 11-15  ((-X)  & 0x1f) << 11
+B3 -> reg bits 16-21  ((-B3) & 0x3f) << 16     <-- the field the 2-field model missed
+bit 31 = programming strobe (LOAD)
+bits 25-24 read back 0x03 = read-only PLL-active status (never written)
 ```
 
-Implemented in `src/parhelia_pll.c` (`ParheliaPLLEncode`).
+Golden words (reproduced by the solver): 108 MHz = N24/P3/X3/B3=6 = `0x033aef48`;
+65 MHz = N23/P5/X3/B3=16 = `0x0330eec9`; 154 MHz single-link = N34/P2/X3/B3=4.
+The DC-head path fixes **X=3** and searches N/P/B3. Implemented in
+`parhelia_program_dc_clock` (`src/parhelia_mode.c`); the legacy VGA-CRTC encoder
+`ParheliaPLLEncode` (`src/parhelia_pll.c`) still omits B3.
 
 **Programming sequence** [DRV]: read-modify to set bit7 / clear bits 2,3,6 and
 write back, delay ~10; write the encoded value with **bit 31 set**, delay ~100;
 write again with **bit 31 clear**, delay ~200; read back to commit.
 
-**On the 65 MHz rounding:** our solver lands 0.18% high on 65 MHz. This is
-*inherent* — 65 MHz is not representable as `N×27/X` with VCO ≤ 1600 MHz — and
-the proprietary driver exhibits the same residual. It is hardware quantization,
-not a model gap. 108 and 162 MHz are exact.
+**On the 65 MHz rounding:** the four-field solver lands 0.18% high on 65 MHz
+(N23/P5/X3/B3=16 → 64687), matching the proprietary driver's own residual —
+hardware quantization, not a model gap. 108 and 162 MHz are exact; 154 MHz lands
+0.65% low (153 MHz, ~59.6 Hz), accepted by the panel.
+
+## Native DC-head mode set — hardware-confirmed (original Parhelia 0x0528)
+
+The original Parhelia drives DVI through the **native DC head, not the VGA CRTC**
+(the 8-bit CRTC can't express >1024-line timing). Cold-boot native modeset works
+on DVI-1 across 800×600, 1024×768, 1280×1024, 1600×1200 and 1920×1200 (154 MHz
+single-link). The full chain (`ParheliaSetModeNative`, `src/parhelia_mode.c`):
+
+1. **Pixel PLL** — solve+program the four-field divider into **PLL2 (0x0E18)**
+   with the LOAD strobe (see PLL section). B3 is mandatory or PLL2 never locks.
+2. **Clock routing** — controller B (**0x1C04**): mux=PLL, clksel=3; then
+   **0x1C08 = 2** selects controller B as the DC-head clock source (required —
+   the head clock does not engage otherwise).
+3. **DC-head timing** — program the timing twin blocks (base 0x1A00 ctrl /
+   0x1B00 timing; head×0x200). The active display width sets the memory-fetch
+   **stride**, so the framebuffer pitch must equal **HDisplay** (aligned to 16) —
+   *not* padded to a power of two, which leaves the padding columns visible as
+   vertical bars. (`0x1A34`'s low field, set to displayWidth, is *not* the real
+   fetch stride; it only appeared to work when displayWidth == HDisplay.)
+4. **Integrated DVO/TMDS serializer** (`parhelia_program_dvo`) — the VBIOS only
+   sets this up during POST, so a native mode must bring it up:
+   - **0x1C20** format+crossbar: byte1 = DVO1, byte3 = DVO2; value
+     `0x14 | (head<<6)` routes a head into the serializer (DVI-1 = head1→DVO1 →
+     byte1 = 0x54). Byte0 bit5 (0x20) is a POST-set global enable (read-only from
+     software).
+   - **0x1C24** serializer power, active-low: bit0=DVO1, bit1=DVO2, bit2=common;
+     DVI-1 up = 0x02.
+   - Serializer clock-source code in the controller reg: DVO1 =
+     0x1C00 {bit27, bits14:13}, DVO2 = 0x1C04 bits[17:15] = the clock index (3),
+     with a hold bit (0x1C00 bit12 / 0x1C04 bit14) asserted across the reprogram.
+
+Mapping (0x0528): **DVI-1 = head1 = DVO1** (0x1C00 / 0x1C20 byte1 / 0x1C24 bit0);
+DVI-2 = head0 = DVO2 (0x1C04 / byte3 / bit1). `0x1A00` bit18 (0x40000) is a
+read-only "CRTC active" status; the live vertical scanline counter is `0x1B24`.
+[RE: `HSLPAREnableDVO`@0xb04f0, `HSLPARSetDVOClock`@0xaef00, all cross-checked
+against a working VBE register dump; validated on hardware.]
 
 ## Memory controller — position corrected
 
