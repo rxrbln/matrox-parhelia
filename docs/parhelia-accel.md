@@ -206,20 +206,44 @@ A 3×3 colour matrix + bias. The base is a hardcoded **BT.601 YCbCr→RGB** matr
 `CSC · contrast · …`; bias = brightness + (0.0625, 0.5, 0.5) (the 16/128/128
 YCbCr offsets). Packed into the shader coefficient registers above.
 
-## Hardware cursor [DRV]
+## Hardware cursor [DRV — register map re-RE'd 2026-08-09; still not visible on HW]
 
 64×64, both 2-colour and full ARGB, direct MMIO. Per head (CRTC1 base 0x18C0,
-CRTC2 base 0x1AC0 — inside the display-head blocks, stride 0x200):
+CRTC2 base 0x1AC0 — inside the display-head blocks, stride 0x200). The earlier
+table in this doc (image@0x1AC0, X/Y pos@0x1ACC/0x1AD0) was **wrong**; the
+corrected map below was traced twice from `MTXHWCursorInit`@0x43a70 and the
+cursor callbacks `mtx58/59/60/63/64/67/68/69` and matches the user's own notes:
 
-| CRTC1 / CRTC2 | Field |
-|---|---|
-| 0x18C0 / 0x1AC0 | image base address |
-| 0x18C4 / 0x1AC4 | control (0 = disable) |
-| 0x18C8 / 0x1AC8 | colours / mask |
-| 0x18CC / 0x1ACC | X position |
-| 0x18D0 / 0x1AD0 | Y position |
+| CRTC1 / CRTC2 | Field | Value |
+|---|---|---|
+| 0x18C0 / 0x1AC0 | colour / LUT data (RGB888) | written after selecting index+mode in +0x04 |
+| 0x18C4 / 0x1AC4 | control | `(lut_index<<8) \| mode`; mode 0=off, 3=2-colour, 4=16-colour/ARGB |
+| 0x18C8 / 0x1AC8 | position (one packed dword) | `((x+64)&0x7fff)<<14 \| ((y+64)&0x7fff)` |
+| 0x18CC / 0x1ACC | image base | **surface address in 8-byte units = `byte_offset >> 3`** (`HSLCRTCSetDisplayStart` >>3 default; the CPU still memcpy's to the byte offset) |
+| 0x18D0 / 0x1AD0 | format | `0x05000000`=2-colour, `0x04000000`=16-colour/ARGB |
 
-Disable writes 0 to the control register and waits for vblank.
+Plus a **DC-level composite enable** at `DC(head)+0x88` = **0x1888 / 0x1A88**,
+RMW `|= 0x16` (asserted in SetCursorPosition and ShowCursor; HideCursor clears
+it / writes control 0). `HSLPARSetDCParameters` never touches the cursor.
+
+**2-colour image**: 2 bits/pixel, 16 bytes/row copied verbatim, 32-byte surface
+row stride (upper 16 bytes zeroed); the 2 bits index LUT[0]=bg / LUT[1]=fg with
+transparency. xf86 realize flags = **swap+and** (0x300 in the vendor's era, i.e.
+`HARDWARE_CURSOR_SWAP_SOURCE_AND_MASK | HARDWARE_CURSOR_AND_SOURCE_WITH_MASK`),
+not INTERLEAVE_1. **ARGB image**: 9 bit-planes per row (4 palette-index planes
+then 5 alpha planes, LSB-first = column 0 in bit 0), 128-byte row stride; alpha =
+top 5 bits of source alpha; ≤16-entry quantised palette loaded into the LUT.
+
+**UNRESOLVED — cursor is invisible on the 0x0528 hardware.** With every register
+above set correctly (verified live: mode 3/4, format 0x05/0x04000000, composite
+0x1A88=0x16, image data confirmed present in VRAM, position on-screen centre, on
+the active head1), the sprite never appears. Confirmed NOT the cause: head swap
+(head1 is the sole active display head, head0 dead), the image-base encoding
+(tried raw `0xffc000`, shifted `0x1ff800`, and the note's raw `0x03f00000` at
+63 MB — all invisible), and the modeset (invisible under BOTH native and VBE
+int10 modeset, including the VBE state where the head is fully active
+0x1A00=0x00040201 and the DVO is fully enabled 0x1C20 byte0=0x30). Software
+cursor is the working fallback. The missing factor is not yet identified.
 
 ## Xv / video overlay [DRV]
 
