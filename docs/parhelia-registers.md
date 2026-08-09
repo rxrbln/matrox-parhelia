@@ -193,6 +193,54 @@ read-only "CRTC active" status; the live vertical scanline counter is `0x1B24`.
 [RE: `HSLPAREnableDVO`@0xb04f0, `HSLPARSetDVOClock`@0xaef00, all cross-checked
 against a working VBE register dump; validated on hardware.]
 
+## Per-variant output routing (DDC / VGA / DVI)
+
+How the connectors are wired differs across the family; most of it is **VBIOS
+(PInS)-driven**, not a device-ID branch. The one real device-ID split is the DVO
+register model.  [DRV: `HSLPARGetDDCIORegMasks`@0xb8420, `HSLPAREnableDVO`@0xb04f0,
+`HSLPARGetDVOIndex`@0xe2b80, `HSLPIN60InitCEMStructure`@0xdaaa0.]
+
+**DDC — register `0x1C48` on every variant.** A logical DDC line is resolved to
+physical GPIO pins through a **packed 4-byte pin-id table**: default `0x05070608`
+(id8→bit0, id6→bit1, id7→bit2, id5→bit3) when the PInS version ≤ 0x609; otherwise
+the table at `PInS[0x1b4]`. Data bit = `1<<pin`, output-enable = `1<<(pin+16)`.
+The candidate (SCL-id, SDA-id) pairs per line yield:
+
+| Variant | DVI-1 (SCL/SDA) | DVI-2 (SCL/SDA) | source |
+|---|---|---|---|
+| 512 (0x0527) / 8x (0x0528) | **SCL3 / SDA1** | **SCL2 / SDA0** | default table |
+| LX (0x2537) / SUNEX (0x2538) / P690 (0x2539) | per VBIOS (P690: **SCL1/SDA0**) | per VBIOS (P690: **SCL3/SDA2**) | `PInS[0x1b4]` |
+
+Analog VGA DDC is just another logical line on the same register/table (no
+separate analog DDC register). **CEM/panel + misc I2C is a different bus at
+`0x1C4C`** (`0x1C4C` is *not* an external-transmitter select); TV is on the
+Chrontel I2C. The hardcoded per-chip pins in `parhelia_ddc.c` are correct in
+effect; the portable source is `PInS[0x1b4]` (fallback `{8,6,7,5}→{0,1,2,3}`).
+
+**Analog VGA / DAC — identical on all variants** (no device-ID branch): DAC1 =
+`0x1C18` (power bits 10,12,15,16), DAC2 = `0x1C1C` (power bits 10,12,16,17),
+head→DAC via bit14. There is no external video DAC; TV/HD uses an external
+Chrontel encoder on its own I2C.
+
+**DVI / DVO — the device-ID split:**
+
+| Variant | DVO register model |
+|---|---|
+| 512 (0x0527) / 8x (0x0528) | **direct crossbar `0x1C20`** (byte1=DVO1, byte3=DVO2), power `0x1C24` bit0/bit1, data `0x1C70` |
+| LX / P650 / SUNEX / P690 (0x2537–9) | **twin regs `0x1C54` (DVO1) / `0x1C58` (DVO2)**, format/config from `PInS[0x190]`/`[0x194]`, data `0x1C70`, power `0x1C24` bit0/bit1 (needs PInS ver > 0x605) |
+
+**External transmitter is probed, not per-chip:** `HSLPARDetectSiliconImage`
+@0xc3a90 reads a SiI164 ID at I2C slaves `0x70`/`0x76`; if one answers the
+connector uses the external SiI164 (dual-link capable), else the integrated
+TMDS/DVO. P690 has integrated TMDS (no SiI164 answers).
+
+**Board wiring:** the connector→output enum `[dev+0x4a9c]` = VBIOS byte
+`PInS[0x1a1]`. It drives `HSLPARGetDVOIndex`/`HSLPARGetDACIndex`, so **DVO1↔DVI-1
+is not universal** — enum `0xa`/`0x10` swap the DVO index and enum `3` inverts it
+(gated on subsys `[dev+0x4aa2]==0x25` for a few values). Our driver's DVI-1=DVO1
+assumption is correct for the tested 0x0528 board but not portable; a fully
+general driver would read the PInS wiring byte.
+
 ## Memory controller — position corrected
 
 > **Correction.** An earlier revision of this document listed a "memory
