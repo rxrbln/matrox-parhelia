@@ -31,7 +31,7 @@ after each `glDrawArrays`/`glClear`.
 | # | Unknown | Register(s) to watch | Trigger | Hint |
 |---|---|---|---|---|
 | 1 | S8Z24 depth format enum | 0x1234 | bind a 24/8 depth-stencil visual | small code (cf. colour=3) |
-| 2 | Fragment op → 0x126c opcode-base (per op) | 0x126c bits[low] | one fragment shader per op (MUL/MAD/DP3…) | done in the kernel module; also readable there |
+| 2 | Fragment op → 0x126c opcode-base (per op) | 0x126c bits[low] | one fragment shader per op (MUL/MAD/DP3…) | in **libGL** `GLFragmentShaderManager` (NOT the kernel .o — verified no 0x126c/0x1264 refs there); statically recoverable |
 | 3 | Blend-factor bank (key 0x5) absolute base | contiguous 4 offsets | `glBlendFunc(SRC_ALPHA, 1-SRC_ALPHA)` | receives codes 0x05 / 0x06 |
 | 4 | Texture wrap/clamp mode field | 0x11c8–0x11d8 | `glTexParameteri(GL_REPEAT)` vs CLAMP | not in the scaler path |
 | 5 | VS declaration-stream (dcl/def) entry layout | key=0x45/0x46 blob | upload a known shader | second token vector |
@@ -39,9 +39,12 @@ after each `glDrawArrays`/`glClear`.
 
 (The fragment **iterated-primary-colour input selector**, previously a capture
 item, is now **pinned to 0x10** statically — see `parhelia-fragment-isa.md`. #2
-above is the remaining fragment-shader piece: the concrete opcode-base bits that
-the *kernel* module packs into 0x126c for each of the 11 ALU ops — readable by
-disassembling that module or by one capture per op.)
+above is the remaining fragment-shader piece: the concrete opcode-base bits
+packed into 0x126c for each of the 11 ALU ops — readable by disassembling
+**libGL** (`GLFragmentShaderManager`, the 64-bit build) or by one capture per op.
+Correction (2026-08): the packing is in userspace libGL, not the kernel module;
+`mtx_parhelia.o` has no 0x126c/0x1264 references — it is a generic register-replay
+engine (see `parhelia-mesa-driver.md`).)
 
 #3 (blend bank base) and the T&L constant-RAM base sit behind the ICD's
 thread-local dispatch and are expected to stay capture-only — though a driver
