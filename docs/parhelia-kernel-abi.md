@@ -1033,3 +1033,68 @@ rebuild the vendor module with `MTX_MAX_ORDER` raised to 10. Everything up to
 `mtxvxd.o` builds; the final link needs a kernel source tree, and
 `/lib/modules/2.6.30-dist/build` on the test box dangles into a T2 tree that no
 longer exists.
+
+## Appendix: the ioctl-to-GPU path, observed live  [HW]
+
+A kernel oops during a texture-format sweep produced a complete call chain,
+which **confirms on live hardware** the dispatcher structure recovered
+statically in sections 4 and 6:
+
+```
+system_call_fastpath
+  sys_ioctl -> do_vfs_ioctl -> vfs_ioctl
+    mtx903+0x420        ioctl entry / doorbell
+      mtx3683+0xc7      generic dispatcher
+        mtx2359+0x20
+          mtx2856+0x5d
+            mtx263+0x155   <-- NULL dereference, CR2 = 0x14
+```
+
+So the userspace path really is: **one ioctl on `/dev/matrox/mtx0` enters
+`mtx903`, which hands off to the generic dispatcher `mtx3683`, which routes to
+the per-operation handler**, and only then does the driver touch the hardware.
+Nothing in userspace reaches the GPU through this path directly — but note the
+separate finding below that userspace ALSO maps BAR1 and writes it without the
+kernel's involvement.
+
+### What kernel-side MMIO a full GL session actually performs  [HW]
+
+From an mmiotrace covering `modprobe mtx`, X start, a GL context, a texture
+upload and a textured draw — 317 register writes in total:
+
+| Register | writes | role |
+|---|---|---|
+| 0x408 | **216** | PRIMEND ring doorbell — the dominant traffic by far |
+| 0x314 | 17 | kick |
+| 0x040 | 11 | aperture/descriptor bank |
+| 0x044 / 0x048 / 0x04c | 5 each | aperture/descriptor bank |
+| 0x384 | 3 | DMAPAD |
+| 0x920 | 2 | WARP arm |
+| 0x300 / 0x308 | 2 each | engine arm |
+| **0x91c** | **0** | **microcode FIFO — never written** |
+
+**Two structural caveats, both important:**
+
+1. **mmiotrace only sees the kernel's `ioremap` mapping.** Userspace maps BAR1
+   itself (`MTX_IOCTL_GET_MEMORY_INFO` hands out `reg_base`/`reg_size`, region
+   type `MTX_MEMTYPE_IO`), and those writes use different page tables, so they
+   are **invisible** to this trace. Zero writes to 0x91c here therefore does
+   **not** prove the microcode is never streamed — only that the *kernel* does
+   not stream it. This weakens, but does not settle, the mtx676 question.
+2. The trace's 384,680 `UNKNOWN` lines are accesses to BAR0 at 0xd0fc0000 with
+   opcode `f3,48,ab` = `rep stosq` — bulk CPU writes of texture/vertex data into
+   the aperture, which mmiotrace cannot decode into address/value pairs.
+
+**Correction to a previously documented verified negative:** section 10 states
+the kernel module never writes 0x314. The trace shows **17 kernel-side writes to
+0x314**, so that negative is wrong as stated.
+
+### A driver bug worth knowing: GL_INTENSITY oopses the kernel  [HW]
+
+`glTexImage2D(..., GL_INTENSITY, ...)` reliably takes down the vendor kernel
+module with a NULL dereference at `mtx263+0x155` on the path above. Captured
+while sweeping internal formats. `GL_RGBA`, `GL_RGB`, `GL_ALPHA`,
+`GL_LUMINANCE` and `GL_LUMINANCE_ALPHA` all complete normally, so the fault is
+specific to that format rather than to the sweep. An open driver should treat
+`GL_INTENSITY` as unsupported on this hardware until proven otherwise, and any
+capture harness should avoid it — it kills the box's driver mid-run.
