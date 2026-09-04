@@ -68,7 +68,17 @@ GROUND-TRUTH draw MMIO (captures/mmio-draw-0528*.txt): per draw =
   scratch driver must reproduce that engine-arm.
 - vertex attribute layout = [x, y, r, g, b] (captured live, docs/parhelia-vertex-isa.md).
 
-## 5. Command construction — CAPTURED (captures/cmdbuf-draw-0528-*)
+## 5. Command construction — FULLY CAPTURED
+**docs/parhelia-command-construction.md** is now the authoritative account: the
+seven `/dev/matrox/mtx0` mappings and their roles, the per-draw 7-dword
+descriptor (header 0x8f000001, vertex count, sequence, vertex-buffer bus
+address), the head/tail publish at region-2 0x18/0x20/0x28, the confirmed
+`[x,y,r,g,b]` 20-byte vertex, the (index,value) state-pair stream, and the
+locked-page buffer allocation. Instrument: tools/parhelia-glsweep.c, raw capture
+captures/glsweep-0528-raw.txt. Per-GL-feature register deltas:
+docs/parhelia-gl-feature-map.md.
+
+### 5a. First capture (superseded in detail, kept for provenance)
 All draws use the SAME ring-submit MMIO; the FEATURE-specific state lives in the
 COMMAND BUFFER the GPU DMA-reads — invisible to mmiotrace, but capturable.
 
