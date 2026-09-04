@@ -117,37 +117,48 @@ DST_COLOR=9, 1-DST_COLOR=0xa, SRC_ALPHA_SATURATE=0xb, CONSTANT_COLOR=0xe,
 
 ## Fragment / pixel shader — DONE (a DX8 ps.1.x-shaped ISA)
 
-The pixel shader is a programmable two-phase combiner (`GL_MTX_fragment_shader`),
-reverse-engineered in full — see **`parhelia-fragment-isa.md`**. Opcode set
-MOV/ADD/SUB/MUL/DP3/DP4/MAD/LRP/CND/CMV/CMP (0–10); input selectors tex0-3=0-3,
-temp0/output=4, temp1=5, constant=0xE, **iterated primary colour=0x10**,
-secondary=0x11; DX8 ps.1.x modifiers (Scale/Saturate, per-arg Convert/Replicate).
-Stage words: `0x1264` = input selectors + control | slot, `0x126c` = output
-(bits[23:20]) + opcode-base; pass-through identity = `0x1264=0`, `0x126c=0x400400`.
-Colour-matrix coeffs `0x1278-0x1284` (signed-11-bit ×1024, two per reg). Texture
-pipes `0x1200-0x120c`: active `0x00040101`, idle `0x00010000`. (The one residual:
-the concrete opcode-base bits per ALU op are packed by the kernel module.)
+The pixel shader is a programmable combiner (`GL_MTX_fragment_shader`) —
+see **`parhelia-fragment-isa.md`**, rewritten 2026-09-05 with the full bit
+layout. Opcode set MOV/ADD/SUB/MUL/DP3/DP4/MAD/LRP/CND/CMV/CMP (internal 0-10)
+with `0x126c[14:9]` bases 0x0400/0x0c00/0x0600/0x0000/0x1000/0x2000/0x0800/
+0x0a00/0x4c00/0x5c00/0x7c00. Register codes tex0-3 = 0-3, r0 (temp0/output) = 4,
+r1 = 5, c0 = 0xE, c1 = 0xF, iterated primary = 0x10, secondary = 0x11.
+`0x1264` = slot[4:0] + **three** source operands (5-bit register + 4-bit
+modifier each) at [13:5]/[22:14]/[31:23]; `0x126c` = three replicate fields
+[2:0]/[5:3]/[8:6], opcode [14:9], result scale [19:17], destination [23:20],
+saturate [24]. Pass-through identity = `0x1264=0x80`, `0x126c=0x00400400`.
+`0x1278-0x1284` are the two constant registers c0/c1 (four signed Q1.10 x1024
+components each), not a dedicated colour matrix. Texture pipes `0x1200-0x120c`:
+active `0x00040101`, idle `0x00010000`. (The opcode bases per ALU op are now
+fully recovered — see docs/parhelia-fragment-isa.md §7; they are packed in user
+space, not by the kernel module.)
 
-## Texturing — DONE (linear); wrap modes TBD [DRV]
+## Texturing — DONE (linear); wrap-mode register found, enum values TBD [DRV]
 
 Corrected register roles (`CDPSTextureEngine::UpdateHardware`):
 - **0x11dc = texture base** — 32-bit byte offset in VRAM (`MmSurface[+0x90]`).
 - **0x11e0 = control word** — `[13:0]`=pitch (32-pixel-aligned width in pixels),
   bit17 set, `[29:24]`=format code, `[31:30]`=tiling (0=linear).
 - **0x11e4 = height** — `0x00010000 | (height & 0x3fff)`.
-- **0x11e8 = filter** — min[7:0] / mag[15:8] / mip[23:16] (build the word directly:
-  nearest/linear/mip per nibble; the driver doesn't translate GL enums).
+- **0x11e8 = texture-cache partition, NOT filter** — CORRECTED 2026-09-05. It is
+  a pure lookup on (active stage count, unit), table MTXPARD 0x1d43f0:
+  1-2 stages `0x00500000` on all units, 3 stages
+  `0x01600000,0x01600000,0x00400000,0x00400000`, 4 stages `0x01600000` on all.
+  The **filter word is 0x11c4** (three 3-bit fields at [2:0]/[5:3]/[8:6] plus a
+  border-colour enable at [10:9]) and the **address/wrap modes are 0x11c0**
+  (2 bits per axis at [1:0]/[4:3]/[7:6], bit12 always set). See
+  docs/parhelia-fragment-isa.md §11.
 
 **Format codes** (proven, corrected): 8bpp `0x10` (0x11 in texture desc), 15bpp
 1:5:5:5 `0x26`, 16bpp 5:6:5/4:4:4:4 `0x28`, **32bpp 8:8:8:8 `0x32`**, 2:10:10:10
-`0x34`, DXT/S3TC `0x2e`. (This also corrects the framebuffer descriptor: 32bpp
+`0x34`, DXT/S3TC `0x2e` (**suspect**: MTXPARD 0xa3b40 classifies code 0x2e as 16 bpp, not 4). (This also corrects the framebuffer descriptor: 32bpp
 is 0x32, not 0x28.)
 
 **Texel layout (linear):** `dst = base + y*pitchBytes + x*bpp`, `pitchBytes =
 ((width+31)&~31) * bpp/8`. Directly implements `glTexImage2D`. Tiling
 (bits[31:30]≠0, power-of-two dims, swizzled) is gated by `reg3DUseTextiled` and
-should be **forced off** for a first driver. **Wrap/clamp modes** aren't in the
-scaler path (it always clamps) — likely in the fixed regs 0x11c8–0x11d8; a
+should be **forced off** for a first driver. **Wrap/clamp modes** are register **0x11c0**, not 0x11c8-0x11d8 (those are
+written as 0 by every path found) — see docs/parhelia-fragment-isa.md §11.3. A
 capture item (or check `libglx.so`).
 
 ## Transform & lighting — mechanism DONE [GL]
