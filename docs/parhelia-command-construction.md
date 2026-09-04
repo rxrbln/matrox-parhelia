@@ -65,6 +65,15 @@ Seven dwords at the slot base:
 `+0x08` tracking the vertex count across GL_TRIANGLES (3) and GL_LINES (2) is
 the clearest single confirmation that this is the draw descriptor.
 
+**Hypothesis (INFERRED, not yet confirmed):** the last three dwords may simply be
+one record in the ring micro-format — `+0x10` is the tag and `+0x14`/`+0x18` are
+its two payload dwords, so that `+0x14` is the value written to **reg 0x1094**
+and `+0x18` the value written to **reg 0x1090** (tag bytes little-endian give
+index order 0x25, 0x24, pad, pad = regs 0x1094 then 0x1090). That would make
+0x1094 a per-draw index and 0x1090 the vertex-buffer address. It does not fully
+square with the earlier state capture, which had `0x1090=1` and `0x1094=6`, so
+treat this as a lead to settle from the ICD disassembly, not as established.
+
 Note that triangles and lines produce otherwise identical descriptors, so the
 **primitive type is not encoded here** — it must live in the state stream or in
 the 0x1090/0x1094 pair the tag names. Resolving that is an open item.
