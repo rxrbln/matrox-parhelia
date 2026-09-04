@@ -7,55 +7,31 @@ parhelia-fragment-isa.md, parhelia-vertex-isa.md, parhelia-3d-driving.md and the
 WARP microcode/draw-submission RE (see [[parhelia-warp-draw-protocol]]).
 Tags: [C]=confirmed from disasm, [P]=probable, [CAP]=capture-only.
 
-## 1. Fragment combiner — opcode-base table [C]
+## 1. Fragment combiner [SUPERSEDED]
 
-The ps.1.x opcode base is NOT packed at token-parse time; a translation function
-(MTXPARD 0x182190) indexes a 24-byte-per-entry `.rdata` table @VMA 0x1d6f98
-(index = D3DSIO opcode, clamped 0x58) and writes `entry[0x00]`→0x1264,
-`entry[0x10]`→0x126c. The per-op 0x126c base (bits ~[14:9], value = base>>9):
+**This section was wrong in several fields and has been replaced by
+`docs/parhelia-fragment-isa.md` (revision 2026-09-05).** Read that file; do not
+use the bit tables that used to be here. Short summary of the corrected model:
 
-| op  | D3DSIO | 0x126c base | >>9 |
-|-----|--------|-------------|-----|
-| MUL | 0x05   | 0x00000000  | 0    |
-| MOV | 0x01   | 0x00000400  | 2    |
-| SUB | 0x03   | 0x00000600  | 3    |
-| MAD | 0x04   | 0x00000800  | 4    |
-| LRP | 0x12   | 0x00000a00  | 5    |
-| ADD | 0x02   | 0x00000c00  | 6    |
-| DP3 | 0x08   | 0x00001000  | 8    |
-| DP4 | 0x09   | 0x00002000  | 0x10 |
-| CND | 0x50   | 0x00004c00  | 0x26 |
-| CMP | 0x58   | 0x00007c00  | 0x3e |
-| NOP | 0x00   | 0x00400400  | (default: out-reg4 \| MOV, 0x1264=0x80) |
-
-RCP/RSQ/MIN/MAX/SLT/SGE/LIT/DST/TEX* fall back to 0x400 (copy — not natively
-combiner-supported). MUL's all-zero base is real (its multiply comes from the
-source-slot config, not the opcode field). **CMV**: absent from the D3D driver
-(no ps.1.x token); it is a GL/mtx_drv-internal conditional-move op in the
-CND/CMP family (base near 0x4c00/0x7c00) — [CAP] exact base.
-
-### 0x1264 / 0x126c operand layout [C]
-- For ALU ops the **0x1264 base = 0** (the 0x07038000 control base is the
-  fixed-function/video CSC path only — MTXPARD 0x1819c9/0x1831e7, mtx_drv).
-- source0 selector → 0x1264 bits[9:5] (`shl 5`, mask 0xffffc01f, @0x182286).
-- source1 selector → 0x1264 bits[18:14] (`shl 0xe`, mask 0xff803fff, @0x1822e8).
-- input-selector code table @0x1d78f8: tex0-3=0-3, temp0/output=4, temp1=5,
-  const≈0xE/0xF, iterated-primary=0x10, secondary=0x11. swizzle table @0x1d7a78
-  (identity 0xe4 folded to 0xff @0x18202f).
-- source-A reg+modifier → 0x126c[24:17]: `((mod&1)<<4 | reg&0xf)<<3 | comp&7`
-  then `<<0x11` (mask 0xfe01ffff); the modifier (negate) bit lands at 0x126c
-  bit21. source0 → 0x126c[1:0]; source1 → 0x126c[4:3].
-- _sat/_x2/_x4 result-modifier bit positions live in helpers 0x181f00/0x181fe0
-  and the dest-writemask path (record+0x34) — [P], not fully pinned.
-
-### Two-phase combiner (UpdateHardware 0x1707b0) [C]
-- flag byte bit0 ⇒ tex-address phase: writes 0x1260 (from +0xc), 0x1268 (+0x10).
-- flag bits[2:1] ⇒ arithmetic/matrix phase: writes 0x1278/0x127c/0x1280/0x1284
-  (matrix coeffs +0x14..+0x20). NB these 0x1278-0x1284 writes are the COMBINER
-  colour-matrix use of those regs (distinct from their clip use, §3).
-- Always writes 0x1264 (from +0x4, XOR-merged with slot low-5) and 0x126c (+0x8).
-Pass-through identity = 0x1264=0x90 (base 0x80 | iterated-primary 0x10),
-0x126c=0x00400400. mtx_drv CSC matrix-multiply base 0x803 (video-only).
+- 10 instruction slots = 5 combiner stages x {colour, alpha}; the slot address
+  lives in `0x1264[4:0]` and the driver's instruction list maps to slots
+  `0,2,4,8,10, 1,3,5,9,11`. Instruction count is padded to 5 or 10.
+- `0x1264` = slot[4:0] + **three** source operands, each 5-bit register selector
+  + 4-bit modifier, at [13:5], [22:14], [31:23]. `0x07038000` is not a control
+  base, it is just "srcB = c1, srcC = c0".
+- `0x126c` = three 3-bit channel-replicate fields [2:0]/[5:3]/[8:6], opcode
+  [14:9], **result scale** [19:17] (x1/x2/x4/x8 — not a write mask), destination
+  register [23:20], saturate [24].
+- `0x1278`-`0x1284` are the two general **constant registers** c0 and c1, four
+  signed Q1.10 (x1024) components each — not a dedicated colour matrix.
+- `0x1260`/`0x1268` are a second instruction word pair per slot (texture
+  address) with the identical layout.
+- Opcode bases (`0x126c[14:9]`): MUL 0x0000, MOV 0x0400, SUB 0x0600, MAD 0x0800,
+  LRP 0x0a00, ADD 0x0c00, DP3 0x1000, DP4 0x2000, CND 0x4c00, **CMV 0x5c00**,
+  CMP 0x7c00. Operand roles: MAD = A*C+B, MUL = A*C, ADD = A+B, SUB = A-B,
+  DP3/DP4 = dot(A,C), CND/CMV/CMP select between B and C on A.
+- `0x00400803` is MAD with source-A replicate = red, not a "colour-matrix
+  multiply" opcode.
 
 ## 2. Viewport / scissor — conflict RESOLVED [C]
 

@@ -115,7 +115,25 @@ descriptors, not word0). All 28 `GLVSInstruction` classes resolved:
 
 **Shared opcodes** differ only by an operand modifier, not word0: Mov/Negate =
 `0x01` (Negate = Mov + source-negate); Add/Sub = `0x02` (Sub = Add + src1-negate).
-Unused/reserved: `0x00, 0x03, 0x08, 0x0e–0x54, 0x5c, 0x5d`.
+
+**CORRECTIONS (2026-09-05):**
+- `Swizzle` is **`0x5c`**, not `0x01`. `glSwizzleEXT`'s handler (libGL64
+  0x160b83–0x160f36) allocates a 0x48-byte node and stores `0x5c` at 0x160f27,
+  packing the four selectors twice: `+0x3c = Σ sel_i<<(2i) | class_i<<(24+2i)`
+  (class 0 = plain, 1 = negate, 2 = constant) and `+0x40 = Σ sel6_i<<(6i)`,
+  default 0x20. `glWriteMaskEXT` is a *separate* handler at 0x160814 (0x40-byte
+  node, opcode `0x01` at 0x160867) which ORs the dest write-mask bits 19:16.
+- **`0x00, 0x08, 0x0e–0x18, 0x4e, 0x4f, 0x5d` are NOT reserved.** The IR opcode
+  space is the D3DSIO enum extended in place, which is exactly why no DX→native
+  LUT exists. From `MTXPARD.dll`'s validation table: `00 nop, 01 mov, 02 add,
+  04 mad, 05 mul, 06 rcp, 07 rsq, 08 dp3, 09 dp4, 0a min, 0b max, 0c slt,
+  0d sge, 0e exp, 0f log, 10 lit, 11 dst, 13 frc, 14 m4x4, 15 m4x3, 16 m3x4,
+  17 m3x3, 18 m3x2, 4e expp, 4f logp, 55 mpow, 56 mclamp, 57 mcross, 58 mround,
+  59 mfloor, 5a minsert, 5b mextract, 5c mswizzle, 5d mwrmask, 5e mlog,
+  5f mexp, 60 mmult, 61 mfrac, 62 mindex, 63 mdp3`. Only `0x03` (sub) and
+  `0x12` (lrp) are genuinely absent.
+- Note that this IR numbering has **nothing to do** with the hardware opcode
+  values in PART 2 — IR `0x60` (mmult) and hardware `0x60` are unrelated.
 
 **No DX→native opcode LUT exists** — translation is structural: the shader
 parser instantiates the matching `GLVSInstruction_*` C++ subclass, each of which
@@ -501,6 +519,37 @@ evidence that the field split is right.
 
 ## 6. Opcode field [w2[30:23] CONFIRMED as the opcode; mnemonics mostly INFERRED]
 
+**The vendor's own code decodes this field.** `mtx3395` (`.text+0xa6940`) is a
+walker over a microcode program:
+
+```
+a6946: add  rdx, 8              ; rdx = &instr.word2
+a6950: mov  eax, [rdx]
+a6952: shr  eax, 0x17           ; >> 23
+a6955: and  eax, 0xff           ; = w2[30:23]
+a695a: sub  eax, 0x29
+a695d: cmp  eax, 0x6b           ; valid opcode range 0x29 .. 0x94
+a6960: ja   next
+a6964: jmp  [.rodata+0x3040 + rax*8]   ; 108-entry jump table
+next:  inc  ecx
+a6972: add  rdx, 0xc            ; 12-byte instruction stride
+a6976: cmp  ecx, esi
+a6978: jb   a6950
+```
+
+That single function independently confirms **both** the 12-byte instruction
+stride and the exact opcode field. I extracted the 108-entry table: it has 108
+relocated entries and only **two** distinct targets — index 0 (opcode `0x29`)
+jumps to the function's `ret`, the other 107 fall through to the loop
+increment. So the routine is "scan forward until opcode `0x29`", which is what
+independently establishes `0x29` as **end-of-program**. (No per-opcode handlers,
+so this table yields no mnemonics.)
+
+Note the walker's range `0x29..0x94` does **not** cover `0x00`, `0x0a` or `0x23`,
+which are all heavily used. Either those form a second instruction class this
+particular scanner does not classify, or the range is deliberately narrowed to
+the arithmetic subrange — do not assume one flat opcode space.
+
 66 distinct opcode values occur across the 39,953 instructions of the analysed
 corpus (the 574-fragment registry plus the self-test and a few unregistered
 `.data` images). The field partitions the corpus cleanly by *shape* — which operand and
@@ -552,10 +601,12 @@ Census (opcodes with ≥100 uses; `wrA`/`wrB` = how many write that port,
 Remaining opcodes seen: 0x29, 0x64, 0x65, 0x66, 0x67, 0x82, 0x84, 0x86, 0x8a,
 0x8b, 0xfe and 17 more with fewer than 20 uses each.
 
-**Opcode 0x29 = END [CONFIRMED].** It occurs 28 times, always as the *identical*
-encoding `00000200 00040000 14c00000`, and always one instruction before the end
-of its fragment (27 of 28; once three before). Together with `0x00` = NOP these
-are the two opcodes whose meaning is settled by encoding alone.
+**Opcode 0x29 = END [CONFIRMED].** Three independent lines agree: `mtx3395`
+scans for exactly this value and stops; it occurs 28 times in the corpus, always
+as the *identical* encoding `00000200 00040000 14c00000`; and it always sits one
+instruction before the end of its fragment (27 of 28; once three before).
+`0x00` = NOP is likewise settled by encoding alone — 1899 of its 1900
+occurrences are the single word `00000200 00040000 00000000`.
 
 **Independent cross-check of the opcode field.** A second, separately extracted
 corpus — 141 `.data` blobs of `mtx_parhelia.o`, 422,796 bytes, 35,233
@@ -693,14 +744,17 @@ library is a validated corpus of working code to imitate.
 
 ## 10. Confidence and what is still open
 
-**Confirmed:** the 12-byte instruction word; the complete bit-field map
-(from the vendor's own patcher, not guessed); three source slots and two
-destination write ports with per-port write masks; the 128-entry register file
-and its one-extended-operand addressing; the 12-bit 3-bits-per-component swizzle
-with identity `0x688`; the 32-bit immediate split; opcode `0x23` = relative
-branch and `0x46` = backward branch; `w2[30:23]` as the opcode field;
-`Add` = 0x76/0x71; the 4×dp4 transform idiom; the 512-instruction store; that
-`mtx2785` is a self-test.
+**Confirmed:** the 12-byte instruction word (twice over — the `0x918`/`0x91c`
+loader and the `mtx3395` walker's 12-byte stride); `w2[30:23]` as the opcode
+field (decoded verbatim by `mtx3395`); opcode `0x00` = NOP and `0x29` = END;
+the complete bit-field map (from the vendor's own patcher, not guessed); three
+source slots and two destination write ports with per-port write masks; the
+128-entry register file and its one-extended-operand addressing; the 12-bit,
+3-bits-per-component swizzle with identity `0x688`; the 32-bit immediate split;
+opcode `0x23` = relative branch and `0x46` = backward branch; `Add` =
+0x76/0x71; the 4×dp4 transform idiom; the 512-instruction store; that `mtx2785`
+is a self-test; and — as a negative — that no IR→hardware opcode table exists in
+any vendor binary, Linux or Windows.
 
 **Inferred, not proven:** the mnemonic for every opcode other than the branches
 and `Add`; whether the two write ports imply dual-issue; the meaning of swizzle
@@ -718,10 +772,52 @@ on its own between two otherwise byte-identical library instructions (both
 `AddEfs`/`AddEfd`/`AddEfm` and many others have an exact twin that differs in
 w0[19] alone), it is set in 33% of the corpus, and it is set in every single
 opcode-0x60 instruction. That is the profile of a one-bit operand or result
-modifier — negate or accumulate. Closing it wants either a live capture
-correlating a known GL shader with the fragments it selects, or the Windows D3D
-driver's vs_1_1 compiler.
+modifier — negate or accumulate. The Windows D3D compiler has already been ruled
+out as a source (§6), so closing these fields means either a live capture
+correlating a known GL shader with the fragments the driver selects for it, or
+targeted experiments on real hardware: upload a hand-built fragment, flip one
+bit, and read the result back.
 
 **No hardware validation has been done.** Nothing in PART 2 has been executed on
-a Parhelia; it is all static analysis of `mtx_parhelia.o` cross-checked against
-itself.
+a Parhelia. It is static analysis of `mtx_parhelia.o`, cross-checked against a
+second independently built corpus, against the Windows `MTXPARD.dll` (30
+byte-identical microcode blobs), and against the internal consistency tests in
+§5 and §7.
+
+## CONFLICT to resolve: what mtx676 actually loads, and why it matters
+
+Two independent RE passes describe `mtx676` (`.text+0xa0230`) differently and
+both cannot be right:
+
+- The **kernel-ABI pass** reads it as the engine's microcode load at device
+  init: it builds `{size=0x12cc, ptr=&mtx2785, entries=4}` and calls `mtx1391`,
+  which streams the image to the `0x91c` FIFO; the return value is an
+  entry-point address.
+- The **ISA pass** reads `mtx676` as a **self-test**, and disassembles the
+  `mtx2785` image as 384 instructions sweeping write port A across registers
+  0-15 — no transform, no texture work, nothing resembling a T&L program. The
+  real vertex microcode on this reading is a library of **574 pre-compiled
+  fragments** in a registry at `dev+0x9c108`, concatenated and bit-patched by
+  the microcode linker `mtx3558` per pipeline state.
+
+The disassembly is visibly a register sweep, which fits "self-test" far better
+than "firmware", and byte-identity of the image across Parhelia and P690 is
+exactly what a self-test would show — so that reading is the stronger one. But
+these are readings of the *same symbol*, so one pass has mis-attributed a
+caller. Resolve before relying on either.
+
+### Why this matters more than it looks
+
+If `mtx2785` is a self-test, it explains thelong-standing result that our
+from-scratch WARP draw **consumes the vertex stream but rasterises nothing**:
+the engine was armed and fed a self-test image rather than a vertex program, so
+there was no transform to run and no fragments to emit. Under that reading, a
+working open driver cannot simply replay `tools/warp_ucode.h` at init — it must
+either assemble the 574-fragment library the way `mtx3558` does, or capture the
+concatenated image the vendor driver actually loads for a given pipeline state.
+
+This has **not** been tested on hardware. The cheap decisive experiment: capture
+the real `0x91c` stream during vendor GL init with mmiotrace (the method in
+docs/parhelia-mmio-capture.md) and compare its length and content against the
+4812-byte `mtx2785` image. If they differ, the self-test reading is confirmed
+and the microcode question reopens as the top 3D blocker.

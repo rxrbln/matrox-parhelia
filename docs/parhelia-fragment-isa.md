@@ -47,10 +47,15 @@ Per slot the driver writes at most eight registers:
 | `0x1278`, `0x127c` | stage constant **c0** (4 × signed 11-bit) |
 | `0x1280`, `0x1284` | stage constant **c1** (4 × signed 11-bit) |
 
-`0x1260`/`0x1268` use the *same* bit layout as `0x1264`/`0x126c`
-(**CONFIRMED**: `PARD 0x170abc` derives the texture-address pair from the ALU
-pair by nothing more than `& ~0x124`, i.e. by clearing the three
-alpha-replicate bits).
+`0x1260`/`0x1268` are believed to use the *same* bit layout as
+`0x1264`/`0x126c` (**INFERRED**). The evidence is `PARD 0x170a10`, which
+maintains a shadow copy of every slot and, when the slot has no texture-address
+instruction (flag bit0 clear), substitutes the ALU pair with bits 2, 5 and 8
+cleared — `and eax,0xfffffedb` @0x170abc, i.e. `& ~0x124`, exactly the three
+alpha-replicate bits of a `0x126c`-shaped word. The mask is applied bluntly to
+both words of the pair, so it argues for a shared layout without proving it.
+No program in either binary puts a non-trivial instruction in `0x1260`/`0x1268`
+(§9.4).
 
 ### 1.1 Slot addressing and the 5-stage / 2-pipe organisation
 
@@ -91,6 +96,27 @@ else (**CONFIRMED**, `PARD 0x1708d0`: `count>10 → 10`, else `count<=5 → 5` e
 `10`; `HAL 0x6e667`: `>10 → 10`, `<6 → 5`, else `10`). Pad slots are filled with
 `0x1264 = 0x00000080`, `0x126c = 0x00400400`, i.e. `MOV r0, r0`
 (**CONFIRMED**, both binaries write those two literals).
+
+### 1.1a Colour / alpha pairing and co-issue
+
+There is **no co-issue bit in the instruction words**. The colour and alpha
+instruction of a combiner stage are two *separate* slots that happen to share a
+stage number, and they are addressed purely by the slot field. Consistent with
+that:
+
+* the D3D `D3DSI_COISSUE` flag (`0x40000000`) is never tested anywhere in
+  MTXPARD's shader compiler (`0x17xxxx`-`0x18xxxx`); **CONFIRMED** by scanning
+  every occurrence of that immediate in `.text`;
+* the GL API exposes the split explicitly as `glFragProcRGBAOp{1,2,3}MTX` versus
+  `glFragProcAlphaOp{1,2,3}MTX` over one shared opcode/selector encoder
+  (`GL 0x1b60e0` / `0x1b64e0`, both calling `0x1b3a50`);
+* no field in `0x126c` selects a write mask (§8 shows bits [19:17] are the
+  result scale).
+
+The practical rule for a code generator: emit your RGB instructions as list
+entries 0-4 and your alpha instructions as entries 5-9, then apply the slot map
+of §1.1. Pairing constraints *within* a stage (whether the colour and alpha
+instruction of the same stage must agree on anything) are **not known**.
 
 ### 1.2 Per-slot flag byte
 
@@ -353,6 +379,22 @@ bit  14     conditional select (ADD-coded base 0x0c00 + bit14 = CND;
 Only the flat values in §7.3 are CONFIRMED; treat the decomposition as a
 plausibility aid, not as a licence to synthesise unlisted encodings.
 
+However, the driver itself decodes operand liveness straight out of these bits,
+which is strong independent evidence that the field really is structured that
+way. `PARD 0x182c60` answers "does this instruction read register code *n*?" by
+examining `0x1264`'s three selector fields under exactly this rule
+(**CONFIRMED**, @0x182c6a-0x182cdb):
+
+```
+source A : always live
+source B : live if opcode bit 9 or opcode bit 11 is set
+source C : live if opcode bit 10 is clear
+all three: if (opcode & 0x7000) >= 0x4000   (the CND/CMV/CMP family)
+```
+
+Applied to the eleven bases in §7.3 this reproduces the A/B/C columns of all
+three tables exactly.
+
 ---
 
 ## 8. Result scale and saturate  **CONFIRMED for codes 0-3, INFERRED for 4-5**
@@ -423,8 +465,24 @@ path to the chip other than `0x1278`-`0x1284`. **CONFIRMED.**
   [ebp+0x12a0],0xa` at `0x176cff`.
 * libGL's colour-phase counter is bounded `<= 9` (`GL 0x1b6126`), i.e. 10
   instructions, agreeing exactly.
-* Queryable caps: `GL_MAX_FP_OPS_MTX`, `GL_MAX_TA_OPS_MTX`,
-  `GL_MAX_FP_TEXTURES_MTX`, `GL_MAX_FP_COLORS_MTX` **[HDR]**.
+* The GL caps the ICD actually returns, read out of libGL's `glGetIntegerv` /
+  `glGetFloatv` dispatch (**CONFIRMED**, `GL 0x13b805`-`0x13b860`, `0x13d0ec`,
+  `0x13d4bb`, `0x13dac5`, `0x13c6a5`, `0x13d0f9`, and the float mirrors at
+  `0x13ed08`-`0x13ed40`):
+
+| token | value |
+|---|---|
+| `GL_MAX_FP_OPS_MTX` (0x8A85) | **10** (10.0f) |
+| `GL_OPT_FP_OPS_MTX` (0x8A88) | **5** (5.0f) |
+| `GL_MAX_TA_OPS_MTX` (0x8A82) | 4 |
+| `GL_OPT_TA_OPS_MTX` (0x8A83) | 4 |
+| `GL_MAX_FP_TEXTURES_MTX` (0x8A86) | 4 |
+| `GL_OPT_FP_TEXTURES_MTX` (0x8A89) | 4 |
+| `GL_MAX_FP_COLORS_MTX` (0x8A87) | 2 |
+
+  The **10 / 5** pair is exactly the padding rule of §1.1 seen from the API
+  side, `MAX_FP_COLORS = 2` is `v0`/`v1`, and `MAX_TA_OPS = 4` is one
+  texture-address instruction per texture unit.
 
 ### 9.4 Texture-address instruction  **partly CONFIRMED**
 
@@ -432,6 +490,11 @@ path to the chip other than `0x1278`-`0x1284`. **CONFIRMED.**
 per slot, and are emitted only when flag bit0 is set. In real programs they
 carry ordinary ALU-looking words (e.g. `0x1260 = 0x40`, `0x1268 = 0x00400400`
 in the MTXPARD video shader — `MOV r0, t2`).
+
+`GL_MAX_TA_OPS_MTX = 4` (§9.3) says there are only **four** texture-address
+instructions, not ten, so the `0x1260`/`0x1268` pair is most likely addressed
+per *texture unit* rather than per ALU slot — but the slot field of `0x1260` is
+0 in every program found, so this could not be checked. **INFERRED.**
 
 The dependent-read opcodes themselves — the `GL_OP_TEX*` set
 (`GL_OP_TEX_NOP/TEX/TEX_COORD`, `TEXKILL_GE/LT`, `TEXBEM`, `TEXDEP_AR/GB/RGB`,
@@ -456,6 +519,10 @@ header dword = four register indices, one per byte, little-endian
                it and everything after it in the header consume no data
 then one data dword per non-pad index
 ```
+
+Independently corroborated by the libGL viewport emitter documented in
+`parhelia-3d-state-complete.md` §2 (header `0x2121a1a0` = two real indices
+`0xa0`/`0xa1` followed by two `0x21` pads, carrying two data dwords).
 
 **CONFIRMED** by the hand-built shader streams in MTXPARD `.text` 0xb2799 ff.,
 where the packet boundaries only line up under this rule (e.g. header
@@ -565,6 +632,14 @@ Stated explicitly rather than guessed:
   only.
 * **Fog and specular combine** — where the fixed-function fog/specular add sits
   relative to the five stages was not investigated.
+* **libGL's per-stage register template** (`.rodata` 0x39fc1c, **CONFIRMED**
+  re-dumped) is `1374 1084 1090 1094 10b0 1104 1264 126c 1278 127c 1280 1284` —
+  twelve `localReg` slots, and **`0x1260`/`0x1268` are not among them**. The
+  Linux ICD therefore never programs the texture-address instruction word
+  through this path, which is a second reason those opcodes stayed out of reach.
+  (libGL genuinely does not contain the `0x1264`/`0x126c` immediates; it emits
+  `{u16 stage, u16 localReg, u32 value}` triples and resolves them through this
+  table.)
 * **Whether `0x1260`/`0x1268` is per-slot or per-stage.** Both are written in
   the same packet as `0x1264`/`0x126c`, but no program in the binaries uses a
   non-trivial texture-address instruction, so the addressing could not be
