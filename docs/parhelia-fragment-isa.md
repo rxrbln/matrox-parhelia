@@ -66,45 +66,43 @@ bit layout as `0x1264`/`0x126c`** (**CONFIRMED**). Two independent proofs:
 The kernel has two instruction packers with identical structure, `mtx1653`
 @0x6b170 and `mtx2619` @0x6a200, one per half.
 
-### 1.1 Slot addressing and the 5-stage / 2-pipe organisation
+### 1.1 Slot addressing
 
 `0x1264[4:0]` is the slot address; it is merged in at upload time, not at
 compile time (**CONFIRMED**: `HAL CDPSPixelShader::UpdateHardware` @0x6d896
 `edx &= ~0x1f; edx |= slot`; `PARD 0x1707b0` @0x1707b3 does the identical
-XOR-merge; all four packers mask `0x1264` with `0xffffc01f` and never touch
-bits [4:0]).
+XOR-merge; `KRN mtx530` @0x6930c does the same; all six packers mask `0x1264`
+with `0xffffc01f` and never touch bits [4:0]).
 
 The driver keeps a flat array of **10 instruction slots**, 36 bytes each
 (**CONFIRMED**: `PARD` ctor 0x170860 fills `edi = 0xa` entries at stride 0x24;
-`HAL BuildShader` 0x6e620 pads the same 10-entry array). The emitter walks that
-array and writes each entry to a hardware slot in this order
-(**CONFIRMED**, `PARD 0x170980`, the `esi` sequence with its `esi==6||esi==7 →
-esi+=2` and `esi==12 → esi=1` fixups):
+`HAL BuildShader` 0x6e620 pads the same 10-entry array; libGL's uploaded blob
+has 10 records of 0x94 bytes, §12.2.2). The emitter walks that array and writes
+each entry to a hardware slot in this order (**CONFIRMED** in all three, e.g.
+`PARD 0x170980` and `KRN 0x692df`-`0x69313`, with the `esi==6||esi==7 → +=2`
+and `esi==12 → 1` fixups):
 
 ```
 instruction index  0  1  2  3  4   5  6  7  8  9
 hardware slot      0  2  4  8 10   1  3  5  9 11
 ```
 
-Slots **6 and 7 are never used**. Read as `slot = 2*stage + pipe`, this is:
-
-```
-combiner stage   0  1  2  (3 reserved)  4  5
-colour pipe      0  2  4       6        8  10
-alpha  pipe      1  3  5       7        9  11
-```
-
-so **five usable combiner stages, each with a colour instruction and an alpha
-instruction**; instructions 0-4 are the colour pipe, 5-9 the alpha pipe.
-(**INFERRED** from the slot map plus the padding rule below; the even/odd =
-colour/alpha reading is the only one that explains both.) Why the stage at
-slots 6/7 is skipped is **not known**.
+Twelve slot addresses exist; **6 and 7 are never used**, and the walk visits the
+even addresses first and the odd ones second. Why 6/7 are skipped, and why the
+order is even-then-odd rather than sequential, is **not known** — a plausible
+reading is five hardware shader units addressed in two passes. It is *not* the
+colour/alpha split; that is carried by the register pair (§1.1a).
 
 The instruction count is padded to **5 or 10** before upload — never anything
 else (**CONFIRMED**, `PARD 0x1708d0`: `count>10 → 10`, else `count<=5 → 5` else
-`10`; `HAL 0x6e667`: `>10 → 10`, `<6 → 5`, else `10`). Pad slots are filled with
-`0x1264 = 0x00000080`, `0x126c = 0x00400400`, i.e. `MOV r0, r0`
-(**CONFIRMED**, both binaries write those two literals).
+`10`; `HAL 0x6e667`: `>10 → 10`, `<6 → 5`, else `10`; `KRN 0x692bd` the same).
+More than 5 instructions additionally sets pipeline bit `0x80000` (`KRN
+0x2576b`). Pad slots are filled with `0x1264 = 0x00000080`,
+`0x126c = 0x00400400`, i.e. `MOV r0, r0` (**CONFIRMED**, all three binaries
+write those two literals; `KRN mtx2628` @0x69080).
+
+The GL caps agree exactly: `GL_MAX_FP_OPS_MTX = 10`, `GL_OPT_FP_OPS_MTX = 5`
+(§9.3).
 
 ### 1.1a Colour / alpha pairing and co-issue
 
@@ -373,23 +371,35 @@ an open driver.**
 | 4 | `DP3` | s0 | – | s1 | `0x0000_1000` | `dot3(A, C)` |
 | 5 | `DP4` | s0 | – | s1 | `0x0000_2000` | `dot4(A, C)` |
 | 6 | `MAD` | s1 | s2 | s0 | `0x0000_0800` | `A * C + B` |
-| 7 | `LRP` | s0 | s1 | s2 | `0x0000_0a00` | `B + C*(A - B)` |
+| 7 | `LRP` | s0 | s1 | s2 | `0x0000_0a00` | `A*C + B*(1-C)` |
 | 8 | `CND` | s0 | s1 | s2 | `0x0000_4c00` | `A > 0.5 ? B : C` |
 | 9 | `CMV` | s0 | s1 | s2 | `0x0000_5c00` | conditional move |
 | 10 | `CMP` | s0 | s1 | s2 | `0x0000_7c00` | `A >= 0 ? B : C` |
 
 `CMV = 0x5c00` closes the last open item of the previous revision (it was
 `[CAP]` there); it is absent from the D3D tables because ps.1.x has no such
-token.
+token, but the X driver emits it (`HAL 0x6e083` `or r12d,0x5c00`).
+
+The **kernel HAL carries a third, byte-for-byte identical copy** — the exported
+object `mtx1291` at `.data + 0x1260`, 264 bytes = 11 entries of 24, read at
+`KRN 0x6a238`-`0x6a25d` (relocations `mtx1291+0`, `+0x10`, `+0x14` pick out the
+same three fields). Re-dumped and diffed against `PARD 0x1d77f0`: identical.
+Three independent tables in three independent binaries agreeing on both the
+bases and the slot permutation is why this table is tagged CONFIRMED rather than
+probable.
 
 ### 7.4 Hardware operand roles  **INFERRED (from the slot-assignment tables)**
 
 The three tables agree on a consistent algebra: **A and C are the multiplier
 inputs, A and B are the adder inputs, A is the predicate**. `MAD = A*C + B`,
-`MUL = A*C` (B idle), `ADD = A + B` (C idle), `SUB = A - B`, dot products fold
-`A*C` across 3 or 4 channels, and the conditional ops select between B and C on
-A. The D3D `mad d,s0,s1,s2` mapping `A←s1, B←s2, C←s0` and `mul d,s0,s1`
-mapping `A←s0, C←s1` are the direct evidence.
+`MUL = A*C` (B idle), `ADD = A + B` (C idle), `SUB = A - B`,
+**`LRP = A*C + B*(1-C)`** (MAD with an implicit complement on B), dot products
+fold `A*C` across 3 or 4 channels, and the conditional ops select between B and
+C on A. The D3D `mad d,s0,s1,s2` mapping `A←s1, B←s2, C←s0` and `mul d,s0,s1`
+mapping `A←s0, C←s1` are the direct evidence; the LRP form is independently
+pinned three ways by the GL fixed-function lowering (§12.2.5), which uses it for
+`GL_BLEND`, `GL_DECAL` and `GL_COMBINE INTERPOLATE` and matches the GL spec in
+all three cases.
 
 ### 7.5 Opcode field structure  **INFERRED**
 
@@ -593,7 +603,7 @@ swallow the unused alpha pair. Frequently used register indices: `0x98`→0x1260
 ### 10.1 A complete real program
 
 MTXPARD `.text` 0xb2799 (the video/procamp path), literal dwords straight out of
-the binary, three colour-pipe stages at slots 0, 2, 4:
+the binary, three RGB instructions in slots 0, 2, 4:
 
 ```
 0x1264 = 0x0703c000   0x126c = 0x00400800   c0, c1 uploaded   ; slot 0
@@ -609,7 +619,7 @@ slot 2:  MAD    r0, t0, c1, r0     ; r0 = t0*r0 + c1
 slot 4:  MAD_x2 r0, t0, c1, r0     ; r0 = (t0*r0 + c1) * 2
 ```
 
-All three are RGB-half instructions in even slots; the packets carry no
+All three are RGB instructions; the packets carry no
 `0x1260`/`0x1268`, so the alpha pipe runs the same instruction with
 alpha-replicate disabled (§1.1a).
 
@@ -1223,15 +1233,16 @@ Stated explicitly rather than guessed:
   the four binaries emits a non-trivial one, and no engine register could be
   tied to them. Recovering the `GL_OP_TEX*` encodings needs a hardware capture
   of a bump-mapping or dependent-read draw.
-* **`0x126c` bits 15, 16 and 25-31.** No writer found in either binary.
+* **`0x126c` bit 16.** No writer anywhere, yet it is deliberately *preserved*
+  by every packer and by the X driver's mask `0xff05fffd` — so it is a real
+  field of unknown purpose. Bit 15 and bits 25-31: no writer either.
 * **Replicate codes 5-7, modifier codes 6-0xE, opcode-field values with
-  bits [11:9] = 1 or 7.** Unused by both drivers.
-* **Why hardware slots 6 and 7 are skipped.** Every emitter — MTXPARD, the X
-  driver and the kernel — jumps over them unconditionally.
-* **`0x126c` bit 16** is deliberately *preserved* by every packer and by the X
-  driver's mask `0xff05fffd`, so it is a real field; nothing writes it.
+  bits [11:9] = 1 or 7.** Unused by every driver.
+* **Why hardware slots 6 and 7 are skipped**, and why the walk order is
+  even-then-odd. Every emitter — MTXPARD, the X driver and the kernel — does the
+  same thing unconditionally.
 * **Fog and specular combine** — where the fixed-function fog/specular add sits
-  relative to the five stages was not investigated.
+  relative to the combiner was not investigated.
 * **libGL's per-stage register template** (`.rodata` 0x39fc1c, **CONFIRMED**
   re-dumped) is `1374 1084 1090 1094 10b0 1104 1264 126c 1278 127c 1280 1284` —
   twelve `localReg` slots, and `0x1260`/`0x1268` are not among them, even though
