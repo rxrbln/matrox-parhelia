@@ -78,6 +78,52 @@ Note that triangles and lines produce otherwise identical descriptors, so the
 **primitive type is not encoded here** — it must live in the state stream or in
 the 0x1090/0x1094 pair the tag names. Resolving that is an open item.
 
+### Vertex count across primitives, and the +0x04 flag
+
+| GL primitive | vertices emitted | descriptor +0x08 | +0x04 |
+|---|---|---|---|
+| GL_TRIANGLES | 3 | 3 | 0 |
+| GL_LINES | 2 | 2 | 0 |
+| GL_QUADS | 4 | 4 | 0 |
+| GL_POINTS | 2 | **3** | **1** |
+| GL_TRIANGLE_STRIP | 4 | **5** | **1** |
+| GL_TRIANGLE_FAN | 4 | **5** | **1** |
+
+`+0x04 = 1` occurs exactly when `+0x08` is one MORE than the number of vertices
+the application emitted, and the vertex heap then holds a stale leading vertex
+before the real ones (visible in the `points` capture, where the first record is
+the previous draw's (0.5, 0.9) position). So `+0x04` marks "the buffer carries a
+leading vertex that is not one of this draw's own", and `+0x08` counts records in
+the buffer rather than application vertices. Why the ICD does this for points,
+strips and fans but not for lists is not yet explained.
+
+### Primitive type — a strong lead, NOT confirmed
+
+Region 2 offset **0x008** carries the GL primitive enum on the draw that changes
+primitive, matching on five of five:
+
+```
+points 0 = GL_POINTS   lines 1 = GL_LINES   tri_flat 4 = GL_TRIANGLES
+tristrip 5 = GL_TRIANGLE_STRIP   trifan 6 = GL_TRIANGLE_FAN
+```
+
+and it stays unchanged across consecutive draws of the same primitive
+(`tri_gouraud`, `tri_second`), which is exactly the behaviour a primitive-type
+field should show.
+
+**But a check across the whole sweep refutes the simple reading:** state-only
+operations also write 0x008, with values that are not primitive enums at all
+(depth_func_gequal 23, blend_srcalpha 27, polygon-mode 0x0C000000,
+swapbuffers 62), and `linewidth` — still GL_LINES — writes 0x0C000000 rather
+than leaving 1 in place. GL_QUADS also lands 2, not 7, though that draw
+coincided with a full state re-upload so it is not clean evidence either way.
+
+The consistent explanation is that offsets 0x000-0x030 are a small **command
+header whose fields are reused per command type**, and the primitive enum
+occupies 0x008 only for draw commands that change primitive. That is a lead to
+settle from the ICD disassembly, not an established field. Do not encode it in a
+driver on this evidence alone.
+
 ## Vertex format — CONFIRMED TWICE, INDEPENDENTLY
 
 `tri_gouraud` (`glColor3f` per vertex, positions (0.5,0.9) (0.1,0.1) (0.9,0.1),
