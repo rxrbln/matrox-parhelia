@@ -128,8 +128,30 @@ hardware** the static RE note that the ARGB path is a 16-colour surface with a
 Format register `0x1ad0` = `0x04000000` for this mode, versus `0x05000000` for
 the core mono mode.
 
-**Still open for ARGB:** where the 16-entry colour palette itself is written.
-The capture covers the image planes only; the LUT was not located.
+**The 16-entry palette — NOT open after all.** It was already recovered in
+`src/parhelia_reg.h` and I flagged it open without checking there first. The
+cursor block exposes an **indexed LUT port** at the DC cursor base:
+
+| Register | head 1 | Role |
+|---|---|---|
+| `PARHELIA_CURSOR_COLOR` (+0x000) | 0x1ac0 | LUT colour data, RGB888 |
+| `PARHELIA_CURSOR_CTL` (+0x004) | 0x1ac4 | `(lut_index << 8) \| mode` |
+
+So an entry is written by setting `0x1ac4 = (index<<8)|mode` and then writing
+the RGB888 value to `0x1ac0`; the driver uploads up to 16 entries this way. That
+also explains why `0x1ac4` read back as 0 in the capture — it is an index/mode
+port, not a readable control word.
+
+**The capture confirms the mode constants on hardware.** The values observed in
+`0x1ad0` match the driver's existing definitions exactly:
+
+```
+PARHELIA_CURSOR_CFG_2COLOR   0x05000000   <- observed for the core mono cursor
+PARHELIA_CURSOR_CFG_16COLOR  0x04000000   <- observed for the ARGB cursor
+```
+
+with `PARHELIA_CURSOR_CTL_2COLOR` = mode 3 and `PARHELIA_CURSOR_CTL_16COLOR` =
+mode 4. Previously these rested on disassembly alone.
 
 ## Summary of the two formats
 
