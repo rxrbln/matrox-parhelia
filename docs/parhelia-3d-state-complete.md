@@ -20,12 +20,13 @@ use the bit tables that used to be here. Short summary of the corrected model:
   + 4-bit modifier, at [13:5], [22:14], [31:23]. `0x07038000` is not a control
   base, it is just "srcB = c1, srcC = c0".
 - `0x126c` = three 3-bit channel-replicate fields [2:0]/[5:3]/[8:6], opcode
-  [14:9], **result scale** [19:17] (x1/x2/x4/x8 — not a write mask), destination
-  register [23:20], saturate [24].
+  [14:9], **result scale** [19:17] as a signed shift (0 x1, 1 x2, 2 x4, 3 x8,
+  7 /2, 6 /4 — not a write mask), destination register [23:20], saturate [24].
 - `0x1278`-`0x1284` are the two general **constant registers** c0 and c1, four
   signed Q1.10 (x1024) components each — not a dedicated colour matrix.
-- `0x1260`/`0x1268` are a second instruction word pair per slot (texture
-  address) with the identical layout.
+- `0x1260`/`0x1268` are the **alpha** instruction of the same slot (identical
+  layout); stage-flag bit0 = "separate alpha present". Texture-address stages
+  are a separate 4-entry descriptor array, and their opcodes are still unknown.
 - Opcode bases (`0x126c[14:9]`): MUL 0x0000, MOV 0x0400, SUB 0x0600, MAD 0x0800,
   LRP 0x0a00, ADD 0x0c00, DP3 0x1000, DP4 0x2000, CND 0x4c00, **CMV 0x5c00**,
   CMP 0x7c00. Operand roles: MAD = A*C+B, MUL = A*C, ADD = A+B, SUB = A-B,

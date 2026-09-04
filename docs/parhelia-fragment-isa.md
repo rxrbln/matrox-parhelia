@@ -1137,19 +1137,33 @@ Absent (zero occurrences in the binary): `GL_NV_register_combiners`,
 GPL-2, `Copyright (c) 2026 Rene Rebe <rene@exactco.de>`.
 
 ```
-parhelia-fragdis.py --selftest                      # decode the programs harvested above
+parhelia-fragdis.py --selftest       # decode the real programs harvested above
 parhelia-fragdis.py --words 0x1264=0x0703c000,0x126c=0x00400803
-parhelia-fragdis.py --stream cmdbuf.bin             # walk a DMA packet stream
+parhelia-fragdis.py --stream cmdbuf.bin
 ```
 
-`--stream` parses the §10 packet framing, filters out everything that is not a
-combiner register, splits the writes into slots and prints each stage with its
-symbolic instruction, its algebraic expansion, its decoded Q1.10 constants and
-the raw register values. It is deliberately conservative: unknown modifier,
-replicate, scale or opcode fields are printed as `{modX}` / `{repX}` /
-`_scaleX` / `OP_xxxx` rather than guessed.
+`--stream` implements the §10 packet framing (terminate on index 0x21, swallow
+a dword on index 0x20), filters out everything that is not a combiner register,
+splits the writes into slots and prints each one with its symbolic RGB and alpha
+instructions, their algebraic expansion, the decoded Q1.10 constants and the raw
+register values. When a slot carries no `0x1260`/`0x1268` it says so explicitly
+rather than inventing an alpha instruction.
 
----
+It is deliberately conservative: unknown modifier, replicate, scale or opcode
+fields print as `{modX}` / `{repX}` / `_scaleX` / `OP_xxxx` rather than being
+guessed at.
+
+Sample output for the video shader of §10.1:
+
+```
+slot 0 (program instruction 0)
+    rgb  MAD        r0, t0, c1, c0
+           ; r0 = t0*c0+c1
+      ; no separate alpha instruction: the alpha pipe runs the rgb one with
+        alpha-replicate disabled
+    const c0 = [+0.7998 +0.6992 +0.5996 +0.0000]
+    const c1 = [+0.0996 -0.0234 +0.2998 +0.0000]
+```
 
 ## 14. Corrections to the previous revision
 
@@ -1181,7 +1195,22 @@ the right registers but several wrong fields. Superseded claims:
    not located; there is no reason to believe a different layout exists.
 7. **"`0x126c` base `0x803` = colour-matrix multiply."** It is `MAD` (`0x800`)
    with source-A replicate = red (`0x3`).
-8. **CMV's base is `0x5c00`**, no longer a capture item.
+8. **CMV's base is `0x5c00`**, no longer a capture item (and the X driver
+   emits it: `HAL 0x6e083` `or r12d,0x5c00`).
+9. **"`0x1260`/`0x1268` are the texture-address instruction."** Wrong — they are
+   the **alpha** instruction of the same slot (§1.1a). The stage flag bit0 is
+   the *separate-alpha* flag, and the `& ~0x124` default the previous revision
+   could not explain is the co-issue fallback: run the RGB instruction in the
+   alpha pipe with alpha-replicate cleared. Texture-address stages are a
+   separate 4-entry descriptor array (§9.4).
+10. **Result-scale codes 4 and 5 for ÷2/÷4.** Wrong: the field is a signed
+   3-bit shift, so ÷2 = 7 and ÷4 = 6 (§8).
+11. **Packet framing.** Index 0x21 terminates a packet, but index 0x20
+   (`0x1080`, DMAPAD) *does* consume a data dword and discard it. The earlier
+   wording lumped them together (§10).
+12. **libGL `0x36ba98` is not a "GL_MTX opcode → ALU-class" table.** It is the
+   `GL_COMBINE`-function → IR-opcode jump table (§12.2.6). The ALU-class table
+   in the previous revision was a misreading and has been removed.
 
 ---
 
@@ -1189,32 +1218,28 @@ the right registers but several wrong fields. Superseded claims:
 
 Stated explicitly rather than guessed:
 
-* **Texture-address opcodes.** No concrete `0x1268` opcode value could be tied
-  to any `GL_OP_TEX*` / D3D t-op. The shipped D3D driver routes all of them to
-  the fallback `MOV` row. Recovering these needs either the libGL texture-address
-  path (`GL 0x1b47c0` writes 36-byte descriptors at `shader+0x6a0`, which are
-  lowered somewhere downstream) or a hardware capture of a bump-mapping draw.
+* **Texture-address opcodes and the register they are written to.** The
+  descriptors exist (4 × 0x24 bytes at blob+0x5d4, §9.4) but no path in any of
+  the four binaries emits a non-trivial one, and no engine register could be
+  tied to them. Recovering the `GL_OP_TEX*` encodings needs a hardware capture
+  of a bump-mapping or dependent-read draw.
 * **`0x126c` bits 15, 16 and 25-31.** No writer found in either binary.
 * **Replicate codes 5-7, modifier codes 6-0xE, opcode-field values with
   bits [11:9] = 1 or 7.** Unused by both drivers.
-* **Why hardware slots 6 and 7 are skipped.** The emitter jumps over them
-  unconditionally.
-* **Result scale codes 4 and 5** (÷2, ÷4) are inferred from `GL_SCALE_D2/D4_MTX`
-  only.
+* **Why hardware slots 6 and 7 are skipped.** Every emitter — MTXPARD, the X
+  driver and the kernel — jumps over them unconditionally.
+* **`0x126c` bit 16** is deliberately *preserved* by every packer and by the X
+  driver's mask `0xff05fffd`, so it is a real field; nothing writes it.
 * **Fog and specular combine** — where the fixed-function fog/specular add sits
   relative to the five stages was not investigated.
 * **libGL's per-stage register template** (`.rodata` 0x39fc1c, **CONFIRMED**
   re-dumped) is `1374 1084 1090 1094 10b0 1104 1264 126c 1278 127c 1280 1284` —
-  twelve `localReg` slots, and **`0x1260`/`0x1268` are not among them**. The
-  Linux ICD therefore never programs the texture-address instruction word
-  through this path, which is a second reason those opcodes stayed out of reach.
-  (libGL genuinely does not contain the `0x1264`/`0x126c` immediates; it emits
-  `{u16 stage, u16 localReg, u32 value}` triples and resolves them through this
-  table.)
-* **Whether `0x1260`/`0x1268` is per-slot or per-texture-unit.** Both are
-  written in the same packet as `0x1264`/`0x126c`, but no program in the
-  binaries uses a non-trivial texture-address instruction, so the addressing
-  could not be exercised.
+  twelve `localReg` slots, and `0x1260`/`0x1268` are not among them, even though
+  the ICD's IR clearly carries alpha sub-instructions. libGL does not contain
+  the `0x1264`/`0x126c` immediates at all; it uploads the 0x664-byte blob and
+  the **kernel** (`KRN mtx1653`/`mtx2619`/`mtx530`) does the packing. Why this
+  template table also exists was not established.
+* **libGL's `useC1Flag`** and the env-colour indexing bug (§12.2.8).
 * **Sampler residuals** (details in §11): the internal-format-id → 6-bit
   hardware format code join; which of `0x11c4`'s three 3-bit fields is
   min/mag/mip and their enum values; which `0x11c0` 2-bit code is clamp versus
@@ -1224,31 +1249,41 @@ Stated explicitly rather than guessed:
 
 ## 16. Confidence statement
 
-The **arithmetic instruction encoding is solid**: every field of `0x1264` and
-`0x126c` except bits 15-16 and 25-31 of the latter was read out of at least one
-binary, and the important ones (source packing, destination, opcode) were read
-out of *four* independent packers in *two* binaries that agree bit for bit, then
-validated by decoding literal shader words that those same binaries embed.
+The **instruction encoding is solid**. Every field of `0x1264` and `0x126c`
+except bits 15-16 and 25-31 of the latter was read out of a binary, and the
+load-bearing ones (source packing, modifiers, replicate, opcode, scale,
+saturate, destination) were read out of **six independent packers in four
+independent binaries** — MTXPARD's ps.1.x and ps.1.4 packers, the X driver's
+`CDPSPixelShader` builders, and the kernel HAL's RGB and alpha packers — which
+agree bit for bit. They were then validated by blind-decoding literal shader
+words those same binaries embed.
 
-The **opcode table is complete and authoritative** for the 11 ALU operations.
+The **opcode table is complete and authoritative** for the 11 ALU operations,
+including the A/B/C slot permutation, which three independent tables and the
+kernel's own operand-liveness logic agree on.
 
-The **texture-address / dependent-read half of the ISA is not recovered.** The
-register pair and its layout are known; the opcodes are not.
+The **RGB/alpha co-issue model is now settled**, not inferred: a slot holds two
+complete instructions, `0x1264`/`0x126c` and `0x1260`/`0x1268`, and the
+separate-alpha flag decides whether the second is emitted. This replaces the
+previous revision's guesswork about write masks and pipes.
 
-The **5-stage × 2-pipe organisation is an inference and the weakest claim
-here.** It is supported by the slot map, the 5/10 padding rule, the separate
-`glFragProcRGBAOp*` / `glFragProcAlphaOp*` entry points and the two-halves
-instruction record at `record+0xe0` / `record+0x118`; it is in tension with
-`GL_MAX_FP_OPS_MTX = 10` over a single shared counter. It should be the first
-thing a hardware bring-up test settles: emit `MOV r0, v0` in slot 0 and
-`MOV r0, c0` in slot 1 and see whether only the alpha channel follows the
-second. If it does not, the fallback model is 10 flat instruction slots with an
-as-yet-unlocated colour/alpha write select in `0x126c` bits 15/16.
+The **texture-address / dependent-read half of the ISA is still not recovered.**
+The descriptors exist and the count is 4; the opcodes and their register are
+unknown.
 
-The **sampler state** (§11) is confirmed at the register-and-layout level and
-has a known-good complete unit state to start from, but three enum tables
-(format code, filter, wrap) are open; §11.9's "mip level chosen on the CPU"
-means an open driver can ship without the mip registers.
+The **fixed-function lowering is fully mapped** (§12.2) and is the right place
+to start an open driver: six modes, at most one instruction per texture unit,
+destination always `r0`, and a `GL_COMBINE` path that maps onto the hardware
+almost one-to-one.
 
-Nothing in this file has been validated against real silicon. Everything is
-static reverse engineering of two vendor binaries plus the shipped `glext.h`.
+The **sampler state** (§11) is confirmed at the register-and-layout level, with
+a known-good complete unit state, but three enum tables (format code, filter,
+wrap) are open; §11.9's "mip level chosen on the CPU" means an open driver can
+ship without the mip registers.
+
+**Nothing here has been validated against real silicon.** It is all static
+reverse engineering of four vendor binaries plus the shipped `glext.h`. The
+first hardware test should be the simplest possible one: a single slot 0
+instruction `MOV r0, v0` with the alpha pair omitted, drawing a Gouraud
+triangle, then the same with `0x1260`/`0x1268` carrying `MOV r0, c0` to check
+that only alpha changes.

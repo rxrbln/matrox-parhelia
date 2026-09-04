@@ -79,14 +79,65 @@ is demonstrably active is consistent with the register-readback unreliability
 already seen elsewhere on this chip. Treat these as write-only; verify cursor
 state through VRAM effects, not readback.
 
-## ARGB — NOT captured
+## The ARGB upload format — SOLVED (planar, 16 colours + 5 alpha planes)
 
-The 32-bit ARGB image did not reach the aperture in its own format: the
-distinctive marker byte (`0xa5` in the green channel of every pixel) appears
-**zero times** in the dump, and the uploaded data is shaped like a mono cursor.
-Either the X server converted the ARGB cursor down before upload, or ARGB
-cursors use a different memory area. The only ARGB-specific evidence is that
-`0x1ad0` changed from `0x05000000` to `0x04000000`.
+The first attempt failed and the failure was instructive: an arbitrary marker
+byte planted in every pixel appeared **zero times**. The hardware has no 32-bit
+cursor — the vendor **quantises ARGB to a 16-entry palette plus alpha planes**,
+which destroys an arbitrary colour by design. Re-capturing with an image built
+from only 16 distinct colours (colour index = row & 15) and a per-row alpha ramp
+makes the format fall straight out.
 
-The ARGB upload format therefore remains **uncaptured**. Do not infer it from
-the format-register change alone.
+**Row stride is 0x80 = 128 bytes**, and each row is a set of **8-byte bitplanes**
+(64 pixels, one bit per pixel, MSB-first):
+
+| Plane | Row offset | Meaning |
+|---|---|---|
+| 0 | +0x00 | colour index bit 0 |
+| 1 | +0x08 | colour index bit 1 |
+| 2 | +0x10 | colour index bit 2 |
+| 3 | +0x18 | colour index bit 3 |
+| 4 | +0x20 | alpha bit 3 (LSB of the retained alpha) |
+| 5 | +0x28 | alpha bit 4 |
+| 6 | +0x30 | alpha bit 5 |
+| 7 | +0x38 | alpha bit 6 |
+| 8 | +0x40 | alpha bit 7 (MSB) |
+| — | +0x48..0x7f | padding |
+
+So **9 planes x 8 bytes = 72 bytes used of a 128-byte row**, giving a 4-bit
+palette index and **5 bits of per-pixel alpha — the top 5 bits of the 8-bit
+alpha; the low 3 bits are discarded.**
+
+Verification, read directly off the capture (`captures/cursor-argb-0528.txt`):
+
+```
+row  colidx alpha | planes 0..8
+  1     1      4  | FF .. .. ..  .. .. .. .. ..     index bit0
+  2     2      8  | .. FF .. ..  FF .. .. .. ..     index bit1, alpha bit3
+  3     3     12  | FF FF .. ..  FF .. .. .. ..     alpha 12 -> bit3 kept, bit2 dropped
+  4     4     16  | .. .. FF ..  .. FF .. .. ..     index bit2, alpha bit4
+  8     8     32  | .. .. .. FF  .. .. FF .. ..     index bit3, alpha bit5
+ 11    11     44  | FF FF .. FF  FF .. FF .. ..     idx 0b1011, alpha 0b101100
+```
+
+Every row matches its colour index and its alpha bit pattern exactly, including
+the deliberate truncation (alpha 12 and 28 both lose bit 2). This **confirms on
+hardware** the static RE note that the ARGB path is a 16-colour surface with a
+128-byte row stride and 5 alpha planes.
+
+Format register `0x1ad0` = `0x04000000` for this mode, versus `0x05000000` for
+the core mono mode.
+
+**Still open for ARGB:** where the 16-entry colour palette itself is written.
+The capture covers the image planes only; the LUT was not located.
+
+## Summary of the two formats
+
+| | core / mono | ARGB (16-colour + alpha) |
+|---|---|---|
+| row stride | **32 bytes** | **128 bytes** |
+| planes per row | 2 (source, mask), 8 bytes each | 9 (4 index + 5 alpha), 8 bytes each |
+| bytes used per row | 16 of 32 | 72 of 128 |
+| `0x1ad0` | `0x05000000` | `0x04000000` |
+| colour | fg/bg registers | 16-entry palette (location not captured) |
+| alpha | none | 5 bits per pixel (top 5 of 8) |

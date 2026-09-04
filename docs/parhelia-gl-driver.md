@@ -125,8 +125,9 @@ with `0x126c[14:9]` bases 0x0400/0x0c00/0x0600/0x0000/0x1000/0x2000/0x0800/
 r1 = 5, c0 = 0xE, c1 = 0xF, iterated primary = 0x10, secondary = 0x11.
 `0x1264` = slot[4:0] + **three** source operands (5-bit register + 4-bit
 modifier each) at [13:5]/[22:14]/[31:23]; `0x126c` = three replicate fields
-[2:0]/[5:3]/[8:6], opcode [14:9], result scale [19:17], destination [23:20],
-saturate [24]. Pass-through identity = `0x1264=0x80`, `0x126c=0x00400400`.
+[2:0]/[5:3]/[8:6], opcode [14:9], result scale [19:17] (signed shift: 0 x1,
+1 x2, 2 x4, 3 x8, 7 /2, 6 /4), destination [23:20], saturate [24]. The alpha
+half of the same slot is `0x1260`/`0x1268` with the identical layout. Pass-through identity = `0x1264=0x80`, `0x126c=0x00400400`.
 `0x1278-0x1284` are the two constant registers c0/c1 (four signed Q1.10 x1024
 components each), not a dedicated colour matrix. Texture pipes `0x1200-0x120c`:
 active `0x00040101`, idle `0x00010000`. (The opcode bases per ALU op are now
