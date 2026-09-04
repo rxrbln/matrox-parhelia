@@ -399,3 +399,36 @@ descriptor; `0x1024` carries a blend factor, not glCullFace; `0x10d8` carries a
 two-float line-width/point-size payload, not stencil state. Consequently **every
 0x12xx claim derived from a stream index >= 0x80 should be treated as
 unproven** until re-checked.
+
+## Capturing from user space — what works and what does not
+
+Established while building the tracer, because it constrains every capture
+method used here.
+
+**Direct rendering is what makes the ICD's buffers visible.** When the vendor
+stack is running direct, a GL client maps `/dev/matrox/mtx0` seven times into
+its own address space and `tools/parhelia-glsweep.c` can snapshot those regions.
+When direct rendering is not active the client has **zero** matrox mappings and
+**issues no ioctls at all** — verified with `strace -e trace=open,openat,ioctl`
+and by counting `/dev/matrox` entries in `/proc/PID/maps` and `/proc/PID/fd`.
+All GPU work then happens inside the X server instead, and a sweep run in that
+state produces an empty capture file rather than an obviously broken one.
+
+**So always verify before trusting a capture:**
+
+```
+grep -c matrox /proc/<pid>/maps     # must be 7, not 0
+grep -c '^== OP' <capture>          # must match the harness op count
+```
+
+An extended primitive/format sweep was run in this state and silently produced
+zero operations. Direct rendering did **not** come back from an X restart or a
+module reload; it needed a full reboot followed by starting X.
+
+**LD_PRELOAD interposition of `open`/`open64`/`ioctl`/`mmap`/`mmap64` logged
+nothing** for a GL client, which is consistent with the above: with direct
+rendering off there is no device access to intercept. The tracer
+(`tools/parhelia-mtxtrace.c`) is kept because it is the right instrument once
+direct rendering is confirmed — it is the only way to see the ioctl stream and,
+via its protect/single-step guard, the register writes userspace performs on its
+own BAR1 mapping, which mmiotrace cannot see.
