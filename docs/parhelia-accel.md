@@ -182,9 +182,13 @@ clips against garbage (the earlier crash).
 (@0x589a7) is a plain store, `MmHostAperture::Lock` (@0x72e20) returns a CPU
 pointer to a mapped BAR window. ColorExpand streams the mono bitmap by CPU stores
 into a mapped scratch/aperture surface then blits (`XferNativeToVid` @0x574a0 for
-WritePixmap; `XferVidToNative` @0x56a50 reads back for ReadPixmap). Mono 8×8
-pattern is a **hardware offscreen pattern** — patx/paty are its VRAM origin (not
-8×8 data dwords), so the pattern bitmap must be pre-placed in VRAM.
+WritePixmap; `XferVidToNative` @0x56a50 reads back for ReadPixmap).
+
+> **Corrected 2026-09:** the mono 8×8 pattern is **not** an offscreen VRAM
+> surface. `Mono8x8PatternFillFlags` sets `HARDWARE_PATTERN_PROGRAMMED_BITS`, so
+> patx/paty are the pattern's two *data* dwords and go to registers **0x131C /
+> 0x1320**; only the 3-bit pattern origin rides in DWGCTL[19:14]. Stipple fill
+> therefore needs no scratch-VRAM allocator.
 
 ### Implementation status in `src/parhelia_xaa.c`
 
