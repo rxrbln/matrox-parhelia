@@ -1098,3 +1098,72 @@ while sweeping internal formats. `GL_RGBA`, `GL_RGB`, `GL_ALPHA`,
 specific to that format rather than to the sweep. An open driver should treat
 `GL_INTENSITY` as unsupported on this hardware until proven otherwise, and any
 capture harness should avoid it — it kills the box's driver mid-run.
+
+## Appendix: the userspace side, traced live  [HW]
+
+Captured with `tools/parhelia-mtxtrace.c` (LD_PRELOAD) around a GL client that
+uploads one texture and draws one textured triangle. Raw:
+`captures/mtxtrace-textured-draw.txt`. This is the half mmiotrace cannot see.
+
+### The full chain, end to end
+
+```
+open("/dev/matrox/mtx0")                      -> fd
+ioctl(fd, 0x80304600)   nr=0   48 B  dir=r    -> GET_MEMORY_INFO
+ioctl(fd, 0xc038461f)   nr=31  56 B  dir=rw   -> create buffer, returns an offset
+mmap64(fd, offset, len)                       -> the buffer in userspace
+... build command/vertex data by plain stores into those mappings ...
+ioctl(fd, 0x4621)       nr=33   0 B  dir=none -> DOORBELL (x30 for this workload)
+```
+
+**`GET_MEMORY_INFO` output decodes exactly as documented** — verified against
+`lspci`:
+
+```
+d0000000 00000000 10000000 ffffffff febfe000 00000000 00002000 00000002 ...
+  fb_base  = 0xd0000000     fb_size  = 0x10000000   (256 MB)
+  reg_base = 0xfebfe000     reg_size = 0x00002000   (8 KB)
+```
+
+**The buffer-create ioctl returns the mmap cookie.** `nr=31`'s output carries
+`0x0c822000` at byte offset 8, and the very next `mmap64` uses exactly that as
+its file offset. So the mmap "offset" is **not** a physical or GPU address — it
+is a handle the kernel hands back from the create call. That is how a userspace
+buffer becomes GPU-visible.
+
+### The seven mappings, with their real offsets
+
+| mmap offset | length | region role |
+|---|---|---|
+| 0x0c822000 | 0x1000 | control page (`+0x230` = submitted stream length) |
+| 0x00e24000 | 0x1000 | control/status page |
+| 0x0c8a9000 | 0x22000 (136 K) | command record stream |
+| 0x18b11000 | 0x1000 | submission serial page |
+| 0x0ccf0000 | 0x320000 (3 M) | vertex ring |
+| 0x0d013000 | 0xa8000 (672 K) | command ring |
+| 0x0d0d3000 | 0x400000 (4 M) | texture heap |
+
+The lengths match the ICD's allocation constants and the regions identified in
+docs/parhelia-command-construction.md, now with the device offsets that produce
+them.
+
+### Submission cost
+
+One texture upload plus one textured triangle issued **30 doorbell ioctls**
+(`nr=33`, `_IO('F',33)` = 0x4621, zero-sized — no payload, the work is already
+in the shared buffers). This is the ioctl that reaches `mtx903` and thence the
+ring doorbell writes seen kernel-side.
+
+### Method notes that cost time
+
+- **Nothing is visible unless direct rendering is active.** Without it the client
+  makes no matrox `open`, no ioctl and no mapping at all — the X server does the
+  work — and a capture silently comes out empty. Check
+  `grep -c matrox /proc/<pid>/maps` (expect 7).
+- **X takes a long time to initialise the mtx device.** `pgrep X` succeeding
+  does not mean the device is up; the module refcount is still 0 and clients
+  fall back to indirect rendering. Poll the X log for `Parhelia device started`
+  (it appears twice) or wait for `lsmod` to show a refcount of 2 before
+  capturing, rather than sleeping a fixed interval.
+- The vendor stack calls `open64`/`mmap64`, not `open`/`mmap`; interposing only
+  the latter logs nothing.

@@ -409,31 +409,49 @@ writes exactly one named bit-field. That jump table *is* the vendor's field map.
 Patch record = `{u32 instr_index, u32 field_kind, u32 value}`; the instruction
 is addressed as `program + instr_index*12`.
 
+**How the two halves of the table relate (2026-09-05, re-read handler by
+handler).** `mtx3558` copies the instruction it is about to patch into **two
+identical three-dword stack slots** (`[rsp+0x10..0x18]` and `[rsp+0x20..0x28]`,
+written at `.text+0xa10b7..0xa10d0`) and both groups of handlers write back the
+same 12 bytes. Kinds `0x00–0x1b` operate on one slot, kinds `0x1c–0x23` on the
+other — so the "duplicates" are **alternative views of the same fields**, not a
+second instruction. Three of those alternates are *wider* than their
+counterparts, and that is what fixes the operand widths:
+
+| wide kind | bits written in one go | narrow kinds covering the same bits |
+|---|---|---|
+| 0x20 | w0[24:20] | 0x06 (w0[23:20]) + 0x07 (w0[24]) |
+| 0x21 | w0[31:27] | 0x09 (w0[30:27]) + 0x0a (w0[31]) |
+| 0x22 | w1[6:2] | 0x0c (w1[5:2]) + 0x0d (w1[6]) |
+| 0x05 | w0[19:18] | 0x1e (w0[18]) + 0x1f (w0[19]) |
+
+A named-field patch that writes five contiguous bits as one value is only
+meaningful if those five bits *are* one field. So the three source register
+selects are **5 bits wide**, and the former `f0d`/`f0f`/`f1b` are their high
+bits, not separate flags [CONFIRMED]. Likewise w0[19:18] is a single 2-bit
+field (`f0bc`), not two flags.
+
 | field | bits | patch kind | meaning |
 |---|---|---|---|
 | `wmask0` | w0[3:0] | 0x00 | write mask, destination port **A** |
-| `dst0` | w0[7:4] | 0x01 | destination register, port **A** |
-| `f0a` | w0[9:8] | 0x02 | unidentified |
+| `dst0` | w0[7:4] | 0x01 | destination register index, port **A** (low 4 bits of `dstA`) |
+| `f0a` | w0[9:8] | 0x02 | port-A control; `2` = port A idle (§11) |
 | `wmask1` | w0[13:10] | 0x03, 0x1c | write mask, destination port **B** |
 | `dst1` | w0[17:14] | 0x04, 0x1d | destination register, port **B** |
-| `f0b` | w0[18] | 0x1e | unidentified |
-| `f0c` | w0[19] | 0x1f | unidentified (kind 0x05 patches w0[19:18] as a pair) |
-| `src2` | w0[23:20] | 0x06 | source operand **2** register (low 4 bits) |
-| `f0d` | w0[24] | 0x07 | unidentified (kind 0x20 patches w0[24:20] as 5 bits) |
+| `f0bc` | w0[19:18] | 0x05, 0x1e, 0x1f | unidentified 2-bit field |
+| `src2` | w0[24:20] | 0x20 (0x06+0x07) | source operand **2** register, **5 bits** |
 | `f0e` | w0[26:25] | 0x08 | unidentified |
-| `src1` | w0[30:27] | 0x09 | source operand **1** register (low 4 bits) |
-| `f0f` | w0[31] | 0x0a | unidentified (kind 0x21 patches w0[31:27] as 5 bits) |
-| `f1a` | w1[1:0] | 0x0b, 0x12 | unidentified |
-| `src0` | w1[5:2] | 0x0c | source operand **0** register (low 4 bits) |
-| `f1b` | w1[6] | 0x0d | unidentified (kind 0x22 patches w1[6:2] as 5 bits) |
-| `f1c` | w1[8:7] | 0x0e | unidentified |
+| `src1` | w0[31:27] | 0x21 (0x09+0x0a) | source operand **1** register, **5 bits** |
+| `f1a` | w1[1:0] | 0x0b, 0x12 | unidentified (port-B related, §11) |
+| `src0` | w1[6:2] | 0x22 (0x0c+0x0d) | source operand **0** register, **5 bits** |
+| `f1c` | w1[8:7] | 0x0e | port-B control; `0` = port B idle (§11) |
 | `f1d` | w1[12:9] | 0x0f | unidentified |
-| `f1e` | w1[13] | 0x10 | unidentified |
-| `exthi` | w1[16:14] | 0x11 | high 3 bits of one operand's register index |
+| `dpgA2` | w1[13] | 0x10 | **port-A destination page, bit 4** (= `dstA[8]`, §11) |
+| `exthi` | w1[16:14] | 0x11 | high 3 bits of one source operand's register index |
 | `extsel` | w1[19:17] | — | which operand `exthi` applies to (0/1/2 = src0/1/2) |
-| `f1f` | w1[21:20] | 0x13 | unidentified |
+| `dpgA0` | w1[21:20] | 0x13 | **port-A destination page, bits 1:0** (= `dstA[5:4]`) |
 | `f1g` | w1[24:22] | 0x14 | unidentified |
-| `f1h` | w1[26:25] | 0x15 | constant/matrix bank select (see §7) |
+| `dpgA1` | w1[26:25] | 0x15 | **port-A destination page, bits 3:2** (= `dstA[7:6]`) |
 | `f1i` | w1[29:27] | 0x16 | unidentified |
 | `swzA` | {w2[9:0], w1[31:30]} | 0x17 | 12-bit swizzle, source operand 0 |
 | `swzB` | w2[21:10] | 0x18 | 12-bit swizzle, source operand 1 |
@@ -450,13 +468,14 @@ relocator (§4), which is how its meaning was established.
 
 ## 3. Operand model [CONFIRMED]
 
-- **Three source register slots**: `src0` = w1[5:2], `src1` = w0[30:27],
-  `src2` = w0[23:20]. Four bits each.
-- **Two destination write ports**, each with its own 4-bit register index and
-  4-bit component write mask: port A (`dst0`/`wmask0`) and port B
-  (`dst1`/`wmask1`). A mask of 0 means that port does not write. Both ports are
-  used simultaneously in real code, so the engine is at least dual-write-port
-  [CONFIRMED]; whether that also means dual-issue ALU is [INFERRED].
+- **Three source register slots**: `src0` = w1[6:2], `src1` = w0[31:27],
+  `src2` = w0[24:20]. **Five bits each** (see the wide-patch argument in §2).
+- **Two destination write ports**: port A writes a **9-bit** register index
+  `dstA` = {w1[13], w1[26:25], w1[21:20], w0[7:4]} (§11); port B writes the
+  4-bit `dst1`. Each has its own 4-bit component write mask, and a mask of 0
+  means that port does not write. Both ports are used simultaneously in real
+  code, so the engine is at least dual-write-port [CONFIRMED]; whether that also
+  means dual-issue ALU is [INFERRED].
 - **Swizzles**: `swzA` selects the components of source 0, `swzB` those of
   source 1. **3 bits per component**, component *c* at bits `[3c+2:3c]`.
   Identity `xyzw` = `0x688`. Codes 0–3 are x/y/z/w; codes 4–7 are extra
@@ -480,15 +499,26 @@ kind 0: idx = word1[5:2]   (src0);  word1[19:17] = 0
 kind 1: idx = word0[30:27] (src1);  word1[19:17] = 1
 kind 2: idx = word0[23:20] (src2);  word1[19:17] = 2
         new7 = idx + 7*value
-        <that operand's 4-bit field> = new7 & 0xf
-        word1[16:14]                 = (new7 >> 4) & 7
+        <that operand's low 4 bits> = new7 & 0xf
+        word1[16:14]                = (new7 >> 4) & 7
 ```
 
-So the register file is **128 vec4 registers**, addressed as
-`{exthi(3) : idx(4)}`, but only **one operand per instruction** may carry the
-high three bits — `extsel` names it. Operands not named by `extsel` are limited
-to registers 0–15. Highest extended index actually observed in the vendor
+So a relocated source register is **7 bits**, addressed as `{exthi(3):idx(4)}`,
+and only **one operand per instruction** may carry the high three bits —
+`extsel` names it. Highest extended index actually observed in the vendor
 library: **121**.
+
+**Tension with the 5-bit source field, recorded [UNRESOLVED].** §2 shows the
+source selects are 5-bit fields, yet the relocator only ever touches their low
+4 bits plus `exthi`. Either the source address is `{exthi(3):idx(4)}` and the
+5th bit (w1[6] / w0[31] / w0[24]) is a per-source modifier that the vendor's
+patch API happens to write together with the index, or it is a genuine address
+bit that the relocator never needs because relocated operands always have it
+clear. The corpus is consistent with both: the 5th bit is set in 9 % / 3 % /
+11 % of instructions respectively and is essentially never combined with a
+non-zero `exthi` (e.g. `src2[4]=1` occurs 4485 times, 4483 of them with
+`extsel=2, exthi=0`). Deciding this needs one hardware experiment: write a
+known value to a high register and read it back through the port in §11.
 
 The relocation step is `7` registers per unit, i.e. the driver's per-stage
 constant blocks are 7 registers wide [INFERRED].
@@ -686,10 +716,13 @@ Write mask sweeps `x, y, z, w`; `src1` sweeps the four matrix rows `r0..r3`;
 `src0` is the vector being transformed. That is a textbook 4×DP4 modelview
 transform, and it is exactly the signature a correct ISA decode must produce.
 
-Across the four blocks the only other field that changes is `f1h` (w1[26:25]),
-which counts 0, 1, 2, 3 — so **w1[26:25] selects the constant/matrix bank**
-(four texture matrices) [INFERRED, but the four-blocks-four-banks correlation is
-exact].
+**CORRECTION (2026-09-05): w1[26:25] is not a matrix bank.** Across the four
+blocks the other fields that change are `dst1` (5, 6, 9, 6) and w1[26:25]
+(0, 1, 2, 3), and §11 shows w1[26:25] to be two bits of the **port-A
+destination** address. The former "four texture matrices" reading is withdrawn:
+it required a *source* bank, and the self-test disproves that these fields page
+the sources (§11). What the four blocks share is the same matrix rows `r0..r3`;
+what differs is where each block's four dot products land.
 
 ## 8. What `tools/warp_ucode.h` actually is [CONFIRMED — corrects the premise]
 
@@ -698,25 +731,28 @@ family firmware and **not** a T&L program. Its only user is `mtx676`, a WARP
 **self-test**, which builds a stack descriptor `{len = 0x12cc, code = mtx2785,
 nblocks = 4, entry[8] = 0}` and calls `mtx1391` with `reset = 1`.
 
-Disassembled, its shape is unmistakable:
+Disassembled with the corrected 9-bit destination decode (§11), its shape is
+unmistakable — a flat ascending sweep of the whole register file:
 
 ```
-   4: wra  a0.xyzw   ...
-   5: wra  a1.xyzw   ...
-  10: wra  a0.xyzw   ...
-  11: wra  a1.xyzw   ...
-   ...                                   (384 instructions)
- 393: wra  a15.xyzw  ...
+   4: wra  a0.xyzw    r0.xyzw, r0.xyzw, r2
+   5: wra  a1.xyzw    r0.xyzw, r0.xyzw, r3
+   ...
+  10: wra  a0.xyzw    r0.xyzw, r0.xyzw, r0
+  11: wra  a1.xyzw    r0.xyzw, r0.xyzw, r1
+   ...                                       (384 instructions, index += 1)
+ 393: wra  a383.xyzw  r0.xyzw, r0.xyzw, r1
 ```
 
-384 = 24 blocks × 16. Each block sweeps destination port A over registers 0–15
-with a full `xyzw` mask; across blocks only `w1[13]`, `w1[21:20]` and
-`w1[26:25]` change (2 × 4 × 4 = 32 combinations, of which 24 are used). It is a
+384 = 24 pages × 16. `src2` alternates 0/1 in lockstep with the destination's
+low bit, which is exactly the alternation the verifier expects (§11). It is a
 register-file / write-path sweep, bracketed by a handful of control instructions
-and NOPs. Byte-identity between the original Parhelia and the P690 is expected
-for a self-test and says nothing about the shader pipeline.
+and NOPs, and it ends with `end` at instruction 397. Byte-identity between the
+original Parhelia and the P690 is expected for a self-test and says nothing
+about the shader pipeline.
 
-The real microcode is the fragment library in §9.
+The real microcode is the fragment library in §9 and the default program set in
+§12.
 
 ## 9. The microcode fragment library [CONFIRMED]
 
@@ -741,6 +777,117 @@ For an open driver this means a from-scratch vertex pipeline does **not** need a
 WARP assembler to get started: a hand-built sequence of these 96-bit
 instructions, uploaded through `0x918`/`0x91c`, is sufficient, and the fragment
 library is a validated corpus of working code to imitate.
+
+## 11. The port-A destination register file — 512 entries, 4 banks [CONFIRMED]
+
+This section resolves five of the sixteen fields that had no interpretation, and
+it does so from the vendor's own self-test rather than from correlation.
+
+### The readback port
+
+`mtx612` (`.text+0xa0120`) is the self-test's verifier. It reads the WARP
+register file back through the indirect port and compares:
+
+```c
+for (bank = 0; bank <= 3; bank++)
+    for (idx = 0; idx <= 0x17f; idx++) {          /* 384 entries */
+        mtx514(this, hal, /*kind=*/3, bank, idx); /* -> 4 dwords */
+        expected = (idx & 1) ? patternB : patternA;
+        if (any of the 4 components differs) { fail[idx] = 0; ok = 0; }
+    }
+```
+
+`mtx514` (`.text+0x8f7c0`) is the port itself:
+
+```c
+addr = (kind << 24) | (((bank << 9) | index) & 0xfff);
+memWriteDword(h, 0x910, addr);
+memWriteDword(h, 0x938, 0xfffffffc);
+for (i = 0; i < 4; i++) v[i] = memReadDword(h, 0x914);
+```
+
+So the index field is **9 bits** and there are **4 banks** — 4 × 512 vec4
+entries. (This retires the earlier note in "Microcode load lifecycle" that
+`mtx514` "addresses only ~7 entries per bank"; the `bank << 9` shift was
+misread.) The four banks hold the same data in the self-test, which is what one
+expects if they are the four parallel vertex units of a WARP quad [INFERRED].
+
+`kind` is validated against `kind <= 10` and two bitmasks: kinds 0/1/3/5 take
+this path, kinds 2/4/8/9/10 take a second one. Only **kind 3** is used to read
+the vertex register file [CONFIRMED].
+
+### The address the microcode writes
+
+The self-test image writes 384 destinations and the verifier checks 384
+entries, so the microcode's port-A destination must be a 9-bit address. The
+fields that vary across the sweep are exactly `w0[7:4]` (0..15, innermost),
+`w1[21:20]` (0..3), `w1[26:25]` (0..3) and `w1[13]` (0..1) — 2 × 4 × 4 = 32
+pages of 16 = **512**, matching the port's index width exactly. 24 of the 32
+pages are used (`w1[13]=1` only with `w1[26:25]` ∈ {0,1}), giving 384.
+
+Only one assignment of those five page bits produces a contiguous 0..383, which
+is what the verifier's linear scan requires:
+
+```
+dstA = (w1[13] << 8) | (w1[26:25] << 6) | (w1[21:20] << 4) | w0[7:4]
+```
+
+Decoding the image that way turns it into a perfectly ordered `a0, a1, … a383`
+sweep (`tools/parhelia-warpdis.py tools/warp_ucode.h`), which is the check that
+promotes this from plausible to settled: any other bit order scrambles the
+sequence.
+
+### What this rules out
+
+These five bits do **not** page the source operands. The self-test's operands
+(`src2` = 0/1, the two registers holding the test patterns) are identical in
+every one of the 24 pages; if the page applied to sources, 23 of the 24 blocks
+would have read unwritten registers and the test could never pass
+[CONFIRMED negative]. Source register extension is a separate, narrower
+mechanism — `exthi`/`extsel`, §4.
+
+Whether the same five bits also extend the **port-B** destination is
+**open**. `mtx368` (§7) is suggestive — its four dp4 blocks vary `w1[26:25]`
+and `dst1` together — but the self-test exercises port A only, so there is no
+proof either way.
+
+### Why this matters for an open driver
+
+`0x910`/`0x914`/`0x938` is a working, vendor-proven way to read any WARP
+register back from the CPU. That is the instrument the remaining unknown fields
+need: upload a one-instruction fragment, flip one bit, read the register file.
+No display output or rasteriser is required to run the experiment.
+
+## 12. What is actually loaded at run time [CONFIRMED]
+
+Eight microcode programs are loaded as one burst by `mtx3806`
+(`.text+0x9fcc0`) — see the call chains in "Resolved: what mtx676 loads" below.
+The engine object is constructed with a **default program in every slot**, from
+`.data` blobs installed by the constructor `mtx2051`:
+
+| engine slot | default blob | bytes | instructions |
+|---|---|---|---|
+| +0x40 | `mtx1824` | 204 | 17 |
+| +0x48 | `mtx3605` | 552 | 46 |
+| +0x50 | `mtx3694` | 564 | 47 |
+| +0x58 | `mtx1223` | 240 | 20 |
+| +0x60 | `mtx1739` | 492 | 41 |
+| +0x68 | `mtx458` | 504 | 42 |
+| +0x70 | `mtx3213` | 192 | 16 |
+| +0x98 | `mtx2068` | 120 | 10 |
+
+2868 bytes = **239 instructions** total, comfortably inside the 512-instruction
+store. Six of the eight are also members of the 575-slot fragment registry
+(`mtx1223` and `mtx3213` are not). This is a complete, self-consistent WARP
+program set that an open driver can extract and replay verbatim — unlike
+`tools/warp_ucode.h`, which is the self-test.
+
+Each descriptor is a 0x138-byte object whose layout is exactly what `mtx1391`
+consumes: `+0x18` = byte length, `+0x20` = code pointer, `+0x28` = 1,
+`+0x2c[]` = per-variant entry offsets, `+0x2` = "owns the buffer" flag. The
+same offsets are written by `mtx976` when it installs a freshly linked program
+(`prog[0x18] = size; prog[0x20] = buffer; prog[0x28] = (size-1)/12 + 1`), which
+is what identifies the two as the same struct [CONFIRMED].
 
 ## 10. Confidence and what is still open
 

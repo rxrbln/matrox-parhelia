@@ -626,15 +626,77 @@ this readable at all.
 
 ```
 TA stage descriptor, 0x24 bytes, 4 of them at blob+0x5d4
+(the same array lives at shaderObj+0x6b0 + stage*0x24 - the blob is the
+ shader object shifted by 0xdc: blob+0x004 <-> obj+0x0e0, blob+0x5d4 <-> obj+0x6b0)
 
-+0x00  u32  opcode              0 = stage unused (skipped entirely)
-                                otherwise  GL_OP_TEX*_MTX token - 0x8A8E
-+0x04  u8   "samples a texture" flag  (1 in every descriptor seen)
-+0x08  u32  nDeps
-+0x0c  u32  dep[nDeps]          indices of other TA stages this one consumes
++0x00  u32  opcode          internal code, 0 = stage unused (skipped); §9.5.2
++0x04  u8   this stage performs a texture fetch      (default 1)
++0x08  u32  nargs - 1       0..3
++0x0c  u32  arg[1]          source TA stage index 0..3
++0x10  u32  arg[2]
++0x14  u32  arg[3]
++0x18  u32  sampling hint   0 nearest, 1 bilinear, 2 trilinear, 3 anisotropic
++0x1c  u32  texture type    0 2D, 1 CUBE, 2 3D, 3 1D, 4 BEML
++0x20  u32  texture format  0 GL_TEX_SIGNED, 1 GL_TEX_UNSIGNED, 2 GL_TEX_BIASED
 ```
 
-Evidence, all in `KRN mtx2132`:
+`blob+0x5cc` — the byte the previous revision called padding — is the
+**"the hint fields +0x18/+0x1c/+0x20 are valid" flag**: the fixed-function
+generator writes 0 (`GL 0x10df59`, right next to `[blob+0x5d0] = 4`) and
+`glTexAddressHintsMTX` writes 1 (`GL 0x1b45cf`). The kernel branches on it in
+two places (`KRN 0x6e23a`, `0x741b7`). **CONFIRMED.**
+
+The API that writes these descriptors is the `GL_MTX_fragment_shader`
+texture-address family **[HDR]**, which the previous revision had not looked
+at:
+
+```
+void glTexAddressOp1MTX (GLenum op, GLenum arg0);
+void glTexAddressOp2MTX (GLenum op, GLenum arg0, GLenum arg1);
+void glTexAddressOp3MTX (GLenum op, GLenum arg0, GLenum arg1, GLenum arg2);
+void glTexAddressOp4MTX (GLenum op, GLenum a0, GLenum a1, GLenum a2, GLenum a3);
+void glTexAddressHintsMTX   (GLenum target, GLbitfield hints);
+void glTexAddressParamuiMTX (GLenum target, GLenum pname, GLuint param);
+void glTexAddressParamfvMTX (GLenum target, GLenum pname, const GLfloat *p);
+```
+
+All four `OpN` entry points funnel into one 5-argument implementation
+(`GL 0x1b47c0`), padding unused arguments with `GL_IGNORED_MTX` = 0x8AB2
+(`GL 0x1afa76`). Every `argN` must be `GL_TEXTURE0_ARB..GL_TEXTURE3_ARB`
+(`GL 0x1b4170`, 0x84C0-0x84C3 → 0..3): `arg0` selects **which** descriptor is
+written, `arg1..argN-1` are recorded as its source stages, and the
+implementation rejects anything that is not **strictly decreasing**
+(`GL 0x1b496d: cmp [rsp+rax*4+0x10],edx ; jge <GL_INVALID_OPERATION>`) — i.e.
+the D3D `texm3x3pad t1,t0 / texm3x3pad t2,t0 / texm3x3tex t3,t0` chain
+collapsed into one instruction. **CONFIRMED.**
+
+The writers:
+
+```
+GL 0x1b4996  lea rax,[rax+rax*8]                    ; 9 * stage
+GL 0x1b499d  mov DWORD PTR [rax+0x10],edx           ; desc+0x00 = opcode
+GL 0x1b49a3  mov DWORD PTR [rax+0x18],edx           ; desc+0x08 = nargs-1
+GL 0x1b49cc  mov DWORD PTR [rbx+rax*4+0x6bc],edx    ; desc+0x0c + k*4
+GL 0x1b45c7  mov DWORD PTR [rax+0x18],r13d          ; desc+0x18 sampling hint
+GL 0x1b45cb  mov DWORD PTR [rax+0x1c],r12d          ; desc+0x1c texture type
+GL 0x1b4d25/3c/53                                   ; desc+0x20 = 1 / 0 / 2
+GL 0x10da5c  mov DWORD PTR [rdi+rax*4+0x5d4],0x1    ; fixed-function: opcode = 1
+```
+
+`glTexAddressHintsMTX` decodes `hints & 0xf` into the sampling hint
+(`GL_HINT_NEAREST` 1→0, `BILINEAR` 2→1, `TRILINEAR` 4→2, `ANISOTROPIC` 8→3) and
+`hints & 0x1f0` into the type (`TEXTURE_1D` 0x10→3, `2D` 0x20→0, `3D` 0x40→2,
+`CUBE` 0x80→1, `BEML` 0x100→4). **`GL_HINT_TEXTURE_BEM_MTX` (0x200) falls
+outside the mask and is silently ignored** — a vendor bug; only the *luminance*
+bump form is reachable from GL.
+
+The fixed-function path leaves the descriptor at
+`{opcode from 0x10da50, +0x04 = 1, rest 0}`; the `GL_MTX` shader object's
+initialiser (`GL 0x1b50e4`-0x1b5128) writes
+`{0, 1→0, 0, 0,0,0, hint 1, type 0, format 1}` — note it stores 1 into `+0x04`
+at 0x1b50ee and then 0 at 0x1b5115, another apparent vendor slip.
+
+Evidence for the kernel side, all in `KRN mtx2132`:
 
 * `mov eax,[rax+0x5d0]` @0x6e22c reads the count; `movzx eax,BYTE [rdx+0x5cc]`
   @0x6e23a reads the byte at blob+0x5cc and passes it on as a *mode* selector
@@ -650,81 +712,119 @@ Evidence, all in `KRN mtx2132`:
   `[r14+0x5dc]` = **`+0x08` as a count** and then
   `movsxd rax,[r13+rax*4+0xc]` = **`+0x0c + k*4` as an array of TA stage
   indices** (@0x6e30e-0x6e350). Each one is turned into
-  `mtx598(record_of(dep), record_of(this))`.
+  `mtx598(record_of(arg), record_of(this))`.
 
 So **texture addressing is a small dependency graph of at most four TA
 instructions, not a linear instruction stream and not fixed function.** A stage
 names the other stages it consumes; there is no register-file encoding on this
 side at all.
 
-The dependency array can reach `+0x20`, which is the whole remaining descriptor
-(6 slots max). In the `blob[0x5cc] == 1` flavour `+0x18`/`+0x1c`/`+0x20` are
-used for something else (§9.5.5), so in that flavour `nDeps` must be ≤ 3. Both
-readings come straight out of the code; which one applies is decided by
-`blob[0x5cc]`.
+#### 9.5.2 The opcode encoding — two stages  **CONFIRMED**
 
-#### 9.5.2 The opcode table  **CONFIRMED**
+`desc+0x00` does **not** hold the GL token minus a constant. There are two
+translations, and they are not the same permutation.
 
-`mtx1652` @0x70b30 reads `ecx = [&TA[i]]` — the opcode — and immediately indexes
-the kernel `.data` table **`mtx1411`** (vma 0x19440, 0x48 bytes = 18 dwords)
-with it, storing the result as the record's *opcode class* at `record+0x8c`:
+**Stage 1, GL token → internal code** (libGL `0x1b4630`):
 
 ```
-70b75: mov ecx,DWORD PTR [rdi]              ; TA[i]+0x00 = opcode
-70b8a: mov eax,DWORD PTR [mtx1411+rax*4]    ; class
+lea eax,[rsi-0x8a8e] ; cmp eax,0xf ; ja reject
+lea rdx,[rip+...]    ; .rodata 0x36ed2c, 16 entries
+movsxd rax,[rdx+rax*4] ; add rax,rdx ; jmp rax   -> mov [rcx],<code>
+```
+
+**Stage 2, internal code → hardware TA opcode** (kernel `mtx1652` @0x70b30):
+
+```
+70b75: mov ecx,DWORD PTR [rdi]              ; desc+0x00 = internal code
+70b8a: mov eax,DWORD PTR [mtx1411+rax*4]    ; hardware TA opcode
 70ba5: mov DWORD PTR [rbx+0x8c],eax
 ```
 
-Two more `.data` tables are indexed by that class:
-
-* **`mtx3585`** (vma 0x167c0, 0x80 bytes = 32 dwords) → `record+0xb8`, a
-  **4-bit RGBA channel mask** (bit0 = R, bit1 = G, bit2 = B, bit3 = A);
-* **`mtx1600`** @0x709b0, a 20-entry jump table (`.rodata+0x2310`) → a small
-  integer 0-3 stored at `record+0x94`.
-
-Raw dumps (re-read from the object file):
+`mtx1411` is kernel `.data` vma 0x19440, 0x48 bytes = 18 dwords, dumped
+verbatim:
 
 ```
 mtx1411 = 00 00 02 03 03 04 10 11 13 05 09 06 0c 0e 0b 0a 0d 08
-mtx3585 = 0f 0f 0f 0f 03 07 03 00 07 07 0f 0f 0f 0f 0f 00 09 06 00 07 0...
-mtx1600 =  0  0  0  0  1  1  2  0  1  1  3  3  2  3  2  0  1  1  1  1
 ```
 
-Joining them gives the TA opcode table:
+Joining the two stages:
 
-| opcode | GL token (`[HDR]`) | class | `mtx3585` mask | `mtx1600` |
-|---|---|---|---|---|
-| 0 | `GL_OP_TEX_NOP_MTX` 0x8A8E | 0 | RGBA | 0 |
-| 1 | `GL_OP_TEX_MTX` 0x8A8F | 0 | RGBA | 0 |
-| 2 | `GL_OP_TEX_COORD_MTX` 0x8A90 | 2 | RGBA | 0 |
-| 3 | `GL_OP_TEXKILL_GE_MTX` 0x8A91 | 3 | RGBA | 0 |
-| 4 | `GL_OP_TEXKILL_LT_MTX` 0x8A92 | 3 | RGBA | 0 |
-| 5 | `GL_OP_TEXBEM_MTX` 0x8A93 | 4 | **R,G** | 1 |
-| 6 | `GL_OP_TEXDEP_AR_MTX` 0x8A94 | 16 | **A,R** (0x9) | 1 |
-| 7 | `GL_OP_TEXDEP_GB_MTX` 0x8A95 | 17 | **G,B** (0x6) | 1 |
-| 8 | `GL_OP_TEXDEP_RGB_MTX` 0x8A96 | 19 | **R,G,B** (0x7) | 1 |
-| 9 | `GL_OP_TEXDOT3_COORD_MTX` 0x8A97 | 5 | R,G,B | 1 |
-| 10 | `GL_OP_TEXDOT3_MTX` 0x8A98 | 9 | R,G,B | 1 |
-| 11 | `GL_OP_TEXM3X2_MTX` 0x8A99 | 6 | R,G | 2 |
-| 12 | `GL_OP_TEXM3X2_DEPTH_MTX` 0x8A9A | 12 | RGBA | 2 |
-| 13 | `GL_OP_TEXM3X3_MTX` 0x8A9B | 14 | RGBA | 2 |
-| 14 | `GL_OP_TEXM3X3_COORD_MTX` 0x8A9C | 11 | RGBA | 3 |
-| 15 | `GL_OP_TEXM3X3_REFLECT_MTX` 0x8A9D | 10 | RGBA | 3 |
-| 16 | (internal, no GL token) | 13 | RGBA | 3 |
-| 17 | (internal, no GL token) | 8 | R,G,B | 1 |
+| GL token **[HDR]** | internal | **HW opcode** | nargs |
+|---|---|---|---|
+| `GL_OP_TEX_NOP_MTX` 0x8A8E | 0 | — (0 = stage absent, never emitted) | 1 |
+| `GL_OP_TEX_MTX` 0x8A8F | 1 | **0x00** | 1 |
+| `GL_OP_TEX_COORD_MTX` 0x8A90 | 2 | **0x02** | 1 |
+| `GL_OP_TEXKILL_GE_MTX` 0x8A91 | 3 | **0x03**, `rec+0xc6 = 1` | 1 |
+| `GL_OP_TEXKILL_LT_MTX` 0x8A92 | 4 | **0x03**, `rec+0xc6 = 0` | 1 |
+| `GL_OP_TEXBEM_MTX` 0x8A93 | 5 | **0x04** | 2 |
+| `GL_OP_TEXDEP_AR_MTX` 0x8A94 | 6 | **0x10** | 2 |
+| `GL_OP_TEXDEP_GB_MTX` 0x8A95 | 7 | **0x11** | 2 |
+| `GL_OP_TEXDEP_RGB_MTX` 0x8A96 | 8 | **0x13** | 2 |
+| `GL_OP_TEXDOT3_COORD_MTX` 0x8A97 | 9 | **0x05** | 2 |
+| `GL_OP_TEXDOT3_MTX` 0x8A98 | 10 | **0x09** | 2 |
+| *(no GL token)* | 11 | 0x06 | invalid (arity 0) |
+| `GL_OP_TEXM3X2_MTX` 0x8A99 | 12 | **0x0C** | 3 |
+| `GL_OP_TEXM3X2_DEPTH_MTX` 0x8A9A | 13 | **0x0E** | 3 |
+| `GL_OP_TEXM3X3_MTX` 0x8A9B | 14 | **0x0B** | 4 |
+| `GL_OP_TEXM3X3_COORD_MTX` 0x8A9C | 15 | **0x0A** | 4 |
+| `GL_OP_TEXM3X3_REFLECT_MTX` 0x8A9D | 16 | **0x0D** | 4 |
+| *(no GL token)* | 17 | 0x08 | — |
 
-**Why `opcode = token - 0x8A8E` is CONFIRMED and not a guess:** the three
-dependent-read opcodes land on masks `0x9`, `0x6`, `0x7` at exactly the
-positions of `TEXDEP_AR`, `TEXDEP_GB` and `TEXDEP_RGB` — A|R, G|B and R|G|B
-read out of the source texel. `TEXBEM` (0x3 = R,G) is the du/dv pair of a V8U8
-bump map and `TEXDOT3` (0x7) needs three components. Position 0 is the one the
-walk treats as "absent", i.e. `TEX_NOP`. Independently, `KRN mtx3603` @0x709f0,
-which manufactures an *implicit* texture fetch, indexes the same table with the
-literal `1` — `GL_OP_TEX_MTX`. Five agreeing constraints.
+Note the gap at internal code 11: the mapping is *not* `token - 0x8A8E` from
+`TEXM3X2` onwards. `TEXKILL_GE` and `TEXKILL_LT` share hardware opcode 3 and are
+separated by a side flag (`KRN 0x70bf2: sete BYTE PTR [rbx+0xc6]` on internal
+code == 3). The hardware opcode space is therefore **0x00-0x13 minus
+{0x01, 0x07, 0x0F, 0x12} — a 5-bit field**.
 
-`mtx1600`'s 0-3 is one value per class; its meaning is **not determined**. It
-correlates with the number of coordinate rows an op consumes (matrix ops 2-3,
-dependent reads 1, plain sample/kill 0) but that is a reading, not evidence.
+The `nargs` column is libGL's own arity table, jump table `.rodata 0x36ed6c`
+(17 entries, indexed by internal code, read at `GL 0x1b4780`): codes 0-4 → 1,
+5-10 → 2, 11 → 0 (invalid), 12-13 → 3, 14-16 → 4. That is exactly why
+`glTexAddressOp1..4MTX` exist as four entry points.
+
+#### 9.5.3 The two per-opcode hardware tables  **CONFIRMED**
+
+Both are indexed by the **hardware** opcode (`record+0x8c`).
+
+**`mtx3585`** (kernel `.data` vma 0x167c0, 0x80 bytes) → `record+0xb8`, a 4-bit
+RGBA mask (bit0 R, bit1 G, bit2 B, bit3 A):
+
+```
+mtx3585 = 0f 0f 0f 0f 03 07 03 00 07 07 0f 0f 0f 0f 0f 00 09 06 00 07 0 ...
+```
+
+| HW opcode | op | mask |
+|---|---|---|
+| 0x00 | TEX | RGBA |
+| 0x02 | TEX_COORD | RGBA |
+| 0x03 | TEXKILL | RGBA |
+| 0x04 | TEXBEM | **R,G** (0x3) — the du/dv pair of a V8U8 bump map |
+| 0x05 / 0x09 | TEXDOT3_COORD / TEXDOT3 | **R,G,B** (0x7) |
+| 0x0A-0x0E | the M3X2 / M3X3 family | RGBA |
+| 0x10 | TEXDEP_AR | **A,R** (0x9) |
+| 0x11 | TEXDEP_GB | **G,B** (0x6) |
+| 0x13 | TEXDEP_RGB | **R,G,B** (0x7) |
+
+The three `TEXDEP_*` masks reading exactly `A|R`, `G|B`, `R|G|B` is the check
+that pins the whole join: nothing else would land those three numbers on those
+three opcodes.
+
+`KRN mtx2577` @0x70eb0 uses the mask as an allocation requirement:
+`record+0xb4` starts at 0x1f (0x20 on one chip variant, @0x70ee5), is OR-ed with
+the `+0xb8` of every linked stage (@0x70f1c `or edx,[rax+0xb8]`) and is then
+AND-matched against a pool mask (@0x70f49). So **a fetch must produce every
+channel any dependent stage reads**; whether the field is literally colour
+channels or the one-hot texture-pipe select of §11.2 is **INFERRED**.
+
+**`mtx1600`** @0x709b0 (jump table `.rodata+0x2310`, 20 entries) → `record+0x94`:
+
+```
+mtx1600[hw] =  0  0  0  0  1  1  2  0  1  1  3  3  2  3  2  0  1  1  1  1
+```
+
+Mapped through the opcode table this is exactly **`nargs - 1`** for every
+reachable opcode (TEX 0, TEXBEM/TEXDEP/DOT3 1, M3X2 2, M3X3 3). The kernel
+recomputes the descriptor's `+0x08` from the opcode rather than trusting it.
+**CONFIRMED** by agreement with libGL's independent arity table.
 
 #### 9.5.3 What a TA stage becomes  **CONFIRMED**
 
@@ -1389,17 +1489,21 @@ verbatim**. This is the first hardware confirmation of anything in this file.
 Three blobs are present. They are found by scanning region 2 for an offset `b`
 where `[b] ∈ 1..10` and `[b+0x5d0] == 4`:
 
-| op | blob at region-2 offset | program id |
-|---|---|---|
-| `clear_color` | 0x1fc | 1 |
-| `tex_tri_nearest` | 0x70 | 3 |
-| `tex_env_replace` | 0x10 | 4 |
+| op | blob at region-2 offset | header at blob−0x10 | program id |
+|---|---|---|---|
+| `clear_color` | 0x1fc | `{0x46, 1, 2, 0}` | 2 |
+| `tex_tri_nearest` | 0x70 | `{0x46, 1, 3, 0}` | 3 |
+| `tex_env_replace` | 0x10 | (first 2 dwords clobbered) | 4 |
+| `matrix_rotate` | 0x20 | `{0x46, 1, 5, 0}` | 5 |
+
+(`matrix_rotate` re-uploads the same `MOV r0, v0` program under a new id.)
 
 Decoded against §12.2.2 (`+0x00` count, `10 x 0x94` records, sub-instruction
 `{opcode, dst, scale, sat, 3 x (code, mod, rep)}`):
 
 ```
 clear_color        count 1   MOV r0, v0            sepalpha=0
+matrix_rotate      count 1   MOV r0, v0            sepalpha=0
 tex_tri_nearest    count 1   MUL r0, t0, v0        sepalpha=0
 tex_env_replace    count 1   MOV r0, t0            sepalpha=1
                              MOV r0.a, v0
@@ -1435,14 +1539,18 @@ that `+0x00` is the opcode and `+0x04` is a separate flag.
 Framing notes for the decoder (`tools/parhelia-glsweep-decode.py` currently
 reports 0x008..0x790 of `tex_tri_nearest` as one 1928-byte `UNDECODED BLOCK`):
 
-* the blob is carried by a **4-dword record header** `{0x46, 1, id, 0}` — the
-  `command 0x46 = re-upload with an id` of §12.2.2. In `tex_env_replace` the
-  first two dwords of that header are the ones the driver clobbers with
-  `(0xff, 1)`, which is why its blob starts at 0x10.
+* the blob is carried by a **4-dword record header** `{0x46, 1, id, 0}`
+  immediately in front of it — the `command 0x46 = re-upload with an id` of
+  §12.2.2. In `tex_env_replace` the first two dwords of that header are the
+  ones the driver clobbers with `(0xff, 1)`, which is why its blob starts at
+  0x10. The record is then padded so the next record starts on a 4-dword
+  boundary (`tex_tri_nearest`: header 0x60, blob 0x70-0x6d3, pad to 0x6e0).
 * immediately after the blob the stream writes the pair `(idx 0x14, id)` —
-  **engine register 0x1050 = the program id** (3 for `tex_tri_nearest`, 4 for
-  `tex_env_replace`, matching the header's id field both times). **INFERRED**
-  from two samples, but the two agree.
+  **engine register 0x1050 = select fragment program**. In all four samples the
+  value equals the header's id field (2, 3, 4, 5). **INFERRED** — four
+  agreeing samples, but the register number rests on the decoder's
+  `reg = 0x1000 + idx*4` reading of region 2 (which its own self-test
+  validates).
 * the first record of `tex_tri_nearest` (region 2 +0x08 ff.) is the texture
   upload: a `0xffffc200........` kernel pointer followed by
   `..., 4, 0,0,0,0, 0x40, 0x40, 1, 0, 2, 0, 1.0f, 1.0f, 1.0f` — the 64x64
