@@ -63,8 +63,12 @@ GROUND-TRUTH draw MMIO (captures/mmio-draw-0528*.txt): per draw =
 - **submit via DMA RING**: 0x404=cmdbuf-bus-addr, then 0x408=end|3 written
   repeatedly (end advances 0x20/packet). This is the RE'd ring
   ([[parhelia-dma-ring-working]]). 0x314=1 kicks; poll 0x8f0/0x450.
-- microcode ROM (mtx2785, 1203 dw, family-shared, tools/warp_ucode.h) streams to
-  the 0x91c FIFO ONCE at init; **0x91c is NOT the per-draw geometry path**.
+- microcode streams to the 0x91c FIFO after seeding 0x918 = instruction index;
+  **0x91c is NOT the per-draw geometry path**. One instruction = 3 dwords = 12
+  bytes; the store holds 512 instructions (0x1800 B). tools/warp_ucode.h
+  (mtx2785, 1203 dw) is the WARP **self-test**, not the pipeline microcode — the
+  real code is a 574-fragment library in the vendor module's .data. Encoding and
+  disassembler: docs/parhelia-vertex-isa.md PART 2, tools/parhelia-warpdis.py.
 - WARP is armed (0x924 low12 0x000->0x100) by a GL context doing 3D — a from-
   scratch driver must reproduce that engine-arm.
 - vertex attribute layout = [x, y, r, g, b] (captured live, docs/parhelia-vertex-isa.md).

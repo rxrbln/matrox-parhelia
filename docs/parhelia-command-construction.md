@@ -21,8 +21,9 @@ The ICD maps `/dev/matrox/mtx0` seven times. Observed in one client:
 
 | Region | Size | Role |
 |---|---|---|
-| 0, 1, 3 | 4096 each | small control/status pages |
-| **2** | 139264 (136K) | **submit-request buffer** — the 0x28-byte records the kernel consumes |
+| **0** | 4096 | **control block**; `+0x230` = submitted stream length in bytes |
+| 1, 3 | 4096 each | small control/status pages |
+| **2** | 139264 (136K) | **command record stream**, rebuilt from offset 0 every submission |
 | **4** | 3276800 (3M) | **vertex ring** (`0x320000`) |
 | **5** | 688128 (672K) | **command ring** (`0xa8000`) |
 | 6 | 4194304 (4M) | third heap (`0x400000`), not used per draw |
@@ -46,8 +47,11 @@ region 4  0x2040 .. 0x2074      3 vertices x 20 bytes
 ```
 
 The next draw (`tri_gouraud`) writes the identical shape at `0x4000` and
-`0x4040`, and only regions 2/4/5 change. So region 2 offsets 0x18/0x20/0x28 are
-the **submission head/tail** the kernel reads.
+`0x4040`, and only regions 2/4/5 change.
+
+Those region 2 dwords are **not** a submission head/tail: they are payload
+inside a DRAW record (see the correction below), carrying the vertex-ring
+offsets for this draw.
 
 ## The per-draw command packets (region 5) — CAPTURED + CONFIRMED in the ICD
 
@@ -152,28 +156,39 @@ kernel through this shared region. Offsets 0x000-0x030 of region 2 are a
 **submit record** whose fields are per-record-type, which is why non-draw
 records put other things at 0x008.
 
-## The submit record (region 2) — capture and disassembly agree
+## CORRECTION: region 2 is a record stream, not a submit-record array
 
-The ICD builds 0x28-byte submit records and hands them over with request opcode
-0x1b. Aligning the disassembled layout against the captured dwords, the record
-in the capture begins at region 2 offset **0x008**:
+An earlier reading here treated region 2 offsets 0x008-0x028 as a 0x28-byte
+submit record with fields `{primcode, handle, START, END|1}`, aligning
+`0x018 = 0x2000` and `0x020 = 0x201d` as START and END-with-low-bit-set. **That
+was wrong.** It pattern-matched three dwords and happened to fit.
 
-| Record field | Region 2 offset | Captured (tri_flat) |
-|---|---|---|
-| +0x00 | 0x008 | 4 — the primitive code |
-| +0x08 u64 device/context handle | 0x010/0x014 | 0xffffc200_009b8004 (kernel pointer) |
-| +0x10 START | 0x018 | 0x00002000 — chunk start |
-| +0x18 END\|1 | 0x020 | 0x0000201d — note the low bit set |
-| +0x20 | 0x028 | 0x00002040 |
+The correct model, independently verified: region 2 is a **variable-length
+record stream that the ICD rebuilds from offset 0 on every submission**, and the
+control block in region 0 carries its length:
 
-START and `END|1` matching the captured 0x2000 / 0x201d is what pins the
-alignment. The `(START, END|1)` pair is what the server/kernel side turns into
-`0x404` PRIMADDRESS and `0x408` PRIMEND with its DMA-mode bits.
+```
+region0 + 0x230 = submitted stream length in bytes
+    clear_depth -> 0x2c    (2-dword opcode + 9-dword CLEAR record)
+    tri_flat    -> 0x30    (2-dword opcode + 10-dword DRAW record)
+```
 
-Discrepancy to resolve: the disassembly reads record +0x00 as a type field
-(`ctx[0xa050]` = 0xd) while the capture shows the primitive code there. Either
-the field is overloaded or the record base is off by one field; the START/END
-match makes the rest of the alignment solid.
+Those lengths match a record-based decode of region 2 exactly, which is the
+check that settles it — a flat `(index,value)` pair decode does not reproduce
+them. `(index,value)` pairs are the *dominant* record type, but draw, clear,
+rect and vertex-format records are **not** pairs and will mis-slice into
+plausible-looking but fake register writes if decoded as such.
+
+Two practical consequences for anyone decoding this format:
+
+- The driver overwrites the first two dwords of every stream with `(0xff, 1)`,
+  so each stream's **first opcode is unrecoverable** from a capture.
+- The `0x2000`/`0x201d`/`0x2040` dwords are DRAW-record payload naming this
+  draw's vertex-ring offsets, not ring pointers.
+
+Decoder: `tools/parhelia-glsweep-decode.py`, self-tested against two anchors
+(region 2 `0x0cc` -> reg 0x1298 = 2048.0f, and `0x0d4`.. -> regs 0x1100-0x117c =
+0xffffffff). Per-feature results: docs/parhelia-gl-feature-map.md.
 
 ## Vertex format — how the stride is built (CONFIRMED)
 
@@ -247,8 +262,24 @@ as it must. This independently reproduces the earlier gdb capture of the ICD's
 internal vertex array, by a completely different route — so the layout is settled.
 
 Positions are the raw GL coordinates (0.5, 0.9, 0.1 …), *not* screen space: the
-viewport transform happens after this buffer. z and w are not streamed; they are
-pipeline constants (w = 1.0, z compared against 0.0).
+viewport transform happens after this buffer.
+
+**CORRECTION: "z and w are not streamed" is wrong as a general statement.** It
+holds only for this particular vertex format. The format is **dynamic and
+announced per submission**, matching the ICD's prefix-sum stride table:
+
+| Stride | Contents |
+|---|---|
+| 20 | x, y, r, g, b |
+| 24 | + z |
+| 28 | + alpha |
+| 24 | x, y, z + **normal** (lighting path) |
+| 32 | window-space wide line |
+
+Two related corrections from the same capture: the **viewport transform is not
+CPU-applied** — region 4 holds raw object-space `glVertex` values, and only the
+wide-line path stores window coordinates. And **lighting runs on the GPU**: the
+lighting draw streams the `glNormal3f` normal rather than a CPU-lit colour.
 
 ## The state stream (region 2) — (index, value) pairs
 
@@ -338,3 +369,33 @@ Still open:
   blocks available in DMA32 — so it is not memory pressure or fragmentation.
   Even a 2-page request fails. Cause not yet identified; the texture rows in the
   feature map are therefore uncaptured.
+
+## Unresolved conflicts between sources
+
+Recorded rather than silently resolved, because each side has real evidence and
+picking one arbitrarily would bake a guess into the driver.
+
+**1. Scissor encoding.** The ICD disassembly shows scissor emitted as
+`[2][0x2121a1a0][(f3<<16)|f0][(f1<<16)|f2]` into regs 0x1280/0x1284 with values
+clamped to +/-1024 (guard band). The live capture disagrees: `glScissor(32,32,
+64,64)` appears as a **4-dword pixel rect with Y measured from the bottom**
+(32, 160, 64, 64), and registers 0x1280/0x1284 never appear at all. Most likely
+two distinct paths (guard-band clip vs scissor rect) with only one exercised
+here. Do not implement either as *the* scissor path until one is confirmed on
+hardware.
+
+**2. Quad decomposition.** The ICD contains a CPU quad-decomposition path
+(GL_QUADS -> primcode 0xb, 16-bit index list) gated on `ctx+0xa0e4`. The capture
+shows the DRAW record carrying the raw GL enum **7 = GL_QUADS**, i.e. quads
+reaching the hardware undecomposed. These reconcile if decomposition is
+conditional and was disabled in the captured configuration — plausible, but
+unproven. Only wide lines were observed being CPU-emulated (as 4 parallel
+1-pixel lines).
+
+**3. Registers whose meaning the capture contradicts.** `0x1230` is written 3 by
+`glFogi(FOG_MODE, LINEAR)`, so it is not the depth surface base; `0x1224` is
+written 1 by `glEnable(GL_LIGHTING)`, so it is not the slot-0 texture
+descriptor; `0x1024` carries a blend factor, not glCullFace; `0x10d8` carries a
+two-float line-width/point-size payload, not stencil state. Consequently **every
+0x12xx claim derived from a stream index >= 0x80 should be treated as
+unproven** until re-checked.

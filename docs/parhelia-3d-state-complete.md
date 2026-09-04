@@ -129,6 +129,12 @@ encodings. Left as the next RE step.
 
 ## Appendix: LIVE-CAPTURED draw state (ground truth) [CAP]
 
+> **Superseded in part by [[parhelia-gl-feature-map]]** (per-GL-feature sweep,
+> same board).  That capture shows the 136KB mapping is a *record* stream, not a
+> flat pair stream, so part of the register list below is mis-sliced payload;
+> it also contradicts §2 (scissor/viewport), §3 (primitive decomposition, CPU
+> viewport transform) and §5 (0x1024, 0x1230).
+
 Everything above is static RE. This appendix is what a **real vendor GL draw
 actually programmed**, captured on hardware 2026-09-04 (0x0528, PCI 256MB board,
 vendor 2009 stack). Where the two disagree, this wins.
