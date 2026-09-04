@@ -10,25 +10,22 @@ value, or two independent ops agree); **[INFERRED]** = best reading of the
 capture, self-consistent but not proven; **[AMBIGUOUS]** = the decode or the
 meaning is genuinely unresolved — do not build on it.
 
-> Coverage caveat: the sweep **aborted after `lighting`**.  The file has no
-> `# sweep complete` marker and no `matrix_rotate`, `swapbuffers`,
-> `tex_upload`, `tex_tri_nearest`, `tex_linear`, `tex_repeat`,
-> `tex_env_modulate` or `tex_env_replace` blocks.  **Nothing about texturing,
-> matrix transform or buffer swap is in this capture** — those rows are absent
-> below rather than empty.
+> **Coverage: complete.** The sweep now runs all 33 operations end to end,
+> including all six texture ops, `matrix_rotate` and `swapbuffers`.
 >
-> Cause, established afterwards on the hardware (not a `glPushMatrix` fault):
-> the vendor kernel driver **fails to allocate the GL context's buffers**,
-> logging `Parhelia OS: Failed to allocate locked pages (nb: 801, type: 2)` and
-> `Failed to create device buffer (size: 3280896, type: 1)`.  801 pages is the
-> 3 MB vertex ring.  This is **not** memory pressure: it persists after a
-> page-cache drop, a module reload and a full reboot with 420 MB free and free
-> order-10 blocks in DMA32, and even a 2-page request fails.  The failure is
-> never reported to the GL client — it simply blocks forever in `glFinish`,
-> which is why the sweep looked like a hang at whatever operation came next.
-> A later run with the ops reordered reached `swapbuffers` and still died at the
-> first texture op.  Cause not yet identified; see the open items in
-> docs/parhelia-command-construction.md.
+> Historical note, kept because the wrong diagnosis was well-evidenced: earlier
+> runs aborted partway and the kernel logged
+> `Failed to allocate locked pages (nb: 801)`, which fits a real hard limit
+> (`MTX_MAX_ORDER` = 9 caps allocations at 512 pages while the request needs
+> order 10) and led to the conclusion that texturing could not be captured on
+> this box. That was wrong on both counts. The allocation failures are non-fatal
+> noise, and the hang was in the **harness**: linked without `-lm`, libGL's
+> `ceilf` bound to the copy exported by `libstdc++` instead of libm and the
+> driver's mip-level loop inside `glTexImage2D` never terminated. See the
+> appendix of docs/parhelia-kernel-abi.md. **Any harness built against this
+> vendor libGL must link `-lm`.**
+>
+> Texture results are in §8.
 
 ## 1. What the mapped regions actually are
 
