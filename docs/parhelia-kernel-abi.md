@@ -977,3 +977,73 @@ driver (`mtx_drv.so`), not to the kernel. `docs/parhelia-gpu-access-map.md`
   through the method-12 buffer-create path (`libGL` @0x357d20 → op 12 →
   `.text+0x1ffc`) with the size computed kernel-side from a 0x1c-byte
   descriptor; the size is not a literal in any of the three binaries.
+
+## Appendix: why GL texturing cannot be captured on the PCI test box  [CONF]
+
+Established 2026-09-05 on the 0x0528 PCI board. Recorded because it looks like a
+memory-pressure problem and is not one, and because it blocks the texture half
+of the 3D feature map.
+
+**Symptom.** The first `glTexImage2D` of *any* size blocks forever — verified at
+4x4, 8x8, 16x16, 32x32 and 64x64, and for both `GL_RGB` and `GL_RGBA`. The GL
+context is created successfully first (`glGetString(GL_RENDERER)` returns
+"OpenGL Linux library for Parhelia"). The kernel logs:
+
+```
+[mtx] *ERROR* Parhelia OS: Failed to allocate locked pages (nb: 801, type: 2)
+[mtx] *ERROR* Failed to create device buffer (size: 3280896, type: 1)
+[mtx] *ERROR* Parhelia OS: Failed to allocate locked pages (nb: 801, type: 1)
+```
+
+**Root cause — a hard-coded vendor limit**, in `kernel/src/mtx_drv.h`:
+
+```c
+#define MTX_MAX_ORDER   9   /* seems to be reasonable, and old-kernel compatible */
+
+static __inline__ INT mtx_get_pg_order(ULONG size) {
+    INT order;
+    for (order = 0; order <= MTX_MAX_ORDER; order++)
+        if ((PAGE_SIZE << order) >= size)
+            return order;
+    return -1;
+}
+```
+
+Order 9 = 512 pages = **2 MB**. The request is **3,280,896 bytes = 801 pages**,
+which needs order 10, so `mtx_get_pg_order` returns -1 and
+`mtx_mem_alloc_pci()` fails **before `__get_free_pages` is ever called** — which
+is why the log never shows the driver's own "Failed to allocate PCI memory"
+message. Type 2 is `MTX_MEMTYPE_PCI_LOCKED`, type 1 is `MTX_MEMTYPE_AGP`.
+
+**Why the AGP fallback also fails here:** the board is PCI/PCI-X on an nForce3
+host bridge, and this kernel has no usable AGP — `/proc/agp` is absent and only
+`intel-agp`, `via-agp` and `sis-agp` modules exist, none of which drive an
+nForce3 (that needs the AMD64 GART driver). So both paths fail and the ICD
+blocks.
+
+**What this is NOT.** Not memory pressure and not fragmentation: it persists
+with 420 MB free and free order-10 blocks in DMA32, survives a page-cache drop,
+a module reload and a full reboot, and the same failure occurs for a 2-page
+request once the driver is in this state. Module parameters do not help either —
+`regSysPhysicalMemory=64` and `reg3DSwapTexturesVidMemOptions=1` leave the
+request at 801 pages, because the 3 MB size is fixed in the user-space ICD (it
+is the vertex ring, `0x320000`, plus a page).
+
+**Misleading evidence to be aware of.** `ioquake3` starts, reports the Parhelia
+renderer, GL 1.3, 4 texture units, multitexture and S3TC — which looks like
+proof that texturing works. It is not: its log shows it failing on **audio**
+(`libopenal`, ALSA) immediately after renderer init, before loading any level
+texture, so it never uploads one.
+
+**The fix**, for anyone who needs live texture capture: rebuild the vendor
+module with `MTX_MAX_ORDER` raised to 10 (4 MB), which covers the 801-page
+request. Everything up to `mtxvxd.o` builds; the final link needs a kernel
+source tree, and `/lib/modules/2.6.30-dist/build` on the test box is a dangling
+symlink into a T2 tree that no longer exists. Alternatively provide a working
+AGP GART for the host bridge.
+
+**Consequence for this project:** the texture rows of the GL feature map are
+**uncaptured**, and the texture sampler register map in
+docs/parhelia-fragment-isa.md sections 11 and 12 rests on static RE alone. It
+should be labelled as such until a box with a working large-buffer path
+confirms it.
