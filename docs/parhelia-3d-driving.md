@@ -44,16 +44,47 @@ directly via MMIO. If that works for the draw registers (being confirmed), a
 userspace tool can skip PRIMADDRESS/PRIMEND entirely: write the state + geometry
 registers directly and kick. This is the first thing to try on hardware.
 
-### Address-space caveat
+### Address-space caveat — and it is BUS-TYPE DEPENDENT
 
-`start`/`end`/`0x408` are in the GPU/AGP address space. A pushbuffer in **VRAM**
+`start`/`end`/`0x408` are in the GPU's view of memory. A pushbuffer in **VRAM**
 is addressed by its offset within video memory (reachable via BAR0 from
-userspace); a pushbuffer in system RAM must be in the **AGP aperture**, which
-only the kernel driver can map. So: VRAM pushbuffer = no kernel needed; AGP
-pushbuffer = needs the Matrox kernel module's GET_BUFFER ioctl. Confirm on
-hardware whether the engine will fetch a primary buffer from VRAM.
+userspace); a pushbuffer in system RAM must be reachable by the GPU as a bus
+master, which only the kernel driver can arrange. So: VRAM pushbuffer = no
+kernel needed; system-RAM pushbuffer = needs the Matrox kernel module's
+GET_BUFFER ioctl (or our own dma32buf module).
 
-## 2. Geometry + per-vertex colour — SOLVED [DRV]
+**How system RAM is reached differs per bus, so do not hardcode one model:**
+
+| Bus | Card examples | System-RAM addressing |
+|---|---|---|
+| **PCI / PCI-X** | Parhelia PCI 256MB (0x0528, the capture box) | plain **PCI bus addresses** (`dma_addr_t`), no GART. What the live capture shows. |
+| **AGP** | Parhelia-512 / AGP-8X (0x0527/0x0528 AGP SKUs) | **AGP aperture** via agpgart; addresses are GART-translated, not raw physical. |
+| **PCIe** | LX/P650/P690 PCIe, Phoenix (0x2538/0x2539/0x0529) | plain bus addresses again (IOMMU-translated where an IOMMU is active). |
+
+The **captures in `captures/` were taken on a PCI/PCI-X board** — `lspci -vv`
+reports `Subsystem: Matrox Graphics, Inc. Parhelia PCI 256MB` with **no AGP and
+no PCIe capability** (only Power Management). Therefore the bus addresses seen
+there (`0x404 = 0x14600000`, the 0x0000–0x0130 descriptor bank, the "AGP
+aperture" regions in the mmiotrace MAP lines) are **PCI bus addresses**, and the
+descriptor bank is a plain address-window/limit setup — *not* GART programming.
+On an AGP board the same registers are expected to carry GART-mapped addresses
+and the aperture setup will additionally involve agpgart; that path is
+**uncaptured**. The register protocol (0x404 start / 0x408 = end|3) is believed
+common to all three, since it is bus-agnostic, but the *address production* is
+not. Re-capture on an AGP board before claiming AGP support.
+
+## 2. Geometry + per-vertex colour — SOLVED [DRV], but see the live capture
+
+> **CORRECTION (live capture 2026-09-04).** The 0x1160/0x1180 attribute-plane
+> scheme below is the **legacy DDA/immediate** path read out of the kernel vertex
+> template. A real vendor GL draw does **not** use it: the mmiotrace
+> (`captures/mmio-draw-0528.txt`) shows the draw submitted through the DMA ring,
+> and the captured command buffer (`captures/cmdbuf-draw-0528-decoded.txt`) is a
+> flat stream of **(register-index, value) dword pairs** that initialises the
+> whole attribute file `0x1100–0x117c = 0xffffffff` and sets a viewport scale
+> `0x1298 = 0x45000000` (2048.0f). Vertices carry **`[x, y, r, g, b]`**, stride 20
+> bytes (z/w are pipeline constants). Prefer the captured sequence; treat this
+> section as background on the register meanings.
 
 Up to **4 vertex slots** (v=0..3), selected by token low-byte `0x58+v` (reg
 `0x1160+4v`). Each attribute **plane** is 4 floats written to `{0x1160+4v,

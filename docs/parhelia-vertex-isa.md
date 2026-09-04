@@ -6,13 +6,20 @@ Reverse-engineering of the Parhelia programmable vertex shader (the WARP-class
 RTTI intact — navigation is by typeinfo-name → vtable → method). Evidence tags:
 [GL]=proven from disasm, [HW?]=needs hardware capture.
 
-**Headline:** the vertex microcode is a **DirectX vs_1_1-shaped token stream**
-carrying Parhelia-native opcodes. A program is literally
-`[0xFFFE0101] + instruction tokens + [0x0000FFFF]` — the D3D version header and
-END token bracket a stream of `[opcode][dest][src…]` instructions — and it is
-uploaded to the engine as a **verbatim memcpy** (no relocation). This is the
-single most useful fact for writing a Parhelia vertex-shader assembler: it is
-"D3D vs.1.1 bytecode with Matrox extended opcodes."
+**Headline:** the vertex program has a **DirectX vs_1_1-shaped token stream**
+IR — `[0xFFFE0101] + [opcode][dest][src…] instructions + [0x0000FFFF]`, Parhelia
+opcodes — held in the shader object's `std::vector<uint32>` at **+0x298**. This
+IR is what the opcode/operand tables below describe.
+
+**IMPORTANT correction (2026-08-19):** the token IR at +0x298 is **NOT** what is
+uploaded to hardware. What key 0x45 memcpy's is a **separate, fixed 1636-byte /
+409-dword C++ register-binding *descriptor* object** at shader **+0x70** — a
+table of register slots + output-activation entries, containing **no opcodes**.
+The DX-token→WARP-microcode assembly is completed **in the kernel**
+(`mtx_parhelia.o`) when it consumes this descriptor (6 microcode variants,
+0x183…0x199=409…0x19d dwords). So the +0x298 IR and the +0x70 uploaded descriptor
+are two different buffers; the "verbatim token upload" phrasing conflated them.
+See "Microcode load lifecycle" below for the descriptor layout.
 
 All three passes (opcode table, operand encoding, serialization + a worked
 program) completed and **cross-validate**. Two small fields — the per-source
@@ -211,6 +218,105 @@ programmable VS 1.1 instruction set (this document). Whether the low-level
 microcode *encoding* is a direct evolution of the G400/G550 WARP microcode is
 plausible but unverified — it would need G550 WARP microcode decoded for
 comparison.
+
+## Microcode load lifecycle — REVERSED (2026-08-19)
+
+Cross-validated from the genuine Parhelia ICD `opengl6/libGL.so.1.3.0` and the
+kernel core `kernel/mtx_parhelia.o`. The WARP vertex engine is microcoded and the
+driver loads uCode into its instruction cache before any draw (kernel params in
+`kernel/src/MtxParhlParms.c`: `reg3DForcePCIAllocation` = uCode memory type,
+`reg3DVECacheMode` = instruction-cache enable, `reg3DPerformCRegCheck` = "Vertex
+Engine enabling / CReg check on boot", `reg3DVertexShader`/`…Options`).
+
+### The push-buffer command-record layer [CONFIRMED, libGL]
+The ICD emits `[method:u32][count:u32][payload]` records (primitive
+`reserve(pb,method,elemSize,count)` @libGL `0x1c9c50`, `commit` @`0x1c9ad0`;
+same-method records coalesce). Key histogram: `0xc`=main register bank
+(reg=0x1000+idx*4), `0x5`=bind/state, `0x20`=constants, `0x45`/`0x46`=uCode
+image, `0x48`=declarations. Upload fn = libGL `0x113700`:
+- **key 0x45** (@`0x1137c1`): `reserve(0x45,elemSize=0x670,1)` then
+  `memcpy(payload, shaderobj+0x70, 0x664)` — the **uCode image = 1636 bytes =
+  409 dwords, verbatim, no relocation**. Wire packet `[0x45][1][image+pad]`.
+- **key 0x46** (@`0x113a02`): image + 8-byte monotonic serial prefix (cached
+  programs).
+- **key 0x48** (@`0x11386c`): `elemSize=0x18` per attribute — the `dcl` binding
+  stream (position, diffuse, …).
+- **bind key 0x05** on the main buffer: `[0x13][1]`=enable VE program,
+  `[0x13][0]`=disable, `[0x14][serial]`=select program.
+- constants are a DIFFERENT key **0x20** (`elemSize=0x44`, `[slot][16 floats]`),
+  so 0x45/0x46 is unambiguously the program image, not uniforms.
+
+Minimal arm order (cold → drawable): build image → `[0x45]` (or `[0x46]+serial`)
+→ `[0x48]` per attribute → `[0x05][0x13,1]` enable → `[0x05][0x14,serial]` select
+→ draw. The standalone tool's zero-pixel WARP is exactly the missing 0x45+0x48+
+0x05 records: an empty VE instruction cache.
+
+### The uploaded 409-dword image is a DESCRIPTOR, not microcode [CONFIRMED]
+The key-0x45 memcpy source `shaderobj+0x70` is a fixed 1636-byte / 409-dword C++
+register-binding descriptor (NOT the +0x298 token IR, which is never uploaded).
+Byte layout (from the ctor @libGL64 `0x1b84a3` + per-slot init `0x10e390`):
+- `[0x000]` (1 dw): attribute/instruction count (default 1, `inc` per bound attr).
+- `[0x004..0x5cc]` (10 × 0x94 = 370 dw): ten register-slot descriptors. Each slot:
+  enable `[+0x34]=1`; two 0x34-byte component descriptors at `[+0x00]`,`[+0x38]`,
+  each `{[0]=index, [4]=count=4, [c]=valid=1, [10]/[1c]/[28]=0xff}`.
+- `[0x5cc..0x664]` (38 dw): trailer — `[0x5d0]` dw, four 0x24-byte output-
+  activation entries at `[0x5d4]` (`image[0x5d4 + i*0x24]=1` marks output i live:
+  0=position,1=color0,…), plus `[+0x8]=4`, `[+0x14]=0x10`.
+1+370+38 = 409 dwords. Component/type codes 0xe/0xf/0x10/0x4/0x0 (`0x10da70`).
+The driver's own default descriptor is the `.bss` global at libGL64 `0x6a2c40`
+(`*(0x65bed8)`, zero in-file). The descriptor is order-independent, no relocation
+=> a captured 1636 bytes is reusable verbatim; and it is CONSTRUCTIBLE from this
+layout. The residual: which slot index binds position vs diffuse (set by the
+token→descriptor compiler, sibling of the fixed-func generator `0x10ddd0`) — and
+the KERNEL'S interpretation of the descriptor into actual VE microcode.
+2. **Final hardware delivery is inside the closed `mtx_parhelia.o`.** Our
+   standalone ring drives the RAW four-index (reg,val) hardware packets directly
+   (bypassing the core), but method 0x45 is translated by the core into the real
+   VE-cache write, which is NOT a clean extractable MMIO sequence. Ruled out: the
+   `mtx514` indirect port (0x910 index/0x938 data/0x914 readback) — its address
+   field `(bank<<24)|((index<<9)&0xfff)` addresses only ~7 entries/bank, far too
+   few for 409. The 6 microcode variants (dword counts 0x183/0x187/0x18b/0x195/
+   0x199=409/0x19d, set in the shader-state ctor `mtx1216` @kern `0x91e70`,
+   variant count at struct+0x1544) are selected by pipe/feature. Delivery is thus
+   a DMA descriptor / dedicated ring-packet type, recoverable reliably only by a
+   **live MMIO/ring capture** of the vendor stack loading one shader.
+
+## Vertex attribute layout — RESOLVED via live capture (2026-09-04)
+
+The per-vertex float layout (the one field four static traces flagged as
+capture-only) was captured live from a WORKING original Parhelia (0x0528) on box
+.56 running the vendor mtx kernel driver + libGL.so.1.3.0 (md5-identical to the
+RE copy). Method: a minimal GLX triangle (glColor3f + glVertex3f, GL_TRIANGLES)
+run under gdb; glVertex3f's trampoline (0x1a6ca0) dispatches to the store handler
+@VMA **0xc9320**, which appends into a vertex-array buffer at `this+0x2f8`
+(base=+0x18, stride=+0xc, count=+0x0). Dumped at glEnd:
+
+- **count=3, stride=20 bytes = 5 floats/vertex, layout = `[x, y, r, g, b]`.**
+  Verified against known inputs: V0=(0.5,0.9)+red → `0.5 0.9 1.0 0.0 0.0`;
+  V1=(0.15,0.15)+green → `0.15 0.15 0.0 1.0 0.0`; V2=(0.85,0.15)+blue.
+
+So the WARP vertex = **position 2 floats (x,y only) + colour 3 floats (r,g,b)**,
+interleaved. z and w are **not streamed** — the position handler sets w=1.0
+(const @0x367a0c) and the z-compare is against 0.0 (@0x36992c); both are
+pipeline constants. This DISPROVES the earlier guessed `[w,z,y,x][a,b,g,r]`.
+The viewport (NDC→screen) transform is CPU-applied (per parhelia-fragment-isa).
+
+**CORRECTION (live MMIO capture, 2026-09-04): per-draw geometry does NOT go to
+0x91c.** An mmiotrace of a real draw (captures/mmio-draw-0528*.txt) shows the
+draw is submitted through the **DMA ring**: `0x404` = command-buffer address,
+then `0x408 = end|3` written repeatedly. **0x91c carries the microcode ROM once
+at init only.** The command buffer itself was captured by diffing the
+`/dev/matrox/mtx0` mapping between glBegin and glFlush
+(captures/cmdbuf-draw-0528-*): it is a stream of **(register-index, value) dword
+pairs** (index = (reg-0x1000)/4), i.e. the same indexed register file the ring
+consumes — not a separate "tokenised 0x91c stream".
+
+So a from-scratch driver: load the microcode to 0x91c once at init, then per draw
+build (index,value) register pairs in a ring buffer and submit via 0x404/0x408 —
+the path already proven by our 2D fill. See docs/parhelia-gpu-access-map.md §4-5.
+`tools/parhelia-3dtri.c --warpstream` (0x91c geometry) is therefore the WRONG
+path for drawing; `--warpring` is the right shape, with the captured state.
+Capture harnesses preserved on box .56: /root/tmp/{cap.c,cap2.c,gltest.c,*.gdb}.
 
 ## Known static limits
 

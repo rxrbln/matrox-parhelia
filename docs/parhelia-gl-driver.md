@@ -13,10 +13,18 @@ busmaster ring; sync by polling `0x8f0` bit17 idle + fence `0x450`.
 ## Command submission & sync — DONE
 
 Direct MMIO: `*(bar1 + 0x1000 + index*4) = value`, then poll `0x8f0` bit17.
-DMA arm-path (pushbuffer in VRAM/AGP): write PRIMEND `0x404`, then PRIMADDRESS
-`0x400` (trigger), poll fence `0x450`. Fire a primitive with the draw-fence
-`0x12bc`. See `parhelia-3d-driving.md` §1. **A GL driver can start with pure
-direct-MMIO** and add DMA batching later.
+Fire a primitive with the draw-fence `0x12bc`. See `parhelia-3d-driving.md` §1.
+
+**DMA ring — what the vendor GL actually does** (live mmiotrace,
+captures/mmio-draw-0528.txt), superseding the arm-path sketch previously here:
+per draw, arm the engine (`0x12b8=0x00070601`, `0x10b0=0x10`, `0x300=0x1f0b0140`,
+`0x384=0` soft-trap, `0x308=0x83`), then submit via **`0x404` = PRIMADDRESS =
+command-buffer bus address** and **`0x408` = PRIMEND = `end|3`** written once per
+~0x20-byte packet (low 2 bits = DMA mode 3 is the trigger); `0x314=1` kicks, poll
+`0x8f0`/`0x450`. Note `0x404` is the *start*, `0x408` the *end* — the earlier
+"PRIMEND 0x404 / PRIMADDRESS 0x400" labelling was inverted. Bus addresses are
+PCI-board-specific; see parhelia-3d-driving.md "Address-space caveat".
+**A GL driver can still start with pure direct-MMIO** and add DMA batching later.
 
 ## Framebuffer / render target / depth — DONE [DRV]
 
@@ -188,3 +196,55 @@ components, opcode 6/7; the exact S8Z24 format enum).
 **Beyond fixed-function:** the programmable **vertex ISA** is being reversed
 separately (`parhelia-vertex-isa.md`) — the last piece for a hardware-T&L /
 vertex-shader driver.
+
+## WARP vertex/raster path — RE'd from win32 MTXPARD.dll (2026-08-18)
+
+Reversed to explain why the standalone tool's WARP triangle rasterises nothing on
+P690 while its 2D blit fill draws correctly. Source: `MtxPar/MTXPARD.dll`, the
+XPDM display driver (vertex emitter @0x170500, WARP draw setup @0x10e8xx).
+Confidence [WIN].
+
+**Command-buffer replay model (confirms ExecuteEmulDma).** Register writes are not
+direct MMIO at draw time; they are appended as `(offset, value)` 8-byte records
+into a command buffer at `[ctx+0x10]` by helper `0x170e10` (stdcall, args
+value+offset), then replayed to hardware. A Mesa/driver submitter batches
+`(reg,val)` pairs, then replays.
+
+**Attribute-plane / latch-register model — the key structural finding.** The WARP
+engine has several per-vertex attribute planes, each committed by its OWN latch
+register, all sharing the same staging registers:
+
+- staging: `0x1160 + 4*v` (component 0, per vertex index v=0,1,2), `0x1174`
+  (comp 1), `0x1178` (comp 2; `0x117c` seen for the 3rd vertex in some paths)
+- **`0x1180` latch = POSITION** — per vertex: w=1.0(`0x3f800000`)→`0x1160+4v`,
+  z=0→`0x1174`, y→`0x1178`, x→latch `0x1180`. (Matches our tool.)
+- **`0x1184` latch = DIFFUSE colour.**
+- **`0x118c` latch = a 4th attribute plane** (texcoord/specular), written per
+  vertex from a 0x48-byte-stride vertex array, **conditional** on a vertex-format
+  flag. **Our standalone tool omits this plane entirely** — a prime suspect for
+  the non-rasterising triangle when the WARP program expects it.
+
+**`0x1264` is a bitfield, not a plain write.** The fragment stage input selector
+lives in `0x1264` bits[4:0]; MTXPARD updates only those bits
+(`new = shadow ^ ((shadow ^ arg) & 0x1f)`) and preserves the upper bits from a
+persistent shadow. **Our tool clobbers `0x1264 = 0`**, selecting fragment input 0
+instead of the iterated primary colour (selector `0x10`). Fix: set the low-5-bit
+selector to `0x10`, preserve upper bits.
+
+**Conditional combiner block** `0x1260`/`0x1268` (state bit0), and
+`0x1278`/`0x127c`/`0x1280`/`0x1284` (state bits1,2 = texture stages) — not needed
+for a flat/Gouraud triangle. Note `0x1280`/`0x1284` here is a scissor DISTINCT
+from the `0x12c8..0x12d4` window our tool sets.
+
+**WARP draw setup** (caller @0x10e8xx, separate from the vertex emitter): surface
+slot 0 `0x1220`/`0x1224` (base/cfg from shadow), depth slot `0x1230`, `0x1300`
+DWGCTL (value from shadow), `0x1324`, bound via helper
+`0x170f50(slot_base=0x1220, depth_base=0x1230, count=2)`; the raster is fired via
+`0x12bc` (as our tool does).
+
+**Concrete next experiments for `tools/parhelia-3dtri.c`** (all static-derived,
+untested): (1) set `0x1264` low-5-bits selector = `0x10` instead of 0;
+(2) add the `0x118c` attribute plane per vertex (try `[s,t,0,1]` or match diffuse);
+(3) confirm the surface-slot bind order (0x1220/0x1224 + depth 0x1230) matches the
+`0x170f50` helper. The 2D blit path is already proven on HW, so submission and
+surface base are NOT the gap — it is one of these WARP-raster inputs.
