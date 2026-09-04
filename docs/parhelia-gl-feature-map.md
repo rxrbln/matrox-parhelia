@@ -382,10 +382,24 @@ pre-transforms.  Verified per op: e.g. `tri_gouraud` v0 = `(0.5, 0.9, 1,0,0)`
   0x1024/0x1028/0x102c/0x1030 to 2), yet it is also written =1 by `scissor`,
   `cullface`, `fog` and `lighting`, =2 by `polymode_line`, and a *second* time
   =3 within `blend_srcalpha`.  No single meaning fits.  [AMBIGUOUS]
-- **PIPELINE-KEY values** 0x10 (base), 0x11 (depth or stencil), 0x51 (blend),
-  0x05 (lighting), 0x852 (wide line).  Not a clean bitmask (lighting's 0x05
-  drops bit 4 that every other state has).  Most likely a shader/pipeline
-  program handle.  [AMBIGUOUS]
+- **PIPELINE-KEY** — partially resolved with the full 33-op capture. Observed:
+  0x10 plain, 0x11 depth, 0x51 blend, 0x05 lighting, 0x852 wide line,
+  **0x20011 textured**.
+
+  **Bit 17 (0x20000) = texturing [CONFIRMED].** This one rests on a clean pair:
+  `tex_tri_nearest` emits 0x20011 and the key returns to 0x11 after
+  `glDisable(GL_TEXTURE_2D)`, with nothing else changing between them.
+
+  **Bit 6 (0x40) = blending [INFERRED].** 0x51 versus 0x11 differ by exactly
+  0x40 when blending is enabled — but not a clean pair, because the ICD's lazy
+  state cleanup means `blend_srcalpha` also carries the previous op's depth
+  teardown. Plausible, not proven.
+
+  The rest still does not fit a monotonic bitmask: bit 4 is set in every key
+  except lighting's 0x05, so lighting is not simply "base plus a bit". That is
+  consistent with the key being a **shader/pipeline program handle** whose low
+  bits happen to encode some state, rather than a pure bitfield. Do not treat
+  unidentified bits as flags. [AMBIGUOUS]
 - **The two kernel buffers** behind `0xffffc200_05c59004` (draw) and
   `0xffffc200_0591d004` (vertex-format descriptor) are not mapped into the
   client, so their contents are outside this capture.
