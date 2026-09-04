@@ -894,7 +894,118 @@ same offsets are written by `mtx976` when it installs a freshly linked program
 (`prog[0x18] = size; prog[0x20] = buffer; prog[0x28] = (size-1)/12 + 1`), which
 is what identifies the two as the same struct [CONFIRMED].
 
-## 10. Confidence and what is still open
+## 13. Surviving vendor names — the 21 symbols the obfuscator missed
+
+`mtx_parhelia.o` was renamed to `mtxNNNN` almost completely: of 4298 symbol
+table entries, 4039 are `mtxNNNN`, and the **complete** set of defined,
+non-obfuscated, non-section symbols is 22 — the five `Add*` microcode words, the
+sixteen `a*L` arrays, and `mtx_parhl_driver`. A tree-wide search of every other
+vendor binary (Windows `MTXPARD.dll`, `MTXOGL.dll`, `MTXPARM.sys`,
+`mtxparmx.sys`, `MtxEscape.dll`, `MtxCIP2.dll`, `mtxpserd.dll`, the Linux
+`libGL.so.1.3.0` and `mtx_drv.so`, and the whole later `m9xdriver` tree) found
+**no further microcode-level names** — those are stripped or obfuscated, and the
+M9 kernel object is 100 % `m9xNNNN` [CONFIRMED negative]. So this is all the
+naming evidence there will ever be from static analysis.
+
+Every `a*L` array has an identically-sized unnamed `mtxNNNN` sibling
+immediately before it in `.data` (e.g. `mtx2247`(48) → `aSL1L`(48)) — the
+obfuscator renamed one of each pair. The five `Add*` words sit inside one run of
+twelve 12-byte objects at `.data+0x83f58..0x83fe8`
+(`mtx2940, mtx2033, mtx1811, AddAfs, AddAfd, mtx507, mtx2791, mtx2282, mtx3312,
+AddEfs, AddEfd, AddEfm`), so seven more single-instruction blobs share the
+`<Op><A|E>f<s|d|m>` scheme with their names lost.
+
+### The `a*L` arrays are relocation lists [CONFIRMED]
+
+Each is a flat array of 8-byte `{u32 instruction_index, u32 kind}` records —
+exactly the relocation records §4 describes, with `kind` ∈ {0,1,2} =
+src0/src1/src2. `aDL1L` for example is
+`{0,0} {1,2} {2,1} {4,1}`. Every one of the sixteen decodes that way, with
+ascending instruction indices and no out-of-range kind.
+
+### The naming scheme
+
+`a` + `{S|P|D}`(one or two of them) + `{I|L}` + `{1|2}` + `L`:
+
+| letter | position | reading |
+|---|---|---|
+| S / P / D | 2nd | which lighting term(s) the fragment computes [INFERRED] |
+| I / L | 3rd | infinite vs local (the classic OpenGL light/viewer distinction) [INFERRED] |
+| 1 / 2 | 4th | one-sided vs two-sided lighting [INFERRED] |
+| L | last | "lighting" [INFERRED] |
+
+The `1`/`2` reading is the best-supported one: for every family the `2` variant's
+fragment is close to twice the size of the `1` variant (`aSL1L` 13 instructions
+vs `aSL2L` 26; `aSI1L` 13 vs `aSI2L` 26; `aPL1L` 12 vs `aPL2L` 20; `aPI1L` 12 vs
+`aPI2L` 20), and each `2` fragment is the `1` body run twice over a shifted
+register set — which is what two-sided lighting is. The same body-doubling also
+appears *within* `mtx3519` (`aDI1L`, 8 instructions): instructions 4–7 repeat
+0–3 with `r5→r12, r1→r8, r3→r10, r2→r9`. Only the first half is relocated
+(`{0,1} {1,1} {2,1} {3,1}`, all patching `src1`, the per-light constant block),
+so what the second half computes is not established.
+
+### Which fragment each list belongs to [INFERRED]
+
+The shader-state object holds a fragment-index array and a `{count, ptr}`
+relocation array whose element strides are in a 1:4 ratio; in `mtx3071`
+(`.text+0x90650`) the relation `fragidx_off = 0xb24 + (relocount_off - 0xb988)/4`
+reproduces all four D-family pairs exactly, and applying it to the other twelve
+sites gives:
+
+| list | fragment index | registry symbol | instructions | relocs |
+|---|---|---|---|---|
+| `aDI1L` | 0x16b | `mtx3519` | 8 | 4 |
+| `aDL1L` | 0x177 | `mtx2637` | 10 | 4 |
+| `aPI1L` | 0x183 | `mtx3976` | 12 | 5 |
+| `aPI2L` | 0x187 | `mtx1496` | 20 | 10 |
+| `aPDI2L` | 0x18b | `mtx841` | 16 | 9 |
+| `aPL1L` | 0x195 | `mtx306` | 12 | 4 |
+| `aPL2L` | 0x199 | `mtx2258` | 20 | 8 |
+| `aSI1L` | 0x1a7 | `mtx2109` | 13 | 7 |
+| `aSI2L` | 0x1ab | `mtx1073` | 26 | 14 |
+| `aSDI2L` | 0x1af | `mtx1717` | 18 | 11 |
+| `aSL1L` | 0x1bf | `mtx534` | 13 | 6 |
+| `aSL2L` | 0x1c3 | `mtx3296` | 26 | 12 |
+| `aSDL2L` | 0x1c7 | `mtx2249` | 20 | 10 |
+| `aSPL2L` | 0x1cb | `mtx404` | 24 | 10 |
+| `aDI2L` | 0x16c | *(does not fit)* | | |
+| `aDL2L` | 0x178 | *(does not fit)* | | |
+
+Fourteen of the sixteen pass the containment check — every relocation index is
+inside the fragment. The two D-family two-sided entries do not (their lists
+address instructions 7 and 9 in 5- and 7-instruction fragments), so either
+`mtx3071` writes a default that a later call overwrites, or the fragment-index
+field sits at a different sub-offset for that family. Treat the fourteen as a
+working correspondence, not a proven one; the whole table is [INFERRED].
+
+### What the lighting fragments show about the opcodes
+
+The named fragments are a small, semantically labelled corpus. Read together
+they say the per-light body is built almost entirely from `0x73`, `0x78`, `0x75`
+and `0x60`, and that each block **ends with `0x81`**:
+
+```
+mtx3519 aDI1L :  78 78 71 81  |  78 78 71 81
+mtx2637 aDL1L :  73 73 78 78 78 78 78 78 81 81
+mtx534  aSL1L :  73 78 60 75 73 78 78 78 78 78 78 75 81
+mtx306  aPL1L :  73 78 60 75 73 78 78 60 78 78 75 81
+```
+
+`0x81` never writes either port anywhere in the corpus (194 occurrences, `wrA`
+and `wrB` both 0) yet always reads two operands, which is the shape of an
+accumulate-into-a-pipeline-latch or a "commit" step [INFERRED]. None of this is
+enough to *name* an opcode, so they stay `opNN`: the vendor's own naming
+survives only for `Add`, and inventing the rest would be guessing.
+
+Note that the five `Add*` words are `44087e00 2803401b bb2221a2` (`AddAfs`),
+`44087e00 28034017 bb2221a2` (`AddAfd`), `30087e00 00440100 b89a2222`
+(`AddEfs`), `28087e00 00440100 b89a2222` (`AddEfd`) and
+`38087e00 28034103 b89a2222` (`AddEfm`), read at `.data+0x83f7c` and following.
+In an `ET_REL` object `st_value` is already section-relative, so the file offset
+is `sh_offset + st_value`; computing it as `sh_offset + (st_value - sh_addr)`
+lands 0x14be0 bytes early and yields plausible-looking but wrong words.
+
+## 14. Confidence and what is still open
 
 **Confirmed:** the 12-byte instruction word (twice over — the `0x918`/`0x91c`
 loader and the `mtx3395` walker's 12-byte stride); `w2[30:23]` as the opcode

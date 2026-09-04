@@ -709,8 +709,8 @@ at 0x1b50ee and then 0 at 0x1b5115, another apparent vendor slip.
 Evidence for the kernel side, all in `KRN mtx2132`:
 
 * `mov eax,[rax+0x5d0]` @0x6e22c reads the count; `movzx eax,BYTE [rdx+0x5cc]`
-  @0x6e23a reads the byte at blob+0x5cc and passes it on as a *mode* selector
-  (see §9.5.5) — it is not padding.
+  @0x6e23a reads the byte at blob+0x5cc and passes it on as the hints-valid
+  flag — it is not padding.
 * Loop 1 @0x6e25c: `mov eax,[rbx+0x5d4] ; test eax,eax ; je next` with
   `add rbx,0x24` — **`+0x00 == 0` means "no stage here"**, so opcode 0 really is
   `GL_OP_TEX_NOP_MTX`.
@@ -899,6 +899,26 @@ itself; the vendor ICD's bump path is a dead end. **CONFIRMED** (three
 independent observations: the 0x664 memcpy length, the absence of any other
 reader of `obj+0x740`, and the kernel's two different writers of `record+0x68`).
 
+**Where the coefficients end up** (`KRN mtx1723` @0x71932-0x719fa, gated by
+`record+0x63 & 2`): three values are taken from `record+0x58`, `+0x5c`, `+0x5e`
+as 14-, 14- and 12-bit fields, routed through `record+0x68`/`+0x6c`/`+0x70`
+according to the hardware opcode (`record+0x8c` — the path is shared by 0x08,
+0x09, 0x0a, 0x0c and 0x0e, i.e. **the whole `TEXDOT3`/`M3X2`/`M3X3` family uses
+the same coefficient registers as `TEXBEM`**), and finally packed into the
+per-stage hardware state block `[record+0x40]`:
+
+```
+[state+0x30] bits [13:0]   coefficient 0     (bits 15:14 preserved)
+[state+0x34] bits [13:0]   coefficient 1     (bits 15:14 preserved)
+[state+0x36] bits [11:0]   coefficient 2     (bits 15:12 preserved)
+identity default = 0x800 in all three        (@0x719a4-0x719b2)
+```
+
+So the address matrix is **three packed fixed-point coefficients with
+1.0 = 0x800**, not four floats, and they live in the same unlocated per-stage
+state block as everything else in §9.5.7. **CONFIRMED** as a software layout;
+the register that block becomes is still unknown.
+
 Note also that `glTexAddressHintsMTX` masks the type field with `0x1f0`, so
 `GL_HINT_TEXTURE_BEM_MTX` (0x200) is unreachable and only the *luminance* form
 `GL_HINT_TEXTURE_BEML_MTX` (0x100) can be selected. Another vendor bug.
@@ -1073,6 +1093,28 @@ but a driver must reproduce the order regardless.
 
 If a unit is disabled (`0x1200[18:16] == 1`) the emitter writes only
 `0x1200 + unit*4` and stops (`0x16fe5d`, `cmp ecx,0x10000`).
+
+**The kernel HAL has the byte-for-byte identical emitter**, `KRN mtx792`
+@0x69790 — a second, independent binary agreeing on the whole struct-offset →
+register mapping above and on the emission order (**CONFIRMED**):
+
+```
+697c5: lea eax,[r12*4+0x200] ; shr eax,2   ; idx 0x80+unit -> reg 0x1200+unit*4
+697d6: or  eax,0x72717000                  ; ... 0x11c0, 0x11c4, 0x11c8
+       data <- struct +0x00, +0x04, +0x0c, +0x10
+69807: mov DWORD PTR [rdx-0x14],0x76757473 ; 0x11cc, 0x11d0, 0x11d4, 0x11d8
+       data <- struct +0x14, +0x18, +0x1c, +0x20
+69836: mov DWORD PTR [rdx-0x14],0x20797877 ; 0x11dc, 0x11e0, 0x11e4, DMAPAD
+       data <- struct +0x24, +0x28, +0x2c
+6979a: movzx eax,BYTE PTR [rdi+0x2] ; and 7 ; dec al ; je 69880
+69880: ... or eax,0x21212100                ; disabled: only 0x1200+unit*4
+```
+
+Note two things this settles: `0x1200 + unit*4` is written **in the same DMA
+packet** as `0x11c0`/`0x11c4`/`0x11c8`, so the ordering is structural rather
+than incidental; and the disabled test is literally
+`(byte at struct+0x2) & 7 == 1`, i.e. **`0x1200[18:16] == 1`** — confirming
+§11.2's type/enable field from a second binary.
 
 ### 11.2 `0x1200 + unit*4` — unit control
 
@@ -1645,7 +1687,10 @@ reports 0x008..0x790 of `tex_tri_nearest` as one 1928-byte `UNDECODED BLOCK`):
   value equals the header's id field (2, 3, 4, 5). **INFERRED** — four
   agreeing samples, but the register number rests on the decoder's
   `reg = 0x1000 + idx*4` reading of region 2 (which its own self-test
-  validates).
+  validates). The pair immediately in front of it is `(idx 5, 1)`
+  = `0x1014 = 1`, a value outside the enum
+  `docs/parhelia-gl-feature-map.md` §5 lists for that register — worth noting
+  when someone reconciles the two.
 * the first record of `tex_tri_nearest` (region 2 +0x08 ff.) is the texture
   upload: a `0xffffc200........` kernel pointer followed by
   `..., 4, 0,0,0,0, 0x40, 0x40, 1, 0, 2, 0, 1.0f, 1.0f, 1.0f` — the 64x64
@@ -1767,13 +1812,17 @@ Stated explicitly rather than guessed:
   consumes that block or a hardware capture of a bump-mapping / dependent-read
   draw.
 * **The `GL_TEXBEM_MATRIX_MTX` coefficient registers.** The coefficients are
-  located in software (`record+0x68`/`+0x6c`/`+0x70`, `0x800` = 1.0) but the
-  register they end up in was not found (§9.5.5).
+  located in software down to bit positions — three packed fields of 14/14/12
+  bits at `[stageState+0x30/+0x34/+0x36]`, `0x800` = 1.0 — but the engine
+  register that state block becomes was not found (§9.5.5, §9.5.7).
 * **Which of `0x11c4`'s first two 3-bit fields is min and which is mag**
   (§9.5.6 / §11.4) — the two kernel tables that feed them are identical.
 * **`0x126c` bit 16.** No writer anywhere, yet it is deliberately *preserved*
   by every packer and by the X driver's mask `0xff05fffd` — so it is a real
-  field of unknown purpose. Bit 15 and bits 25-31: no writer either.
+  field of unknown purpose. The kernel's RGB packer preserves it too: the
+  destination step masks byte 2 with `0xf` and the scale step with `0xf1`
+  (`KRN 0x6b20e`, `0x6b21a`), and bit 0 of that byte — `0x126c` bit 16 — is
+  never touched by either. Bit 15 and bits 25-31: no writer either.
 * **Replicate codes 5-7, modifier codes 6-0xE, opcode-field values with
   bits [11:9] = 1 or 7.** Unused by every driver.
 * **Why hardware slots 6 and 7 are skipped**, and why the walk order is

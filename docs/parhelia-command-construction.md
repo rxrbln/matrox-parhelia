@@ -432,3 +432,44 @@ rendering off there is no device access to intercept. The tracer
 direct rendering is confirmed — it is the only way to see the ioctl stream and,
 via its protect/single-step guard, the register writes userspace performs on its
 own BAR1 mapping, which mmiotrace cannot see.
+
+## What one draw costs, measured  [HW]
+
+`tools/parhelia-mtxtrace.c` with `MTXTRACE_BUFS=1` snapshots every mapped buffer
+and dumps what changed at each doorbell ioctl, interleaved with the GL calls that
+caused it. Five `glFinish`-separated triangles
+(`tools/parhelia-drawcount.c`, capture `captures/mtxtrace-5draws.txt`) give an
+exactly repeating signature — one submission per draw, touching three regions:
+
+```
+GL glEnd
+SUBMIT n  region 0x1000-page   changed=4   span=0x0-0x0          serial: 1 dword
+SUBMIT n  vertex ring          changed=60  span=0x2040-0x2078    3 verts x 20 B
+SUBMIT n  command ring         changed=24  span=0x2000-0x2018    6 dwords
+```
+
+and the slot advances by exactly **0x2000 per draw** — 0x2040, 0x4040, 0x6040,
+0x8040, 0xa040 in the vertex ring and 0x2000, 0x4000, … in the command ring.
+This independently confirms both the 0x2000 slot stride and the `slot + 0x40`
+vertex offset derived earlier from the ICD's ring geometry.
+
+**So one untextured triangle costs:** one zero-sized doorbell ioctl, 24 bytes of
+command, 60 bytes of vertex data (3 x the 20-byte `[x,y,r,g,b]` vertex) and one
+serial dword. Nothing else moves.
+
+### Context init dominates a short run
+
+In a client that uploads one texture and draws one textured triangle
+(`captures/mtxtrace-textured-submits.txt`), **17 submissions complete before the
+application's first GL call**, and the largest single command-stream write in
+the whole run — 3372 bytes — happens during that init rather than at any draw.
+A driver bring-up therefore has far more state to reproduce before the first
+triangle than the per-draw traffic suggests.
+
+### Region identity is per-run, not fixed
+
+The mmap offsets differ between runs (`0xc822000` in one capture, `0x7d4000` and
+`0xaf70000` in others) because they are kernel-issued handles, not addresses.
+Identify regions by **size** (0x1000 control pages, 0x22000 command stream,
+0x320000 vertex ring, 0xa8000 command ring, 0x400000 texture heap), never by a
+remembered offset.
