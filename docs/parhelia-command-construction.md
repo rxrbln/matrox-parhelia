@@ -22,14 +22,15 @@ The ICD maps `/dev/matrox/mtx0` seven times. Observed in one client:
 | Region | Size | Role |
 |---|---|---|
 | 0, 1, 3 | 4096 each | small control/status pages |
-| **2** | 139264 (136K) | **command + state buffer** and the submission head/tail |
-| **4** | 3276800 (3M) | **vertex data heap** |
-| **5** | 688128 (672K) | **per-draw command descriptors** |
-| 6 | 4194304 (4M) | untouched by these draws (texture/surface heap) |
+| **2** | 139264 (136K) | **submit-request buffer** — the 0x28-byte records the kernel consumes |
+| **4** | 3276800 (3M) | **vertex ring** (`0x320000`) |
+| **5** | 688128 (672K) | **command ring** (`0xa8000`) |
+| 6 | 4194304 (4M) | third heap (`0x400000`), not used per draw |
 
-Regions 4 and 5 are addressed in lockstep: draw *n* uses slot `n * 0x2000` in
-both — descriptor at `0x2000*n` in region 5, vertex data at `0x2000*n + 0x40` in
-region 4.
+The ring sizes match the ICD's own allocation constants exactly, which is what
+identifies each region. Regions 4 and 5 are addressed in lockstep: draw *n* uses
+slot `n * 0x2000` in both — command packets at `0x2000*n` in region 5, vertex
+data at `align64(0x2000*n) + 0x40` in region 4.
 
 ## Per-draw work — it is remarkably small
 
@@ -48,81 +49,179 @@ The next draw (`tri_gouraud`) writes the identical shape at `0x4000` and
 `0x4040`, and only regions 2/4/5 change. So region 2 offsets 0x18/0x20/0x28 are
 the **submission head/tail** the kernel reads.
 
-## The per-draw descriptor (region 5) — CAPTURED
+## The per-draw command packets (region 5) — CAPTURED + CONFIRMED in the ICD
 
-Seven dwords at the slot base:
+What the capture showed as "seven dwords" is **two concatenated command
+packets**, confirmed against the ICD disassembly (the 64-bit `libGL.so.1.3.0`
+under `opengl6/lib64/` — `opengl6/libGL.so.1.3.0` itself is the 32-bit build).
 
-| Offset | tri_flat | tri_gouraud | points | lines | Reading |
-|---|---|---|---|---|---|
-| +0x00 | 0x8f000001 | 0x8f000001 | 0x8f000001 | 0x8f000001 | constant header/opcode |
-| +0x04 | 0 | 0 | **1** | 0 | set only for GL_POINTS |
-| +0x08 | 3 | 3 | 3 | **2** | **vertex count** |
-| +0x0c | 2 | 2 | 2 | 2 | constant in all observed draws |
-| +0x10 | 0x21212425 | 0x21212425 | 0x21212425 | 0x21212425 | register-index tag: bytes 0x25,0x24,0x21,0x21 -> regs 0x1094, 0x1090 (0x21 = pad) |
-| +0x14 | 3 | 4 | 6 | 7 | **sequence number**, +1 per draw |
-| +0x18 | 0x05f58000 | 0x05f58000 | 0x05f58000 | 0x05f58000 | bus address of the vertex buffer |
-
-`+0x08` tracking the vertex count across GL_TRIANGLES (3) and GL_LINES (2) is
-the clearest single confirmation that this is the draw descriptor.
-
-**Hypothesis (INFERRED, not yet confirmed):** the last three dwords may simply be
-one record in the ring micro-format — `+0x10` is the tag and `+0x14`/`+0x18` are
-its two payload dwords, so that `+0x14` is the value written to **reg 0x1094**
-and `+0x18` the value written to **reg 0x1090** (tag bytes little-endian give
-index order 0x25, 0x24, pad, pad = regs 0x1094 then 0x1090). That would make
-0x1094 a per-draw index and 0x1090 the vertex-buffer address. It does not fully
-square with the earlier state capture, which had `0x1090=1` and `0x1094=6`, so
-treat this as a lead to settle from the ICD disassembly, not as established.
-
-Note that triangles and lines produce otherwise identical descriptors, so the
-**primitive type is not encoded here** — it must live in the state stream or in
-the 0x1090/0x1094 pair the tag names. Resolving that is an open item.
-
-### Vertex count across primitives, and the +0x04 flag
-
-| GL primitive | vertices emitted | descriptor +0x08 | +0x04 |
-|---|---|---|---|
-| GL_TRIANGLES | 3 | 3 | 0 |
-| GL_LINES | 2 | 2 | 0 |
-| GL_QUADS | 4 | 4 | 0 |
-| GL_POINTS | 2 | **3** | **1** |
-| GL_TRIANGLE_STRIP | 4 | **5** | **1** |
-| GL_TRIANGLE_FAN | 4 | **5** | **1** |
-
-`+0x04 = 1` occurs exactly when `+0x08` is one MORE than the number of vertices
-the application emitted, and the vertex heap then holds a stale leading vertex
-before the real ones (visible in the `points` capture, where the first record is
-the previous draw's (0.5, 0.9) position). So `+0x04` marks "the buffer carries a
-leading vertex that is not one of this draw's own", and `+0x08` counts records in
-the buffer rather than application vertices. Why the ICD does this for points,
-strips and fans but not for lists is not yet explained.
-
-### Primitive type — a strong lead, NOT confirmed
-
-Region 2 offset **0x008** carries the GL primitive enum on the draw that changes
-primitive, matching on five of five:
+Generic packet form: `[header][payload...]`, header = `(opcode << 24) | count`.
 
 ```
-points 0 = GL_POINTS   lines 1 = GL_LINES   tri_flat 4 = GL_TRIANGLES
-tristrip 5 = GL_TRIANGLE_STRIP   trifan 6 = GL_TRIANGLE_FAN
++0x00  0x8f000001   DRAW packet: opcode 0x8f, count 1
++0x04  first        first vertex index in this slot's vertex array
++0x08  last         one-past-end vertex index
+---- second packet ----
++0x0c  0x00000002   REGISTER-WRITE list, 2 registers
++0x10  0x21212425   index bytes 0x25, 0x24, pad, pad
++0x14  fence value  -> reg 0x1094
++0x18  fence addr   -> reg 0x1090
 ```
 
-and it stays unchanged across consecutive draws of the same primitive
-(`tri_gouraud`, `tri_second`), which is exactly the behaviour a primitive-type
-field should show.
+**Count semantics differ per opcode (CONFIRMED):** a draw header's low 16 bits
+accumulate +2 per appended range and are decremented once at flush, so on the
+wire `count = payload dwords - 1`; one range gives exactly `0x8f000001`.
+Register-list counts are *not* decremented — count = number of registers.
 
-**But a check across the whole sweep refutes the simple reading:** state-only
-operations also write 0x008, with values that are not primitive enums at all
-(depth_func_gequal 23, blend_srcalpha 27, polygon-mode 0x0C000000,
-swapbuffers 62), and `linewidth` — still GL_LINES — writes 0x0C000000 rather
-than leaving 1 in place. GL_QUADS also lands 2, not 7, though that draw
-coincided with a full state re-upload so it is not clean evidence either way.
+Draw header bits: `0x03000000 | ctx[0xa040] | ctx[0xa044] | count`, where
+`ctx[0xa040]` bit27 set means **sequential vertex ranges** (payload = `first,
+last` pairs) and clear means a **packed 16-bit index list**. So `0x8f000000` =
+"draw sequential ranges", `0x07000000` = "draw packed index pairs".
 
-The consistent explanation is that offsets 0x000-0x030 are a small **command
-header whose fields are reused per command type**, and the primitive enum
-occupies 0x008 only for draw commands that change primitive. That is a lead to
-settle from the ICD disassembly, not an established field. Do not encode it in a
-driver on this evidence alone.
+### Corrections to my first reading of this capture
+
+Three things inferred from the capture alone were wrong; the disassembly settles
+them. Recorded because the wrong readings were plausible and someone re-deriving
+this from the raw capture would make them again:
+
+| First reading | Actually |
+|---|---|
+| `+0x04` = a GL_POINTS flag | **first vertex index** — it was 1 because that batch had already accumulated one vertex |
+| `+0x08` = vertex count | **one-past-end vertex index**; count = last - first |
+| `+0x18` = vertex buffer bus address | **fence write-back address** (reg 0x1090); `+0x14` is the fence value (reg 0x1094) |
+
+That also disposes of the "stale leading record" theory: points, strips and fans
+read one higher simply because `first` was 1, not because a stale vertex was
+present. The earlier guess that `+0x14`/`+0x18` are the two payload dwords for
+regs 0x1094/0x1090 was correct.
+
+`0x1090` holds the 32-bit bus address of a 4-byte completion word and `0x1094`
+the value the engine writes there; the ring allocator spins on that word. Both
+are per-context constants, which is why `+0x18` never varied between draws.
+
+## Primitive type — SOLVED: register 0x10b0 (index 0x2c)
+
+Not in the descriptor. It is emitted as its own 3-dword register packet:
+
+```
+0x10b0 = 0x00040000 | ((B[p] & 7) << 12) | (A[p] & 0x7f)
+```
+
+| primitive | p | reg 0x10b0 |
+|---|---|---|
+| GL_POINTS | 0 | 0x00040020 |
+| GL_LINES | 1 | 0x0004103d |
+| GL_LINE_STRIP | 2 | 0x0004203d |
+| GL_LINE_LOOP | 3 | 0x0004203d |
+| GL_TRIANGLES | 4 | 0x0004305c |
+| GL_TRIANGLE_STRIP | 5 | 0x0004405c |
+| GL_TRIANGLE_FAN / GL_POLYGON | 6 | 0x0004505c |
+| GL_QUADS | 7 | 0x0004605c |
+| GL_QUAD_STRIP | 8 | 0x0004705c |
+
+INFERRED: bits[6:0] take only three values (0x20 point / 0x3d line / 0x5c
+triangle) and look like a WARP setup-program entry address; bits[14:12] are the
+topology selector; bit18 is always set.
+
+**Why the sweep never showed a 0x10b0 write:** the ICD emits it only when the
+primitive code changes *and* old and new fall in the same equivalence class
+(`{0}{1,2}{3}{4,5,6}{7,8}`). Across a class boundary it emits nothing here and
+the change is handled by state validation on the server side. A run of
+same-primitive draws therefore carries no primitive packet at all.
+
+GL_QUADS and GL_QUAD_STRIP are **decomposed on the CPU** into 16-bit index
+lists. GL_LINE_LOOP emits the range packet plus a `0x07000001` packet carrying
+`(first<<16)|(last-1)` as the closing segment.
+
+### The 0x008 lead, resolved
+
+Region 2 offset 0x008 was observed carrying what looked like the GL primitive
+enum (points 0, lines 1, triangles 4, strip 5, fan 6), then refuted as a
+dedicated field because state-only operations wrote unrelated values there.
+Both halves were right. Those values are the ICD's internal **primitive code**
+`p` — the same `p` that indexes the table above — which the ICD stores at
+`ctx+0xa080` and, per the disassembly, never reads back itself. It reaches the
+kernel through this shared region. Offsets 0x000-0x030 of region 2 are a
+**submit record** whose fields are per-record-type, which is why non-draw
+records put other things at 0x008.
+
+## The submit record (region 2) — capture and disassembly agree
+
+The ICD builds 0x28-byte submit records and hands them over with request opcode
+0x1b. Aligning the disassembled layout against the captured dwords, the record
+in the capture begins at region 2 offset **0x008**:
+
+| Record field | Region 2 offset | Captured (tri_flat) |
+|---|---|---|
+| +0x00 | 0x008 | 4 — the primitive code |
+| +0x08 u64 device/context handle | 0x010/0x014 | 0xffffc200_009b8004 (kernel pointer) |
+| +0x10 START | 0x018 | 0x00002000 — chunk start |
+| +0x18 END\|1 | 0x020 | 0x0000201d — note the low bit set |
+| +0x20 | 0x028 | 0x00002040 |
+
+START and `END|1` matching the captured 0x2000 / 0x201d is what pins the
+alignment. The `(START, END|1)` pair is what the server/kernel side turns into
+`0x404` PRIMADDRESS and `0x408` PRIMEND with its DMA-mode bits.
+
+Discrepancy to resolve: the disassembly reads record +0x00 as a type field
+(`ctx[0xa050]` = 0xd) while the capture shows the primitive code there. Either
+the field is overloaded or the record base is off by one field; the START/END
+match makes the rest of the alignment solid.
+
+## Vertex format — how the stride is built (CONFIRMED)
+
+A prefix sum over per-attribute sizes with a **fixed attribute order**; the
+total is the stride. Position is always at offset 0.
+
+| Attribute | Selector | Sizes |
+|---|---|---|
+| position | fmt[1:0] | {8, 12, 16, 8} (xy / xyz / xyzw) |
+| diffuse colour | fmt[3:2] | {0, 12, 0, 8} |
+| specular colour | fmt[7] | {0, 12} |
+| texcoord 0 | fmt[6:4] | {0, 12, 4, 8, 8, 16, 0, 0} |
+| texcoord 1 | fmt[10:8] | same table |
+| fog / point size | fmt[30:29] | {0, 4} |
+| extra 0..3 | fmt>>{16,19,22,25} & 7 | {0, 4, 8, 12, 16, 0, 0, 0} |
+
+The captured `[x,y,r,g,b]` stride 20 is exactly `fmt[1:0]=0` (8 bytes: x,y) plus
+`fmt[3:2]=1` (12 bytes: r,g,b), everything else zero. **Adding a 2-float
+texcoord** sets `fmt[6:4]=3`: +8 bytes, stride 28, texcoord at offset 20.
+**Adding a secondary colour** sets `fmt[7]`: +12 bytes at offset 20, pushing
+texcoord 0 to 32. The stride grows; the order never changes.
+
+## The two rings
+
+| Ring | Size | Region |
+|---|---|---|
+| vertex | 0x320000 (3276800) | region 4 |
+| command | 0xa8000 (688128) | region 5 |
+| third heap | 0x400000 | region 6, unused per draw |
+
+Slot size is hard-coded **0x2000**, which is the per-draw stride the capture
+shows. The ring base is 16-byte aligned and each flush aligns the write cursor
+**up to 64** before writing — the source of the observed `+0x40` vertex offset.
+Vertex *k* lives at `align64(slotStart) + k*stride`, and the draw packet's
+`first`/`last` index into that array.
+
+Batch capacity is chosen per `(primitive, stride)` so `maxVerts*stride` fits
+0x2000 and is a multiple of the primitive size — e.g. (TRIANGLES, 24) -> 339,
+(LINES, 20) -> 408, (TRIANGLES, 32) -> 255.
+
+## Scissor
+
+If the scissor is dirty the chunk is prefixed with
+`[2][0x2121a1a0][(f3<<16)|f0][(f1<<16)|f2]` -> regs **0x1280 / 0x1284**, values
+clamped to +/-1024. This confirms the documented guard-band scissor encoding.
+
+## Still open in the ICD
+
+- Draw-header bit30 (0x40000000), gated on `ctx+0xa4f2`.
+- Register 0x1104 (index 0x41), alternating 0/4 on line-strip/loop draws.
+- Where the vertex-ring **base address** reaches the hardware: libGL emits only
+  four register indices in total (0x2c, 0x41, 0xa0/0xa1, 0x24/0x25), so the base
+  must be bound once at context creation by the server/kernel side.
+
+
 
 ## Vertex format — CONFIRMED TWICE, INDEPENDENTLY
 
@@ -211,9 +310,24 @@ than fail cleanly.
 
 ## Open items
 
-- Where the primitive type (triangles / lines / points / strip / fan) is encoded.
-- Descriptor `+0x0c` (constant 2) and the exact meaning of `+0x04`.
-- How the vertex stride and attribute order change when texture coordinates or
-  a specular colour are added.
+Resolved since first writing (see the sections above): primitive-type encoding
+(reg 0x10b0), descriptor `+0x04`/`+0x08`/`+0x0c`/`+0x18`, and how the vertex
+stride and attribute order change with texcoords or a specular colour.
+
+Still open:
+
+- Draw-header bit30 (`0x40000000`), gated on `ctx+0xa4f2`.
+- Register 0x1104 (index 0x41), alternating 0/4 on line-strip/loop draws.
+- Where the vertex-ring **base address** reaches the hardware. The ICD emits only
+  four register indices in total (0x2c, 0x41, 0xa0/0xa1, 0x24/0x25), so the base
+  is bound once at context creation by the server/kernel side.
+- The submit-record `+0x00` discrepancy noted above.
 - The full decode of the region 2 init/state stream (see
   docs/parhelia-gl-feature-map.md).
+- **Texture capture is still missing.** Every attempt to capture the texture
+  operations failed: the driver could not create the GL context's buffers
+  ("Failed to allocate locked pages"), and this persisted across a page-cache
+  drop, a module reload and a full reboot with 420 MB free and free order-10
+  blocks available in DMA32 — so it is not memory pressure or fragmentation.
+  Even a 2-page request fails. Cause not yet identified; the texture rows in the
+  feature map are therefore uncaptured.

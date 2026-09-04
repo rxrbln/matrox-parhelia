@@ -65,8 +65,14 @@ can be VRAM, AGP, PCI-locked, or vmalloc'd [SRC].
 | 0xAF | 0x12BC | **DWGSYNC** | soft-trap sync tag |
 | 0xC5 | 0x1314 | **FCOL** | foreground colour (replicated per bpp) |
 | 0xC6 | 0x1318 | **BCOL** | background colour |
-| 0x88–0x8B | 0x1220–0x122C | **SURF descriptors** | src/dst surface descriptor dwords (format+addr+pitch) |
-| 0xB0 | 0x12C0 | **PLNWT** | plane write mask (planemask; 0xFFFFFFFF = all) |
+| 0x88–0x8F | 0x1220–0x123C | **SURF descriptors** | four {base, config} slot pairs |
+| 0xC7 / 0xC8 | 0x131C / 0x1320 | **PAT0 / PAT1** | 8×8 mono pattern data |
+| 0xC9 | 0x1324 | **PLNWT** | plane write mask (planemask; 0xFFFFFFFF = all) |
+| 0xCA / 0xCB | 0x1328 / 0x132C | **SCISSOR MIN / MAX** | 2D clip corners |
+
+> **Corrected 2026-09** (see [`parhelia-2d-accel-complete.md`](parhelia-2d-accel-complete.md)
+> for the evidence): PLNWT is index **0xC9 = 0x1324**, not 0xB0/0x12C0 —
+> 0x12C0/0x12C4 are 3D/DPS colour masks.
 
 FCOL/BCOL were pinned down after the first accel pass: the solid-fill and copy
 `Subsequent*` functions leave colour to the context flush, which emits packet
@@ -83,21 +89,29 @@ per blit.
 ### DWGCTL bit fields [DRV]
 
 ```
-DWGCTL = dstSlot | (srcSlot >> 2) | (BOP << 4) | opcode | 0x800000(blockmode)
+DWGCTL = opcode | (BOP << 4) | (srcSlot << 8) | (dstSlot << 10) | modifiers
 ```
 
 | Bits | Field |
 |---|---|
-| [3:0] | destination surface-descriptor slot (`1 << slot`) |
+| **[3:0]** | **opcode**: 0 fill · 1 line · 2 BITBLT · 3 colour-expand · 0xC textured rect |
 | **[7:4]** | **BOP** — raster/logic op (see ROP table) |
-| bit 0 (0x1) | line / colour-expand enable |
-| bit 1 (0x2) | BITBLT/copy opcode |
-| [9:8] (0x300) | colour-expand source type (→ base `0x303`) |
-| bit 12 (0x1000) | blit X-direction (R→L) / colour-key or pattern transparent |
-| bit 13 (0x2000) | blit Y-direction (B→T) / pattern-fill mode |
-| bit 22 (0x400000) | transparency (colour-key) enable |
-| bit 23 (0x800000) | blockmode |
-| [22:20] (line) | line style / octant (`0x700001` / `0x300001`) |
+| **[9:8]** | **source** surface-descriptor slot (0–3) |
+| **[11:10]** | **destination** surface-descriptor slot (0–3) |
+| bit 12 (0x1000) | pattern-transparent (opcode 0) / expand-transparent (opcode 3) |
+| bit 13 (0x2000) | 8×8 pattern enable (opcode 0) |
+| [16:14] / [19:17] | pattern X / Y origin |
+| bit 22 (0x400000) | colour-key transparency (opcode 2) / draw-last-pixel (opcode 1) |
+| bit 23 (0x800000) | **clip/scissor enable** |
+| [22:20] (line) | line mode (`0x700001` draw-last / `0x300001` omit-last) |
+
+> **Corrected 2026-09:** bits [3:0] are the *opcode*; the slot fields are
+> [11:10] (dst) and [9:8] (src).  The `1 << slot` value in the vendor's
+> `SetupFor*` is the driver's shadow dirty mask, not a DWGCTL field.  Bit 23 is
+> clip-enable, not "blockmode".  The blit direction bits 0x1000/0x2000 are
+> **unproven** — the vendor's own copy path never uses them (it routes every
+> screen-to-screen blit through a temporary surface).  Full derivation in
+> [`parhelia-2d-accel-complete.md`](parhelia-2d-accel-complete.md).
 
 Pattern origin is OR'd into DWGCTL at draw time: `patx`→bits[16:14],
 `paty`→bits[19:17].
