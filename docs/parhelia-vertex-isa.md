@@ -27,7 +27,8 @@ software token IR*, not the hardware. The real WARP machine encoding —
 space — is in **PART 2** at the end of this file. Two PART 1 claims are wrong
 and are corrected there: the kernel does **not** assemble DX tokens into
 microcode (it concatenates pre-compiled fragments and patches bit-fields), and
-`tools/warp_ucode.h` is a WARP **self-test**, not the shared firmware.
+`tools/warp_ucode.h` is a WARP **self-test**, not the shared firmware — the
+programs the driver really loads are listed in PART 2 §12.
 
 All three passes (opcode table, operand encoding, serialization + a worked
 program) completed and **cross-validate**. Two small fields — the per-source
@@ -299,9 +300,10 @@ the KERNEL'S interpretation of the descriptor into actual VE microcode.
    standalone ring drives the RAW four-index (reg,val) hardware packets directly
    (bypassing the core), but method 0x45 is translated by the core into the real
    VE-cache write, which is NOT a clean extractable MMIO sequence. Ruled out: the
-   `mtx514` indirect port (0x910 index/0x938 data/0x914 readback) — its address
-   field `(bank<<24)|((index<<9)&0xfff)` addresses only ~7 entries/bank, far too
-   few for 409. The 6 microcode variants (dword counts 0x183/0x187/0x18b/0x195/
+   `mtx514` indirect port (0x910 index/0x938 data/0x914 readback) — it is a
+   register-file *read* port, not a microcode path (see PART 2 §11; the address
+   is `(kind<<24)|(((bank<<9)|index)&0xfff)`, i.e. 4 banks × 512 entries, and
+   the earlier "~7 entries/bank" was a misreading of the shift). The 6 microcode variants (dword counts 0x183/0x187/0x18b/0x195/
    0x199=409/0x19d, set in the shader-state ctor `mtx1216` @kern `0x91e70`,
    variant count at struct+0x1544) are selected by pipe/feature. Delivery is thus
    a DMA descriptor / dedicated ring-packet type, recoverable reliably only by a
@@ -365,7 +367,10 @@ Evidence tags: **CONFIRMED** = read out of the vendor binary and cross-validated
 against independent data; **INFERRED** = consistent with the data but not proven.
 
 Disassembler: `tools/parhelia-warpdis.py` (reads a raw image or
-`tools/warp_ucode.h`).
+`tools/warp_ucode.h`). Sections are in derivation order; if you only want the
+answers, read **§11** (the register file and the CPU readback port), **§12**
+(the eight programs the driver really loads) and the resolution of the `mtx676`
+question at the end.
 
 ## 1. Instruction word — 12 bytes / 96 bits [CONFIRMED]
 
@@ -895,8 +900,9 @@ is what identifies the two as the same struct [CONFIRMED].
 loader and the `mtx3395` walker's 12-byte stride); `w2[30:23]` as the opcode
 field (decoded verbatim by `mtx3395`); opcode `0x00` = NOP and `0x29` = END;
 the complete bit-field map (from the vendor's own patcher, not guessed); three
-source slots and two destination write ports with per-port write masks; the
-128-entry register file and its one-extended-operand addressing; the 12-bit,
+5-bit source slots and two destination write ports with per-port write masks;
+the 9-bit port-A destination address and the 4 × 512 register file behind it
+(§11); the 7-bit one-extended-operand source addressing; the 12-bit,
 3-bits-per-component swizzle with identity `0x688`; the 32-bit immediate split;
 opcode `0x23` = relative branch and `0x46` = backward branch; `Add` =
 0x76/0x71; the 4×dp4 transform idiom; the 512-instruction store; that `mtx2785`
@@ -905,25 +911,53 @@ any vendor binary, Linux or Windows.
 
 **Inferred, not proven:** the mnemonic for every opcode other than the branches
 and `Add`; whether the two write ports imply dual-issue; the meaning of swizzle
-codes 4–7; `w1[26:25]` as a matrix-bank select; the high-nibble/low-nibble
-reading of the opcode field.
+codes 4–7; the high-nibble/low-nibble reading of the opcode field; that the four
+`mtx514` banks are four parallel vertex units.
 
-**Unresolved:** 16 bit-fields carry no interpretation yet — `w0[9:8]`, `w0[18]`,
-`w0[19]`, `w0[24]`, `w0[26:25]`, `w0[31]`, `w1[1:0]`, `w1[6]`, `w1[8:7]`,
-`w1[12:9]`, `w1[13]`, `w1[21:20]`, `w1[24:22]`, `w1[29:27]`, `w2[22]`, `w2[31]`.
-They are almost certainly source modifiers (negate/absolute/saturate), operand
-bank selectors and per-port routing.
+**Withdrawn:** `w1[26:25]` as a constant/matrix bank (§7) — it is two bits of
+the port-A destination address (§11). `f0d`/`f0f`/`f1b` as separate flags — they
+are the high bit of `src2`/`src1`/`src0` (§2). The claim that `w0[19]` is the
+only bit that ever varies alone between two otherwise identical library
+instructions: over the 3458 distinct encodings in the 575-fragment corpus,
+`w1[24:22]` varies alone in 634 pairs, `src0` in 620, `dst1` in 469, `src1` in
+368, `w1[26:25]` in 347 and `w0[19]` in only 3. `w0[19]` is nonetheless
+opcode-linked — it is set in all 2783 opcode-`0x60` instructions and in 72 % of
+opcode-`0x76` — but it is one half of the 2-bit field `w0[19:18]`, whose value
+is `2` for every `0x60` and `0` for every control-class opcode.
 
-The best lead among them is **`w0[19]`**: it is the *only* bit that ever differs
-on its own between two otherwise byte-identical library instructions (both
-`AddEfs`/`AddEfd`/`AddEfm` and many others have an exact twin that differs in
-w0[19] alone), it is set in 33% of the corpus, and it is set in every single
-opcode-0x60 instruction. That is the profile of a one-bit operand or result
-modifier — negate or accumulate. The Windows D3D compiler has already been ruled
-out as a source (§6), so closing these fields means either a live capture
-correlating a known GL shader with the fragments the driver selects for it, or
-targeted experiments on real hardware: upload a hand-built fragment, flip one
-bit, and read the result back.
+**Progress on the unresolved fields (2026-09-05).** Of the sixteen, five are now
+interpreted and three were not fields at all:
+
+| was | now |
+|---|---|
+| `w1[13]`, `w1[21:20]`, `w1[26:25]` | port-A destination page, `dstA[8]`, `dstA[5:4]`, `dstA[7:6]` (§11) |
+| `w0[24]`, `w0[31]`, `w1[6]` | high bit of `src2`, `src1`, `src0` (§2) |
+| `w0[18]` + `w0[19]` | one 2-bit field `w0[19:18]` |
+| `w0[9:8]` | port-A control: value `2` ⟺ `wmask0 == 0` in 32057/32738 cases, and values 0/1/3 imply `wmask0 != 0` in 6304/6304 [INFERRED] |
+| `w1[8:7]` | port-B control: value `0` ⟺ `wmask1 == 0` in 21781/24419, values 1/2/3 imply `wmask1 != 0` in 14075/14624 [INFERRED] |
+
+Still uninterpreted: `w0[19:18]`, `w0[26:25]`, `w1[1:0]`, `w1[12:9]`,
+`w1[24:22]`, `w1[29:27]`, `w2[22]`, `w2[31]`, and the `extsel` codes 3–7.
+Corpus behaviour that constrains them:
+
+- Every opcode below `0x60` except `0x0a` and `0x4a` leaves the whole operand
+  encoding inert — `f0a=2`, and `w0[19:18]`, `w0[26:25]`, `w1[1:0]`, `w1[8:7]`,
+  `w1[12:9]` all zero — and carries only an immediate. So the opcode space
+  really does split into a control class (`0x00`–`0x52`) and an arithmetic class
+  (`0x60`+), with `0x0a` and `0x4a` as the two exceptions that write both ports.
+- `w2[22]` is opcode-determined for the whole control class (1 for `0x0d`,
+  `0x23`, `0x24`, `0x25`, `0x27`; 0 for the rest) but varies inside the
+  arithmetic class (13 % of `0x76`, 48 % of `0x89`), so it is a modifier that
+  only some opcodes use rather than a ninth opcode bit.
+- `w1[24:22]` and `w1[29:27]` are the highest-entropy unknowns and the ones that
+  most often vary alone; both correlate with whether the two swizzles are
+  present, which is the profile of an operand-select or third-operand control.
+
+The Windows D3D compiler is ruled out as a source (§6) and the Linux ICD builds
+only the token IR of PART 1, so closing the rest means hardware: §11 gives a
+vendor-proven CPU readback path (`0x910`/`0x914`/`0x938`, kind 3), so the
+experiment is "upload a one-instruction fragment, flip one bit, read the
+register file back" — no rasteriser or display output required.
 
 **No hardware validation has been done.** Nothing in PART 2 has been executed on
 a Parhelia. It is static analysis of `mtx_parhelia.o`, cross-checked against a
@@ -931,10 +965,99 @@ second independently built corpus, against the Windows `MTXPARD.dll` (30
 byte-identical microcode blobs), and against the internal consistency tests in
 §5 and §7.
 
-## CONFLICT to resolve: what mtx676 actually loads, and why it matters
+## RESOLVED (2026-09-05): what `mtx676` loads — both readings were right
 
-Two independent RE passes describe `mtx676` (`.text+0xa0230`) differently and
-both cannot be right:
+**Both happen.** `mtx676` *is* a self-test, and it *does* run at device init on
+the normal path, streaming `mtx2785` to the `0x91c` FIFO through `mtx1391`.
+The real vertex programs are loaded later (and repeatedly) by a different
+function. Every claim below is read out of `mtx_parhelia.o`; relocation counts
+are exhaustive, taken from `readelf -rW` over the whole object, so "the only
+caller" means literally the only reference anywhere in the module.
+
+### Call chains
+
+```
+mtx2839 (.text+0x38bf0, device create)
+  └─ walks the exported 22-entry module table mtx67 (.rodata+0x1860,
+     528 bytes, entries of {create, destroy, name})
+     └─ entry 19 -> mtx3810 (.text+0xa3c20)                 [engine create]
+          ├─ new(0xa3128) -> dev[0x2190], ctor mtx2051
+          ├─ if (params[0x558]->get() && params[0x560]->get())
+          │     └─ mtx676 (.text+0xa0230)                   [WARP SELF-TEST]
+          │          └─ mtx1391 (.text+0x9f6b0, reset=1, entry=8)
+          │               -> 0x918 / 0x91c, image = mtx2785 (0x12cc bytes)
+          └─ memWriteDword(0x920, ...)
+```
+
+```
+mtx3380 -> mtx656 (.text+0xa0e40)   /  mtx2565 (.text+0x9fe10)
+  └─ mtx3806 (.text+0x9fcc0)                                 [REAL UCODE LOAD]
+       ├─ mtx2316(this, this[0x40], reset=1, entry=2)
+       ├─ mtx2316(this, this[0x48..0x70], reset=0, entry=2)  x6
+       ├─ mtx2316(this, this[0x98], reset=0, entry=2)
+       │     └─ mtx1391  (hardware)   |  mtx1650 -> mtx1397 (software WARP)
+       └─ returns the entry-point value written to 0x920
+```
+
+```
+mtx2381 (.text+0x8a8f0, shader state change)
+  └─ mtx976 (.text+0xa6470)          [program cache, 5 slots + 682-entry LRU]
+       ├─ miss: mtx1374 / mtx3075 / mtx2310 build the recipe, sizing dev[0x100]
+       ├─ new[](dev[0x100])
+       └─ mtx3558 (.text+0xa0f20)    [LINKER: memcpy fragments, relocate, patch]
+             -> prog[0x18]=size, prog[0x20]=buffer
+```
+
+- `mtx676` has **exactly one** reference in the module: the call at
+  `.text+0xa3ccf` inside `mtx3810`. There is no diagnostic ioctl path.
+- `mtx2785` has **exactly one** reference: `.text+0xa03a0`, inside `mtx676`.
+- `mtx1391` has **exactly two** callers: `mtx676` and `mtx2316`.
+- `mtx3558` has three callers: `mtx324`, `mtx2884`, `mtx976`.
+
+### Why `mtx676` is a self-test, not a firmware load
+
+Its 3079 bytes do far more than build a descriptor:
+
+1. `new[](0x180)` — a 384-byte per-register pass/fail array, memset to 1.
+2. write `0x920` (engine control), then load `mtx2785` with `reset = 1`.
+3. emit ring packets `0x2121212d`, `0x212c1000`, `0x41403c3c`, `0x2121213c`.
+4. **loop 100 times** (`0x63` down to 0): push a vertex whose two 16-byte
+   attributes are the walking patterns `AAAAAAAA/55555555`,
+   `55555555/AAAAAAAA`, `FFFFFFFF/00000000`, `00000000/FFFFFFFF`
+   (packet header `0x4106000f`, attribute offsets 0, 0x40, 0x80, 0xc0, 0x100,
+   0x140); poll `0x8f0` until stable; call `mtx612`, which reads the whole
+   register file back through `0x910`/`0x914`/`0x938` and compares (§11).
+5. return the accumulated pass/fail boolean.
+
+Walking `0x55`/`0xAA`/all-ones/all-zeros patterns through a memory and reading
+them back is a RAM test, and the image it runs is the flat `a0..a383` sweep of
+§8. `mtx3810` calls it only when two registry-parameter predicates are true, so
+it is a boot-time diagnostic on the normal path — most plausibly gated by
+`reg3DPerformCRegCheck` ("Vertex Engine enabling / CReg check on boot") and a
+companion, though the exact parameter binding is [INFERRED, not traced].
+
+### What is streamed to `0x91c` in normal GL operation
+
+The eight program buffers of §12 — initially the built-in `.data` blobs
+installed by `mtx2051`, and from the first state change onward the buffers that
+`mtx3558` builds by concatenating registry fragments, relocating their operands
+(§4) and patching their bit-fields (§2). `mtx3806`'s **first** `mtx2316` call
+passes `reset = 1`, which zeroes the write cursor `this[0xa3118]`, so the
+self-test image is simply overwritten by the first real load [CONFIRMED].
+
+### Consequence for an open driver
+
+`tools/warp_ucode.h` must **not** be replayed as the vertex program — that was
+the correct half of the second reading, and it explains a WARP that consumes
+the vertex stream and rasterises nothing. Replay the §12 default set instead
+(2868 bytes, 239 instructions, extractable by symbol name), or link fragments
+the way `mtx3558` does. `warp_ucode.h` remains useful for a different purpose:
+it is a ready-made register-file test, and running it plus `mtx612`'s readback
+loop is a cheap first sign of life on real hardware.
+
+### Historical note — the two readings
+
+Two independent RE passes had described `mtx676` (`.text+0xa0230`) differently:
 
 - The **kernel-ABI pass** reads it as the engine's microcode load at device
   init: it builds `{size=0x12cc, ptr=&mtx2785, entries=4}` and calls `mtx1391`,
@@ -947,24 +1070,14 @@ both cannot be right:
   fragments** in a registry at `dev+0x9c108`, concatenated and bit-patched by
   the microcode linker `mtx3558` per pipeline state.
 
-The disassembly is visibly a register sweep, which fits "self-test" far better
-than "firmware", and byte-identity of the image across Parhelia and P690 is
-exactly what a self-test would show — so that reading is the stronger one. But
-these are readings of the *same symbol*, so one pass has mis-attributed a
-caller. Resolve before relying on either.
+Neither pass had mis-attributed a caller: the first was describing the *load*
+`mtx676` performs, the second the *content* of the image it loads. Both are
+correct; what was missing was the second, separate load path (`mtx3806`) that
+carries the real programs. The "why it matters" prediction also held — a
+from-scratch driver that replays `warp_ucode.h` arms the engine with a RAM test,
+which is why the vertex stream is consumed and nothing is rasterised.
 
-### Why this matters more than it looks
-
-If `mtx2785` is a self-test, it explains thelong-standing result that our
-from-scratch WARP draw **consumes the vertex stream but rasterises nothing**:
-the engine was armed and fed a self-test image rather than a vertex program, so
-there was no transform to run and no fragments to emit. Under that reading, a
-working open driver cannot simply replay `tools/warp_ucode.h` at init — it must
-either assemble the 574-fragment library the way `mtx3558` does, or capture the
-concatenated image the vendor driver actually loads for a given pipeline state.
-
-This has **not** been tested on hardware. The cheap decisive experiment: capture
-the real `0x91c` stream during vendor GL init with mmiotrace (the method in
-docs/parhelia-mmio-capture.md) and compare its length and content against the
-4812-byte `mtx2785` image. If they differ, the self-test reading is confirmed
-and the microcode question reopens as the top 3D blocker.
+None of PART 2 has been executed on a Parhelia. The cheapest confirmation on
+hardware is still an mmiotrace of vendor GL init (the method in
+docs/parhelia-mmio-capture.md): the `0x91c` burst should be 2868 bytes across
+eight `0x918`-seeded runs, not one 4812-byte run.

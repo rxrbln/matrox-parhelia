@@ -611,16 +611,26 @@ actually reads (`GL 0x10da50`, driven from `0x10df65`-`0x10e161`; the alpha half
 is scanned only when `record+0x34 != 0`), i.e. a plain "sample this unit".
 
 The **descriptor layout and the opcode encoding are now recovered** (§9.5). What
-is still missing is the engine register — see §9.5.6 and §15.
+is still missing is the engine register — see §9.5.7 and §15.
 
 ### 9.5 The texture-address (TA) stage array  **recovered 2026-09**
 
-The whole TA half was recovered from the **kernel HAL**, which is the component
-that consumes libGL's uploaded blob. The entry point is `KRN mtx2132` @0x6e1d0
-(`docs` tag `[KRN]`): its argument `rdx` is the 0x664-byte blob, and its first
-two loops walk the TA array *before* the ALU instruction loop at 0x6e372.
-`objdump -dr` on the object file names every call target, which is what makes
-this readable at all.
+Two sources, not one:
+
+* the **`glTexAddress*MTX` entry points** in libGL — the only code that writes
+  a non-trivial descriptor — reached through the per-context dispatch table
+  (the exported symbols are TLS thunks): `glTexAddressOp1..4MTX` → `GL 0x1b47c0`,
+  `glTexAddressHintsMTX` → `GL 0x1b4490`, `glTexAddressParamuiMTX` →
+  `GL 0x1b4be0`, `glTexAddressParamfvMTX` → `GL 0x1b4ac0`;
+* the **kernel HAL**, which consumes the uploaded blob: `KRN mtx2132` @0x6e1d0
+  (its `rdx` is the 0x664-byte blob; its first two loops walk the TA array
+  *before* the ALU loop at 0x6e372) and the per-stage packer `KRN mtx1652`
+  @0x70b30. `objdump -dr` on the object file names every call target and every
+  `.data` table, which is what makes the kernel readable at all.
+
+The earlier passes missed both: they looked at libGL's *fixed-function*
+generator (which only ever emits a plain fetch) and at MTXPARD (whose ps.1.x
+path never emits one at all).
 
 #### 9.5.1 Descriptor layout  **CONFIRMED**
 
@@ -826,7 +836,7 @@ reachable opcode (TEX 0, TEXBEM/TEXDEP/DOT3 1, M3X2 2, M3X3 3). The kernel
 recomputes the descriptor's `+0x08` from the opcode rather than trusting it.
 **CONFIRMED** by agreement with libGL's independent arity table.
 
-#### 9.5.3 What a TA stage becomes  **CONFIRMED**
+#### 9.5.4 What a TA stage becomes  **CONFIRMED**
 
 TA stages are **allocated out of the same 0x148-byte record pool as the ALU
 instructions**, at `ctx + 0x9f8 + n*0x148`, and they advance the same
@@ -840,70 +850,126 @@ shader instruction slot, which is what makes `GL_MAX_TA_OPS_MTX = 4` and
 | record field | source | note |
 |---|---|---|
 | `+0x04` | `ctx+0x1c` (the compile mode) | `mtx3603` writes the literal 3 |
-| `+0x8c` | `mtx1411[opcode]` | opcode class |
-| `+0x94` | `mtx1600[class]` | 0-3, meaning unknown |
+| `+0x68`, `+0x6c` | literal `0x800` | bump coefficients, §9.5.5 |
+| `+0x8c` | `mtx1411[internal code]` | **hardware TA opcode** |
+| `+0x94` | `mtx1600[hw opcode]` | nargs − 1 |
 | `+0xa4`,`+0xa8`,`+0xac` | the TA stage index | |
-| `+0xb0` | `TA+0x04 == 1`; forced to 1 for opcodes 3, 4, 13 | "must execute" |
-| `+0xb4` | 0x1f or 0x20 (chip-revision dependent, `mtx2577` @0x70ee5) | channel mask accumulator |
-| `+0xb8` | `mtx3585[class]` | this stage's channel mask |
-| `+0xc6` | `opcode == 3` (`TEXKILL_GE` only) | |
-| `+0xc8` | byte `TA+0x04` | gates `mtx2577` entirely |
+| `+0xb0` | `desc+0x04 == 1`; forced to 1 for internal codes 3, 4, 13 | "must execute" |
+| `+0xb4` | 0x1f or 0x20 (chip-revision dependent, `mtx2577` @0x70ee5) | channel-mask accumulator |
+| `+0xb8` | `mtx3585[hw opcode]` | this stage's channel mask |
+| `+0xc4` | 1 when `desc+0x20 == 0` (`GL_TEX_SIGNED`) | |
+| `+0xc6` | internal code == 3 (`TEXKILL_GE`, not `_LT`) | |
+| `+0xc8` | byte `desc+0x04` | gates `mtx2577` entirely |
+| `+0x11c` | `desc+0x1c` | texture type |
+| `+0x138`,`+0x13c`,`+0x140` | `mtx1864`/`mtx2559`/`mtx1674` `[desc+0x18]` | filter fields, §9.5.6 |
 | `+0x18`,`+0x20`,`+0x28` | `ctx+0x38 + 0x1c + stage*0x82` | pointer into a 10-entry, 130-byte-per-stage pipeline-state block at `ctx+0x54` |
+
+The last five rows are taken only when `blob+0x5cc == 1`
+(`mtx1652` @0x70bf9 `dec r8b ; je 0x70cc3`) — i.e. only when
+`glTexAddressHintsMTX` has supplied them.
 
 `mtx598` @0x70dd0 links a producer to a consumer in both directions
 (`producer+0xf0` count with `producer+0xf8[]`, `consumer+0xcc` count with
-`consumer+0xd0[]`), and `mtx2577` @0x70eb0 then propagates the masks:
-`record+0xb4 |= record+0xf8[k]+0xb8` over all links (@0x70f05-0x70f26) — i.e.
-**a fetch must produce every channel any dependent stage reads.** That is the
-whole point of the `mtx3585` mask.
+`consumer+0xd0[]`), and `mtx2577` @0x70eb0 then propagates the masks (§9.5.3).
 
 `KRN mtx1271` @0x70050 walks the same 0x148 records and resolves each one to a
 **texture object** (`record+0x8` = the bound texture, @0x701cb), checking its
 format nibble `[tex+0x1ad]&0xf` and calling `mtx2577` on it. So a live TA record
 *is* a texture-unit binding.
 
-#### 9.5.4 Where the TEXBEM coefficients are not
+#### 9.5.5 The TEXBEM matrix — stored by GL, never uploaded
 
-`GL_TEXBEM_MATRIX_MTX` (0x8A9E) reaches no engine register in the kernel object.
-`mtx1652`'s only numeric constants on the TA path are `record+0x68 = record+0x6c
-= 0x800` in the `blob[0x5cc]==1` flavour (§9.5.5). Searching the kernel's DMA
-headers for a register group that could hold a 2x2 matrix plus scale/offset
-turns up only `0x1220`-`0x123c`, and that is the already-documented 2D
-**surface-descriptor** array (`docs/parhelia-2d-accel-complete.md` §"SURF"), not
-a bump matrix. **The bump-matrix register was not found.**
+`glTexAddressParamfvMTX(target, GL_TEXBEM_MATRIX_MTX, m)` (`GL 0x1b4ac0`) stores
+a **2x2 float matrix per texture unit** at `shaderObj+0x740 + unit*0x10`
+(`GL 0x1b4b56`), identity-initialised to `{1,0,0,1}` (`GL 0x1b513a`).
+`glGetTexAddressParamfvMTX` (0x1b42a4) reads the same words.
 
-#### 9.5.5 The second blob flavour, `blob[0x5cc] == 1`
+**`obj+0x740` is `blob+0x664` — one byte past the end of the upload.** The ICD
+memcpys exactly 0x664 bytes (`GL 0x1137d9: mov edx,0x664`), so the bump matrix
+**never reaches the kernel in this build**; grepping libGL finds only those
+three sites touching `+0x740..+0x74c`. Correspondingly the kernel hard-codes the
+coefficients on the GL path: `mtx1652` @0x70cca/0x70cd1 writes
+`record+0x68 = record+0x6c = 0x800`. The D3D path is different — `KRN mtx1723`
+@0x71979 writes `record+0x68`/`+0x6c`/`+0x70` from real
+`D3DTSS_BUMPENVMAT` arguments — so the coefficients live in the **stage record**,
+in a fixed point where **`0x800` = 1.0** (Q?.11).
 
-`mtx1652` @0x70bf9 does `dec r8b ; je 0x70cc3`, so when the byte at blob+0x5cc
-is 1 the descriptor tail is read differently:
+An open driver therefore has to wire the GL matrix to `record+0x68`/`+0x6c`
+itself; the vendor ICD's bump path is a dead end. **CONFIRMED** (three
+independent observations: the 0x664 memcpy length, the absence of any other
+reader of `obj+0x740`, and the kernel's two different writers of `record+0x68`).
+
+Note also that `glTexAddressHintsMTX` masks the type field with `0x1f0`, so
+`GL_HINT_TEXTURE_BEM_MTX` (0x200) is unreachable and only the *luminance* form
+`GL_HINT_TEXTURE_BEML_MTX` (0x100) can be selected. Another vendor bug.
+
+**No engine register for the bump matrix was found.** The one register block
+that would fit a 2x2 plus scale/offset, `0x1220`-`0x123c`, is the already
+documented 2D surface-descriptor array
+(`docs/parhelia-2d-accel-complete.md`), not a bump matrix.
+
+#### 9.5.6 Filter enums fall out of the hint tables  **CONFIRMED**
+
+`desc+0x18` (the sampling hint) indexes three 4-entry kernel `.data` tables
+(`mtx1652` @0x70cde-0x70d0d, and again `KRN mtx3577` @0x74366):
 
 ```
-70cc3:  rdx = (s32)TA[i]+0x18                     ; 0..3
-        record+0x11c  = TA[i]+0x1c
-        record+0x68 = record+0x6c = 0x800
-        record+0x138 = mtx1864[rdx]   ; {0, 2, 2, 3}
-        record+0x13c = mtx2559[rdx]   ; {0, 2, 2, 3}
-        record+0x140 = mtx1674[rdx]   ; {1, 1, 2, 2}
-        if TA[i]+0x20 == 0:  record+0xc4 = 1
+mtx1864 (.data 0x19370) = {0, 2, 2, 3}   -> record+0x138
+mtx2559 (.data 0x19360) = {0, 2, 2, 3}   -> record+0x13c
+mtx1674 (.data 0x19350) = {1, 1, 2, 2}   -> record+0x140
 ```
 
-The three 4-entry tables look like a texture-target descriptor (component counts
-for 1D / 2D / 3D / cube), but that is **INFERRED**. Every blob observed on
-hardware has `blob[0x5cc] = 0`, so this path is untested.
+```
+nearest      -> (0, 0, 1)
+bilinear     -> (2, 2, 1)
+trilinear    -> (2, 2, 2)
+anisotropic  -> (3, 3, 2)
+```
 
-#### 9.5.6 What is still missing
+Three fields, values 0-3 — these are the **three 3-bit fields of sampler
+register `0x11c4`** (§11.4, which could only report the literal `0x49` the
+vendor drivers always emit; `0x49` = (1,1,1) is the bilinear-ish default). So:
+**filter enum 0 = nearest, 2 = linear, 3 = anisotropic**, and the third field is
+the mip selector, **1 = no mip, 2 = mip-linear**. Which of the two identical
+tables is min and which is mag cannot be separated — they are equal in all four
+rows. Tables **CONFIRMED**; the min/mag/mip assignment **INFERRED**.
+
+`KRN mtx3577` @0x74160 additionally copies, when `blob+0x5cc == 1`, a 4 x 0x14
+array to `ctx+0x2a84` holding `{valid, mtx1864[h], mtx2559[h], mtx1674[h],
+type}` per stage (@0x74359-0x7438e).
+
+#### 9.5.7 What is still missing
 
 **No engine register carries a TA descriptor.** The kernel's combiner emitter
 `mtx530` (§10) emits only `0x1264`/`0x126c`, `0x1260`/`0x1268` and the four
-constant registers; TA records never reach it. Everything a TA stage produces
-goes into (a) the 10 x 130-byte pipeline-state block at `ctx+0x54`, whose bits
-`mtx2255` @0x71490 and `mtx2797` @0x6e000 set, and (b) a texture-unit binding.
-So on this evidence the Parhelia has **no texture-address instruction register**:
-addressing is expressed as per-stage descriptors that the driver resolves into
-texture-unit state (`0x1200+u*4`, `0x11c0`-`0x11e4`, §11) plus, for the ops that
-need it, bits in a pipeline word that has not been located. Recovering the last
-step needs a hardware capture of a bump-mapped or dependent-read draw; none of
-the captures on hand contains one (§12.3).
+constant registers; TA records never reach it. The kernel's *only* per-texture-
+stage register emitter is `KRN mtx792` @0x69790, which emits exactly the §11.1
+window and nothing else:
+
+```
+697c5: lea eax,[r12*4+0x200] ; shr eax,2   ; index 0x80+unit -> reg 0x1200+unit*4
+697d6: or  eax,0x72717000                  ; + 0x11c0, 0x11c4, 0x11c8
+69807: mov DWORD PTR [rdx-0x14],0x76757473 ; 0x11cc, 0x11d0, 0x11d4, 0x11d8
+69836: mov DWORD PTR [rdx-0x14],0x20797877 ; 0x11dc, 0x11e0, 0x11e4, DMAPAD
+698a0: or  eax,0x21212100                  ; disabled unit: only 0x1200+unit*4
+```
+
+(That independently **confirms §11.1 and §11.2's "disabled ⇒ only
+`0x1200+u*4`" from a second binary.**) A scan of every DMA header immediate in
+the kernel finds no other per-stage register window; nothing TA-shaped exists in
+the 0x1230-0x125f or 0x1288-0x12f0 candidate ranges.
+
+So the TA opcode almost certainly rides in the §11 per-unit window. The
+**leading candidate is `0x1200+unit*4` bits [23:19]** — a 5-bit field, exactly
+the width of the hardware opcode space 0x00-0x13, and MTXPARD's errata list for
+that same field, `{2, 3, 9, 0xa, 0xe}` (`PARD 0x2cea0`), is precisely
+{`TEX_COORD`, `TEXKILL`, `TEXDOT3`, `TEXM3X3_COORD`, `TEXM3X2_DEPTH`} in
+hardware-opcode numbering. That is a hard coincidence to explain away — but it
+is **INFERRED, not decoded**, and §11.2 currently calls the same field a
+"filter code". Do not implement against it.
+
+Settling it needs a hardware capture of a bump-mapped or dependent-read draw;
+none of the captures on hand contains one (§12.3).
 
 ---
 
@@ -1015,7 +1081,7 @@ If a unit is disabled (`0x1200[18:16] == 1`) the emitter writes only
 | [3:0] | one-hot texture-pipe select (1, 2, 4, 8) — `0x1052e7` `1 << tbl0x1d3ac0[cnt*4+unit]`; idle defaults `0x00010001/2/4/8` for units 0-3 at `0x15a2d5` |
 | [11:8] | constant `0x1` on every path (`or ...,0x40100`) |
 | [18:16] | texture type / enable: `1` = disabled, `4`-`7` = enabled; bit16 is a projective ("divide by q") sub-flag that an errata path rewrites 5→4 and 7→6 (`0x2c900`) |
-| [23:19] | 5-bit filter code in the DDraw-side texture-object representation (`0xa2915`: `obj[+4] << 0x13`, mask `0xf80000`; `0xa293e` forces `0x480000` = 9). Codes 2, 3, 9, 0xa, 0xe trigger a hardware-errata workaround (`0x2cea0`) |
+| [23:19] | 5-bit code, called a "filter code" here because that is where MTXPARD's DDraw-side texture object keeps it (`0xa2915`: `obj[+4] << 0x13`, mask `0xf80000`; `0xa293e` forces `0x480000` = 9). Codes 2, 3, 9, 0xa, 0xe trigger a hardware-errata workaround (`0x2cea0`). **See §9.5.7: those five codes are exactly the hardware TA opcodes of `TEX_COORD`, `TEXKILL`, `TEXDOT3`, `TEXM3X3_COORD` and `TEXM3X2_DEPTH`, so this field is the leading candidate for the texture-address opcode. Unresolved.** |
 | [24], [28:27] | writable (mask `0xe404f1f1`), purpose unknown |
 
 Known-good values: active `0x00040101`, idle `0x00010000`.
@@ -1047,9 +1113,15 @@ Write mask `0xfffffe49`; every path found writes the constant `0x49`:
 [10:9]  border-colour enable (cleared when a border colour is programmed, 0x105378)
 ```
 
-**Which field is min / mag / mip, and the filter enum values, are NOT
-determined** — both stage fillers (`0x1051b0`, `0x15a2d0`) emit the literal
-`0x49`. This **corrects `docs/parhelia-gl-driver.md`**, which claimed
+**The filter enum values are now known** (§9.5.6, from the kernel's hint tables
+`mtx1864`/`mtx2559`/`mtx1674`): **0 = nearest, 2 = linear, 3 = anisotropic** in
+the first two fields, and the third is the mip selector, **1 = no mip,
+2 = mip-linear**. The four hint presets are `nearest (0,0,1)`,
+`bilinear (2,2,1)`, `trilinear (2,2,2)`, `anisotropic (3,3,2)`. **Which of the
+first two fields is min and which is mag is still undetermined** — the two
+kernel tables are identical in all four rows, and both MTXPARD stage fillers
+(`0x1051b0`, `0x15a2d0`) emit only the literal `0x49` = (1,1,1), which is not
+one of the four presets. This **corrects `docs/parhelia-gl-driver.md`**, which claimed
 `0x11e8 = min[7:0]/mag[15:8]/mip[23:16]`; `0x11e8` is not a filter register
 (§11.6).
 
@@ -1258,10 +1330,16 @@ stage's `c0` (`{u32 0; u32 instrIdx; float envcol[4]}`, `0x11386c`).
 ```
 +0x000  u32        instruction count (max 10)
 +0x004  10 x 0x94  instruction records
-+0x5cc  u8         0
++0x5cc  u8         "sampling hints valid" flag (§9.5.1)
 +0x5d0  u32        4   = texture-address stage count
-+0x5d4  4 x 0x24   texture-address stage descriptors
++0x5d4  4 x 0x24   texture-address stage descriptors (§9.5.1)
 ```
+
+The blob is the front of the shader object shifted by 0xdc (`obj+0x0e0` is
+`blob+0x004`), and the object continues past the upload: the `TEXBEM` matrices
+sit at `obj+0x740` = `blob+0x664`, one byte past the memcpy, and are never sent
+(§9.5.5). All of this is **confirmed on hardware** — the blob appears verbatim
+in a live capture, see §12.3.
 
 Instruction record, 0x94 bytes:
 
@@ -1467,6 +1545,22 @@ Absent (zero occurrences in the binary): `GL_NV_register_combiners`,
 `GL_NV_texture_env_combine4`, `GL_ATI_fragment_shader`,
 `GL_ARB_texture_env_crossbar`.
 
+Two of the advertised extensions turn out **not** to use the texture-address
+stages at all (**CONFIRMED**, checked because both look like they should):
+
+* `GL_NV_texgen_reflection` is pure vertex-side texgen. `GL_NORMAL_MAP_NV`
+  (0x8511) and `GL_REFLECTION_MAP_NV` (0x8512) are only ever compared against
+  the per-coordinate texgen mode words at `state+0xa88/0xa8c/0xa90`
+  (`GL 0xc1fab`, `0xc1fd6`, `0xc1ff8`, `0xc201d`, `0xc2042`, `0xc2196`,
+  `0xfd308`-`0xfd3a0`, `0xfd828`, `0xfd923`, `0xfda17`, `0x1124f5`,
+  `0x112509`). None of those sites touches `blob+0x5d4..0x664`. It does **not**
+  map onto `GL_OP_TEXM3X3_REFLECT_MTX`.
+* `GL_ARB_texture_env_dot3` needs no TA op. The only TA writer outside the
+  `GL_MTX` API is `GL 0x10da50`, and its six call sites (0x10df79/84/8f,
+  0x10e146/151/15c) are driven purely by which source *registers* an ALU
+  sub-instruction reads, so `DOT3_RGB(A)` produces descriptor opcode 1 (plain
+  fetch) plus the ALU `DP3` of §12.2.6.
+
 #### 12.2.8 Two loose ends on the GL side
 
 * `useC1Flag` — `0x113700` stores it in bit 7 of `hw+0x77a` (part of the cache
@@ -1479,7 +1573,7 @@ Absent (zero occurrences in the binary): `GL_NV_register_combiners`,
   disabled, the `c0` upload (command 0x48) for a `GL_BLEND` or `GL_CONSTANT`
   stage is skipped. Worth reproducing on hardware before copying the logic.
 
-## 12.3 Hardware ground truth — the blob in `captures/glsweep-0528-raw.txt`
+### 12.3 Hardware ground truth — the blob in `captures/glsweep-0528-raw.txt`
 
 `captures/glsweep-0528-raw.txt` is a live capture from a 0x0528 board running
 the vendor stack (`tools/parhelia-glsweep.c`). Its **region 2 is the ICD →
@@ -1531,10 +1625,11 @@ The **TA descriptors** in all three blobs:
                   TA[1..3] = {0, 1, 0,0,0,0,0,0,0}
 ```
 
-i.e. `+0x00 = 1` (`GL_OP_TEX_MTX`) on the sampled unit and `0`
-(`GL_OP_TEX_NOP_MTX`) elsewhere, `+0x04 = 1` everywhere, `nDeps = 0`,
-`blob+0x5cc = 0`. This matches §9.5 exactly and is the hardware confirmation
-that `+0x00` is the opcode and `+0x04` is a separate flag.
+i.e. `+0x00 = 1` — internal code 1, `GL_OP_TEX_MTX`, hardware opcode 0x00 — on
+the sampled unit and `0` (`GL_OP_TEX_NOP_MTX`) elsewhere, `+0x04 = 1`
+everywhere, `nargs-1 = 0`, no hints, `blob+0x5cc = 0`. This matches §9.5 field
+for field and is the hardware confirmation that `+0x00` is the opcode, `+0x04`
+is a separate flag, and `+0x5cc` is the hints-valid flag.
 
 Framing notes for the decoder (`tools/parhelia-glsweep-decode.py` currently
 reports 0x008..0x790 of `tex_tri_nearest` as one 1928-byte `UNDECODED BLOCK`):
@@ -1641,14 +1736,20 @@ the right registers but several wrong fields. Superseded claims:
    `GL_COMBINE`-function → IR-opcode jump table (§12.2.6). The ALU-class table
    in the previous revision was a misreading and has been removed.
 13. **"The texture-address opcodes could not be determined" (§9.4 as of the
-   2026-09-05 rewrite).** Superseded: the opcode encoding *is*
-   `GL_OP_TEX*_MTX token − 0x8A8E`, and the descriptor layout is
-   `{opcode, sample-flag, nDeps, dep[]}` — §9.5. What remains unknown is only
-   the engine register (§9.5.6). The place to look was the **kernel**, not
-   libGL or MTXPARD: `KRN mtx2132` / `mtx1652` and the `.data` tables
-   `mtx1411` / `mtx3585`.
-14. **"`blob+0x5cc` is a zero byte."** It is a **mode selector** that changes
-   how the tail of every TA descriptor is read (§9.5.5).
+   2026-09-05 rewrite).** Superseded: §9.5 recovers the descriptor layout, the
+   `GL_MTX` API that writes it, the GL-token → internal → hardware opcode
+   translation, the arity and channel-mask tables, and the bump-coefficient
+   location. What remains unknown is only the engine register (§9.5.7). The
+   places to look were the **`glTexAddress*MTX` entry points** in libGL and the
+   **kernel** object's symbol table — not MTXPARD, and not libGL's
+   fixed-function generator, which only ever emits a plain fetch.
+14. **"`blob+0x5cc` is a zero byte."** It is the **"sampling hints are valid"**
+   flag: 0 from the fixed-function generator, 1 from `glTexAddressHintsMTX`
+   (§9.5.1).
+15. **`GL_OP_TEX*_MTX` is not a straight `token − 0x8A8E`.** libGL translates
+   through a 16-entry jump table with a hole at internal code 11, and the
+   kernel translates again through `mtx1411`. Both permutations matter
+   (§9.5.2).
 
 ---
 
@@ -1657,18 +1758,19 @@ the right registers but several wrong fields. Superseded claims:
 Stated explicitly rather than guessed:
 
 * **The engine register (if any) that carries a texture-address descriptor.**
-  The opcodes and the descriptor layout are now recovered (§9.5) but nothing in
-  the kernel emits a TA record into the DMA stream the way `mtx530` emits
-  combiner slots; TA records dissolve into a pipeline-state block at
-  `ctx+0x54` (10 stages x 130 bytes) and into texture-unit bindings. The last
-  step needs either a disassembly of whatever consumes that block or a hardware
-  capture of a bump-mapping / dependent-read draw.
-* **`mtx1600`'s per-class value 0-3** (`record+0x94`) and the `blob[0x5cc]==1`
-  descriptor flavour with its three 4-entry tables `mtx1864`/`mtx2559`/`mtx1674`
-  (§9.5.5).
-* **The `GL_TEXBEM_MATRIX_MTX` coefficient registers.** No candidate found;
-  the one register block that would fit (`0x1220`-`0x123c`) is the 2D surface
-  descriptor array (§9.5.4).
+  The opcodes, the descriptor layout and the per-opcode tables are now
+  recovered (§9.5), but nothing in the kernel emits a TA record into the DMA
+  stream the way `mtx530` emits combiner slots; TA records dissolve into a
+  pipeline-state block at `ctx+0x54` (10 stages x 130 bytes) and into
+  texture-unit bindings. `0x1200+unit*4[23:19]` is a strong lead (§9.5.7) but
+  is **not** decoded. The last step needs either a disassembly of whatever
+  consumes that block or a hardware capture of a bump-mapping / dependent-read
+  draw.
+* **The `GL_TEXBEM_MATRIX_MTX` coefficient registers.** The coefficients are
+  located in software (`record+0x68`/`+0x6c`/`+0x70`, `0x800` = 1.0) but the
+  register they end up in was not found (§9.5.5).
+* **Which of `0x11c4`'s first two 3-bit fields is min and which is mag**
+  (§9.5.6 / §11.4) — the two kernel tables that feed them are identical.
 * **`0x126c` bit 16.** No writer anywhere, yet it is deliberately *preserved*
   by every packer and by the X driver's mask `0xff05fffd` — so it is a real
   field of unknown purpose. Bit 15 and bits 25-31: no writer either.
@@ -1715,14 +1817,16 @@ separate-alpha flag decides whether the second is emitted. This replaces the
 previous revision's guesswork about write masks and pipes.
 
 The **texture-address / dependent-read half of the ISA is now mostly
-recovered** (§9.5). The descriptor layout, the opcode encoding
-(`GL_OP_TEX*_MTX − 0x8A8E`), the per-opcode channel masks and the
-stage-dependency mechanism all come out of the kernel object with symbols, and
-the fixed-function case is confirmed against hardware (§12.3). Texture
-addressing is a **dependency graph of at most four descriptors that consume
-shader instruction slots**, not a second instruction stream and not fixed
-function. What is still missing is the final lowering step: which register (or
-which bits of the texture-unit state) the descriptor becomes.
+recovered** (§9.5). The 0x24-byte descriptor is fully decoded, the GL →
+internal → hardware opcode translation is pinned by two independent tables in
+two binaries, the per-opcode channel masks and arities cross-check each other,
+the bump coefficients are located in software, and the fixed-function case is
+confirmed against hardware (§12.3). Texture addressing is a **dependency graph
+of at most four descriptors that consume shader instruction slots**, not a
+second instruction stream and not fixed function; `arg0` names the destination
+stage and `arg1..argN` its sources, strictly decreasing. What is still missing
+is the final lowering step: which register (or which bits of the texture-unit
+state) the descriptor becomes.
 
 The **fixed-function lowering is fully mapped** (§12.2) and is the right place
 to start an open driver: six modes, at most one instruction per texture unit,
