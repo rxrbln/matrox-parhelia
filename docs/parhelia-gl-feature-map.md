@@ -415,3 +415,64 @@ the buffer (`0x0cc` → reg 0x1298 = 2048.0f, `0x0d4`… → regs 0x1100–0x117
 0xffffffff) and must print `PASS`, then prints the per-op record stream and the
 per-feature delta against the `tri_flat` baseline.  To extend coverage, fix the sweep so it survives past
 `lighting` and re-capture — texturing is the largest gap.
+
+## 8. Texturing — CAPTURED (supersedes the coverage caveat in the header)
+
+The texture operations were captured once the harness was linked with `-lm`
+(see the appendix in docs/parhelia-kernel-abi.md). The sweep now completes all
+33 operations. Raw: `captures/glsweep-0528-raw.txt`, plus three controlled
+variants used to identify fields: `captures/tex_32x16_0.txt`,
+`captures/tex_64x64_0.txt` (RGBA), `captures/tex_64x64_1.txt` (RGB).
+
+### Where texture data goes  [HW]
+
+Texture pixels land in **region 6, the 4 MB heap** — the region previously
+recorded as "not used per draw". They appear at **first use, not at upload**:
+`tex_upload` changes nothing, and `tex_tri_nearest` changes exactly **16384
+bytes = 64 x 64 x 4**.
+
+That byte count is itself a result: a 64x64 texture occupies 16384 bytes for
+**both** `GL_RGB` and `GL_RGBA`, i.e. **the driver stores 32 bits per texel
+regardless of the requested internal format**. This matches ioquake3 reporting
+"texture bits: 32" on this hardware.
+
+### The texture descriptor record  [HW]
+
+`tex_tri_nearest` carries a descriptor in the region 2 command stream. Fields
+identified by differential capture — changing exactly one property at a time:
+
+| Offset | 64x64 | 32x16 | Meaning |
+|---|---|---|---|
+| +0x08/+0x0c | 0xffffc200_008a8004 | (varies) | 64-bit kernel pointer to the texture object |
+| +0x2c | 0x40 | **0x20** | **width** |
+| +0x30 | 0x40 | **0x10** | **height** |
+| +0x34 | 1 | 1 | level count / depth (constant here) |
+
+Width and height are plain dword counts, not encoded log2 or pitch values.
+
+**No format field was found.** Two runs identical in every respect except
+`GL_RGB` versus `GL_RGBA` produce **byte-identical descriptors** (only the
+kernel pointer differs, and that varies run to run anyway). Consistent with the
+32-bit-always storage above: at this level there is nothing to distinguish them.
+
+### Texturing's effect on vertex and pipeline state  [HW]
+
+- **Vertex stride grows to 32 bytes (8 floats)** for a textured triangle, from
+  24 bytes untextured. Note this contradicts the prediction of 28 bytes from the
+  ICD's static stride table for a 2-float texcoord — the ICD selected the
+  12-byte texcoord entry, not the 8-byte one.
+- **PIPELINE-KEY gains bit 0x20000** when texturing is enabled: `0x20011`
+  textured versus `0x11` untextured. The key drops back to `0x11` after
+  `glDisable(GL_TEXTURE_2D)`.
+
+### Still not decoded
+
+`tex_tri_nearest` carries a **1928-byte block** the decoder cannot frame, which
+contains the sampler state proper (filter, wrap, base address, pitch). The
+per-feature deltas that should isolate those are small — `tex_linear` 48 bytes,
+`tex_repeat` 28 bytes, `tex_env_modulate` 12 bytes in region 2 — but they decode
+as record payload rather than `(index, value)` pairs, and do **not** name any of
+the texture registers recovered statically (0x11c0 wrap, 0x11c4 filter, 0x11dc
+base, 0x11e0 control, 0x11e4 height). So either those registers are written
+through a path this capture does not see, or the static register assignment is
+wrong. Unresolved — do not assume either.
