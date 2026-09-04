@@ -103,7 +103,9 @@ vertex-list triangle** (kernel uses `0xc07`) — the T&L primitive that carries
 per-vertex colour, no texture needed. (0x4c2 = opcode 2 = textured trapezoid, the
 2D DPS path.) **Fire:** write the draw-fence `0x12bc` with a running index
 (stepped by 8); `ExecuteEmulDma` special-cases it (reads 0x450/0x41c, writes
-0x384 — the soft-trap that kicks rasterisation).
+0x384 - DMAPAD, a write-combining pad; the earlier 'soft-trap that kicks
+rasterisation' reading is WRONG, corrected 2026-09-05 from the kernel
+disassembly).
 
 **Primitive types:** the hardware draws only triangles; strip/fan/lines/points
 are decomposed to triangles in software by the GL layer.

@@ -63,10 +63,17 @@ Generic packet form: `[header][payload...]`, header = `(opcode << 24) | count`.
 +0x08  last         one-past-end vertex index
 ---- second packet ----
 +0x0c  0x00000002   REGISTER-WRITE list, 2 registers
-+0x10  0x21212425   index bytes 0x25, 0x24, pad, pad
++0x10  0x21212425   index bytes 0x25, 0x24, then 0x21 = END-OF-PACKET
 +0x14  fence value  -> reg 0x1094
 +0x18  fence addr   -> reg 0x1090
 ```
+
+**Index 0x21 TERMINATES the packet — it is not a filler (CONFIRMED from the
+kernel's own stream interpreter).** The next dword after a 0x21 is read as a new
+header, which is why packets can be short. The pad/no-op that *can* sit in the
+middle of a tag is **index 0x20 (reg 0x1080, DMAPAD)**. Getting these two the
+wrong way round produces a stream the engine mis-parses, so: 0x20 to fill, 0x21
+to end.
 
 **Count semantics differ per opcode (CONFIRMED):** a draw header's low 16 bits
 accumulate +2 per appended range and are decremented once at flush, so on the

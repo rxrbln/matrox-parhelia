@@ -48,7 +48,7 @@ R 0x0450            ; fence read
 W 0x10b0 0x00000010
 W 0x12b8 0x00070601 ; <-- the engine-arm value we RE'd, CONFIRMED live
 R 0x0300 ; W 0x0300 0x1f0b0140
-W 0x0384 0x0        ; soft-trap
+W 0x0384 0x0        ; DMAPAD (write-combining pad), NOT a soft-trap
 W 0x0308 0x00000083
 ```
 
@@ -84,3 +84,7 @@ W 0x0408 ... 0x146003c3    ; each write submits one command packet
 - Modeset (record modprobe+startx) = display bring-up sequence.
 - The command-buffer contents for a draw (the tokenised packet stream).
 - 2D accel ops, DDC, dual-head - each via the same method.
+
+## Correction: 0x384 (2026-09-05)
+
+`0x384` is **DMAPAD**, a write-combining erratum pad — NOT a soft-trap (corrected 2026-09-05 from the kernel disassembly). Rule: write `0x384 = 0` whenever the previous register write offset was within 128 bytes *below* the new one; a register *read* resets the tracker and suppresses the next pad.

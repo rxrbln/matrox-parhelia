@@ -18,7 +18,7 @@ Fire a primitive with the draw-fence `0x12bc`. See `parhelia-3d-driving.md` §1.
 **DMA ring — what the vendor GL actually does** (live mmiotrace,
 captures/mmio-draw-0528.txt), superseding the arm-path sketch previously here:
 per draw, arm the engine (`0x12b8=0x00070601`, `0x10b0=0x10`, `0x300=0x1f0b0140`,
-`0x384=0` soft-trap, `0x308=0x83`), then submit via **`0x404` = PRIMADDRESS =
+`0x384=0` DMAPAD (not a soft-trap), `0x308=0x83`), then submit via **`0x404` = PRIMADDRESS =
 command-buffer bus address** and **`0x408` = PRIMEND = `end|3`** written once per
 ~0x20-byte packet (low 2 bits = DMA mode 3 is the trigger); `0x314=1` kicks, poll
 `0x8f0`/`0x450`. Note `0x404` is the *start*, `0x408` the *end* — the earlier

@@ -57,7 +57,8 @@ blend in 2D path).
 
 ## 4. 3D / WARP — submission CAPTURED, command content = next
 GROUND-TRUTH draw MMIO (captures/mmio-draw-0528*.txt): per draw =
-- **arm**: 0x12b8=0x70601, 0x10b0=0x10, 0x300=0x1f0b0140, 0x384=0 (soft-trap),
+- **arm**: 0x12b8=0x70601, 0x10b0=0x10, 0x300=0x1f0b0140, 0x384=0 (DMAPAD, NOT a
+  soft-trap - see docs/parhelia-kernel-abi.md),
   0x308=0x83 (done twice).
 - **submit via DMA RING**: 0x404=cmdbuf-bus-addr, then 0x408=end|3 written
   repeatedly (end advances 0x20/packet). This is the RE'd ring

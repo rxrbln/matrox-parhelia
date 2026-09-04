@@ -139,6 +139,7 @@ docs/parhelia-3d-driving.md "Address-space caveat".
 
 ### Submission (mmiotrace, captures/mmio-draw-0528*.txt)
 Per draw: arm `0x10b0=0x10`, `0x12b8=0x00070601`, `0x300=0x1f0b0140`, `0x384=0`
+(DMAPAD, not a soft-trap)
 (soft-trap), `0x308=0x83`; submit `0x404` = command-buffer bus address, then
 `0x408 = end|3` repeatedly (end advances 0x20/packet); `0x314=1` kicks; poll
 `0x8f0`/`0x450`. The **0x91c FIFO carries the WARP microcode ROM once at init
