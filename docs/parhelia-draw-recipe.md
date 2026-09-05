@@ -1504,3 +1504,32 @@ headers as register pairs. The framing used here is the one described in §0:
 `(opcode, count)` plus `count` elements of the per-opcode stride, validated by
 requiring the stream to end exactly at `region0 + 0x230`. Any re-implementation
 should keep that check as its self-test — it is what caught every mis-framing.
+
+## Verification notes from the main session
+
+**The CLEAR rect form is static-only, not yet proven on hardware.** Two
+independent reverse-engineering passes read the last four dwords of the CLEAR
+record as corners `(x1, y1, x2, y2)` rather than `(x, y, w, h)`, which is good
+static support. But our captures **cannot distinguish the two**: every captured
+clear covers the whole 256x256 window, where both readings give the identical
+`0, 0, 0x100, 0x100`. Decoded payload:
+
+```
+clear_color  mask=1 argb=ff000000 depth=3f800000 stencil=0 accum=80808080
+             rect = 0x0 0x0 0x100 0x100
+```
+
+The experiment that settles it is one line in the sweep harness: clear a
+**sub-rectangle** (say 32,48 to 96,144) and read the four dwords back. Until
+then, treat the corner reading as INFERRED.
+
+The same payload independently corroborates a separate finding: the fifth dword
+`0x80808080`, long recorded as a mystery constant, sits exactly where an
+accumulation-buffer clear value belongs.
+
+**Confirmed by three independent passes**, and therefore safe to build on: the
+region-2 records are `[key][count]` headers followed by typed or paired payload,
+and the region-2 indices are GL state slots rather than MMIO register offsets.
+This recipe, the render-target pass and the fragment-operations pass reached
+that conclusion separately, and a mechanical re-walk of a capture consumes a
+stream exactly under that grammar.

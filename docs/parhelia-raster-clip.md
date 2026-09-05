@@ -743,9 +743,61 @@ Note bank-B index `0x1C` and bank-A index `0x1C` (fog enable, capture-confirmed)
 are different registers — the cleanest single proof that the two banks are
 distinct address spaces (§1).
 
-### Polygon offset
+### Polygon offset — a hardware feature, five registers, values unscaled
 
-*(pending — see §14)*
+`glPolygonOffset` is vtable slot +0x130 → `0x123850` → `0x1ce100`, which is just
+
+```
+1ce100: movss DWORD PTR [rdi+0x1c],xmm0   ; factor -> state+0x9fc
+1ce105: movss DWORD PTR [rdi+0x20],xmm1   ; units  -> state+0xa00
+```
+
+plus `or DWORD PTR [ctx+0x10],0x4` — dirty bit 2. CONFIRMED. Completing the
+polygon-state object of §9:
+
+| offset in `state+0x9e0` | field |
+|---|---|
+| +0x16 / +0x17 / +0x18 | `GL_POLYGON_OFFSET_FILL` / `_LINE` / `_POINT` enable bytes |
+| +0x1c | offset **factor** (float) |
+| +0x20 | offset **units** (float) |
+
+(`+0x16` = `GL_POLYGON_OFFSET_FILL` is CONFIRMED against `glIsEnabled`
+`0x1276ff`; the `_LINE`/`_POINT` assignment of `+0x17`/`+0x18` is INFERRED from
+the emission order below.)
+
+The validation branch at `0x11256d` emits the depth range and then five bank-B
+records back to back (CONFIRMED, all `opcode 0x05`, elemsize 8):
+
+| bank-B index | source | value |
+|---|---|---|
+| 0x15 | `poly+0x1c` | offset factor, **raw IEEE float** |
+| 0x16 | `poly+0x20` | offset units, **raw IEEE float** |
+| 0x17 | `poly+0x18` | offset enable (point) |
+| 0x18 | `poly+0x17` | offset enable (line) |
+| 0x19 | `poly+0x16` | offset enable (fill) |
+
+Two conclusions. **The offset is applied by the hardware, not the CPU** — which
+matches the vendor switch `regOGLPolygonOffset` ("(0) Disables use what is
+available / (1) Enables Hardware PolygonOffset", default TRUE) — and **the
+driver does no scaling at all**: `factor` and `units` are copied through as the
+application gave them, so the implementation-dependent `r` (the smallest
+resolvable depth difference, `1/2^24` for a 24-bit buffer) and the
+maximum-depth-slope term `m` are both computed in silicon. No `5.96e-8`
+constant or equivalent exists anywhere on this path. CONFIRMED by absence over
+the whole emission chain.
+
+The coupling with the depth range is deliberate: when dirty bit 2 (polygon
+offset) is set, the generic depth-range emission at `0x1118b1`/`0x112833` is
+**skipped**, because this block re-emits it (`0x112577`) immediately before the
+offset registers. An open driver should treat depth range and polygon offset as
+one state group.
+
+Under the bank-B ⇒ `0x1000+index*4` assumption these would be 0x1054–0x1064 —
+but bank-A already has capture-confirmed, unrelated meanings at 0x1058
+(cull), 0x105C (depth func), 0x1060 (alpha ref) and 0x1064 (alpha func), so
+either bank B has a different base or a different stride. **Do not guess the
+MMIO addresses**; this is the cleanest available test case for pinning bank B's
+base with one capture (§14).
 
 ### Fill rules and subpixel precision
 
@@ -787,30 +839,58 @@ thought to carry them is the near/far pair (§5). What exists is:
   the viewport height squared (§3).
 
 **The software takeover threshold** is in `GLPrimitiveSoftwareClipDispatch::
-ValidateState` (`0xea660`), and there are two regimes selected by the boolean
-`state+0xaac` — which corresponds to the `regOGLWideLines` switch
-("(0) Disables (software support) (1) Enables (hardware support)", default TRUE):
+ValidateState` (`0xea660`). Line state lives at `state+0xaa0`: `+0x08` = width
+(float), `+0x0c` = a boolean that selects between two regimes — most plausibly
+`GL_LINE_SMOOTH` [INFERRED], since it is exactly the flag that makes any
+non-unit width matter:
 
 | `state+0xaac` | test | result |
 |---|---|---|
-| non-zero (hw wide lines) | `lineWidth != 1.0f` (`0xea6ea`) | `Clip_Line_to_Wideline` |
-| zero (sw only) | `lineWidth >= 1.5f` (`0xea8f6`, `.rodata 0x36ad04 = 1.5f`) | `Clip_Line_to_Wideline` |
-| | otherwise | `Clip_Line_to_Line` (hardware 1-pixel lines) |
+| non-zero | `lineWidth != 1.0f` (`0xea6ea`) | `Clip_Line_to_Wideline` |
+| zero | `lineWidth >= 1.5f` (`0xea8f6`, `.rodata 0x36ad04 = 1.5f`) | `Clip_Line_to_Wideline` |
+| | otherwise | `Clip_Line_to_Line`, hardware 1-pixel lines |
 
-CONFIRMED. **1.5f is the threshold**, i.e. widths that round to 1 stay on the
-hardware path. Points are handled the same way: `pointSize != 1.0f`
-(`0xea717`) selects `Clip_Point_to_Sizedpoint` instead of `Clip_Point_to_Point`,
-and `Tri_to_Sizedpoint` / `Tri_to_Wideline` are the polygon-mode-POINT/LINE
+CONFIRMED. **1.5f is the threshold** in the ordinary case: widths that round to
+1 stay on the hardware path. Points work the same way — `pointSize != 1.0f`
+(`0xea717`) selects `Clip_Point_to_Sizedpoint` — and `Tri_to_Wideline` /
+`Tri_to_Sizedpoint` are the `glPolygonMode(GL_LINE)` / `(GL_POINT)`
 equivalents. CONFIRMED.
 
-`LineToWideLine_CopyToVertexBuffer` (assert text `iLineWidth > 1` at
-`.rodata:0x36ad50`, assert site `0xe77c7`) is the expansion itself. It takes an
-integer width and writes **window-space** vertices — which is why the capture
-sees the wide-line path alone using the 32-byte
-`[x_win][y_win][z][w][r][g][b][a]` vertex format: the CPU has already applied
-the viewport transform (`0xe77e0`, §3) because it must offset in pixels.
+**The expansion, exactly.** `LineToWideLine_CopyToVertexBuffer` starts at
+`0xe7190` (assert `iLineWidth > 1`, `.rodata:0x36ad50`, site `0xe77c7`):
 
-*(exact expansion geometry — pending, see §14)*
+```
+e71f7   xmm4 = lineWidth                       ; state+0xaa8
+e7240   [rsp+0x67] = (|dx| >= |dy|)            ; major axis
+e7245   if (state+0xaac != 0) goto e74e1       ; smooth/perpendicular variant
+e7252   xmm4 += 0.5f                           ; .rodata 0x36acf4
+e725a   N = (int)xmm4                          ;  N = round(width)
+e725e   [rsp+0x60] = N
+e7262   if (N-1 <= 0) assert-fail
+e7285   [rsp+0x5c] = (N-1)/2                   ; dec / shr 31 / add / sar 1
+        loop k = 1 .. (N-1)/2 : emit line at -k and at +k
+        if (N & 1) == 0 : emit one more at -(N/2)
+```
+
+The offset is subtracted from **y** for an x-major line and from **x** for a
+y-major line (the two loop bodies at `0xe7391` and `0xe749c`, selected by
+`[rsp+0x67]`); `0xe774d` is the "−k" body, `0xe73ae`/`0xe73ba` the "+k" one.
+
+So for **width 4**: `N = 4`, `(N−1)/2 = 1`, giving the base line, `−1`, `+1`,
+and — because `N` is even — one extra at `−2`. Offsets `{0, −1, +1, −2}`.
+That is **precisely** the captured
+`y = 115.2, 114.2, 116.2, 113.2` for a nominal `y = 115.2`. CONFIRMED, in both
+directions: the code predicts the capture and the capture pins the code.
+
+When `state+0xaac != 0` the driver instead builds a true perpendicular offset:
+`0xe7501`–`0xe7679` normalises `(dx, dy)` with `pow(dx²+dy², e)`
+(`.rodata:0x3697b8`) and displaces both endpoints by `±width/2` along the
+normal. CONFIRMED as the code path; not exercised by any capture.
+
+The expansion writes **window-space** vertices — it has to, because it offsets
+in pixels — which is exactly why the capture sees this path alone using the
+32-byte `[x_win][y_win][z][w][r][g][b][a]` vertex format, having applied the
+viewport transform on the CPU first (`0xe77e0`, §3).
 
 ---
 

@@ -1,0 +1,691 @@
+# Parhelia GL capability limits and the state-validation path
+
+What the vendor OpenGL ICD declares the hardware can do, what it actually
+enforces, what the Windows Direct3D driver declares for the *same silicon*, and
+how a GL state change becomes a hardware pipeline configuration.
+
+Sources, all read directly:
+
+* `matroxdriver-x86_64-cvs-20090511/opengl6/lib64/libGL.so.1.3.0` — the Linux
+  ICD (ELF64, stripped but with C++ RTTI names). Disassembly:
+  `scratchpad/libGL64.asm`. Section note: `.rodata` has vaddr == file offset;
+  `.data` and `.data.rel.ro` have vaddr = file offset + 0x200000.
+* `matroxdriver-x86_64-cvs-20090511/kernel/mtx_parhelia.o` — the kernel module,
+  **with symbols** (`mtxNNNN`). Disassembly: `scratchpad/mtxk.asm`.
+* `xddm32_210_00_105_se_u_nowhql/MtxPar/MTXPARD.dll` — the Windows XPDM D3D
+  driver. Disassembly: `scratchpad/pard.asm`.
+* `captures/glsweep-0528-raw.txt` — the live 33-op sweep on a Parhelia 0x0528,
+  decoded in `docs/parhelia-gl-feature-map.md`.
+
+Tags: **[CONFIRMED]** = read out of the code/data, or two independent sources
+agree; **[INFERRED]** = best reading, self-consistent but not proven;
+**[AMBIGUOUS]** = unresolved, do not build on it.
+
+Scope note: the M9 (0x0540) is a different render engine and is not covered.
+
+---
+
+## 1. The PIPELINE-KEY — decoded
+
+**It is a bitfield: a packed vertex-format / pipeline descriptor.** Not a hash,
+not a program handle, not an index into a table of pipeline configurations. Every
+field is a small integer describing one vertex attribute slot, and the record's
+other five dwords are constants. The decode below accounts for **all six** key
+values in the live capture and for their vertex strides, exactly.
+
+### 1.1 The record
+
+`docs/parhelia-gl-feature-map.md` §2 records it as `(0x07, 1)` + 6 dwords
+`{key, 0, 0, ffffffff, ffffffff, ffffffff}`. Both halves of the stack agree on
+that shape [CONFIRMED]:
+
+* ICD: emitted by `reserve(buf, opcode=0x07, elemsize=0x18, count=1)` — two emit
+  sites, `libGL64 0xc5113` (fixed-function path) and `0xf3461`
+  (`GLPrimitiveSoftware` path). Both copy six dwords from a cached struct.
+* Kernel: command-list opcode 0x07 → handler `.text+0x45d02` → `mtx651`
+  (`0x471c0`) → **`mtx1763` (`0x1b8d0`)**, which copies exactly **24 bytes**
+  into the device state block at `+0x1e04` and sets dirty bit 0x20 in the byte
+  at `+0x1bec`. The interpreter then advances the stream by `count*3` qwords
+  (`0x45ce1`), i.e. 24 bytes per element — matching `elemsize` on the ICD side.
+
+The reset value of that block (`mtx2556`, `0x1bbbd`) is
+`{0, 0, 0, -1, -1, -1}` with a 2-bit field at key bits[30:29] forced to 2
+(`byte3 = (byte3 & ~0x60) | 0x40`). The ICD's shadow copy is initialised to
+`{0xffffffff, 0, 0, -1, -1, -1}` at `libGL64 0x10adb0` so the first draw always
+emits. The three `0xffffffff` dwords are therefore just the *default* of three
+further descriptor fields that the fixed-function and software paths never
+change [CONFIRMED that they are defaults; their meaning is [AMBIGUOUS] — most
+likely bound-stream or bound-shader handles, since the hardware-vertex-shader
+path is the only one that could set them].
+
+### 1.2 Key bit layout
+
+Recovered from three independent places that all agree:
+
+* the fixed-function builder `libGL64 0xc3f20` (key lives at `ctx+0xa560`),
+* the `GLPrimitiveSoftware` builder `libGL64 0xf30e0` (key at `obj+0x25b0`),
+* the matching per-vertex writer `libGL64 0xf37b0`, which walks the same fields
+  to decide what to store per vertex — this is what pins each field to a real
+  attribute and a real byte count.
+
+| bits | field | values seen | vertex cost |
+|---|---|---|---|
+| [1:0] | **position format** | 0 = `x,y`; 1 = `x,y,z`; 2 = `x,y,z,w` | 8 / 12 / 16 B |
+| [3:2] | **normal** | 0 = absent, 1 = present (`nx,ny,nz`) | 0 / 12 B |
+| [6:4] | **diffuse colour** | 0 = absent, 1 = `r,g,b`, 5 = `r,g,b,a` | 0 / 12 / 16 B |
+| 7 | unused in every path seen | 0 | — |
+| [10:8] | **secondary / specular colour** | 0 = absent; 1 (fixed-function) / 5 (software) = present | 0 / 16 B |
+| 11 | software-T&L / pre-transformed marker | set only by the `GLPrimitiveSoftware` builder | — |
+| [15:12] | unused | 0 | — |
+| [18:16] | **texcoord set 0** | 0 = stage off, else component count (2 fixed-function, 4 software) | n × 4 B |
+| [21:19] | **texcoord set 1** | same | |
+| [24:22] | **texcoord set 2** | same | |
+| [27:25] | **texcoord set 3** | same | |
+| 28 | one extra 32-bit per-vertex attribute (packed dword) | from `obj+0x2688` | +4 B |
+| [30:29] | 2-bit selector, kernel default 2, fixed-function sets 1 | | [AMBIGUOUS] |
+
+The four texture-stage shifts **{16, 19, 22, 25}** are not inferred — they are
+read from literal tables in `.rodata`: `0x36ada0` (used by the software builder,
+`0xf31a5` and `0xf3895`) and `0x369830` (used by the fixed-function builder,
+`0xc4112`). Both contain `16, 19, 22, 25` [CONFIRMED].
+
+Field values [3:2], [6:4] and [10:8] are *codes*, not component counts — the
+builder ORs in a constant per case (`|1`, `|5`, `|0x12`, …) and later uses the
+code as an index into a table of per-attribute copy routines
+(`obj+0xb0d0`, `obj+0xb3b0`, `obj+0xb7d0` at `0xc4002`, `0xc408e`, `0xc4128`).
+Only the four texture fields hold a literal component count.
+
+### 1.3 Every captured key, decoded
+
+| key | position | normal | diffuse | tex | components | stride | capture |
+|---|---|---|---|---|---|---|---|
+| `0x00000010` | `x,y` | – | RGB | – | 2+3 = 5 | **20** | plain ✓ |
+| `0x00000011` | `x,y,z` | – | RGB | – | 3+3 = 6 | **24** | depth ✓ |
+| `0x00000051` | `x,y,z` | – | RGBA | – | 3+4 = 7 | **28** | blend ✓ |
+| `0x00000005` | `x,y,z` | yes | – | – | 3+3 = 6 | **24** | lighting ✓ |
+| `0x00020011` | `x,y,z` | – | RGB | set0 = 2 | 3+3+2 = 8 | **32** | textured ✓ |
+| `0x00000852` | `x,y,z,w` | – | RGBA | – | 4+4 = 8 | **32** | wide line ✓ |
+
+Every stride in `docs/parhelia-gl-feature-map.md` §4 falls out of the bit
+decode with no free parameters [CONFIRMED]. This also disposes of the
+"not a monotonic bitmask / lighting drops bit 4" puzzle: bit 4 is not a flag, it
+is the low bit of the 3-bit **diffuse colour** field, and lighting has no
+diffuse colour in the vertex — it has a normal instead, in the [3:2] field.
+
+The strides are not derived after the fact either: the builders accumulate the
+byte count into `obj+0x25d0` alongside the key (`+0x20` base, `+0x10` per active
+texture stage, `+0x10` for secondary colour, `+4` for the bit-28 attribute —
+`0xf3159`, `0xf31f3`, `0xf319e`, `0xf3216`), and that same word is what the
+`(0x08, 1)` vertex-format record carries at payload offset `+0x10` (`0xf3404`)
+— the field the capture calls "vertex stride in bytes" [CONFIRMED].
+
+### 1.4 The static template table — direct proof
+
+The fixed-function path does not always compute the key; for common vertex
+layouts it picks a **pre-built descriptor** from a table of function-local
+statics in `.bss`, each built once behind a `__cxa_guard`. Reading the
+constructors gives the key values literally:
+
+| descriptor | key | builder | decode |
+|---|---|---|---|
+| `0x69a860` | **0x00000051** | `0xc4744` | pos `xyz` + diffuse RGBA |
+| `0x69a880` | **0x00000011** | `0xc46b9` | pos `xyz` + diffuse RGB |
+| `0x69a8a0` | **0x00000005** | `0xc4597` | pos `xyz` + normal |
+| `0x69a8c0` | **0x00020005** | `0xc4500` | pos `xyz` + normal + texcoord0 (2) |
+| `0x69a8e0` | **0x00000015** | `0xc4475` | pos `xyz` + normal + diffuse RGB |
+| `0x69a900` | **0x00000001** | `0xc43ea` | pos `xyz` only |
+| `0x69a920` | **0x00120005** | `0xc4622` | pos `xyz` + normal + texcoord0 (2) + texcoord1 (2) |
+
+Each constructor writes the same 24-byte shape: key, two zero dwords, three
+`0xffffffff` [CONFIRMED]. Three of these keys (`0x05`, `0x11`, `0x51`) are
+byte-for-byte the values the live capture recorded, and `0x00020005` /
+`0x00120005` show the texture field taking the value **2 = two texcoord floats**
+at shift 16 and 19 — which is what makes `0x20011` in the capture readable at a
+glance.
+
+### 1.5 What the kernel does with it
+
+`mtx1763` stores the block and sets a dirty bit; **nothing in `mtx_parhelia.o`
+reads `+0x1e04` back** (the only three references to that offset are the one
+writer and two initialisers) [CONFIRMED]. So the pipeline key is *not* itself
+programmed into a register. It is the vertex-format contract between the ICD and
+the kernel's vertex-fetch setup, kept in the per-context shadow for state
+restore. An open driver reproduces its *effect* by agreeing on the vertex layout
+with its own vertex fetcher; it does not need to reproduce the encoding.
+
+---
+
+## 2. The command-record grammar (needed for everything below)
+
+The ICD builds its stream through two tiny helpers, and reading them settles
+several open questions in `docs/parhelia-gl-feature-map.md`.
+
+`reserve(buf, opcode, elemsize, count)` — **`libGL64 0x1c9c50`** [CONFIRMED]:
+
+1. if `buf[0x34]` is set, call the context's virtual `[0xb8]` to (re)open the buffer;
+2. if `write_ptr + 8 + elemsize*count` passes the end, **flush** (`0x1c9be0`);
+3. **if the previous record's opcode equals this one, just add `count` to its
+   header and append** — otherwise write a fresh `(opcode, count)` header and
+   remember it in `buf[0x28]`;
+4. return the payload pointer; `buf[0x30] = elemsize*count`.
+
+`commit(buf)` — **`0x1c9ad0`**: `write_ptr += buf[0x30]`.
+
+Consequences:
+
+* A "run of `(index, value)` pairs" in the capture is **one record** with a
+  large `count`, not many records. That is the coalescing in step 3.
+* `flush` (`0x1c9be0`) submits `[buf+0x18] .. write_ptr` through the device's
+  virtual `[0x60]`, then **rewrites the first two dwords of the buffer as
+  `(0x000000ff, 0x00000001)`** and points both the write pointer and the
+  "previous record" pointer at the buffer base (`0x1c9c13`–`0x1c9c28`).
+  **This is the "CLOBBERED first token" of `docs/parhelia-gl-feature-map.md`
+  §2** — it is not a clobber and not a lost record: it is a post-submit sentinel
+  whose only job is to make the opcode compare in step 3 fail, so the next
+  record cannot coalesce into a stale one. The capture reads the buffer after
+  the reset, so the *previous* stream's first record has already been
+  overwritten [CONFIRMED, and it removes the need to guess the first token].
+
+### 2.1 Complete opcode table
+
+Left: every `reserve()` call site in the ICD (279 of them), grouped by
+`(opcode, elemsize)`. Right: the kernel command-list interpreter `mtx558`
+(`0x44ef0`), whose 82-entry jump table at `.rodata+0x1b08` dispatches opcodes
+0x00–0x51 (opcodes with no handler fall to the default at `.text+0x452b8`).
+
+| op | elemsize | ICD sites | kernel handler | role |
+|---|---|---|---|---|
+| 0x05 | 8 | 53 | `mtx1734` `0x1abf0` | **render-state bank A**, index ≤ 0x1c |
+| 0x06 | 8 | 11 | `mtx3081` `0x1ae50` | **texture-stage state**, `(u16 group ≤ 10, u16 sub ≤ 10, u32)` |
+| 0x07 | 0x18 | 3 | `mtx651` → `mtx1763` | **PIPELINE-KEY** (§1) |
+| 0x08 | 0x20 | 2 | `mtx2530` | **vertex-format / attribute declaration** |
+| 0x0a | 0x48 | 2 | inline `0x45ad9` | |
+| 0x0c | 8 | 111 | `mtx2617` `0x19950` | **render-state bank B**, index ≤ 0xab; 0x101–0x200 = enable bitmap |
+| 0x0d | 0x20 | 4 | `mtx3074` | |
+| 0x0e | 8 | 34 | inline `0x459dc` | **texture-stage state array**, `(u16 group ≤ 10, u16 sub, u32)`, 130-byte structs at `+0xdd7` |
+| 0x12 | 0x10 | 4 | inline `0x45f5f` | vec4 / clip rect (shadowed at `+0xcd9`) |
+| 0x15 | 0x24 | 1 | inline `0x45d83` | **CLEAR** (9 dwords) |
+| 0x19 | 0x20 | 1 | `mtx790` | |
+| 0x1a | 0x18 | 1 | `mtx1314` | |
+| 0x1b | 0x28 | 1 | `mtx2196` | **DRAW** (10 dwords) |
+| 0x1c | 0xc8 | 1 | `mtx1385` | |
+| 0x20 | 0x44 | 6 | | matrix upload: slot + 16 floats |
+| 0x21 | **0x70** | 1 | `mtx227` | **light / material block — 112 bytes, not 120** |
+| 0x21 | 8 | 1 | | |
+| 0x22 | 0x48 | 1 | `mtx2441` | |
+| 0x23 | 0x10 | 1 | | 4 floats (light-model ambient) |
+| 0x24 | 8 | 1 | `mtx3554` | |
+| 0x25 | 0x14 | 2 | | |
+| 0x26 | 0x10 | 3 | | viewport rect |
+| 0x27 | 8 | 2 | | depth range (2 floats) |
+| 0x35 | 0x10 | 2 | | |
+| 0x36 | 8 | 1 | `mtx1688` | point size + line width (2 floats) |
+| 0x37 | 0x10 | 1 | `mtx2824` | |
+| 0x40 | — | 1 | `mtx2166` | bulk vertex data |
+| 0x41/0x42 | 8 | 1/2 | `mtx2488` | |
+| 0x44 | 0x30 | 1 | `mtx631` | |
+| 0x45 | **0x670** | 1 | `mtx3443` | shader microcode |
+| 0x46 | **0x678** | 5 | inline `0x453d1` | shader microcode (the 0x664-byte fragment program + header) |
+| 0x47 | 8 | 3 | `mtx2833` | |
+| 0x48 | 0x18 | 5 | | |
+| 0x49 | 0x14 | 2 | `LocMemCpy` | |
+| 0x50 | 0x20 | 1 | `mtx3996` | |
+| 0x51 | 8 | 1 | `mtx4017` | |
+
+Corrections this makes to `docs/parhelia-gl-feature-map.md` §2:
+
+* the light/material element is **0x70 = 28 dwords**, not 30;
+* the `(0x08,1)` payload is 0x20 bytes = 8 dwords, and the "mask" dword at
+  payload `+0x18` is the literal constant `0xffffffff` (`libGL64 0xf340a`);
+* `(0x08, N)` has a *second* shape: `libGL64 0xc4d40` emits `count =
+  [obj+0x170]` elements of 0x20 bytes copied from `obj+0x70 + i*0x20` — a real
+  attribute-declaration array, not a single descriptor.
+
+### 2.2 The record index is a render-state id, **not** an MMIO register index
+
+This is the most consequential correction in this document, and it is read
+straight out of the kernel.
+
+`docs/parhelia-gl-driver.md` and `docs/parhelia-gl-feature-map.md` §3 both model
+the `(index, value)` records as `MMIO reg = 0x1000 + index*4`. The kernel's
+handlers say otherwise [CONFIRMED]:
+
+* **op 0x0c** → `mtx2617` (`0x19950`): if `index ≤ 0x100` it is shadowed at
+  `ctx[0x10 + index*4]`, and if it changed, dispatched through a **172-entry
+  jump table at `.rodata+0xba0`** (`index ≤ 0xab`). Each entry writes a
+  *differently shaped* field — e.g. index 0x07 → `ctx+0xc9b` (dword) + dirty bit
+  0x4 at `+0xc87`; index 0x08 → a 2-bit field inside byte `ctx+0x1be4` + dirty
+  bit 0x80 at `+0x1bec`; index 0x09 → the top 2 bits of the same byte; index
+  0x16 → a 2-bit field in `ctx+0x1be5`. Indices `0x101..0x200` are not states at
+  all — they set/clear bits in an **enable bitmap** at `ctx+0x414`.
+* **op 0x05** → `mtx1734` (`0x1abf0`): `index ≤ 0x1c`, shadow `ctx[0x3a0 +
+  index*4]`, again a per-index jump table writing bitfields.
+* **op 0x06** → `mtx3081` (`0x1ae50`): a 2-D `(group, sub)` array at
+  `ctx+0xa74`, both ≤ 10 — D3D-style texture-stage state.
+* **op 0x0e** → inline (`0x459dc`): `(group ≤ 10, sub, value)` into 130-byte
+  per-stage structs at `ctx+0xdd7 + group*130`.
+
+Nothing in any of these paths touches MMIO. The register programming is a
+*second* pass in the kernel — `mtx3712` (`0x188f0`) walks the dirty words
+(`+0xc87`, `+0xc08`, `+0xd54`, `+0x1b44`, `+0xdbb`, `+0x1bd8`, …) and calls
+per-group updaters (`mtx698`, `mtx297`, …), and the resulting packets go out
+over the DMA ring. The live mmiotrace in `docs/parhelia-mmio-capture.md`
+independently shows **no** `0x1000+idx*4` writes at draw time — the geometry and
+state travel in the ring buffer.
+
+So the per-feature table in `docs/parhelia-gl-feature-map.md` §3 remains
+valuable and correct as *"GL call → driver render-state id → value"* — the
+GL-semantic mapping is real and hard-won — but the "= MMIO register 0x101c"
+column is an unproven relabelling. There are **four** index namespaces (banks
+0x05, 0x06, 0x0c, 0x0e), and the same numeric index means different things in
+each. An open driver must supply the second-stage translation itself; the
+kernel's jump tables are the specification for it.
+
+---
+
+## 3. The complete limit table
+
+### 3.1 How the ICD answers `glGet`
+
+`glGetString` `0x1aa2f0` tail-calls `0x120d40`:
+
+| query | value | where |
+|---|---|---|
+| `GL_VENDOR` | `"Matrox Graphics Inc."` | `.rodata 0x36be5a` |
+| `GL_RENDERER` | `"OpenGL Linux library for Parhelia"` | `.rodata 0x36be38` |
+| `GL_VERSION` | `"1.3 "` + `"ICD v1.03"` | literal `"1.3 "` at `0x120dfe`; the suffix is appended by `0x364ec8` — `movabs rdx,"ICD v1.0"` at `0x364ed4` plus `mov dword [end+8], 0x33` (`'3'`) at `0x364ee6` |
+| `GL_EXTENSIONS` | pointer in `0x65c930` | see §5 |
+
+The version string is a hardcoded constant with no chip dependency
+[CONFIRMED], and it matches the "1.3 ICD v1.03" ground truth exactly.
+
+`glGetIntegerv` `0x1a9ee0` dispatches through the per-context table slot
+`[ctx+0x688]`. There are four parallel implementations, one per type, all with
+the same binary-search-over-enum shape:
+
+| entry | address | common tail | invalid-enum |
+|---|---|---|---|
+| `glGetBooleanv` | `0x1340f0` | `0x13430c` | `0x134436` |
+| `glGetDoublev` | `0x137410` | `0x137606` | |
+| `glGetIntegerv` | **`0x13aa30`** | `0x13ac83` | **`0x13adb6`** |
+| `glGetFloatv` | `0x13dfa0` | `0x13e171` | `0x13e2b6` |
+
+The invalid-enum path sets `GL_INVALID_ENUM` (0x500) into `ctx+0xc` and returns
+without writing the caller's buffer. Each of the four answers the **same 256 enums** (extracted by walking the
+compare/branch ladder of each function; the two lists are identical).
+
+### 3.2 Constant limits [all CONFIRMED — read as immediates]
+
+| enum | name | int | float |
+|---|---|---|---|
+| 0x0D33 | `GL_MAX_TEXTURE_SIZE` | **2048** (`0x13df0b`) | 2048.0 (`0x141110`) |
+| 0x8073 | `GL_MAX_3D_TEXTURE_SIZE` | **2048** (`0x13bced`) | 2048.0 |
+| 0x851C | `GL_MAX_CUBE_MAP_TEXTURE_SIZE` | **2048** (`0x13c546`) | 2048.0 |
+| 0x84E2 | `GL_MAX_TEXTURE_UNITS_ARB` | **4** (`0x13c67b`) | 4.0 |
+| 0x84FF | `GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT` | **2** (`0x13d653`) | 2.0 (`0x140aa9`) |
+| 0x84FD | `GL_MAX_TEXTURE_LOD_BIAS_EXT` | **2** (`0x13dab8`) | 2.0 |
+| 0x0D3A | `GL_MAX_VIEWPORT_DIMS` | **4096, 4096** (`0x13ac73`) | |
+| 0x0D32 | `GL_MAX_CLIP_PLANES` | **6** (`0x13d48f`) | |
+| 0x0D30 | `GL_MAX_EVAL_ORDER` | 8 | |
+| 0x0B31 | `GL_MAX_LIST_NESTING` | 64 | |
+| 0x0D34 | `GL_MAX_PIXEL_MAP_TABLE` | 32 | |
+| 0x0D35 | `GL_MAX_ATTRIB_STACK_DEPTH` | 16 | |
+| 0x0D3B | `GL_MAX_CLIENT_ATTRIB_STACK_DEPTH` | 16 | |
+| 0x0D37 | `GL_MAX_NAME_STACK_DEPTH` | 64 | |
+| 0x0D38 | `GL_MAX_PROJECTION_STACK_DEPTH` | 32 | |
+| 0x0D39 | `GL_MAX_TEXTURE_STACK_DEPTH` | 32 | |
+| 0x0D50 | `GL_SUBPIXEL_BITS` | **4** | |
+| 0x80E8 | `GL_MAX_ELEMENTS_VERTICES` | **100000** (0x186a0) | |
+| 0x80E9 | `GL_MAX_ELEMENTS_INDICES` | **100000** | |
+| 0x0B12 | `GL_POINT_SIZE_RANGE` | 0, 10 | **0.25, 10.0** |
+| 0x0B13 | `GL_POINT_SIZE_GRANULARITY` | 0 | **0.25** |
+| 0x0B22 | `GL_LINE_WIDTH_RANGE` | 0, 10 | **0.25, 10.0** |
+| 0x0B23 | `GL_LINE_WIDTH_GRANULARITY` | 0 | **0.25** |
+| 0x846D | `GL_ALIASED_POINT_SIZE_RANGE` | **1, 2048** | 1.0, 2048.0 |
+| 0x846E | `GL_ALIASED_LINE_WIDTH_RANGE` | **1, 2048** | 1.0, 2048.0 |
+| 0x86A2 | `GL_NUM_COMPRESSED_TEXTURE_FORMATS` | **4** | |
+| 0x86A3 | `GL_COMPRESSED_TEXTURE_FORMATS` | **0x83F0, 0x83F1, 0x83F2, 0x83F3** (DXT1-RGB, DXT1-RGBA, DXT3, DXT5) | |
+| 0x0C30/0x0C31/0x0C33 | `GL_INDEX_MODE` / `GL_RGBA_MODE` / `GL_STEREO` | 0 / 1 / 0 | |
+
+Dynamic (visual- or context-dependent, *not* a constant to copy):
+`GL_RED/GREEN/BLUE/ALPHA/DEPTH/STENCIL/ACCUM_*_BITS` and `GL_AUX_BUFFERS` are
+each a virtual call on the drawable object at `[0x65cf18]` (e.g.
+`GL_DEPTH_BITS` → vtable `+0x28` at `0x13c486`, `GL_BLUE_BITS` → `+0x50` at
+`0x13d9b1`, `GL_ALPHA_BITS` → `+0x58` at `0x13db24`);
+`GL_SAMPLE_BUFFERS` / `GL_SAMPLES` are read from `ctx+0x7c74` / `ctx+0x7c78`.
+
+### 3.3 `GL_EXT_vertex_shader` limits — answered, but the extension is not advertised
+
+| enum | name | value | address |
+|---|---|---|---|
+| 0x87C5 | `GL_MAX_VERTEX_SHADER_INSTRUCTIONS_EXT` | **512** | `0x13b7a9` |
+| 0x87C6 | `GL_MAX_VERTEX_SHADER_VARIANTS_EXT` | 16 | |
+| 0x87C7 | `GL_MAX_VERTEX_SHADER_INVARIANTS_EXT` | 256 | |
+| 0x87C8 | `GL_MAX_VERTEX_SHADER_LOCAL_CONSTANTS_EXT` | 256 | |
+| 0x87C9 | `GL_MAX_VERTEX_SHADER_LOCALS_EXT` | 12 | |
+| 0x87CB | `GL_MAX_OPTIMIZED_VERTEX_SHADER_VARIANTS_EXT` | 16 | |
+| 0x87CC | `GL_MAX_OPTIMIZED_VERTEX_SHADER_LOCAL_CONSTANTS_EXT` | 256 | |
+| 0x87CD | `GL_MAX_OPTIMIZED_VERTEX_SHADER_INVARIANTS_EXT` | 256 | |
+| 0x87CE | `GL_MAX_OPTIMIZED_VERTEX_SHADER_LOCALS_EXT` | 12 | |
+
+(`0x87CA`, `GL_MAX_OPTIMIZED_VERTEX_SHADER_INSTRUCTIONS_EXT`, is **not**
+answered — an omission in the same style as §3.5.)
+
+### 3.4 `GL_MTX_fragment_shader` limits
+
+Answered by `glGetIntegerv` but with no public enum names. Values [CONFIRMED]:
+
+| enum | int | float | handler |
+|---|---|---|---|
+| 0x8A81 | dynamic — `[[ctx+0x7c28]+4]` | same | `0x13d4c8` |
+| 0x8A82 | 4 | 4.0 | `0x13db9d` |
+| 0x8A83 | 4 | 4.0 | |
+| 0x8A84 | 4 | 4.0 | |
+| 0x8A86 | 4 | 4.0 | |
+| 0x8A87 | **2** | 2.0 | |
+| 0x8A88 | **5** | 5.0 | |
+| 0x8A89 | 4 | 4.0 | |
+| 0x8A8B | **5** | 5.0 | |
+| 0x8A8C | 4 | 4.0 | |
+| 0x8A8D | **2** | 2.0 | |
+
+See §5 for the naming of these against the fragment-shader compiler's own
+limit checks.
+
+### 3.5 Limits the ICD does **not** answer
+
+* **`GL_MAX_LIGHTS` (0x0D31) is not implemented.** The 32-bit immediate
+  `0x00000d31` does not occur anywhere in the binary — a byte search of the
+  whole `.so` finds zero matches, while `0x0d33` (`GL_MAX_TEXTURE_SIZE`) occurs
+  at all four `glGet*` sites. Querying it yields `GL_INVALID_ENUM` and an
+  untouched result buffer [CONFIRMED].
+  The real limit is **12**: `glEnable(GL_LIGHT0+i)` accepts `i ≤ 0x0b`
+  (`0x1252c2`), sets the per-light enable flag at `state+0x348 + i*0x78 + 0xc4`
+  (`0x1253df`) and OR's bit `6+i` into the light-enable word at `(state+0x348)+0x66c`;
+  `i ≥ 12` raises `GL_INVALID_ENUM` (`0x1252d7`). The Windows D3D driver
+  independently declares `MaxActiveLights = 12` (§4). **This is the cleanest
+  example of the "under-declared resources read as hardware limits" trap in the
+  whole ICD — an app that trusts `glGet` learns nothing, and an app that assumes
+  the GL 1.3 minimum uses 8 of the 12 the part has.**
+* **`GL_MAX_MODELVIEW_STACK_DEPTH` (0x0D36) is not implemented either.** Here
+  there is a defensible reason: all three matrix stacks are dynamically grown
+  containers (`glPushMatrix` at `0x155cf0` calls a reserve helper `0x1b19a0`
+  per mode and only raises `GL_STACK_OVERFLOW` when the container refuses to
+  grow), so there is no constant to report. That makes the *reported* 32 for the
+  projection and texture stacks a declaration rather than a hardware limit
+  [CONFIRMED].
+
+### 3.6 Limits that are actually **enforced**, not merely declared
+
+Worth separating, because they constrain a replacement driver's conformance
+choices rather than describing the silicon:
+
+* **Power-of-two textures are mandatory.** `glTexImage2D`/`3D` validate
+  `dim ≤ 2048` *and* `(dim-1) & dim == 0` for every dimension, else
+  `GL_INVALID_VALUE` — 2D at `0x14a28d`–`0x14a2b8`, 3D at `0x14b078`–`0x14b0bc`
+  [CONFIRMED]. See §4 for why this is a **software** restriction.
+* **Anisotropy is clamped, not just declared.**
+  `glTexParameter(GL_TEXTURE_MAX_ANISOTROPY_EXT, n)` rejects `n < 1.0`
+  (`0x131fab`) and then applies `min(n, 2.0f)` — the literal `0x40000000` at
+  `0x132062` [CONFIRMED].
+
+---
+
+## 4. The Direct3D declaration for the same silicon, and the gaps
+
+From `MTXPARD.dll`. The caps are two **static `.data` templates** `rep movsd`'d
+by `BuildDeviceCaps` (`0x875f0`) — D3DDEVICEDESC from `0x1d1e78`,
+D3DHAL_D3DEXTENDEDCAPS from `0x1d1e00` — then reshaped into `D3DCAPS8` by
+`BuildD3DCAPS8` (`0x869f0`) and `D3DCAPS9` by `BuildD3DCAPS9` (`0x86ca0`).
+There is **no device-ID branch in the caps path at all**; everything variable is
+a registry option or one chip-class bit test (§6).
+
+### 4.1 Where the two declarations agree [CONFIRMED both sides]
+
+| quantity | GL ICD | D3D |
+|---|---|---|
+| max 2D texture | 2048 | `MaxTextureWidth/Height` 2048 (`.data 0x1d1e08/0x1d1e10`) |
+| max volume texture | 2048 | `MaxVolumeExtent` 2048 (`0x86bc4`) |
+| max anisotropy | 2 | `MaxAnisotropy` 2 (`0x1d1e2c`) |
+| texture units | `GL_MAX_TEXTURE_UNITS_ARB` 4 | `MaxTextureBlendStages` 4, `MaxSimultaneousTextures` 4 (`0x1d1e50`) |
+| user clip planes | `GL_MAX_CLIP_PLANES` 6 | `MaxUserClipPlanes` 6 (`0x1d1e5c`) |
+| lights | *(not answered)* — real limit 12 | `MaxActiveLights` **12** (`0x1d1e54`) |
+| S3TC | 4 GL formats (DXT1/DXT1a/DXT3/DXT5) | DXT1–DXT5, all five, as 2D **and** cube **and** volume |
+| blend factors | full enum ZERO…1−CONSTANT_ALPHA | `SrcBlendCaps` = `DestBlendCaps` = 0x1FFF, every factor |
+| depth/alpha compare | 8 functions each | `ZCmpCaps` = `AlphaCmpCaps` = 0xFF |
+| stencil ops | KEEP…DECR incl. wrap | `StencilCaps` = 0xFF |
+
+The agreement on 2048 / 4 units / anisotropy 2 is the useful negative result:
+those really are hardware limits, not conservative declarations.
+
+### 4.2 Where they disagree — candidate under-declarations
+
+| # | GL says | D3D says | assessment |
+|---|---|---|---|
+| 1 | **power-of-two only** (`GL_INVALID_VALUE` otherwise, §3.6) | `TextureCaps` = 0x1EC4D with **`D3DPTEXTURECAPS_POW2` clear**, and `CUBEMAP_POW2` / `VOLUMEMAP_POW2` / `SQUAREONLY` also clear (`.data 0x1d1efc`) | **The hardware does non-power-of-two textures — 2D, cube and volume, mipmapped.** The GL restriction is the ICD being a GL 1.3 driver (where POT is required by spec) and never adding `GL_ARB_texture_non_power_of_two` or `GL_ARB_texture_rectangle`. An open driver can expose NPOT. **Biggest single win in this comparison.** |
+| 2 | no vertex-program extension advertised, but the ICD answers 512-instruction `GL_EXT_vertex_shader` limits (§3.3) | `VertexShaderVersion` = **`0xFFFE0101` = vs_1_1**, `MaxVertexShaderConst` = **256**, `D3DDEVCAPS_HWTRANSFORMANDLIGHT` and `D3DDEVCAPS_PUREDEVICE` set (`0x86c7a`, `0x87650`, `0x87678`) | **The part has a programmable vertex unit and hardware T&L, and the Linux ICD does not advertise it.** See §5 Q3. |
+| 3 | `GL_MTX_fragment_shader` only | `PixelShaderVersion` = **`0xFFFF0103` = ps_1_3** (`0x86c8a`), `PixelShader1xMaxValue` 1.0f | The MTX extension is the GL door onto a ps_1_3-class combiner; the limits in §3.4 should be read against `docs/parhelia-fragment-isa.md`. |
+| 4 | `GL_ARB_texture_env_combine` / `dot3` | `TextureOpCaps` = 0x03FEFFFF: additionally **BUMPENVMAP, BUMPENVMAPLUMINANCE, MULTIPLYADD, LERP** (`.data 0x1d1e4c`) | Bump mapping and LRP/MAD are hardware but have no fixed-function GL path. Reachable through the fragment ISA (`MAD`, `LRP` are in the opcode table already). |
+| 5 | `GL_POINT_SIZE_RANGE` / `GL_LINE_WIDTH_RANGE` 0.25–**10.0** | `MaxPointSize` = **2048.0f** (`0x86bda`) | The 10.0 is a *software* rasteriser limit, consistent with the capture's CPU-expanded wide-line path. `GL_ALIASED_*_RANGE` already reports 1–2048. |
+| 6 | `GL_MAX_VIEWPORT_DIMS` 4096×4096 | guard band **±8160.0f** (`.data 0x1d1e30`–`0x1d1e3c`, also inline in the clipper at `0xd6cf6`) | The clip window is nearly ±8K; 4096 is the ICD's own choice. |
+| 7 | `GL_MAX_ELEMENTS_VERTICES/INDICES` 100000 | `MaxPrimitiveCount` = `MaxVertexIndex` = **0x7FFFFFFF**, `MaxStreamStride` 65535, `MaxStreams` 8 | GL's are only hints, but the gap is real. |
+| 8 | 4 texture units | `FVFCaps` TEXCOORDCOUNTMASK = **8** texcoord sets (`0x1d1e48` + `or 0x100000` at `0x86b94`), `MaxVertexBlendMatrices` 4, `MaxVertexBlendMatrixIndex` 31 | 8 texcoord *sets* can be delivered to 4 sampling stages; also 4-matrix vertex blending exists with no GL exposure (no `GL_ARB_vertex_blend`). |
+| 9 | fog listed as CPU-side in `docs/parhelia-gl-driver.md` | `RasterCaps` 0x07F309A7 sets **FOGVERTEX, FOGTABLE, FOGRANGE, WFOG, ZFOG**, plus **SCISSORTEST, DEPTHBIAS, SLOPESCALEDEPTHBIAS, ANISOTROPY** (`0x1d1ee4`) | Fog, scissor and polygon offset are hardware. The live capture already shows fog enable and fog mode as emitted state, so the old "software fog / software polygon offset" note is wrong. |
+| 10 | `GL_ARB_multisample` advertised, `GL_SAMPLES` read from the drawable | multisample word rewritten per format at `0x86f90` from the `AAMode` registry setting: `0x0009`, `0x8001` or 0 | FAA is a driver/mode option, not a fixed cap. |
+
+Two D3D declarations worth recording for a modeset/2D driver as well:
+`dwDeviceRenderBitDepth` = 0x500 (16 and 32 bpp only) and
+`dwDeviceZBufferBitDepth` = 0x400 (16 bpp) in the legacy DX7 desc, versus the
+D3D8/9 depth format list D16 / D15S1 / D24X4S4 / D24S8 (`.data 0x1d14d8`).
+
+---
+
+## 5. Extensions: hardware, software, or absent
+
+*(section filled from the ICD extension analysis — see below)*
+
+---
+
+## 6. Per-variant differences
+
+### 6.1 The chip-class word
+
+`mtx_parhelia.o` has one classifier, **`mtx1916` (`0x40a70`)**, which maps
+`(PCI device id, revision)` to a **one-hot class bit** written to `dev+0x20`
+[CONFIRMED]. A second, structurally identical routine `mtx427` (`0x40b90`)
+writes the same classification to `dev+0x68`.
+
+| device | rev | class bit | project variant (`docs/parhelia-variants.md`) |
+|---|---|---|---|
+| 0x0525, 0x2527 | any | 0x00001 | pre-Parhelia G-series |
+| 0x0527 | 0 / 1 / 2 / 3 / other | 0x00002 / 0x00004 / 0x00008 / 0x00020 / 0x00010 | **A — Parhelia-512** |
+| 0x0528 | 1 / 2 / 6 / other | 0x00040 / 0x00080 / 0x00200 / 0x00100 | **B — Parhelia 8X / PCI** |
+| 0x2537 | 1 / 2 / other | 0x00400 / 0x01000 / 0x00800 | **C — Parhelia-LX (Sundog)** |
+| 0x2538 | 0 / 1 / other | 0x02000 / 0x04000 / 0x08000 | **D — Sunex** |
+| 0x2539 | 0 / 1 / other | 0x10000 / 0x20000 / 0x40000 | **E — P690 generation** |
+| anything else | | 0 | (0x0529 Phoenix is **not** classified — consistent with "stubbed") |
+
+### 6.2 What actually branches on it
+
+The Windows D3D driver's only chip-dependent caps decision is
+`test dword [pDev+0x1c], 0x7FC00` (`0x86879` and `0x87bf7`), which selects the
+35-entry format table at `.data 0x1d19a0` instead of the 34-entry table at
+`0x1d1560` — the difference being the extra Matrox-private texture format
+`0x102B0003`. Mask `0x7FC00` is bits 10–18, which by §6.1 is **exactly the
+class-bit range of 0x2537 / 0x2538 / 0x2539** — i.e. the test is "is this an
+LX-generation part?" [CONFIRMED by matching the mask to the classifier; the
+Windows-side writer of `[pDev+0x1c]` lives in the display driver, not in
+`MTXPARD.dll`].
+
+Everything else that varies in the D3D caps is a **registry option**, not
+silicon: `HwTransformLight` (default 1) gates
+`D3DDEVCAPS_HWTRANSFORMANDLIGHT`, `HwPureDevice` (1) gates `PUREDEVICE`,
+`VertexShader` (1) gates vs_1_1 versus 0xFFFE0000, `VertexBuffers` (1) gates
+`MaxStreams` 8↔1 and the HW vertex/index buffer caps, `GuardBandClipping` (2)
+zeroes the guard band when 0, `TEPipeSelect` (4) overwrites the DX7
+`wMaxSimultaneousTextures` *after* CAPS8/9 are built, `np2Conditional` (0) adds
+`NONPOW2CONDITIONAL`, `MipmapLodBias` (0) adds `MIPMAPLODBIAS`, and `AAMode`
+(0x54) drives the multisample rewrite.
+
+That is itself a finding: **on the Windows side the vendor made hardware T&L,
+vertex shaders, guard-band clipping and NPOT-conditional textures switchable at
+runtime, all defaulting to on.** None of those switches exists in the Linux GL
+declaration.
+
+*(ICD-side variant branching — see §5.)*
+
+---
+
+## 7. The state-validation path
+
+### 7.1 Lazy validation by dispatch-table swap
+
+The ICD does not check a dirty flag on every GL call. It **swaps the whole GL
+entry-point table** in thread-local storage. The RTTI names survive in the
+binary and name the three pipelines:
+
+| class | RTTI name at file offset | vtable (`.data.rel.ro`) | first method |
+|---|---|---|---|
+| `GLSendStateHardwareTnL` | 3587376 | `0x467620` | `0x116320` |
+| `GLSendStateHardwareTnLVS` | 3587408 | `0x467760` | `0x118790` |
+| `GLSendStateSoftwareTnL` | 3587440 | `0x467880` | `0x11b330` |
+
+Each of the ~30 virtual slots in these tables is a **shim**: it calls a single
+validate routine, re-reads the (now updated) TLS dispatch pointer, and
+tail-jumps to the corresponding slot of the real table. E.g. slot 0 at
+`0x116320`: `call 0x116140` → `pthread_getspecific` → `jmp [[tls]+0x00]`
+[CONFIRMED].
+
+**`Validate()` = `libGL64 0x116140`** [CONFIRMED]:
+
+```
+if (check([this+0x250]))            /* 0x1bed70 */
+        fast_path([this+0x250]);    /* 0x1bf150 — nothing to revalidate */
+else {
+        [this+0x258]->[0x70]->vtbl[0xa8]();      /* begin state emit           */
+        validate_A([this+0x238] + 0x0c30);       /* 0x15d120                   */
+        validate_tex([this+0x238] + 0x4160);     /* 0x14c2b0 — texture units   */
+        if (!dev->vtbl[0x18]()) ... else dev->vtbl[0x20]();
+        emit_state([this+0x248]);                /* 0x113b80                   */
+        emit_state2([this+0x248]);               /* 0x1117c0 — the big one     */
+        [this+0x258]->[0x70]->vtbl[0xb0]();      /* end state emit             */
+        if ([this+0x240][0x10a8]) { 0x15af70(); [this+0x240][0x10a8] = 0; }
+        finish([this+0x238]);                    /* 0x122e30                   */
+        pthread_setspecific(key, [this+0x258]->[0x70]);   /* install valid tbl */
+}
+```
+
+The last line is the mechanism: after validation the TLS pointer names the
+*validated* dispatch table, so subsequent GL calls cost nothing extra. Any
+state change that invalidates the pipeline re-installs the shim table. There is
+a matching `GLStateInvalid` RTTI name (file offset 3587696) and
+`GLStateInsideBegin` / `GLStateInsideVSBegin` (3587536 / 3587568) — the same
+trick is used to swap in the inside-`glBegin` dispatch.
+
+### 7.2 What is cached: per-item shadow compare
+
+`emit_state2` (`0x1117c0`) is the model for the whole driver. For each state
+item it compares the GL value against a **per-device shadow** and only emits if
+it differs:
+
+```
+if ([state+0xaa8] != shadow[0x96c]) {
+        shadow[0x96c] = value;
+        p = reserve(buf, /*opcode*/ 0x05, /*elemsize*/ 8, /*count*/ 1);
+        p[0] = 0x1b; p[1] = value;          /* (index, value) */
+        commit(buf);
+}
+```
+
+Every emission in the ICD has this shape. The shadows live in the device object
+(e.g. `+0x96c`, `+0x274`, `+0x23c`, `+0x910`) and the buffer is
+`dev+0xb08`. The PIPELINE-KEY has its own 6-dword shadow at `dev+0xb10`,
+compared field by field before emitting (`0xc50ab`–`0xc50f0`, `0xf34c9`–
+`0xf34fa`) [CONFIRMED].
+
+### 7.3 The dirty mask and what forces which record
+
+Above the per-item shadows sits a coarse dirty word, `[prim+0x238]`, and a
+flush driver **`libGL64 0xc4dd0`** called as `Flush(this, src, mask)`:
+
+| mask bit(s) | what it flushes | code |
+|---|---|---|
+| 0x0003 | **PIPELINE-KEY** — compare `src+0x30..0x44` against `dev+0xb10`, emit opcode 0x07 | `0xc4e0a` → `0xc4f90` → `0xc5113` |
+| 0x000c | **vertex attribute declaration** — emit opcode 0x08, `count = [src+0x170]` elements of 0x20 bytes | `0xc4e17` → `0xc4fd6` → `0xc4d63` |
+| 0x0070 | flush pending vertex data | `0xc4e2b` → `0xc5000` |
+| 0x0080 | virtual `[this][0x120]` | `0xc4e38` → `0xc5030` |
+| 0x0300 | texture/sampler revalidation (`0x1589c0`) | `0xc4e47` |
+| 0x0c00 | a texgen/texture-stage check on `[..+0x77c..0x78c] == 7` | `0xc4e8e` |
+| 0x1000 | emit opcode 0x48 (0x18 B) or opcode 0x50 (0x20 B) | `0xc4eff` / `0xc507a` |
+
+The dirty word is initialised to `0xffffffff` (all dirty) at `0xc28c0` and
+`0xc4cfa`. Individual GL setters mark bits; e.g. `0xf3530` sets bit 1 of
+`[obj+0x25cc]` when a value changes.
+
+The kernel keeps a **second** dirty layer of its own — three words at
+`ctx+0x1bec/0x1bf0/0x1bf4` plus per-group bytes (`+0xc08`, `+0xc87`, `+0xdbb`,
+`+0xd54`, `+0x1b44`, …). `mtx1008` (`0x18160`) marks everything dirty,
+`mtx412` (`0x18720`) clears everything, and `mtx3712` (`0x188f0`) is the pass
+that walks them and programs the hardware.
+
+### 7.4 What forces a submit
+
+Only seven call sites reach the flush `0x1c9be0` [CONFIRMED]:
+`0x1c9d13` (reserve found the buffer full), `0x1c9d7c`, `0x1c9f06` (buffer
+helpers), `0x1b21c6` and `0x1b2406` (vertex-heap helpers), `0x1ba5a2`, and
+`0x35897e`. So a submission happens on **buffer exhaustion** or an explicit
+end-of-frame/finish, not per draw. That matches the capture, where each
+`glFinish` produced exactly one submission and `region0+0x230` held the whole
+stream length.
+
+`GLPrimitiveSoftware::WriteStoredVertex` also confirms how the *vertex* stream
+is filled — `0xf37b0` walks the PIPELINE-KEY fields in order (position 16 B,
+optional bit-28 dword 4 B, optional specular 16 B, diffuse 16 B, then each
+enabled texture stage 16 B) and bumps `obj+0x25e8` [CONFIRMED]. The
+fixed-function path uses the narrower per-field sizes of §1.2.
+
+### 7.5 Which GL state is lazy
+
+From the sweep and the code together: **everything is lazy.** No GL setter
+writes a record; setters write the ICD's own state block and mark dirty bits,
+and the first draw (or clear) after the change runs `Validate()`. That is why
+`docs/parhelia-gl-feature-map.md` §3 sees each op's stream carrying the
+*previous* op's teardown. Two consequences an open driver should copy:
+
+* state is emitted in **validation order, not call order** — do not try to
+  attribute a record to the immediately preceding GL call;
+* an unchanged value is never re-emitted, so a capture will silently omit any
+  state that happens to already match the shadow (this is exactly why
+  `GL_ALWAYS` never appeared for the stencil compare function).
+
+---
+
+## 8. Summary for an open driver
+
+Confirmed real hardware limits (both vendor stacks agree): 2048×2048 textures,
+2048 volume extent, **4 texture units**, **anisotropy 2**, 6 user clip planes,
+DXT1–DXT5, all blend factors both sides, all 8 depth/alpha compares, the full
+stencil op set including wrap.
+
+Confirmed *under*-declarations in the Linux GL stack, in descending order of
+value:
+
+1. **Non-power-of-two textures** — the hardware has them (2D, cube, volume,
+   mipmapped); the ICD hard-rejects them.
+2. **A programmable vertex unit with hardware T&L** — declared as vs_1_1 with
+   256 constants on Windows, present as a complete but unadvertised
+   `GL_EXT_vertex_shader` implementation on Linux (§5 Q3).
+3. **12 lights**, not 8, and `GL_MAX_LIGHTS` is not answerable at all.
+4. **BUMPENVMAP / BUMPENVMAPLUMINANCE / MULTIPLYADD / LERP** texture ops with
+   no fixed-function GL path.
+5. **Guard band ±8160** versus a declared 4096 viewport.
+6. **4-matrix vertex blending**, **8 texcoord sets**, and hardware
+   fog / scissor / slope-scaled depth bias.
+
+And the structural lesson: the ICD→kernel stream is a **render-state token
+stream**, not a register stream (§2.2). The GL→state-id→value mapping already
+recovered in `docs/parhelia-gl-feature-map.md` is sound and reusable; the
+state-id→MMIO-register half is the kernel's per-index jump tables
+(`.rodata+0xba0` for bank 0x0c, `mtx1734`'s table for bank 0x05) plus the
+programming pass `mtx3712`, and that is the piece an open driver must write for
+itself.
