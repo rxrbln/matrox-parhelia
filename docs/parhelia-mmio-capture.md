@@ -21,12 +21,18 @@ page-faults every access to `ioremap`'d regions and logs each MMIO read/write.
 Steps (all as root):
 1. `mount -t debugfs none /sys/kernel/debug` (not mounted by default).
 2. `echo <kb> > .../tracing/buffer_size_kb` — use a MODEST size (16384). 256MB
-   hung the box (OOM/thrash).
+   hung the box (OOM/thrash), and **32768 hung it too** (2026-09-05). 16384 is
+   not a starting point to tune upward from; treat it as the ceiling.
 3. `echo 0 > .../tracing/tracing_on` (record off), `echo mmiotrace > current_tracer`.
 4. **`modprobe mtx` AFTER mmiotrace is on** — mmiotrace only hooks ioremaps done
    while it is active; a pre-loaded mtx is NOT traced (this cost a lot of time —
    empty traces). modprobe itself is fast.
 5. Start X (`/usr/X11/bin/startx` — full path; PATH in a detached script lacks it).
+   **Do NOT have tracing on while X starts.** mmiotrace page-faults every MMIO
+   access and single-steps it; X's init does enough traffic to wedge the machine
+   on its own. Arm tracing only for the narrow window you actually need, and
+   never across a phase you are not measuring (2026-09-05: tracing armed across
+   X startup with a 32 MB buffer took the box down).
 6. Arm the WARP with a GL client (`glxgears` 3s) while `tracing_on=0`.
 7. `echo 1 > tracing_on`; `echo MARK_START > trace_marker`; run the GL op to
    capture (a MINIMAL client: context + glBegin/glEnd/**glFlush** — NOT glFinish,
