@@ -440,3 +440,27 @@ Stated plainly, so nobody reads confidence into these:
 - Everything in this file is an engineering assessment. If the project is going
   to be carried by a distribution, the distribution's own licence review is the
   one that counts.
+
+## Extracted microcode is no longer tracked (2026-09-05)
+
+`tools/warp_programs.h` and `tools/warp_ucode.h` contain Matrox object code
+lifted verbatim from the vendor kernel module.  Both carry a
+"NOT REDISTRIBUTABLE - NO LICENCE IS GRANTED OVER THIS DATA" notice, yet both
+were committed to this GPL-2 repository, which contradicts the notice and would
+have shipped vendor object code to anyone cloning it.
+
+They are now untracked and listed in `.gitignore`.
+
+Regenerate them locally, from a vendor driver you have obtained yourself:
+
+    gcc -O2 -o extract-ucode tools/parhelia-extract-ucode.c
+    ./extract-ucode -c -n warp_ucode -o tools/warp_ucode.h \
+        matroxdriver-x86_64-cvs-20090511/kernel/mtx_parhelia.o
+
+The symbol is resolved through the ELF section header table, not a hard-coded
+offset.  `warp_programs.h` holds the seven-descriptor boot burst loaded by
+mtx3806 (2664 bytes, 222 instructions) from the same object's `.data`.
+
+Note this removes them from the working tree only: **earlier commits still
+contain the blobs.**  Purging them from history is a rewrite of published
+history and is a decision for the maintainer, not something done in passing.
