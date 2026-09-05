@@ -743,3 +743,42 @@ indexed array -- lights or texture stages, six or more instances.
 A parser can therefore validate itself: walk headers, and require each record to
 end exactly on another well-formed header or the end of the stream. That check
 is what pinned the boundaries here, and it is cheap enough to keep permanently.
+
+
+## Replaying the working stream: how far it gets
+
+The point of solving the grammar was to avoid reversing the kernel's
+slot-to-register translation at all -- drive the slot interface and let the
+kernel translate. `tools/parhelia-replay.c` against the ioquake3 capture:
+
+**Works:**
+
+* **7/7 cookies resolvable** on a real working trace, with the same publication
+  sites as the older captures (control page `+0x28`, second slot `+0x48`). The
+  harness generalises beyond the capture it was written against.
+* The ioctl-returned cookie is correctly fixed up -- recorded `0x3a8000` becomes
+  the live `0x104c000` -- and that region maps.
+
+**Does not work:**
+
+* `mmap` of the in-band buffers fails **EINVAL**. The live read at `+0x28`
+  returns the *recorded* value rather than a freshly published one, so the
+  kernel has not actually created the buffer at that point in the replay: the
+  in-band creation handshake is being replayed as data rather than performed.
+* The replay then **hangs in the kernel** on a doorbell ioctl and the process is
+  unkillable (`kill -9` does not reap it).
+* The engine is left unable to draw -- the 2D fill health check returns
+  **0/120000** afterwards, needing a reboot.
+
+Memory is also a practical constraint: the full 349 MB trace OOMs the 497 MB
+box, because the harness holds every event. Filtering the texture-heap submits
+(524288 dwords each, and irrelevant to a first triangle) makes it fit.
+
+**What this says.** Cookie resolution -- the thing that blocked this harness for
+its whole life -- is solved. The remaining blocker is different and more
+specific: **buffer creation is an in-band handshake, not a replayable byte
+sequence.** The client writes a request into the control page and the kernel
+answers there; replaying the recorded bytes reproduces the question and the
+stale answer, but never asks the kernel to allocate. A replay has to *perform*
+that handshake -- write the request, ring the doorbell, then read the cookie the
+kernel publishes -- rather than replaying both sides of it.
