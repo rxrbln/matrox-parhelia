@@ -500,14 +500,33 @@ the cookie somewhere the current tracer does not capture. That is a real
 protocol fact the replay attempt surfaced, and it is why "capture the ioctls and
 replay them" is insufficient for this driver.
 
+**Second attempt (tracer fixed, replay improved).** The tracer now dumps control
+pages **whole** at every doorbell instead of only their changed spans, and that
+worked: 5 of the 7 cookies now appear in the captured page data, and the
+publication site is consistent — **offset +0x28 of a control page, written by
+the kernel right after the doorbell that requested the buffer**. Of the other
+two, one comes from the buffer-create ioctl return and one (`0xe24000`) is
+constant across runs.
+
+The replayer was restructured to apply writes and ring the doorbell inline, then
+read the live cookie rather than replaying the recorded one. It still maps only
+2 of 7, and the reason is now understood and is a **design conflict, not a
+missing fact**: because control pages are dumped whole, the replay writes the
+recorded page back over the live one, **clobbering the kernel-published cookie
+before it can be read**. Replaying only the changed dwords does not help either,
+since kernel-authored writes also show as changes. The capture does not record
+who authored each dword, so the replayer cannot currently separate the client's
+request fields from the kernel's response fields in a shared page.
+
 **The concrete fix**, in order:
-1. Make the tracer dump the **full control pages** at every doorbell rather than
-   only their changed spans, so a cookie written by the kernel is visible even
-   if it lands in bytes that were previously non-zero.
-2. Split the replayer into parse and execute passes, so cookie publication sites
-   can be located across the whole trace before any mmap is attempted.
-3. Re-run: with the publication site known, read the live cookie from the same
-   offset instead of replaying the recorded one.
+1. ~~Dump full control pages~~ — **done**; the publication site is +0x28.
+2. ~~Read the live cookie instead of the recorded one~~ — **done**, but defeated
+   by the clobber above.
+3. **Record write provenance.** The tracer must mark each dword as
+   client-authored or kernel-authored. It can: snapshot a control page
+   immediately *before* the doorbell ioctl as well as after, so writes appearing
+   only in the after-snapshot are the kernel's and must never be replayed.
+   This is a small change to `dump_submits` and is the remaining work.
 
 Until that lands, treat the submission protocol as **understood but unproven** —
 which is exactly the distinction the procedure draws, and the reason the first

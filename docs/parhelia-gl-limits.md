@@ -14,6 +14,15 @@ Sources, all read directly:
   **with symbols** (`mtxNNNN`). Disassembly: `scratchpad/mtxk.asm`.
 * `xddm32_210_00_105_se_u_nowhql/MtxPar/MTXPARD.dll` — the Windows XPDM D3D
   driver. Disassembly: `scratchpad/pard.asm`.
+* **`matroxdriver-x86_64-cvs-20090511/opengl6/include/glext.h`** — the vendor's
+  own header, shipped in the driver tree. It declares the complete
+  `GL_MTX_fragment_shader` token block (lines 1446 ff.: get-parameters, texture
+  opcodes, ALU opcodes, registers, result and argument modifiers, replicate
+  channels, texture formats, sampling hints) **and** the full
+  `GL_EXT_vertex_shader` block (line 1298 ff., prototypes at 2045 ff.). Names
+  that would otherwise have to be inferred are simply written down here; it
+  should be cross-referenced from `docs/parhelia-fragment-isa.md` and
+  `docs/parhelia-vertex-isa.md` too.
 * `captures/glsweep-0528-raw.txt` — the live 33-op sweep on a Parhelia 0x0528,
   decoded in `docs/parhelia-gl-feature-map.md`.
 
@@ -327,6 +336,35 @@ over the DMA ring. The live mmiotrace in `docs/parhelia-mmio-capture.md`
 independently shows **no** `0x1000+idx*4` writes at draw time — the geometry and
 state travel in the ring buffer.
 
+**The decisive argument.** A second, independent pass over the ICD produced a
+complete index→GL-feature map for both small banks, and it collides with itself
+under `0x1000 + index*4`:
+
+* bank **0x05**: idx 0x09/0x0a/0x0b/0x0c = blend `srcA`/`srcRGB`/`dstA`/`dstRGB`
+  (emitted at `libGL64 0x114c84`–`0x114dac`), idx **0x15/0x16/0x17** =
+  polygon-offset factor / units / enable (`0x112570`), idx 0x08 = polygon mode,
+  idx 0x01 = colour sum, idx **0x12** = vertex-shader mode (§5.3);
+* the live capture pins **0x1058** to `glCullFace` and **0x105c** to
+  `glDepthFunc`.
+
+Apply `0x1000 + index*4` to bank 0x05 and polygon-offset units/enable land on
+`0x1058`/`0x105c` — on top of cull face and depth func. Both banks use small
+indices from overlapping ranges, so **at most one of them can be a register
+bank, and neither is**: `mtx1734` (bank 0x05, index ≤ 0x1c) and `mtx2617` (bank
+0x0c, index ≤ 0xab) each dispatch through their own jump table into differently
+shaped shadow fields, and neither writes MMIO. The blend factors match
+`0x1000+idx*4` because the *kernel* happens to program them there, not because
+the stream carries register numbers.
+
+The index→GL-feature map is still valuable in its own right. Bank 0x05: 0x01
+colour sum, 0x08 polygon mode, 0x09–0x0c blend factors, 0x12 vertex-shader
+mode, 0x15–0x17 polygon offset. Bank 0x0c: 0x07/0x0e/0x17 depth
+enable/mask/func, 0x0c logic op, 0x18/0x19 alpha ref/func, 0x1b blend enable,
+0x1c fog enable, 0x1d colour sum, 0x23 and 0x8c fog mode (depth- versus
+coordinate-sourced), 0x34–0x3a stencil enable/ops/func/ref/mask, 0x9a/0x9b/0xa6
+point size/min/max, 0xa8 colour write mask, 0xab blend equation. Treat these as
+**state ids**, and get the register from the kernel's tables.
+
 So the per-feature table in `docs/parhelia-gl-feature-map.md` §3 remains
 valuable and correct as *"GL call → driver render-state id → value"* — the
 GL-semantic mapping is real and hard-won — but the "= MMIO register 0x101c"
@@ -347,8 +385,8 @@ kernel's jump tables are the specification for it.
 |---|---|---|
 | `GL_VENDOR` | `"Matrox Graphics Inc."` | `.rodata 0x36be5a` |
 | `GL_RENDERER` | `"OpenGL Linux library for Parhelia"` | `.rodata 0x36be38` |
-| `GL_VERSION` | `"1.3 "` + `"ICD v1.03"` | literal `"1.3 "` at `0x120dfe`; the suffix is appended by `0x364ec8` — `movabs rdx,"ICD v1.0"` at `0x364ed4` plus `mov dword [end+8], 0x33` (`'3'`) at `0x364ee6` |
-| `GL_EXTENSIONS` | pointer in the global `0x65c930`; the candidate string literal is in **writable** `.data` at vaddr `0x66e5a0` (file 0x46e5a0) | §5 |
+| `GL_VERSION` | `"1.3 "` + `"ICD v1.03"` | literal `"1.3 "` at `0x120dfe`; the suffix comes from `ICDLinkImpl::GetVersion()` at **`0x364ed0`** — `strlen`, then `movabs rdx, 0x302e317620444349` (`"ICD v1.0"`) at `0x364edc` and `mov WORD [end+8], 0x0033` (`'3'`, NUL) at `0x364ee6` |
+| `GL_EXTENSIONS` | `mov rax,[rip+…] # 65c930; ret` at `0x120e2b` — one load. The global is initialised by a single `R_X86_64_RELATIVE` reloc to **`0x66e0e0`** (file 0x46e0e0), the 1189-byte / 51-token string, and is **written nowhere in `.text`** | §5.1 |
 
 The version string is a hardcoded constant with no chip dependency
 [CONFIRMED], and it matches the "1.3 ICD v1.03" ground truth exactly.
@@ -422,29 +460,60 @@ each a virtual call on the drawable object at `[0x65cf18]` (e.g.
 | 0x87CD | `GL_MAX_OPTIMIZED_VERTEX_SHADER_INVARIANTS_EXT` | 256 | |
 | 0x87CE | `GL_MAX_OPTIMIZED_VERTEX_SHADER_LOCALS_EXT` | 12 | |
 
-(`0x87CA`, `GL_MAX_OPTIMIZED_VERTEX_SHADER_INSTRUCTIONS_EXT`, is **not**
-answered — an omission in the same style as §3.5.)
+Addresses for the rest: 0x87C6 `0x13d5f0`, 0x87C7 `0x13db5c`, 0x87C8
+`0x13d0df`, 0x87C9 `0x13c688`. **`0x87CA`
+(`GL_MAX_OPTIMIZED_VERTEX_SHADER_INSTRUCTIONS_EXT`) and `0x87CF` are not
+answered at all** — the same omission style as §3.5.
 
-### 3.4 `GL_MTX_fragment_shader` limits
+The ICD also answers **live per-shader counters** out of the vertex-shader
+function object (`[ctx+0x7b78]`): `GL_VERTEX_SHADER_BINDING_EXT` 0x8781
+(`0x13bbaa`), `…VARIANTS` 0x87D0 = `+0x0c` (`0x13d803`), `…INVARIANTS` 0x87D1 =
+`+0x10` (`0x13dead`), `…LOCAL_CONSTANTS` 0x87D2 = `+0x14` (`0x13b1f6`),
+`…LOCALS` 0x87D3 = `+0x18` (`0x13c5e2`), `…OPTIMIZED` 0x87D4 = byte `+0x05`
+(`0x13bec9`). A driver does not report live counts for a feature it did not
+implement — see §5.3.
 
-Answered by `glGetIntegerv` but with no public enum names. Values [CONFIRMED]:
+### 3.4 `GL_MTX_fragment_shader` limits — **named from the vendor's own header**
 
-| enum | int | float | handler |
-|---|---|---|---|
-| 0x8A81 | dynamic — `[[ctx+0x7c28]+4]` | same | `0x13d4c8` |
-| 0x8A82 | 4 | 4.0 | `0x13db9d` |
-| 0x8A83 | 4 | 4.0 | |
-| 0x8A84 | 4 | 4.0 | |
-| 0x8A86 | 4 | 4.0 | |
-| 0x8A87 | **2** | 2.0 | |
-| 0x8A88 | **5** | 5.0 | |
-| 0x8A89 | 4 | 4.0 | |
-| 0x8A8B | **5** | 5.0 | |
-| 0x8A8C | 4 | 4.0 | |
-| 0x8A8D | **2** | 2.0 | |
+`opengl6/include/glext.h` lines 1449–1462 give the names outright, so nothing
+here is guessed. Values read from `glGetIntegerv`; enforcement sites from the
+shader compiler.
 
-Naming these against the fragment-shader compiler's own limit checks is
-**still open** — see §5.3 item 2.
+| enum | vendor name | meaning | value | glGet | enforced at |
+|---|---|---|---|---|---|
+| 0x8A80 | `GL_FRAGMENT_SHADER_MTX` | enable | — | `glIsEnabled` `0x127717` | `glEnable` `0x125592` writes **1** to `ctx+0x7c30`; pipeline selector tests it at `0x1bef93` |
+| 0x8A81 | `GL_FRAGMENT_SHADER_BINDING_MTX` | currently bound shader — **live** | `[[ctx+0x7c28]+4]` | `0x13d4c8` | shader ctor `0x1b59c0`, bind `0x1b8220` |
+| 0x8A82 | `GL_MAX_TA_OPS_MTX` | max texture-address ops | **4** | `0x13db9d` | the 4-entry TA descriptor array (fragment-ISA §9.5) |
+| 0x8A83 | `GL_OPT_TA_OPS_MTX` | optimal TA ops | **4** | `0x13d116` | |
+| 0x8A84 | `GL_TA_OPS_MTX` | TA ops used by the bound shader | **4** *(constant)* | `0x13bbc9` | — |
+| 0x8A85 | `GL_MAX_FP_OPS_MTX` | **max colour/RGBA instructions** | **10** | `0x13d0ec` | `cmp [shader+0xdc],9; jbe` at **`0x1b6126`** → "Too many color instructions" (`0x36e390`, raised `0x1b615c`) |
+| 0x8A86 | `GL_MAX_FP_TEXTURES_MTX` | max textures | **4** | `0x13d4bb` | in-use bitmask `[shader+0x10]` at `0x1b2650`–`0x1b2690` |
+| 0x8A87 | `GL_MAX_FP_COLORS_MTX` | max iterated colours (`COLOR0`/`COLOR1`) | **2** | `0x13dac5` | header: `GL_COLOR0_MTX` 0x0B00, `GL_COLOR1_MTX` 0x8459 |
+| 0x8A88 | `GL_OPT_FP_OPS_MTX` | optimal instruction count | **5** | `0x13b856` | the "pad to 5 or 10" upload rule (fragment-ISA §1.1/§9.3) |
+| 0x8A89 | `GL_OPT_FP_TEXTURES_MTX` | | **4** | `0x13c6a5` | |
+| 0x8A8A | `GL_OPT_FP_COLORS_MTX` | | **2** | `0x13d051` | |
+| 0x8A8B | `GL_FP_OPS_MTX` | ops used by the bound shader | **5** *(constant)* | `0x13d60d` | — |
+| 0x8A8C | `GL_FP_TEXTURES_MTX` | textures used | **4** *(constant)* | `0x13dbb9` | — |
+| 0x8A8D | `GL_FP_COLORS_MTX` | colours used | **2** *(constant)* | `0x13c2a6` | — |
+
+Two things to carry forward. First, **`GL_MAX_FP_OPS_MTX` = 10 colour
+instructions with an "optimal" count of 5** — this is the real fragment-program
+budget and it confirms, from a second direction, the 5/10 slot structure in
+`docs/parhelia-fragment-isa.md` §1.1. Second, the four "used by the current
+shader" queries (0x8A84, 0x8A8B, 0x8A8C, 0x8A8D) return **hard-coded
+constants**, unlike their `GL_EXT_vertex_shader` counterparts (§3.3), so they
+cannot be used to introspect a compiled program.
+
+`glext.h` also names the rest of the ISA the way the hardware sees it — texture
+opcodes `GL_OP_TEX*_MTX` 0x8A8E–0x8A9D, ALU opcodes
+`GL_OP_{MOV,ADD,SUB,MUL,DP3,DP4,MAD,LRP,CND,CMV,CMP}_MTX` 0x8AA0–0x8AAA,
+registers `GL_TEMPORARY0/1_MTX` 0x8AB0/0x8AB1 and `GL_OUTPUT_COLOR_MTX` 0x8AB3,
+result modifiers `SATURATE` / `SCALE_X2/X4/X8/D2/D4`, argument modifiers
+`INVERT/NEGATE/BIAS/BIAS_NEGATE/SIGNED/SIGNED_NEGATE`, texture formats
+`TEX_UNSIGNED/SIGNED/BIASED` and the sampling hints
+`GL_HINT_{NEAREST,BILINEAR,TRILINEAR,ANISOTROPIC,TEXTURE_1D,2D,3D,CUBE,BEML,BEM}_MTX`.
+That is the whole opcode/modifier vocabulary of
+`docs/parhelia-fragment-isa.md`, with vendor names.
 
 ### 3.5 Limits the ICD does **not** answer
 
