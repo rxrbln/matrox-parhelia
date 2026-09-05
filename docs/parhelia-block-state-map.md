@@ -3,22 +3,34 @@
 What lives in each entry of the 0x180 x 16-byte indexed **block state file**, how
 the validators compute it, and how to ship it with a DMA block-load packet.
 
-Recovered from `matroxdriver-x86_64-cvs-20090511/kernel/mtx_parhelia.o`
-(unstripped, `mtxNNNN` symbols).  Reads foundation-first: this document assumes
-`docs/parhelia-state-slot-map.md`, which establishes the record stream, the
-software shadow (HWSTATE) and the existence of the block file.  Symbol addresses
-below are `.text` offsets in that object.
+Two independent binaries were read: `matroxdriver-x86_64-cvs-20090511/kernel/
+mtx_parhelia.o` (Linux, unstripped, `mtxNNNN` symbols; `.text` offsets below) and
+`xddm32_210_00_105_se_u_nowhql/MtxPar/MTXPARD.dll` (Windows XDDM D3D8; VMAs
+below).  Where they agree the row is marked **2-src**.
 
-Naming used throughout:
+Reads foundation-first: assumes `docs/parhelia-state-slot-map.md`, which
+establishes the record stream, the software shadow (HWSTATE) and the existence of
+the block file.
+
+## The one-line answer
+
+**The block file is a 384-entry vec4 constant store for the WARP vertex engine.**
+Fixed-function transform and lighting is lowered onto fixed slots in it: matrix
+palette, normal matrices, materials, viewport, clip planes, fog, guard band,
+point size, polygon offset, and exp/log coefficient tables.  Per-fragment state
+— depth test, stencil, alpha test, blend, colour mask — is *not* in it and has no
+index; that state travels in the byte-index register namespace.
+
+Names used throughout:
 
 | name | meaning |
 |---|---|
 | HWSTATE | `[[driverobj+0x30]+0x78]`, the GL state shadow |
 | HWREG | `[[HWSTATE+0x8]+0x50]`, the object holding both block-file banks |
-| **BANK** | one bank: `bitmapBase`; registers at `bitmapBase + 0x230 + index*0x10` |
-| raster | `HWSTATE + 0x1bd8`; validators take this as `rsi`, so `raster[X] = HWSTATE[0x1bd8+X]` |
-| DS | `[HWSTATE+0x1e90]` = `HWSTATE+0x0d01`, the depth/stencil sub-state block |
-| VF | `[HWSTATE+0x1e80]` = `HWSTATE+0x0d98`, the viewport-depth + fog sub-state block |
+| **BANK** | one bank: `bitmapBase`; entries at `bitmapBase + 0x230 + index*0x10` |
+| raster / STATE | `HWSTATE + 0x1bd8`; validators take it as `rsi`, so `raster[X] = HWSTATE[0x1bd8+X]` |
+| SURF | `[HWSTATE+0x1e90]` = `HWSTATE+0x0d01` — packed surface + viewport + depth-format descriptor |
+| FOG | `[HWSTATE+0x1e80]` = `HWSTATE+0x0d98` — packed fog parameter block |
 
 **The block file's absolute MMIO address is still unknown and is deliberately not
 guessed here.**  You do not need it: the DMA engine resolves the index.
@@ -27,104 +39,106 @@ guessed here.**  You do not need it: the DMA engine resolves the index.
 
 ## 1. Minimum viable state for one untextured Gouraud triangle
 
-This is the vendor's own answer, not a reconstruction: `mtx2209` @0x8e000 (and
-its twin `mtx867` @0x8eab0) is the context constructor, and it writes exactly
-this set and marks every one of these indices dirty, so the very first flush
-after context creation ships them.  Everything else in the file starts as
-`{0,0,0,0}` (`mtx3107` @0x8fef0 constructs all 0x180 entries via `mtx2321`
-@0x8f600, which stores four zero dwords).  CONFIRMED.
+Every entry is `{0,0,0,0}` until written — `mtx3107` @0x8fef0 constructs all 0x180
+entries through `mtx2321` @0x8f600, which stores four zero dwords.  CONFIRMED.
+So anything the WARP program reads must be programmed explicitly.
 
-Emit in this order.  Every value is a 32-bit IEEE float unless noted.
+Four packets, 26 entries, 104 payload dwords.  All values are 32-bit IEEE floats.
 
-### 1.1 One packet: indices 0x172 .. 0x17e (13 entries)
+### 1.a Viewport — indices 0x160, 0x161 — **the one you cannot omit**
 
 ```
-dword0 = 0x411a0037          ; 0x41000000 | (13<<17) | (13*4+3)
-dword1 = 0x0000000d          ; count = 13
-dword2 = 0x00000172          ; start index
+dword0 = 0x4104000b   ; 0x41000000 | (2<<17) | (2*4+3)
+dword1 = 0x00000002
+dword2 = 0x00000160
 dword3 = 0x00000001
 dword4 = 0x00000000
-then 13 * 4 dwords, in index order:
 ```
 
-| idx | d0 | d1 | d2 | d3 | what it is |
-|---|---|---|---|---|---|
-| 0x172 | `3f800000` 1.0 | `00000000` 0.0 | `00000000` 0.0 | `3f800000` 1.0 | point/line size group; d3 = half-width |
-| 0x173 | `3f800000` 1.0 | `3f800000` 1.0 | `3f000000` 0.5 | `bf000000` -0.5 | size clamp min/max + two constants |
-| 0x174 | `45ff0000` 8160.0 | `45ff0000` 8160.0 | `c5ff0000` -8160.0 | `c5ff0000` -8160.0 | guard-band clip limits (+X,+Y,-X,-Y) |
-| 0x175 | `43000000` 128.0 | `00000000` | `00000000` | `00000000` | d1..d3 copied from the surface block |
-| 0x176 | 0 | 0 | 0 | 0 | not written by any code path found |
-| 0x177 | 0 | 0 | 0 | 0 | not written by any code path found |
-| 0x178 | `00000000` 0.0 | `00000000` 0.0 | `3f000000` 0.5 | `49400000` 786432.0 | polygon offset factor / units / line half-width / constant |
-| 0x179 | `bf800000` -1.0 | `3e75fdf0` | `bd635847` | `3c1d955b` | EXP coefficient table |
-| 0x17a | `3f800000` 1.0 | `baaec3ff` | `39218489` | `b77fe5fe` | EXP coefficient table |
-| 0x17b | `3fb8aa3b` log2e | `bf38aa3b` | `3ef6384f` | `beb8aa3b` | LOG coefficient table |
-| 0x17c | `3f800000` 1.0 | `3e93bb63` | `be76384f` | `3e530bb1` | LOG coefficient table |
-| 0x17d | `4b000000` 2^23 | `3d4ccccd` 0.05 | `41f80000` 31.0 | `3d042108` 1/31 | fixed-point / range constants |
-| 0x17e | `00000000` 0.0 | `3d800000` 0.0625 | `00000000` 0.0 | `00000000` 0.0 | sub-pixel / sample scale group |
+For a viewport of `W x H` at `(X, Y)` on an unscaled render target:
 
-CONFIRMED for every literal: read from `mtx2209` @0x8e434..0x8e685 and
-@0x8e7c2..0x8ea5e.  The 0x179/0x17a values marked with bit patterns only are
-computed at runtime as `pow(ln2,n)/(±n!)` (`0x8e8db`..`0x8e9d7`); the bit
-patterns given are the exact IEEE encodings of those expressions and are
-INFERRED to that extent.
+| idx | d0 | d1 | d2 | d3 |
+|---|---|---|---|---|
+| 0x160 | `+0.5*W` | `-0.5*H` | 0 | — (never written) |
+| 0x161 | `X + 0.5*W` | `Y + 0.5*H` | 0 | `(float)H` |
 
-> The existing `parhelia-state-slot-map.md` §6.3 lists four of these rows with
-> the wrong dword order or wrong constants (it read the register `ebx` as 1.0
-> where it is 0.0).  **Corrections: 0x172 is `{1,0,0,1}` not `{0,1,1,0}`;
-> 0x175 is `{128,0,0,0}` not `{128,1,1,1}`; 0x178 is `{0,0,0.5,786432}` not
-> `{1,1,0,786432}`; 0x17e is `{0,0.0625,0,0}` not `{1,0.0625,1,1}`.**  All four
-> are re-read instruction by instruction here.
+That is the standard NDC→window transform with the Y flip in `0x160.d1`.
+2-src CONFIRMED: `mtx2926` @0x87220 (Linux) and the setter at 0x119371/0x1193d3
+(DLL) compute the same expressions.  The general form carries two surface scale
+factors `fx = SURF[0x39]`, `fy = SURF[0x3d]`:
+`0x160 = {0.5*W*fx, -0.5*H*fy}`, `0x161 = {(X1+X0)*fx + 0.5*W*fx, (Y1+Y0)*fy + 0.5*H*fy}`.
+`fx = fy = 1.0` for an unscaled target (INFERRED).
 
-### 1.2 One packet: indices 0x14d .. 0x14e (2 entries)
+Depth range folds into this viewport transform; there is no separate depth-range
+entry.
+
+### 1.b Transform — indices 0x000..0x006 and 0x149..0x14c
 
 ```
-dword0 = 0x4104000b ; dword1 = 2 ; dword2 = 0x14d ; dword3 = 1 ; dword4 = 0
+packet 1: dword0=0x410e001f, count=7, start=0x000    ; world0 * view, + normal matrix
+packet 2: dword0=0x41080013, count=4, start=0x149    ; projection (or modelview*projection)
+```
+
+* `0x000..0x003` = the 4x4 `world[0] * view` matrix, 16 floats, row-major as
+  stored.  For an untransformed triangle: identity.
+* `0x004..0x006` = the 3x3 inverse-transpose of that matrix (normal matrix),
+  written as three vec4s with `w` left untouched.  For identity: `{1,0,0,*}`,
+  `{0,1,0,*}`, `{0,0,1,*}`.
+* `0x149..0x14c` = the projection matrix (or `modelview*projection` in the fused
+  path).  For an untransformed triangle: identity.
+
+CONFIRMED (`mtx1394` @0x85220: `mtx3265` copies 16 dwords to `*[HWREG+0x238+8k]`
+= entry `7k`, `mtx3731` copies the 3x3 to `*[HWREG+0x360+8k]` = entry `7k+4`,
+then `mtx2702(bitmap, 7k, 7k+7)`; the projection path copies through
+`[HWREG+0x358]` = entry 0x149 and marks `0x149..0x14d`).  The identity source
+constant is at `.rodata+0x2bc0`.
+
+### 1.c Setup constants — indices 0x172 .. 0x17e (13 entries)
+
+```
+dword0 = 0x411a0037   ; 0x41000000 | (13<<17) | (13*4+3)
+dword1 = 0x0000000d ; dword2 = 0x00000172 ; dword3 = 1 ; dword4 = 0
 ```
 
 | idx | d0 | d1 | d2 | d3 |
 |---|---|---|---|---|
-| 0x14d | 0 | `(float)VF-derived int`, see §3 | 0 | `42000000` 32.0 |
-| 0x14e | `3f800000` 1.0 | `00000000` 0.0 | 0 | 0 |
+| 0x172 | `3f800000` 1.0 | `00000000` | `00000000` | `3f800000` 1.0 |
+| 0x173 | `3f800000` 1.0 | `3f800000` 1.0 | `3f000000` 0.5 | `bf000000` -0.5 |
+| 0x174 | `45ff0000` 8160.0 | `45ff0000` 8160.0 | `c5ff0000` -8160.0 | `c5ff0000` -8160.0 |
+| 0x175 | `43000000` 128.0 | `00000000` | `00000000` | `00000000` |
+| 0x176 | 0 | 0 | 0 | 0 |
+| 0x177 | 0 | 0 | 0 | 0 |
+| 0x178 | `00000000` | `00000000` | `3f000000` 0.5 | `49400000` 786432.0 |
+| 0x179 | `bf800000` -1.0 | `3e75fdf0` | `bd635847` | `3c1d955b` |
+| 0x17a | `3f800000` 1.0 | `baaec3ff` | `39218489` | `b77fe5fe` |
+| 0x17b | `3fb8aa3b` log2e | `bf38aa3b` | `3ef6384f` | `beb8aa3b` |
+| 0x17c | `3f800000` 1.0 | `3e93bb63` | `be76384f` | `3e530bb1` |
+| 0x17d | `4b000000` 2^23 | `3d4ccccd` 0.05 | `41f80000` 31.0 | `3d042108` 1/31 |
+| 0x17e | `00000000` | `3d800000` 0.0625 | `00000000` | `00000000` |
 
-0x14e is **depth range**: `d0 = 1/(zFar-zNear)`, `d1 = -zNear/(zFar-zNear)`.
-For the GL default range `[0,1]` that is `{1.0, 0.0}`.  CONFIRMED
-(`mtx3654` @0x8b6ad..0x8b709).  `mtx2209` only initialises 0x14d d3 = 32.0;
-0x14e is left zero by the constructor, so **a from-scratch driver must program
-0x14e itself before the first draw** — leaving it `{0,0}` collapses all depth.
+This is exactly what the vendor context constructor `mtx2209` @0x8e000 (and its
+twin `mtx867` @0x8eab0) writes and marks dirty, so the first flush after context
+creation ships it.  CONFIRMED, read instruction by instruction @0x8e434..0x8e685
+and @0x8e7c2..0x8ea5e.  The 0x179/0x17a bit patterns are the IEEE encodings of
+`pow(ln2,n)/(±n!)`, computed at runtime @0x8e8db..0x8e9d7 (INFERRED to that
+extent); the four immediates in 0x17b/0x17c and everything else are literals.
 
-### 1.3 One packet: indices 0x160 .. 0x161 (2 entries)
+0x174 (`±8160.0`) and 0x17d are **byte-identical in the D3D driver** — the
+strongest independent confirmation of the index numbering in this document.
 
-```
-dword0 = 0x4104000b ; dword1 = 2 ; dword2 = 0x160 ; dword3 = 1 ; dword4 = 0
-0x160 = { 0, 0, 0, 3f800000 }     ; d3 = 1.0
-0x161 = { 0, 0, 0, 00000000 }     ; d3 = 0.0
-```
-CONFIRMED (`mtx2209` @0x8e6d5/0x8e6e5, mirrored at 0x8e6ed/0x8e6f4).
+> The existing `parhelia-state-slot-map.md` §6.3 lists four of these rows wrongly
+> (it read the register `ebx` as 1.0 where it holds 0.0).  **Corrections:
+> 0x172 = `{1,0,0,1}` not `{0,1,1,0}`; 0x175 = `{128,0,0,0}` not `{128,1,1,1}`;
+> 0x178 = `{0,0,0.5,786432}` not `{1,1,0,786432}`; 0x17e = `{0,0.0625,0,0}` not
+> `{1,0.0625,1,1}`.**  Both binaries agree with the corrected values.
 
-### 1.4 Matrix blocks — needed once transform is on
+### 1.d Not in this file — do not look for an index
 
-Six 4x4 float matrices, each occupying four consecutive entries.  `mtx2209`
-@0x8e8a3 memcpy's a 0x40-byte identity matrix (`.rodata+0x2bc0`,
-`{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}`) into three of them.  For a triangle with
-an identity modelview/projection, program:
-
-```
-0x149..0x14c = identity 4x4      (packet: count=4, start=0x149, dword0=0x41080013)
-```
-
-CONFIRMED that 0x149 is a matrix head (`mtx3654` @0x8cc7f copies 16 dwords
-through `[HWREG+0x358]` and then marks 0x149..0x14c).
-
-### 1.5 Not in this file
-
-**Depth test / depth func / depth mask, stencil, alpha test, blend factors,
-blend equation, colour mask are NOT block-file state.**  See §6.  Program those
-through the byte-index namespace (`reg = 0x1000 + index*4`, ring tag
-`0xc0afafc0` / `0x2121xxxx`) exactly as the repo already documents.
-
-So the complete "first triangle" block-file program is: §1.1, §1.2, §1.3 and, if
-you transform on the GPU, §1.4.  Four packets, 21 entries, 84 payload dwords.
+Depth test / func / mask, stencil (all), alpha test enable / func / ref, blend
+enable / factors / equation, colour mask, cull face, front face, scissor and the
+viewport *rectangle* are **not** block-file state.  See §6.  Program them through
+the byte-index namespace (`reg = 0x1000 + index*4`, ring tags `0x2121xxxx` /
+`0xc0afafc0`) exactly as the repo already documents.
 
 ---
 
@@ -139,49 +153,47 @@ base+0x038   dirty bitmap 1 : u32 summary; u32 word[12]
 base+0x06c   dirty bitmap 2 : u32 summary; u32 word[12]
 base+0x0a0   u32 flag, +0xa4 ring head, +0xa8 ring tail
 base+0x0b0   client-upload slot ring: 6 entries x 0x40      (see §5.3)
-base+0x230   registers: 0x180 entries x 0x10 bytes
+base+0x230   entries: 0x180 x 0x10 bytes
 base+0x1a30  end
 ```
 
 The two banks inside HWREG:
 
 ```
-HWREG+0x07e8   bank A bitmap      HWREG+0x0a18   bank A registers
-HWREG+0x2218   bank B bitmap      HWREG+0x2448   bank B registers
+HWREG+0x07e8   bank A bitmap      HWREG+0x0a18   bank A entries
+HWREG+0x2218   bank B bitmap      HWREG+0x2448   bank B entries
+bankB_addr = bankA_addr + 0x1a30
 ```
-`bankB_addr = bankA_addr + 0x1a30` exactly, verified on every mirrored store
-pair in `mtx740`, `mtx2497`, `mtx3654` and `mtx2209`.
-
 `entry(bank, idx) = bitmapBase + 0x230 + idx*0x10`, four dwords, four distinct
-values.  Independently re-confirmed by the pointer tables of §3.4.
+values.  Verified on every mirrored store pair in `mtx740`, `mtx2497`, `mtx2926`,
+`mtx2522`, `mtx3654` and `mtx2209`.  The DLL's scan loop terminates on
+`cmp edi,0x180`, and its entry stride is `shl eax,4` — same geometry.  2-src.
 
 ---
 
 ## 3. The validators
 
 `mtx3712` @0x188f0 is the validate pass.  It dispatches one validator per dirty
-group.  **Only the raster group reaches the block file**:
+group.  **Only the raster group reaches the block file:**
 
-| dirty group | validator | target object | block file? |
+| dirty group | validator | target | block file? |
 |---|---|---|---|
-| `[HWSTATE+0xc87]` depth/stencil | `mtx360` @0x12370 | `[dev+0x40]+0x88` | no |
+| `[HWSTATE+0xc87]` surface/viewport/depth-stencil | `mtx360` @0x12370 | `[dev+0x40]+0x88` and SURF | no |
 | `[HWSTATE+0xc08]` blend/alpha/colour-mask | `mtx2480` @0x129e0 | `[dev+0x40]+0x60/0xb00` | no |
-| `[HWSTATE+0xd54]` fog enables | (@0x189bc) | `[dev+0x40]+0xa8` | no |
+| `[HWSTATE+0xd54]` fog enables | @0x189bc | `[dev+0x40]+0xa8` | no |
 | `[HWSTATE+0x1b44]` | `mtx3024` @0xb560 | `[dev+0x3288]` | no |
 | `[HWSTATE+0xdbb]` texture/fragment | `mtx297` | `[dev+0x58]` | no |
 | **`[HWSTATE+0x1bd8]` raster** | **`mtx3654` @0x8b510** | `rdi = HWREG` | **yes** |
 
-CONFIRMED: of the 81 `mtx2702` (mark-dirty) call sites in the whole object, none
-is inside `mtx360` or `mtx2480`.  The complete set of callers is `mtx4027`,
-`mtx1322`, `mtx558`, `mtx2441`, `mtx1394`, `mtx740`, `mtx2497`, `mtx2588`,
-`mtx2926`, `mtx2522`, `mtx309`, `mtx3654`, `mtx2209`, `mtx867`.
+CONFIRMED: of the 81 `mtx2702` (mark-dirty) call sites in the object, none is
+inside `mtx360` or `mtx2480`.  The complete caller set is `mtx4027`, `mtx1322`,
+`mtx558`, `mtx2441`, `mtx1394`, `mtx740`, `mtx2497`, `mtx2588`, `mtx2926`,
+`mtx2522`, `mtx309`, `mtx3654`, `mtx2209`, `mtx867`.
 
 `mtx3654` is called as `mtx3654(rdi=HWREG, rsi=raster, rdx=HWSTATE+0x1e98,
-rcx=[dev+0x40]+0x1c0)` and calls the leaf validators with the same `rdi/rsi`.
+rcx=[dev+0x40]+0x1c0)` and passes the same `rdi`/`rsi` to the leaf validators.
 
-### 3.1 `mtx740` @0x864f0 — polygon offset -> **0x178 d0, d1**
-
-The anchor, re-verified end to end.
+### 3.1 `mtx740` @0x864f0 — polygon offset → **0x178 d0, d1**
 
 Gate (CONFIRMED, and it doubles as proof of two enum tables):
 
@@ -198,7 +210,7 @@ Arithmetic (@0x865e6..0x86679):
 ```
 factor = raster[0x270]              ; HWSTATE[0x1e48], key 0x05 slot 0x15
 units  = raster[0x274]              ; HWSTATE[0x1e4c], key 0x05 slot 0x16
-units *= DS[0x15]                   ; HWSTATE[0xd16], per-depth-format resolution
+units *= SURF[0x15]                 ; HWSTATE[0xd16], per-depth-format resolution
 if !(raster[0x08] & 1) {            ; HWSTATE[0x1be0] bit0
     factor *= [HWREG+0x6f4]
     units  *= (float)[HWREG+0x6f0] * [HWREG+0x6f4]
@@ -207,27 +219,32 @@ block[0x178].d0 = factor            ; both banks
 block[0x178].d1 = units             ; both banks
 ```
 
-* `[HWREG+0x6f4]` is a **sign** taken from a depth-format LUT at `.data+0x8b20`
-  indexed by `min(DS[0x0c], 8)` (`mtx3654` @0x8cc55):
+* `[HWREG+0x6f4]` is a **sign** from a depth-format LUT at `.data+0x8b20` indexed
+  by `min(SURF[0x0c], 8)` (`mtx3654` @0x8cc55):
   `{0.0, 0.0, -1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 0.0}`.  Default 1.0 (`mtx3995`
   @0x851ab).  CONFIRMED.
 * `[HWREG+0x6f0]` is an integer read once at init from a driver configuration
-  object through a vtable call (`mtx2163` @0x84e4d).  Not a GL value; treat it
-  as a units multiplier and use 1.  CONFIRMED as a config read, value INFERRED.
-* Slots 0x17/0x18/0x19 of key 0x05 are the three enable predicates above — not
+  object through a vtable call (`mtx2163` @0x84e4d).  Not a GL value; use 1.
+  CONFIRMED as a config read, value INFERRED.
+* Key 0x05 slots 0x17/0x18/0x19 are the three enable predicates above, not
   registers.  CONFIRMED.
 
-### 3.2 `mtx2497` @0x867a0 — point/line size -> **0x172 d3**
+*Disagreement with the D3D driver:* MTXPARD writes a pair of floats into
+0x178 d0/d1 from a point-size code path and puts D3D depth bias in 0x17c d2/d3
+instead.  The Linux gate above is unambiguous (it tests the polygon-offset enable
+bits against the polygon mode), so 0x178 d0/d1 = polygon offset is CONFIRMED for
+the GL stack; whether the WARP program reads it as offset or as size depends on
+which fixed-function program is bound.  Flagged, not resolved.
 
-Called as `mtx2497(rdi=HWREG, rsi=raster, rdx=[dev+0x40]+0x1c0, xmm0=DS[0x39])`.
-`DS[0x39]` (`HWSTATE[0xd3a]`) is a float scale carried in the depth/stencil
-block; it multiplies sizes and divides distances, which is the signature of a
-supersample/AA scale factor (INFERRED as to meaning, CONFIRMED as to use).
+### 3.2 `mtx2497` @0x867a0 — point/line size → **0x172 d3**
+
+Called as `mtx2497(rdi=HWREG, rsi=raster, rdx=[dev+0x40]+0x1c0, xmm0=SURF[0x39])`,
+i.e. the viewport X scale.
 
 ```
 v = raster[0x258]                       ; HWSTATE[0x1e30], key 0x0c slot 0x9a
 if !(raster[0x09] & 2) {                ; HWSTATE[0x1be1] bit1 = slot 0x9d
-    if (scaleSelect == 0) v *= DS[0x39]
+    if (scaleSelect == 0) v *= SURF[0x39]
     v = max(block[0x173].d0, min(v, block[0x173].d1))   ; clamp to the size range
 }
 if ((HWREG[0xe4]&3)==1 && !(raster[0x09]&2) && !(HWREG[0xe0]&0x40)) {
@@ -237,9 +254,9 @@ if ((HWREG[0xe4]&3)==1 && !(raster[0x09]&2) && !(HWREG[0xe0]&0x40)) {
 }
 block[0x172].d3 = v
 ```
-CONFIRMED (@0x86900..0x86998).  Note `block[0x173].d0/d1` are read back out of
-**bank A** through the pointer table — the file is its own state, the validator
-compares against it.
+CONFIRMED (@0x86900..0x86998).  `block[0x173].d0/d1` are read back out of
+**bank A** through the pointer table — the file is its own state, and the
+validator compares against it.
 
 ### 3.3 `mtx3654` @0x8b510 — the raster validator
 
@@ -247,129 +264,203 @@ All rows CONFIRMED unless tagged.
 
 | block | dwords | source | arithmetic | site |
 |---|---|---|---|---|
-| **0x14e** | 0,1 | `VF[0x05]` gate, `VF[0x06]`=zNear, `VF[0x0a]`=zFar | `d0 = 1/(far-near)`, `d1 = -near/(far-near)` | 0x8b6ad |
-| **0x154** | 0..3 | `VF[0x04]` gate, `VF[0x0f]`=start, `VF[0x13]`=end, `VF[0x17]`=density, `VF[0x1b]`=mode | `d0 = start`; `d1 = end/(end-start)`; `d2 = 1/(end-start)`; `d3 = density*log2e` (mode!=2) or `density²*log2e` (mode==2) | 0x8ccce, 0x8d394 |
+| **0x14e** | 0,1 | `FOG[0x05]` gate, `FOG[0x06]`, `FOG[0x0a]` | `d0 = 1/(end-start)`, `d1 = -start/(end-start)` — **linear fog**, 2-src | 0x8b6ad |
+| **0x154** | 0..3 | `FOG[0x04]` gate, `FOG[0x0f]`=start, `FOG[0x13]`=end, `FOG[0x17]`=density, `FOG[0x1b]`=mode | `d0 = start`; `d1 = end/(end-start)`; `d2 = 1/(end-start)`; `d3 = density*log2e` (mode!=2) or `density²*log2e` (mode==2, EXP2) — 2-src | 0x8ccce, 0x8d394 |
 | **0x155** | 3 | `raster[0x254]` = `HWSTATE[0x1e2c]`, key 0x0c slot 0xaa | verbatim | 0x8d230 |
-| **0x172** | 0,1,2 | `raster[0x264/0x268/0x26c]` = `HWSTATE[0x1e3c/0x1e40/0x1e44]`, key 0x0c slots 0x9e/0x9f/0xa0 | `v * (1.0 / DS[0x39])` | 0x8bb29 |
-| **0x173** | 0 | `raster[0x25c]` = `HWSTATE[0x1e34]`, key 0x0c slot 0x9b | `v * DS[0x39]` | 0x8bbd7 |
-| **0x173** | 1 | `raster[0x260]` = `HWSTATE[0x1e38]`, key 0x0c slot 0xa6 | `min(v * DS[0x39], 2048.0)` | 0x8bbdc |
+| **0x172** | 0,1,2 | `raster[0x264/0x268/0x26c]` = `HWSTATE[0x1e3c/0x1e40/0x1e44]`, slots 0x9e/0x9f/0xa0 | `v * (1.0 / SURF[0x39])` | 0x8bb29 |
+| **0x173** | 0 | `raster[0x25c]` = `HWSTATE[0x1e34]`, slot 0x9b | `v * SURF[0x39]` | 0x8bbd7 |
+| **0x173** | 1 | `raster[0x260]` = `HWSTATE[0x1e38]`, slot 0xa6 | `min(v * SURF[0x39], 2048.0)` | 0x8bbdc |
 | **0x175** | 1,2,3 | `[HWSTATE+0x1ad8]+0x60/0x64/0x68` | copied verbatim as dwords | 0x8bff6 |
 | **0x14d** | 1 | `[HWSTATE+0x0c6b]+0x0c` (int) | `(float)(int)v` | 0x8bf46 |
 | **0x178** | 2 | `raster[0x278]` = `HWSTATE[0x1e50]`, key 0x05 slot 0x1b | `v < 2.0 ? 0.5 : 0.5*trunc(v)` | 0x8c715 |
 | **0x17e** | 0,2,3 | `WORD [raster+0x27e]` = `HWSTATE[0x1e56]` | `d3 = (float)w * 16.0`; `d2 = 0.5/d3`; `d0 = 0.0` | 0x8b9c2 |
-| **0x139+4k** | 4x4 | `[raster + 0x78 + (t+0x22)*8]` | 16-dword matrix copy via `mtx3265`, k = 0..3 | 0x8c360 |
+| **0x139+4k** | 4x4 | `[raster + 0x78 + (t+0x22)*8]`, k = 0..3 | 16-dword matrix copy via `mtx3265` | 0x8c360 |
 | **0x149** | 4x4 | `[raster+0x80]` = `[HWSTATE+0x1c58]` | 16-dword matrix copy | 0x8cc7f |
 
-`mtx3654` also *reads* 0x134/0x135/0x137 (comparing three dwords against zero to
-set the software flags `HWREG+0x6e4/0x6e5`) without writing them — those are
-produced by `mtx1322`/`mtx2441`.
+`mtx3654` also *reads* 0x134/0x135/0x137 (three-dwords-vs-zero tests that set the
+software flags `HWREG+0x6e4/0x6e5`) without writing them.
 
-The predicate bits: `raster[0x09] bit0` (key 0x0c slot 0x9c) is copied to
-`HWREG+0x6e9` and gates the 0x172 path; `bit1` (slot 0x9d) bypasses the size
-scale/clamp.  Neither is a register.  CONFIRMED (@0x8bab9).
+Predicate bits: `raster[0x09] bit0` (slot 0x9c) is copied to `HWREG+0x6e9` and
+gates the 0x172 path; `bit1` (slot 0x9d) bypasses the size scale and clamp.
+Neither is a register.  CONFIRMED (@0x8bab9).
 
-### 3.4 Pointer tables — third independent confirmation of the addressing
+### 3.4 `mtx1394` @0x85220 — matrix palette → **0x000..0x0df**, projection → **0x149..0x14c**
 
-`mtx2209` builds three tables inside HWREG, and every entry satisfies
+Sources: `[STATE+0x78]` = view, `[STATE+0x80]` = projection, `[STATE+0x88+8k]` =
+world matrix *k*.  Per matrix, up to 32 of them:
+
+```
+M = world[k] * view                       ; mtx1749
+*[HWREG+0x238 + 8k] <- M                  ; entries 7k .. 7k+3   (mtx3265, 16 dwords)
+N = transpose(inverse(M))
+*[HWREG+0x360 + 8k] <- N[3x3]             ; entries 7k+4 .. 7k+6 (mtx3731, 3x3, w untouched)
+mtx2702(bitmapA, 7k, 7k+7)
+```
+CONFIRMED, first index is 0 (`xor esi,esi; mov edx,0x7` @0x856fa).  32 x 7 = 0xe0,
+so the palette is exactly `0x000..0x0df` and the texture-stage array begins at
+0xe0 — which the DLL confirms independently (`0xe0 + 7k`, k = 0..11, loop at
+0x121b81 running to `0xe0 + 12*7 = 0x134`).  2-src.
+
+The projection path copies `[STATE+0x80]` (or `modelview*projection`) through
+`[HWREG+0x358]` into 0x149..0x14c and marks `0x149..0x14d`.
+
+`mtx1394` also keeps two non-block 4x4 scratch matrices at `HWREG+0x1b4` and
+`HWREG+0x1f4`; the latter is `transpose(inverse(view*projection))` and is what
+§3.6 uses.
+
+### 3.5 `mtx2926` @0x87220 — viewport → **0x160, 0x161**
+
+Source `S = SURF`, packed at odd offsets: `S[0x21],S[0x25]` = X0,Y0;
+`S[0x29],S[0x2d]` = W,H; `S[0x31],S[0x35]` = X1,Y1; `S[0x39],S[0x3d]` = fx,fy.
+(`mtx360` is what writes that rect into SURF.)
+
+```
+if (dword[HWREG+0xec] != 0):            ; transform enabled
+    0x160.d0 =  0.5*W*fx
+    0x160.d1 = -0.5*H*fy
+    0x160.d2 =  raw dword [STATE+0x28]
+    0x161.d0 =  (X1+X0)*fx + 0.5*W*fx
+    0x161.d1 =  (Y1+Y0)*fy + 0.5*H*fy   ; -0.046875 when (HWREG[0xe4]&0x1f)==5
+    0x161.d2 =  raw dword [STATE+0x2c]
+    0x161.d3 =  (float)H                ; bank A only — see §6
+else:                                   ; pre-transformed vertices
+    0x160 = {fx, fy}; 0x161 = {X1*fx, Y1*fy}   ; bank A only, skipped if identity
+```
+CONFIRMED; the DLL setters at 0x119371/0x1193d3 compute the same.  2-src.
+`0x160.d3` is never written by anything.
+
+### 3.6 `mtx2522` @0x87790 — user clip planes → **0x16c .. 0x171**
+
+Plane array `P = STATE + 0x1c8`, six planes of 16 bytes.  Enable mask
+`E = (HWSTATE[0x1be7] >> 1) & 0x3f`; enabled planes are **compacted** into
+consecutive slots.  That mask closes a loose end in
+`parhelia-state-slot-map.md` §3.2: **key 0x0c slot 0x98**, which writes
+`[0x1be7]` bits 1-6 = `v & 0x3f`, is the `glEnable(GL_CLIP_PLANEi)` bitmask.  Per enabled plane `i` at slot `s`:
+
+```
+dst = [HWREG + 0x3d00 + s*8]                     ; bank A entry 0x16c+s
+dst = M * P[i]      where M = HWREG+0x1f4 = transpose(inverse(view*proj))
+        d0 = p·M[0..3]   d1 = p·M[4..7]   d2 = p·M[8..11]   d3 = p·M[12..15]
+copy to HWREG + 0x3b08 + s*0x10                  ; bank B entry 0x16c+s
+mark 0x16c+s in both bitmaps
+```
+CONFIRMED.  The DLL agrees (loop at 0x11fb5c with `mov ebp,0x16c`, six entries,
+gated on a 6-bit enable mask).  2-src.
+
+### 3.7 `mtx1322` / `mtx2441` — materials → **0x134..0x137** and **0x156..0x159**
+
+`mtx2441(rdi=ctx, rsi=array, edx=count)` walks records of stride 0x48:
+`{u32 type; float m[16]; float Power;}`, and before every compare it executes
+`m[11] = Power` — packing the scalar at byte 64 into `w` of the third vec4.  That
+is `D3DMATERIAL{Diffuse, Ambient, Specular, Emissive, Power}` with
+`Power → Specular.w`:
+
+| entry | field |
+|---|---|
+| 0x134 / 0x156 | Diffuse |
+| 0x135 / 0x157 | **Ambient** |
+| 0x136 / 0x158 | Specular (`w` = Power / shininess) |
+| 0x137 / 0x159 | Emissive |
+
+`type==1` → 0x134..0x137; `type==2` → 0x156..0x159; `type==3` → both.  Front and
+back material for two-sided lighting.  CONFIRMED for the mechanism and the
+Power-packing; the GL/D3D field naming is INFERRED but the layout match is exact.
+Cached pointers: `[HWSTATE+0x1e68]` = `&bankA[0x134]`,
+`[HWSTATE+0x1e70]` = `&bankA[0x156]`, `[HWSTATE+0x1e58]` = `HWREG+0x7e8`
+(set by `mtx1440`, called with `rdi = HWSTATE+0x1bd8` @0x1826c).  Bank A only.
+
+### 3.8 `mtx2588` @0x86bf0 — ambient product → **0x138**
+
+```
+if      (HWREG[0x6e6] && dword[HWREG+0x114] != 0)  V[i] = STATE[0x244+4i]
+else if (HWREG[0x6e6] && HWREG[0x6e4])             V[i] = STATE[0x244+4i] * entry0x135[i]
+else                                               V    = {0,0,0,0}
+block[0x138] = V                                   ; bank A only
+```
+`entry0x135` is the material Ambient of §3.7, so 0x138 is
+`globalAmbient x materialAmbient` — the ambient lighting term.  CONFIRMED
+mechanically; naming INFERRED, but it is corroborated by two independent
+decodings meeting at 0x135.
+
+The same function also derives the four colour-material source selectors
+(`0=material, 1=COLOR1, 2=COLOR2`) into non-block scalars at
+`HWREG+0x104/0x108/0x10c/0x110/0x114/0x118/0x11c/0x120`.
+
+### 3.9 Pointer tables — third independent confirmation of the addressing
+
+`mtx2209` builds three tables inside HWREG; every entry satisfies
 `ptr = HWREG + 0xa18 + index*0x10`:
 
 | table | contents | block index |
 |---|---|---|
-| `[HWREG+0x238 + n*8]`, n=0..0x1f | `HWREG + 0xa18 + n*0x70` | `7n` |
-| `[HWREG+0x360 + n*8]`, n=0..0x1f | `HWREG + 0xa58 + n*0x70` | `7n + 4` |
+| `[HWREG+0x238 + n*8]`, n=0..0x1f | `HWREG + 0xa18 + n*0x70` | `7n` (matrix) |
+| `[HWREG+0x360 + n*8]`, n=0..0x1f | `HWREG + 0xa58 + n*0x70` | `7n + 4` (normal matrix) |
 | `[HWREG+0x338 + k*8]`, k=0..3 | `HWREG + 0x1da8 + k*0x40` | `0x139 + 4k` |
 | `[HWREG+0x358]` | `HWREG + 0x1ea8` | `0x149` |
-| `[HWREG+0x3c48 + …]` | see `parhelia-state-slot-map.md` §4.1 | 0x134..0x178 |
-
-So block indices 0x000..0x131 are a regular array of **7-entry groups** (the
-`[HWREG+0x3c88+k*8]` sub-range k=0..11 covers `0xe0 + 7k`, the twelve texture
-stages), and 0x139..0x14c is a run of **4-entry 4x4 matrices**.  Group structure
-CONFIRMED; "texture stage" naming INFERRED.
+| `[HWREG+0x3c48 …]` | see `parhelia-state-slot-map.md` §4.1 | 0x134..0x178 |
 
 ---
 
 ## 4. Block-index map
 
-CONFIRMED = the index and the writing code were read.  INFERRED = the GL meaning
-is deduced from the arithmetic.
+CONFIRMED = the index and its writer were read.  INFERRED = the meaning is
+deduced from the arithmetic.  2-src = both binaries agree.
 
-| index | holds | dword layout | fed by |
+| index | holds | layout | writer |
 |---|---|---|---|
-| 0x000..0x131 | 7-register groups, `group g` at `7g` | — | texture stages (`mtx309` @0x89cb0 marks `0xe0..0xe6`); CONFIRMED index, INFERRED role |
-| 0x134..0x137 | 4x4 matrix, read by `mtx3654` as three-dword-vs-zero tests | 16 floats | `mtx1322`, `mtx2441`; CONFIRMED |
-| 0x138 | one entry | 4 floats | `mtx2588` @0x86bf0; CONFIRMED index |
-| 0x139..0x148 | four 4x4 matrices, `0x139+4k`, k=0..3 | 16 floats each | `mtx3654` @0x8c360, source selected per unit; CONFIRMED |
-| 0x149..0x14c | 4x4 matrix; init = identity | 16 floats | `mtx3654` @0x8cc7f, `mtx1394` @0x85220; CONFIRMED |
-| 0x14d | d1 = `(float)(int)[HWSTATE+0xc77]`; d3 init 32.0 | | `mtx3654` @0x8bf46; CONFIRMED |
-| **0x14e** | **depth range** | d0 `1/(far-near)`, d1 `-near/(far-near)` | `mtx3654` @0x8b6ad, `mtx309`; CONFIRMED |
-| **0x154** | **fog parameters** | d0 start, d1 `end/(end-start)`, d2 `1/(end-start)`, d3 `density*log2e` (or `density²*log2e` for EXP2) | `mtx3654` @0x8ccce; CONFIRMED mechanically, GL naming INFERRED (the log2e factor and the linear-fog reciprocal are unambiguous) |
+| **0x000..0x0df** | **matrix palette**: 32 slots of 7 entries — `world[k]*view` at `7k..7k+3`, its 3x3 inverse-transpose at `7k+4..7k+6` | 4x4 + 3x3 | `mtx1394`; CONFIRMED, 2-src on the geometry |
+| **0x0e0..0x133** | **12 texture stages**, 7 entries each at `0xe0 + 7k` | | `mtx309` @0x89cb0; CONFIRMED, 2-src (DLL loop 0x121b81) |
+| **0x134..0x137** | **front material**: Diffuse, Ambient, Specular(w=Power), Emissive | 4 vec4 | `mtx1322`/`mtx2441`; CONFIRMED, naming INFERRED |
+| **0x138** | **ambient product** `globalAmbient * materialAmbient` | vec4 | `mtx2588`; CONFIRMED |
+| **0x139..0x148** | four 4x4 matrices at `0x139 + 4k` — per-unit texture transforms | 16 floats each | `mtx3654` @0x8c360; CONFIRMED, role INFERRED |
+| **0x149..0x14c** | **projection** (or `modelview*projection`); init = identity | 4x4 | `mtx1394`, `mtx3654`; CONFIRMED, 2-src |
+| 0x14d | d1 = `(float)(int)[HWSTATE+0xc77]`; d3 init 32.0 | | `mtx3654` @0x8bf46; CONFIRMED, 2-src on the arithmetic |
+| **0x14e** | **linear fog**: `{1/(end-start), -start/(end-start)}` | d0,d1 | `mtx3654` @0x8b6ad; CONFIRMED, 2-src |
+| **0x154** | **fog parameters**: `{start, end/(end-start), 1/(end-start), density*log2e}` (`density²*log2e` for EXP2) | vec4 | `mtx3654` @0x8ccce; CONFIRMED, 2-src |
 | 0x155 | d3 = key 0x0c slot 0xaa verbatim | | `mtx3654` @0x8d230; CONFIRMED |
-| 0x156..0x159 | 4x4 matrix | 16 floats | `mtx1322`, `mtx2441`; CONFIRMED |
-| 0x160, 0x161 | d3 = 1.0 / 0.0 at init | | `mtx2926` @0x87220; CONFIRMED |
-| 0x16c..0x171 | six entries reached through `[HWREG+0x3d00+k*8]` | | `mtx2522` @0x87790; CONFIRMED |
-| **0x172** | **point/line size group** | d0..d2 = slots 0x9e/0x9f/0xa0 `/ DS[0x39]`; **d3 = the clamped, optionally half-and-snapped size** | `mtx3654`, `mtx2497`; CONFIRMED |
-| **0x173** | **size clamp range** | d0 = min (slot 0x9b `* DS[0x39]`), d1 = max (slot 0xa6 `* DS[0x39]`, capped 2048.0), d2/d3 constants 0.5 / -0.5 | `mtx3654` @0x8bbd7; CONFIRMED |
-| **0x174** | **guard band** | `{+X, +Y, -X, -Y}` = `{8160, 8160, -8160, -8160}` | init only (`mtx2209` @0x8e7d0); CONFIRMED literal, "guard band" INFERRED |
-| 0x175 | d0 = 128.0 constant; d1..d3 copied from `[HWSTATE+0x1ad8]+0x60..0x68` | | `mtx3654` @0x8bff6; CONFIRMED |
+| **0x156..0x159** | **back material**, same layout as 0x134 | 4 vec4 | `mtx2441`; CONFIRMED |
+| **0x160** | **viewport scale** `{0.5*W*fx, -0.5*H*fy, raw, —}` | | `mtx2926`; CONFIRMED, 2-src |
+| **0x161** | **viewport bias** `{(X+0.5W)*fx, (Y+0.5H)*fy, raw, (float)H}` | | `mtx2926`; CONFIRMED, 2-src |
+| **0x16c..0x171** | **six user clip planes**, transformed by `inv(view*proj)ᵀ`, compacted | vec4 each | `mtx2522`; CONFIRMED, 2-src |
+| **0x172** | point/line size group: d0..d2 = slots 0x9e/0x9f/0xa0 `/ SURF[0x39]`; **d3 = the clamped, optionally half-and-snapped size** | | `mtx3654`, `mtx2497`; CONFIRMED |
+| **0x173** | **size clamp range**: d0 = min (slot 0x9b `* SURF[0x39]`), d1 = max (slot 0xa6 `* SURF[0x39]`, capped 2048.0); d2/d3 constants 0.5 / -0.5 | | `mtx3654` @0x8bbd7; CONFIRMED |
+| **0x174** | **guard-band clip limits** `{+X, +Y, -X, -Y}` = `{8160, 8160, -8160, -8160}` | | init only; CONFIRMED, **byte-identical in both binaries** |
+| 0x175 | d0 = 128.0 constant; d1..d3 copied from `[HWSTATE+0x1ad8]+0x60..0x68` | | `mtx3654` @0x8bff6; CONFIRMED, 2-src |
 | 0x176, 0x177 | never written | zero | — |
-| **0x178** | **polygon offset + line half-width** | d0 factor, d1 units (both scaled, §3.1), d2 = `0.5*trunc(slot 0x1b)` clamped to ≥ 0.5, d3 constant 786432.0 | `mtx740`, `mtx3654`; CONFIRMED |
-| 0x179, 0x17a | EXP coefficient table | `{c1,c2,c3,c4}` / `{1.0,c5,c6,c7}`, `cn = pow(ln2,n)/(±n!)` | init only; CONFIRMED literals, role INFERRED |
-| 0x17b, 0x17c | LOG coefficient table | `{log2e, -log2e/2, log2e/3, -log2e/4}` / `{1.0, log2e/5, -log2e/6, log2e/7}` | init only; CONFIRMED literals, role INFERRED |
-| 0x17d | range constants | `{2^23, 0.05, 31.0, 1/31}` | init only; CONFIRMED |
-| 0x17e | sub-pixel / sample group | d3 = `(float)WORD[HWSTATE+0x1e56] * 16.0`, d2 = `0.5/d3`, d0 = 0.0, d1 constant 0.0625 | `mtx3654` @0x8b9c2; CONFIRMED |
-| 0x17f | never written | zero | — |
-
-### Priority GL state — where it actually is
-
-| GL state | block index | note |
-|---|---|---|
-| depth range | **0x14e d0,d1** | CONFIRMED |
-| polygon offset factor/units | **0x178 d0,d1** | CONFIRMED |
-| polygon mode | — | gate only; `HWSTATE[0x1be4]` bits 4-5, 1=POINT 2=LINE 3=FILL, re-confirmed by `mtx740` |
-| point size / line width | **0x172 d3**, bounds in **0x173 d0,d1** | CONFIRMED |
-| line width (second path) | **0x178 d2** | key 0x05 slot 0x1b, half-width |
-| fog start/end/density/mode | **0x154** | CONFIRMED |
-| guard band / clip limits | **0x174** | CONFIRMED literal |
-| depth test / func / mask | **not in this file** | `mtx360`, byte-index namespace |
-| stencil (all) | **not in this file** | `mtx360` |
-| alpha test enable / func / ref | **not in this file** | `mtx2480` |
-| blend enable / factors / equation | **not in this file** | `mtx2480` |
-| colour mask | **not in this file** | `mtx2480` |
-| cull face / front face | **not in this file** | consumed as gates and by `mtx2480`/`mtx360` groups |
-| scissor | **not in this file** | RECT records, `0x1328/0x132c` (see `parhelia-raster-clip.md`) |
-| viewport | **not in this file** | RECT record (key 0x26) |
-
-That negative half is the single most useful result here: **the block file is
-float setup state — transform matrices, depth range, fog, sizes, guard band,
-transcendental tables.  Per-fragment test/blend state is integer state and
-travels in the byte-index namespace.**  A driver that tries to express depth
-func or blend factors as block entries will find no index to write.
+| **0x178** | **polygon offset** d0 factor, d1 units (both scaled, §3.1); d2 = `0.5*trunc(slot 0x1b)`, min 0.5 (line half-width); d3 constant 786432.0 | | `mtx740`, `mtx3654`; CONFIRMED for the GL stack, see the note in §3.1 |
+| 0x179, 0x17a | EXP coefficient table `{c1..c4}` / `{1.0, c5..c7}`, `cn = pow(ln2,n)/(±n!)` | | init only; literals CONFIRMED, role INFERRED |
+| 0x17b, 0x17c | LOG coefficient table `{log2e, -log2e/2, log2e/3, -log2e/4}` / `{1.0, log2e/5, -log2e/6, log2e/7}` | | init only; literals CONFIRMED, role INFERRED. The D3D driver reprograms 0x17c d2/d3 from its depth-bias state |
+| 0x17d | range constants `{2^23, 0.05, 31.0, 1/31}` | | init only; CONFIRMED, byte-identical in both binaries |
+| 0x17e | sub-pixel / sample group: d3 = `(float)WORD[HWSTATE+0x1e56] * 16.0`, d2 = `0.5/d3`, d0 = 0.0, d1 constant 0.0625 | | `mtx3654` @0x8b9c2; CONFIRMED |
+| 0x17f | one dword from a state block (DLL setter 0x11d58d); never written on the GL side | | INFERRED |
 
 ---
 
 ## 5. Dirty-bitmap protocol
 
-### 5.1 Marking — `mtx2702` @0x8f560
+### 5.1 Marking — `mtx2702` @0x8f560 (DLL equivalent at 0xf99c0)
 
-`mtx2702(rdi = bitmapBase, esi = firstIndex, edx = lastIndex)`, where
-`lastIndex == 0` means "same as first".  It sets bits `first..last` **inclusive**
-in `bitmapBase[4 + (i>>5)*4]` and ORs a word-presence mask into `bitmapBase[0]`:
+`mtx2702(rdi = bitmapBase, esi = firstIndex, edx = lastIndex)`; `lastIndex == 0`
+means "same as first".  It sets bits `first..last` **inclusive**:
 
 ```
 word(i)     = *(u32*)(bitmapBase + 4 + (i>>5)*4)
 bit(i)      = 1 << (i & 31)
 summary bit = 1 << (i >> 5)     ; OR'd into *(u32*)bitmapBase
 ```
-CONFIRMED.  The summary word is the flush trigger: `mtx693` @0x437c9 calls the
-emitter only when `*(u32*)bitmapBase != 0`.
+2-src CONFIRMED.  The summary word is the flush trigger: `mtx693` @0x437c9 calls
+the emitter only when `*(u32*)bitmapBase != 0`.
 
-### 5.2 Emission — `mtx1342` @0x90010
+Over-marking is normal and harmless: a 7-entry matrix record marks `[7k, 7k+7]`
+(8 bits) and a 4-entry matrix marks `[0x149, 0x14d]` (5 bits), because the range
+is inclusive.  One neighbouring, already-valid entry is re-uploaded.
 
-`mtx1342(r11 = bitmapBase, rsi = ring)` scans indices 0..0x17f, coalesces each
-maximal run of consecutive dirty indices, and splits every run into packets of
-at most **0x3f (63) entries** — not 0x40; the code is
-`cmp ebx,0x40 ; cmovae ebx,0x3f` at 0x901f0.  That matters because the count is
-carried in a 6-bit field.  Per packet:
+### 5.2 Emission — `mtx1342` @0x90010 (DLL equivalent at 0xf9c40)
+
+Scan indices 0..0x17f, coalesce each maximal run of consecutive dirty indices,
+split every run into packets of at most **0x3f (63) entries** — not 0x40.  Linux:
+`cmp ebx,0x40 ; cmovae ebx,0x3f` @0x901f0.  DLL: `cmp edi,0x3f ; jb ; mov ebp,0x3f`
+@0xf9e39.  The cap exists because the count field is 6 bits wide.  Per packet:
 
 ```
 dword 0 : 0x41000000 | ((count << 17) & 0x007e0000) | ((count*4 + 3) & 0xffff)
@@ -380,29 +471,58 @@ dword 4 : 0
 payload : count * 16 bytes, copied from bitmapBase + 0x230 + start*0x10
 ring    : advanced by (count*4 + 5) dwords
 ```
-CONFIRMED (0x901d6..0x9025f).  Ring space is checked as
-`(runLength*4 + 0x23)` dwords before the first packet of a run.
+2-src CONFIRMED, field for field.  The DLL builds the tag as
+`((0x2080 | (count & 0x3f)) << 17) | ((count*4+3) & 0xffff)` — and
+`0x2080 << 17 == 0x41000000` exactly, which is why no literal `0x41000000` header
+appears anywhere in that binary.  A second DLL encoder at 0x13b103 derives both
+fields from the total dword count and agrees algebraically.
+
+Ring space is checked as `(runLength*4 + 0x23)` dwords before the first packet of
+a run.
 
 **Entries need not be contiguous.**  Non-adjacent dirty indices simply produce
-separate packets; a run that spans 200 indices produces four packets of 63,63,63,11.
-Nothing forbids a driver from emitting one packet per entry (`count = 1`,
-`dword0 = 0x41020007`) — the vendor coalesces only to save ring space.
+separate packets; a 200-index run produces four packets of 63, 63, 63, 11.
+Nothing forbids one packet per entry (`count = 1`, `dword0 = 0x41020007`) — the
+vendor coalesces only to save ring space.
 
 `mtx1342` does **not** clear the dirty bits; the caller does.
 
-### 5.3 Client-supplied payload
+Useful headers:
+
+| count | dword0 | payload dwords |
+|---|---|---|
+| 1 | `0x41020007` | 4 |
+| 2 | `0x4104000b` | 8 |
+| 4 | `0x41080013` | 16 |
+| 7 | `0x410e001f` | 28 |
+| 13 | `0x411a0037` | 52 |
+| 63 | `0x417e00ff` | 252 |
+
+### 5.3 Client-supplied payload, and the direct-constant path
 
 Before scanning, `mtx1342` ORs the six dwords at `bitmapBase + 0xc8 + n*0x40`
-(n = 0..5) into a word-presence mask.  If a dirty index falls in a word that
-mask claims, it walks the slot ring at `bitmapBase + 0xb0 + n*0x40` — entry
-layout `{u8 hasExtra @0, void* data @8, u32 startIndex @0x10, u32 extra @0x14,
-u32 wordMask @0x18, u32 word[] @0x1c}` — and, on a hit, **replaces the payload
-source with the client's buffer** (`src = data - startIndex*0x10`, 0x902da).
-This is the destination of record key 0x42 (`mtx558` @0x45462), which registers
-`(index, count, pointer)`.  CONFIRMED as to the substitution; the tie to key 0x42
-is INFERRED (same triple, same 0x40-stride ring).
+(n = 0..5) into a word-presence mask.  If a dirty index falls in a word that mask
+claims, it walks the slot ring at `bitmapBase + 0xb0 + n*0x40` — entry layout
+`{u8 hasExtra @0, void* data @8, u32 startIndex @0x10, u32 extra @0x14,
+u32 wordMask @0x18, u32 word[] @0x1c}` — and on a hit **replaces the payload
+source with the client's buffer** (`src = data - startIndex*0x10`, @0x902da).
 
-An open driver can ignore this path entirely and always ship its own shadow.
+Separately, `mtx4027` @0x144a0 and `mtx558` @0x44ef0 share an identical inner
+loop that writes the file at a **runtime index**:
+
+```
+base = [HWSTATE+0x1e60]
+repeat count times:
+    node = <20-byte payload>
+    idx  = dword [node+0x10]                          ; entirely client-supplied
+    memcpy(base + 0x230 + (idx<<4), node, 0x10)
+    mtx2702(base, idx, 0)
+```
+The record is `{u128 value; u32 blockIndex;}` and there is **no range check** in
+either caller — any of the 384 entries can be written directly.  CONFIRMED.  This
+is the fixed-function-bypass constant upload (the `SetVertexShaderConstant`
+equivalent), and it is the simplest path for an open driver that wants to drive
+its own WARP program: build the vec4s, emit the block-load packet, done.
 
 ---
 
@@ -416,24 +536,28 @@ if (HWREG[0x7a0] != 0)  flush bank A (HWREG+0x7e8)
 else                    flush bank B (HWREG+0x2218)
 ```
 `mtx2209` leaves `HWREG[0x7a0] = 0`, so **bank B is the default flushed copy**.
-`HWREG[0x7a0]` is set to 1 by `mtx3654` @0x8bece and cleared at 0x8cde2 after a
-merge pass that folds bank A's secondary bitmaps into bank B's.  CONFIRMED.
+`HWREG[0x7a0]` is set by `mtx3654` @0x8bece and cleared @0x8cde2 after a merge
+that folds bank A's secondary bitmaps into bank B's.  CONFIRMED.
 
-Validators keep **bank A** as their comparison shadow (every pointer in the
-`[HWREG+0x3c48…]` table points into bank A, and every "has it changed?" read
-comes from there) and write both copies.
+Validators keep **bank A** as their comparison shadow — every pointer in the
+`[HWREG+0x3c48 …]`, `[HWREG+0x238 …]` and `[HWREG+0x3d00 …]` tables points into
+bank A, and every "has it changed?" read comes from there — and write both
+copies.  The mirroring is not exact.  Four confirmed asymmetries:
 
-They are *mostly* mirrors, but not exactly.  Two confirmed asymmetries:
-
-* `mtx2497` @0x86970/0x86977 writes the **snapped** half-size `0.5*round(v)` to
-  bank A's `0x172 d3` and the **un-snapped** clamped `v` to bank B's.
+* `mtx2497` @0x86970/0x86977 writes the **snapped** half-size to bank A's
+  `0x172 d3` and the **un-snapped** clamped value to bank B's.
 * `mtx2209` initialises bank A `0x173 = {1.0, 1.0, 0.5, -0.5}` but bank B
-  `0x173 = {-0.5, -0.5, 0.5, 0.5}` (@0x8e455 vs @0x8e4ad).
+  `0x173 = {-0.5, -0.5, 1.0, 1.0}` (@0x8e455 vs @0x8e4ad).  The D3D driver keeps
+  two whole shadow copies too (`ctx+0x8b4` and `ctx+0x2298`, delta 0x19e4) and
+  shows **the same 0x173 discrepancy between them**.  2-src, unexplained.
+* `mtx2926` writes `0x161 d3` (the viewport height) to bank A only, yet marks
+  bank B's 0x161 dirty.
+* `mtx1394`, `mtx1322`/`mtx2441` and `mtx2588` write bank A only.
 
 **For an open driver: keep one shadow and one bitmap.**  The block-load packet
-carries no bank selector — the two banks are a host-side double-buffer inside
-the vendor's HWREG object, not a hardware resource.  Program the bank-A values
-(they are the ones the validators keep self-consistent) and emit them.
+carries no bank selector — the two banks are a host-side double-buffer inside the
+vendor's HWREG object, not a hardware resource.  Program the bank-A values (they
+are the ones the validators keep self-consistent) and emit them.
 
 ---
 
@@ -443,15 +567,25 @@ the vendor's HWREG object, not a hardware resource.  Program the bank-A values
   `parhelia-state-slot-map.md` §5.3 and still resolvable only by experiment:
   write one index with a known payload via an opcode-0x41 packet, then dump the
   register window and diff.  Not needed to emit the packet.
-* The GL meaning of 0x14d, 0x155, 0x160/0x161, 0x16c..0x171, 0x175 d1..d3 and
-  0x17e — the arithmetic is recovered, the GL name is not.
-* Which of the four matrix blocks 0x139..0x148 is modelview vs projection vs
-  texture-unit k.  The selector is `[entry+0x18] & 7` on a 20-byte-stride array
-  at `[HWSTATE+0x1ad8]`, entries `0x1ae4 + j*0x14` (the per-unit dirty words of
-  `parhelia-state-slot-map.md` §3.5); resolving it needs a capture, not more
-  disassembly.
+* Whether 0x178 d0/d1 is read by the WARP program as polygon offset (Linux GL) or
+  as a point-size pair (D3D).  Both stacks write two floats there from different
+  API state; the bound fixed-function program decides.  This is the one place the
+  two binaries disagree outright.
+* The meaning of 0x14d, 0x155, 0x175 d1..d3, 0x17e, 0x17f, and which of
+  0x139/0x13d/0x141/0x145 is which texture unit.  The selector is
+  `[entry+0x18] & 7` over a 20-byte-stride array at `[HWSTATE+0x1ad8]` (entries
+  `0x1ae4 + j*0x14`, the per-unit dirty words of `parhelia-state-slot-map.md`
+  §3.5); resolving it needs a capture, not more disassembly.
+* Which physical bank `[HWSTATE+0x1e60]` names in the direct-constant path — its
+  store is in a different object file.  INFERRED to be the run-time-selected
+  bank.
 * `mtx309` @0x89cb0 writes 0x14e and the `0xe0..0xe6` texture-stage group; only
   its index set was read here.
+* The byte-index → MMIO `0x1000 + index*4` mapping is *not* re-derived here; it
+  still rests on the earlier Linux-side work.  The D3D driver confirms the packet
+  encoding of that namespace (`dword0 = dwords_following - 1`, then interleaved
+  tag dwords packing four byte-indices with `0x21` as the pad, followed by one
+  data dword per non-pad index) but not the address arithmetic.
 
 ---
 
