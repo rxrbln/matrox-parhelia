@@ -1,0 +1,91 @@
+# PCIe P690 (0x2539) versus PCI-X Parhelia-512 (0x0528)
+
+Copyright 2026 René Rebe <rene@exactco.de>
+SPDX-License-Identifier: GPL-2.0
+
+Measured on box 56 after swapping the PCI-X 0x0528 for a PCIe x16 P690.  This
+records what actually differs, because the caveat raised at the start of this
+work -- that captures are bus-type specific -- turns out to be justified in at
+least one functional respect.
+
+## 1. Bus and resource layout **[HW]**
+
+| | 0x0528 Parhelia-512 | 0x2539 P690 |
+|---|---|---|
+| slot | 0000:06:00.0 | 0000:03:00.0 |
+| bus | PCI-X | PCIe x16, Express v2 Endpoint, 2.5GT/s |
+| BAR0 (framebuffer) | 0xd0000000, **256 MB**, 32-bit prefetchable | 0xf0000000, **128 MB**, **64-bit** prefetchable |
+| MMIO BAR | **index 1**, 8 KB | **index 2**, 8 KB (BAR0 being 64-bit consumes slots 0 and 1) |
+| MSI | not presented | present, Count=1/4, Maskable |
+| MaxPayload / MaxReadReq | n/a | 128 / 128 bytes |
+| subsystem | 0x102b:0x14e1 | 0x102b:0x0040 |
+
+Consequences for the tools:
+
+- `p3dtri` resolves the MMIO BAR by scanning, and correctly reports
+  `BAR indices: fb=0 mmio=2` on the P690.  Anything that assumes BAR1 is MMIO
+  is wrong on this card.
+- **The framebuffer aperture is half the size.**  `--rtoff 0x08000000` is
+  exactly 128 MB and therefore lands one byte past the end of P690 VRAM; the
+  old `--physbuf 0xd8000000` is a different card's address entirely.  Both must
+  be re-chosen inside 0xf0000000..0xf7ffffff.
+
+## 2. The vendor driver applies a different errata set **[HW]** **[RE]**
+
+Same driver, same kernel, only the card swapped:
+
+    0x0528:  [mtx] Parhelia patches applied: PowerM EOBTag Cap66Mhz CompBypass
+    0x2539:  [mtx] Parhelia patches applied: PowerM Cap66Mhz CompBypass
+
+**EOBTag is applied to the 0x0528 and not to the P690.**  This is not a
+configuration accident -- the decision is structural.  In `mtx_parhelia.o`,
+function `mtx3376` selects the patch set (strings at `.rodata.str1.1+0x00`
+"PowerM ", `+0x08` "EOBTag ", `+0x10` "Cap66Mhz ", `+0x1a` "CompBypass "):
+
+    c06:  cmp  r13d, 0x528102b        ; device+vendor
+    c0d:  je   e20                    ; 0x0528 has its own path
+    c13:  cmp  r13d, 0x527102b
+    c1a:  sete dl
+    c1d:  cmp  DWORD PTR [rsp], 0x3051106   ; host bridge = VIA 1106:0305
+    c24:  sete al
+    c27:  test al, dl
+    c29:  je   c3f                    ; skip EOBTag unless BOTH
+    c2b:  mov  rsi, <"EOBTag ">
+    c35:  or   BYTE PTR [rsp+0x8], 0x40
+    ...
+    e20:  test BYTE PTR [rsp+0x4], 0x2 ; 0x0528: gated on a bus flag
+    e25:  jne  c2b                    ; -> apply EOBTag
+    e30:  jmp  c13                    ; else fall into the generic path
+
+So EOBTag is reachable **only** for a 0x0527 sitting behind a specific VIA host
+bridge, or for a 0x0528 when a bus flag bit is set.  A 0x2539 can never reach
+it.  `Cap66Mhz` conversely is applied to anything that is not a 0x0527, which
+is why it appears on both cards.
+
+The surrounding code reads an MMIO register at `0x300`, masks it
+(`and ecx, 0xe0e0ff3f`, then ORs in fields derived from the device id) and
+writes `0x308`; the neighbouring path touches `0x384`, which is the DMAPAD
+write-combining pad register already documented here.  That places this whole
+block in the bus-master configuration group, and EOBTag sets bit 6 of the byte
+at `+0x8` of the value being assembled.
+
+**What EOBTag actually does to the hardware is NOT established.**  The name and
+its neighbourhood suggest end-of-buffer tagging for DMA command buffers, which
+would put it adjacent to the fence pair `0x12BC`/`0x41C`.  That is inference,
+not a finding.
+
+## 3. What this invalidates, and what it does not
+
+Confirmed unchanged on the P690 **[HW]**: the engine register file responds
+identically at `0x0000`, `0x450`, `0x8f0` (idle = `0x00020000`), `0x1300`, and
+`0x400`/`0x404` are writable with the vendor X driver's own ring addresses
+visible in them.
+
+**Explicitly not carried over:** the `0x404 == end` block-load framing result
+was obtained on the 0x0528, which runs with EOBTag applied.  Since EOBTag sits
+in the bus-master configuration path and the P690 does not get it, that result
+must be re-measured on this card before it is relied on here.  It is a result
+about the 0x0528, not about "Parhelia".
+
+Any future capture or hardware claim in this repository should name the device
+id it was taken on.

@@ -465,7 +465,7 @@ kernel does not perform that mapping.
 | 0xa2 | 0x1288 | 0xffffffff |  |
 | 0xa3 | 0x128c | 0x0 |  |
 | 0xa4 | 0x1290 | 0x0 |  |
-| 0xa6 | 0x1298 | 4096f | guard band / viewport scale |
+| 0xa6 | 0x1298 | 4096f | GL_POINT_SIZE_MAX (NOT guard band -- see note) |
 | 0xa7 | 0x129c | 0x0 |  |
 | 0xa8 | 0x12a0 | 0xf |  |
 | 0xaa | 0x12a8 | 1f |  |
@@ -474,6 +474,19 @@ kernel does not perform that mapping.
 Note `id 0x40..0x5f = 0` here, whereas the *first draw* stream sets the same 32
 ids to `0xffffffff` (§2). Both values are real; that block of state is written
 twice with different content. [CONFIRMED, purpose of the difference UNKNOWN]
+
+
+> **Note on slot 0xa6 / register 0x1298.** This was previously glossed here as
+> "guard band / viewport scale" in two places.  That reading is **retracted**.
+> Slot 0xa6 belongs to the point-size group (0x9a size / 0x9b min / 0xa6 max,
+> emitted at 0x1142aa / 0x1143a1 / 0x1143ea) and the captured 2048.0f is exactly
+> `GL_ALIASED_POINT_SIZE_RANGE` max, which both the GL and D3D capability blobs
+> declare as 2048.  The guard band is a different quantity entirely: +/-8160.0f,
+> block index 0x174, byte-identical in both vendor binaries.  The 4096f default
+> coinciding with `GL_MAX_VIEWPORT_DIMS` 4096x4096 is what made the wrong
+> reading look plausible.  See docs/parhelia-gl-limits.md and
+> docs/parhelia-raster-clip.md.
+
 
 #### Texture environment, group `0x0e`
 
@@ -556,7 +569,7 @@ the vendor emits it; the ones a minimal driver can plausibly drop are noted.
             id 0x17 = 2                      depth func LESS
             id 0x26 = 1.0f
             id 0x9b = 0
-            id 0xa6 = 2048.0f                guard band / viewport scale
+            id 0xa6 = 2048.0f                GL_POINT_SIZE_MAX (see note)
             id 0x40..0x5f = 0xffffffff        the 32-entry attribute block
 0x0168  (0x12,  1)  SCISSOR-RECT   0, 0, 256, 256
 0x0180  (0x46,  1)  FRAGPROG-UPLOAD  progid 2, 0x664-byte blob
