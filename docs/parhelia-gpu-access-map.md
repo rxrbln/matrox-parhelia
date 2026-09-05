@@ -78,8 +78,15 @@ GROUND-TRUTH draw MMIO (captures/mmio-draw-0528*.txt): per draw =
 seven `/dev/matrox/mtx0` mappings and their roles, the per-draw 7-dword
 descriptor (header 0x8f000001, vertex count, sequence, vertex-buffer bus
 address), the head/tail publish at region-2 0x18/0x20/0x28, the confirmed
-`[x,y,r,g,b]` 20-byte vertex, the (index,value) state-pair stream, and the
-locked-page buffer allocation. Instrument: tools/parhelia-glsweep.c, raw capture
+`[x,y,r,g,b]` 20-byte vertex, the record stream, and the locked-page buffer
+allocation.
+
+**Note on the stream format (corrected 2026-09-05):** region 2 is a
+`[key][count]` record stream whose indices are **GL state slots**, NOT MMIO
+registers — `reg = 0x1000 + index*4` is the DMA-ring namespace in region 5.
+Three independent RE passes agree. Any register attribution below that came
+from a region-2 index is unproven; see the correction notice at the top of
+docs/parhelia-gl-feature-map.md. Instrument: tools/parhelia-glsweep.c, raw capture
 captures/glsweep-0528-raw.txt. Per-GL-feature register deltas:
 docs/parhelia-gl-feature-map.md.
 
@@ -110,8 +117,9 @@ mis-aligns in places, so treat the raw dump as authoritative.)
 0x1024/0x1028/0x102c=2, 0x1088=2, 0x109c=1, 0x1094=6, 0x1080=6, 0x1058=1.
 Raw: captures/cmdbuf-draw-0528-decoded.txt (1109 dwords) + the pre/post .bin.
 
-This is the missing raster state our from-scratch draw never programmed — the
-0x1100-0x117c attribute-file init and the 0x1298 scale in particular.
+**Superseded:** this list was produced by the old pair-decoder and its register
+names are unproven (see the note above). 0x1298 = 2048.0f is GL_POINT_SIZE_MAX,
+not a viewport scale.
 
 **To map each GL feature:** run the same PRE/POST diff around each op in
 gltest.c (flat/gouraud/textured/blended/depth/lit, quads/lines/points) and diff
