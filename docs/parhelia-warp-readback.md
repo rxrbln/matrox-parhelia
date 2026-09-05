@@ -113,6 +113,44 @@ Incidental observation: the four banks alias in pairs (bank0 == bank2 and
 bank1 == bank3 for every index tested), so bit 1 of the bank field appears to be
 ignored on this part.
 
+## THE PORT HAS NEVER BEEN SHOWN TO OBSERVE ANYTHING (2026-09-05, P690)
+
+**This retracts the interpretation of every "N registers changed" result in this
+file and elsewhere.** The port has no positive control. Measured, on a healthy
+engine, with no lock-up in any run:
+
+| stimulus | provably happened? | port response |
+|---|---|---|
+| 2D solid fill | **yes** -- 120000 pixels drawn | 0 changes, all 8 spaces x 4 banks x 384 |
+| block load, framing confirmed (`0x404 == end`) | packet consumed | marker absent from all 12288 locations |
+| block load **with a program bound**, same stream | packet consumed | marker absent |
+| `mtx676` self-test replicated: `mtx2785` streamed, bound, four walking-pattern packets | stream accepted, engine went busy | 0 changes |
+
+The 2D-fill row does not prove the port is broken -- a 2D fill does not use the
+WARP, so a blind port and an uninvolved WARP look identical. But taken together
+with the other three, **there is no operation we can provably execute that this
+port reflects.**
+
+Consequences:
+
+* "0 WARP registers changed -- no evidence the program ran" means **the
+  experiment was not measured**, not that the WARP is idle. Earlier statements
+  in this repository that the WARP "is not executing" rest on this port and are
+  withdrawn.
+* Until a positive control exists, the port cannot be used to accept or reject
+  any hypothesis about program execution.
+
+What would constitute a positive control: the vendor GL stack drawing a frame
+with a diff taken around it, since that provably exercises the WARP. That is
+currently blocked -- `/dev` is tmpfs and `mtx` registers no character-device
+major while loaded, so no GL client can open the device. `init_module` does call
+`register_chrdev` with the major taken from a global (a module parameter,
+default probably 0 = dynamic), so the registration exists; why it is absent from
+`/proc/devices` was not traced.
+
+Until then, **use VRAM as the observable, not this port.** The 2D fill shows
+VRAM is a reliable witness on this card.
+
 ## What has NOT been shown
 
 Uploading a marker vec4 through a block-load packet produced no change outside
