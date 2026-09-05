@@ -659,3 +659,46 @@ which `parhelia-state-slot-map.md` already showed is not a simple
 So the correct shape for a from-scratch 3D driver is either to reproduce the
 kernel's slot translation faithfully, or to drive the slot interface and let the
 kernel do it. Emitting registers into the ring and hoping is neither.
+
+
+## Decoded state slots from the working ioquake3 context
+
+Walking the record stream from `captures/ioq3-p690-working-draw.txt` with the
+`[count][a][key][b]` + `(slot, value)` pair grammar:
+
+| record | count | key | slots | non-zero |
+|---|---|---|---|---|
+| 1 | 81 | `0x02` | `0x07..0x8a` | 22 |
+| 2 | 139 | `0x8c` | `0x8e..` | 71 |
+| 3 | 5 | `0x01` | `0x02..0x07` | 1 |
+| 4 | 8 | `0x09` | `0x0a..0x14` | 3 |
+| 5 | 26 | `0x15` | `0x06..` | 19 |
+
+Then the walk breaks at dword 538 (`count` decodes as `0x20002`), and records 2
+and 5 show impossible slot ids like `0x1c0003` partway through. **That is the
+documented behaviour, not a decoder bug**: region 2 is a `[key][count]` record
+stream in which draw, clear, rect and vertex-format records are *not* (slot,
+value) pairs and therefore mis-slice under a pair-only reader. A full decode
+needs the record grammar, not this approximation.
+
+**What decodes cleanly is still worth having**, and it independently confirms
+several documented readings from a *live, working* context rather than from a
+binary:
+
+* `slot 0x08 = 3` — polygon mode, and the documented enum is `1=point 2=line
+  3=fill`, so a filled polygon. Correct.
+* `slot 0x16 = 3`, `0x17 = 4` — cull group, consistent with the documented
+  2-bit field where 1 = off.
+* `slot 0x9a = 1.0f`, `0x9b = 1.0f`, `0xa6 = 4096.0f` — **the point-size group**,
+  exactly as `parhelia-gl-limits.md` places it (`0x9a` size / `0x9b` min /
+  `0xa6` max), with `0xa6` at its documented 4096 default.
+
+That last one is an independent confirmation of the `0xa6` correction made
+earlier today: it is the point-size maximum, not "guard band / viewport scale".
+A working GL context sets it to the value the limits doc predicts.
+
+* `slot 0x3a = 0xffffffff`, `0x3b = 0xffffffff` — masks
+* `slots 0x40..0x5f` are present and all **zero** in a working context, which is
+  worth noting against the retracted advice to replay `0x1100-0x117c =
+  0xffffffff` as "the state a from-scratch draw is most likely to be missing".
+  The vendor writes zeros there.
