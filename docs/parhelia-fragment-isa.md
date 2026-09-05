@@ -369,6 +369,15 @@ ps.1.x path of the shipped driver rather than a different encoding; an open
 driver should use the ps.1.4 mapping. **CONFIRMED** (both tables re-dumped from
 file offsets 0x1c6f98 and 0x1c6740).
 
+**Note on the texture-address rows.** The table has exactly **0x59 entries**
+(indices 0x00-0x58, 24 bytes each — `0x1d6f98 + 0x59*24 = 0x1d77f0`, precisely
+where the GL table of §7.3 begins), and the packer clamps the index to 0x58
+(`PARD 0x1821d2 cmp eax,0x58 ; jae ; mov eax,0x58`). Rows 0x40-0x57 do exist
+and are all the degenerate `MOV` row. **But no `D3DSIO_TEX*` opcode ever
+reaches this packer** — see §9.5.8. The earlier reading, "the ps.1.3 table
+routes every t-op to a fallback MOV, therefore the driver does not implement
+them", was a wrong inference from a true observation.
+
 ### 7.2 ps.1.4 variant — table `0x1d6740`, used by `PARD 0x183be0`
 
 Identical to §7.1 except `DP3 = {A←s0, C←s1}`. Everything else matches.
@@ -600,7 +609,7 @@ instruction list. libGL's uploaded program blob is 0x664 bytes and is laid out
 ```
 +0x000  u32   instruction count
 +0x004  10 x 0x94  instruction records                      (ends 0x5cc)
-+0x5cc  u8    0
++0x5cc  u8    "sampling hints valid" flag (§9.5.1)
 +0x5d0  u32   4  = number of texture-address stages
 +0x5d4  4 x 0x24   texture-address stage descriptors        (ends 0x664)
 ```
@@ -615,7 +624,7 @@ is still missing is the engine register — see §9.5.7 and §15.
 
 ### 9.5 The texture-address (TA) stage array  **recovered 2026-09**
 
-Two sources, not one:
+Three sources, none of them the ones the earlier passes used:
 
 * the **`glTexAddress*MTX` entry points** in libGL — the only code that writes
   a non-trivial descriptor — reached through the per-context dispatch table
@@ -628,9 +637,13 @@ Two sources, not one:
   @0x70b30. `objdump -dr` on the object file names every call target and every
   `.data` table, which is what makes the kernel readable at all.
 
-The earlier passes missed both: they looked at libGL's *fixed-function*
-generator (which only ever emits a plain fetch) and at MTXPARD (whose ps.1.x
-path never emits one at all).
+plus, for the D3D view of the same hardware, MTXPARD's **`D3DSIO` dispatcher**
+`PARD 0x188b48` and its own texture-address tables (§9.5.8) — which is where the
+two opcodes GL has no token for get named.
+
+The earlier passes missed all of it: they looked at libGL's *fixed-function*
+generator, which only ever emits a plain fetch, and at MTXPARD's *combiner*
+packer, which the t-ops never reach.
 
 #### 9.5.1 Descriptor layout  **CONFIRMED**
 
@@ -772,19 +785,49 @@ Joining the two stages:
 | `GL_OP_TEXDEP_RGB_MTX` 0x8A96 | 8 | **0x13** | 2 |
 | `GL_OP_TEXDOT3_COORD_MTX` 0x8A97 | 9 | **0x05** | 2 |
 | `GL_OP_TEXDOT3_MTX` 0x8A98 | 10 | **0x09** | 2 |
-| *(no GL token)* | 11 | 0x06 | invalid (arity 0) |
+| *(no GL token, = `D3DSIO_PHASE`)* | 11 | 0x06 | invalid from GL (arity 0) |
 | `GL_OP_TEXM3X2_MTX` 0x8A99 | 12 | **0x0C** | 3 |
 | `GL_OP_TEXM3X2_DEPTH_MTX` 0x8A9A | 13 | **0x0E** | 3 |
 | `GL_OP_TEXM3X3_MTX` 0x8A9B | 14 | **0x0B** | 4 |
 | `GL_OP_TEXM3X3_COORD_MTX` 0x8A9C | 15 | **0x0A** | 4 |
 | `GL_OP_TEXM3X3_REFLECT_MTX` 0x8A9D | 16 | **0x0D** | 4 |
-| *(no GL token)* | 17 | 0x08 | — |
+| *(no GL token, = `D3DSIO_TEXM3x2PAD`/`TEXM3x3PAD`)* | 17 | 0x08 | — |
 
 Note the gap at internal code 11: the mapping is *not* `token - 0x8A8E` from
 `TEXM3X2` onwards. `TEXKILL_GE` and `TEXKILL_LT` share hardware opcode 3 and are
 separated by a side flag (`KRN 0x70bf2: sete BYTE PTR [rbx+0xc6]` on internal
 code == 3). The hardware opcode space is therefore **0x00-0x13 minus
 {0x01, 0x07, 0x0F, 0x12} — a 5-bit field**.
+
+**The Windows driver has the same hardware opcode numbering, from a completely
+different direction.** `PARD .data 0x1d4388` maps `D3DSIO` opcode (clamped to
+[0x40, 0x61], `PARD 0x1790ba`) to the same numbers, and `PARD 0x1790fb` stores
+the result at `texAddrDescriptor+0x74`:
+
+| D3DSIO | **HW opcode** | GL equivalent |
+|---|---|---|
+| 0x42 `TEX` | 0x00 | `GL_OP_TEX` |
+| 0x40 `TEXCOORD` | 0x02 | `GL_OP_TEX_COORD` |
+| 0x41 `TEXKILL` | 0x03 | `GL_OP_TEXKILL_*` |
+| 0x43 `TEXBEM`, 0x44 `TEXBEML` | 0x04 | `GL_OP_TEXBEM` |
+| 0x53 `TEXDP3TEX` | 0x05 | `GL_OP_TEXDOT3_COORD` |
+| **0x61 `PHASE`** | **0x06** | *(none)* |
+| **0x47 `TEXM3x2PAD`, 0x49 `TEXM3x3PAD`** | **0x08** | *(none)* |
+| 0x55 `TEXDP3` | 0x09 | `GL_OP_TEXDOT3` |
+| 0x56 `TEXM3x3` | 0x0A | `GL_OP_TEXM3X3_COORD` |
+| 0x4A `TEXM3x3TEX`, 0x4B `TEXM3x3DIFF` | 0x0B | `GL_OP_TEXM3X3` |
+| 0x48 `TEXM3x2TEX` | 0x0C | `GL_OP_TEXM3X2` |
+| 0x4C `TEXM3x3SPEC`, 0x4D `TEXM3x3VSPEC` | 0x0D | `GL_OP_TEXM3X3_REFLECT` |
+| 0x54 `TEXM3x2DEPTH` | 0x0E | `GL_OP_TEXM3X2_DEPTH` |
+| 0x45 `TEXREG2AR` | 0x10 | `GL_OP_TEXDEP_AR` |
+| 0x46 `TEXREG2GB` | 0x11 | `GL_OP_TEXDEP_GB` |
+| 0x52 `TEXREG2RGB` | 0x13 | `GL_OP_TEXDEP_RGB` |
+
+Every row agrees with the GL-derived column, and the two opcodes with **no GL
+token are now named**: **0x06 = `PHASE`** (the ps.1.4 phase marker) and
+**0x08 = the `TEXM3xNPAD` no-sample matrix row**. Hardware opcode 0x01 remains
+unassigned; the natural reading is the second `TEXKILL` polarity, but nothing
+writes it, so that stays a guess.
 
 The `nargs` column is libGL's own arity table, jump table `.rodata 0x36ed6c`
 (17 entries, indexed by internal code, read at `GL 0x1b4780`): codes 0-4 → 1,
@@ -817,6 +860,11 @@ mtx3585 = 0f 0f 0f 0f 03 07 03 00 07 07 0f 0f 0f 0f 0f 00 09 06 00 07 0 ...
 The three `TEXDEP_*` masks reading exactly `A|R`, `G|B`, `R|G|B` is the check
 that pins the whole join: nothing else would land those three numbers on those
 three opcodes.
+
+**MTXPARD carries a byte-identical copy** of this table at `PARD .data 0x1dc970`,
+indexed by the same hardware opcode and stored at `texAddrDescriptor+0xac` next
+to `+0xa8 = 0x1f` (`PARD 0x17913b`-0x179158) — the same `0x1f` seed the kernel
+uses at `mtx2577` @0x70ee5. Two unrelated driver stacks, same table, same seed.
 
 `KRN mtx2577` @0x70eb0 uses the mask as an allocation requirement:
 `record+0xb4` starts at 0x1f (0x20 on one chip variant, @0x70ee5), is OR-ed with
@@ -899,25 +947,69 @@ itself; the vendor ICD's bump path is a dead end. **CONFIRMED** (three
 independent observations: the 0x664 memcpy length, the absence of any other
 reader of `obj+0x740`, and the kernel's two different writers of `record+0x68`).
 
-**Where the coefficients end up** (`KRN mtx1723` @0x71932-0x719fa, gated by
-`record+0x63 & 2`): three values are taken from `record+0x58`, `+0x5c`, `+0x5e`
-as 14-, 14- and 12-bit fields, routed through `record+0x68`/`+0x6c`/`+0x70`
-according to the hardware opcode (`record+0x8c` — the path is shared by 0x08,
-0x09, 0x0a, 0x0c and 0x0e, i.e. **the whole `TEXDOT3`/`M3X2`/`M3X3` family uses
-the same coefficient registers as `TEXBEM`**), and finally packed into the
-per-stage hardware state block `[record+0x40]`:
+**The hardware number format is fully recovered from MTXPARD.** The quantizer
+is `PARD 0x17a755`-0x17aaf5, run once per coefficient, with `ebp` = the
+**previous** stage's D3D block (correct D3D semantics: `BUMPENVMAT` is set on
+the stage that does the `BUMPENVMAP`, and consumed by the stage that samples)
+and `edi` = the hardware texture-address record:
 
 ```
-[state+0x30] bits [13:0]   coefficient 0     (bits 15:14 preserved)
-[state+0x34] bits [13:0]   coefficient 1     (bits 15:14 preserved)
-[state+0x36] bits [11:0]   coefficient 2     (bits 15:12 preserved)
+17a755  fld   DWORD PTR [ebp+0x60]        ; BUMPENVMAT00 (float)
+17a761  fmul  DWORD PTR ds:0x19ee20       ; K = 16/15, or 128/127, or 256/255,
+                                          ;   chosen by the bump texture's format id
+        clamp to [-16.0, +16.0]           ; 0x19ee10 / 0x19cf74
+17a7a0  fmul  DWORD PTR ds:0x19d454       ; 2048.0
+17a7a9  fadd  DWORD PTR ds:0x19c9d4       ; 0.5   (round to nearest)
+17a7af  call  0x198d80                    ; ftol
+17a7bd  mov   WORD PTR [edi+0x24],ax      ; m00
+17a814  mov   WORD PTR [edi+0x26],ax      ; m01
+17a98f  mov   WORD PTR [edi+0x28],ax      ; m10
+17aaf1  mov   WORD PTR [edi+0x2a],ax      ; m11
+17aaf5  or    DWORD PTR [edi],0x2         ; "bump matrix valid"
+```
+
+So the matrix is **four signed 16-bit S4.11 fixed-point values** —
+`round(clamp(m * K, -16, +16) * 2048)`, i.e. **1.0 = 0x800**, range ±16.0 — laid
+out as **two dwords**:
+
+```
+record+0x24 = m00 | (m01 << 16)
+record+0x28 = m10 | (m11 << 16)
+```
+
+Independently confirmed by the ps.1.x path, which writes the same two offsets as
+whole dwords from pre-packed fields (`PARD 0x17a6ff`-0x17a714:
+`[eax+0x24] = [esi+0xb0]`, `[eax+0x28] = [esi+0xb4]`, `or [eax],2`). The 11
+fractional bits are the same numeric domain as the combiner constants of §9.1.
+
+`BUMPENVLSCALE` / `BUMPENVLOFFSET` (D3D stage block `+0x70`/`+0x74`) are stored
+but **never read anywhere in MTXPARD** — consistent with `TEXBEML` mapping to
+the same hardware opcode 0x04 as `TEXBEM` (§9.5.2). The luminance term is not
+implemented.
+
+The Linux kernel HAL packs the same data differently, into the per-stage state
+block `[record+0x40]` (`KRN mtx1723` @0x71932-0x719fa, gated by
+`record+0x63 & 2`, values sourced from `record+0x58`/`+0x5c`/`+0x5e` via
+`record+0x68`/`+0x6c`/`+0x70`):
+
+```
+[state+0x30] bits [13:0]   (bits 15:14 preserved)
+[state+0x34] bits [13:0]   (bits 15:14 preserved)
+[state+0x36] bits [11:0]   (bits 15:12 preserved)
 identity default = 0x800 in all three        (@0x719a4-0x719b2)
 ```
 
-So the address matrix is **three packed fixed-point coefficients with
-1.0 = 0x800**, not four floats, and they live in the same unlocated per-stage
-state block as everything else in §9.5.7. **CONFIRMED** as a software layout;
-the register that block becomes is still unknown.
+Same `0x800` = 1.0 scale, but three fields of 14/14/12 bits rather than four of
+16. The two layouts have **not** been reconciled; the kernel path is also shared
+by hardware opcodes 0x08, 0x09, 0x0a, 0x0c and 0x0e, so the `TEXDOT3` / `M3X2` /
+`M3X3` family uses the same coefficient storage as `TEXBEM`. Treat the MTXPARD
+form as the authoritative *number* format and the kernel form as an open
+question about *packing*.
+
+Also in the Windows texture-address record: `+0x08` bits [6:4] = the
+texture-coordinate set index (`PARD 0x17ab19`, from D3D block `+0x10 & 7`),
+`+0x04` bits [3:0] and [11:8] = two 4-bit operand fields (`PARD 0x174862`),
+`+0x00` = a valid/dirty mask (bits 0, 1, 2 seen; `or ...,7` @0x17487e).
 
 Note also that `glTexAddressHintsMTX` masks the type field with `0x1f0`, so
 `GL_HINT_TEXTURE_BEM_MTX` (0x200) is unreachable and only the *luminance* form
@@ -979,17 +1071,120 @@ window and nothing else:
 the kernel finds no other per-stage register window; nothing TA-shaped exists in
 the 0x1230-0x125f or 0x1288-0x12f0 candidate ranges.
 
-So the TA opcode almost certainly rides in the §11 per-unit window. The
-**leading candidate is `0x1200+unit*4` bits [23:19]** — a 5-bit field, exactly
-the width of the hardware opcode space 0x00-0x13, and MTXPARD's errata list for
-that same field, `{2, 3, 9, 0xa, 0xe}` (`PARD 0x2cea0`), is precisely
-{`TEX_COORD`, `TEXKILL`, `TEXDOT3`, `TEXM3X3_COORD`, `TEXM3X2_DEPTH`} in
-hardware-opcode numbering. That is a hard coincidence to explain away — but it
-is **INFERRED, not decoded**, and §11.2 currently calls the same field a
-"filter code". Do not implement against it.
+MTXPARD says the same thing from the Windows side. A sweep of **every** engine
+register immediate in its whole `.text` (it has exactly two register appenders:
+`0x170e10` for 3D `(reg, value)` pairs and `0x1b6c0`/`0x1b690` for 2D) gives the
+complete set it ever writes:
 
-Settling it needs a hardware capture of a bump-mapped or dependent-read draw;
-none of the captures on hand contains one (§12.3).
+```
+1000 1008 10cc 10d0 10d4
+1160 1164 1168 1174 1178 117c 1180 118c 1190 1194 1198
+11c0 11c4 11c8 11cc 11d0 11d4 11d8 11dc 11e0 11e4 11e8   1200+unit*4
+1220 1224 1228 122c 1230 1234
+1260 1264 1268 126c 1278 127c 1280 1284
+12b0 12c0 12c4 12c8 12e4 12e8 12f4 12fc
+1300 1304 1308 130c 1314 1318 1324 1328 132c 1356 1374 138c
+```
+
+In the candidate windows only `0x1230`/`0x1234` (a render-target/Z surface pair,
+shadows `[ebp+0xaac]`/`[ebp+0xabc]`), `0x12b0` (2D/blit only) and
+`0x12c0`-`0x12c8`/`0x12e4`/`0x12e8` appear, none of them shader state.
+**`0x1238`-`0x125c`, `0x1288`-`0x12ac`, `0x12b4`-`0x12bc`, `0x12cc`-`0x12e0`
+and `0x12ec`-`0x12f0` have no writer anywhere in MTXPARD.** The texture-address
+records (4 x 0x38 at `compiler+0x9a4`) leave the DLL as a **structure image**,
+block-copied, never as `(register, value)` pairs — which is exactly why the
+earlier passes could not find a register: it is applied outside the code the
+binary contains.
+
+Two independent leads, mutually compatible, both **INFERRED — do not implement
+against either**:
+
+1. **The opcode** may ride in `0x1200+unit*4` bits [23:19]: a 5-bit field, the
+   exact width of the hardware opcode space 0x00-0x13, and MTXPARD's errata
+   list for that same field, `{2, 3, 9, 0xa, 0xe}` (`PARD 0x2cea0`), is
+   precisely {`TEX_COORD`, `TEXKILL`, `TEXDOT3`, `TEXM3X3_COORD`,
+   `TEXM3X2_DEPTH`} in hardware-opcode numbering. §11.2 currently calls the same
+   field a "filter code".
+2. **The bump matrix** may live in the untouched `0x1240`-`0x125c` block: eight
+   registers directly below the combiner window, which is exactly 4 stages x the
+   two dwords of §9.5.5. (`0x1238`/`0x123c` are SURF3 in
+   `docs/parhelia-2d-accel-complete.md`, so the free run starts at `0x1240`.)
+
+One hardware test settles both: an mmiotrace of a `texbem` draw with the matrix
+set to a distinctive value — `m00 = 1.0` gives `0x0800` — then search the
+capture for a dword with `0x0800` in either half. None of the captures on hand
+contains such a draw (§12.3).
+
+#### 9.5.8 The Windows D3D front end  **CONFIRMED**
+
+MTXPARD **does** implement the ps.1.3 texture-address set; it simply never
+routes it through the combiner packer of §7.1. The real dispatcher is
+`PARD 0x188b48`, which splits the `D3DSI_OPCODE_MASK` into three ranges — ALU
+0x00-0x09 (jump table `0x188db0`), `LRP` 0x12, and 0x40-0x58 (jump table
+`0x188dd8`, 25 entries) — and rejects everything else:
+
+| D3DSIO | handler | | D3DSIO | handler |
+|---|---|---|---|---|
+| 0x40 TEXCOORD | `0x187450` | | 0x4C TEXM3x3SPEC | `0x187f70` |
+| 0x41 TEXKILL | `0x1874e0` | | 0x4D TEXM3x3VSPEC | `0x188130` |
+| 0x42 TEX | `0x187570` | | 0x51 DEF | `0x188280` |
+| 0x43 TEXBEM | `0x187600` | | 0x52 TEXREG2RGB | `0x188350` |
+| 0x44 TEXBEML | `0x187720` | | 0x53 TEXDP3TEX | `0x188470` |
+| 0x45 TEXREG2AR | `0x187840` | | 0x54 TEXM3x2DEPTH | `0x188800` |
+| 0x46 TEXREG2GB | `0x187960` | | 0x55 TEXDP3 | `0x188590` |
+| 0x47 TEXM3x2PAD | `0x187a80` | | 0x56 TEXM3x3 | `0x1886b0` |
+| 0x48 TEXM3x2TEX | `0x187bb0` | | 0x50 CND | `0x186b40` |
+| 0x49 TEXM3x3PAD | `0x187cf0` | | 0x58 CMP | `0x186fb0` |
+| 0x4A TEXM3x3TEX | `0x187e20` | | 0x61 PHASE | `0x188940` |
+
+Rejected (`0x188d52`, which aborts the parse and makes the shader-create call
+return 0): `RCP`, `RSQ` and everything else in 0x0a-0x11, `TEXM3x3DIFF` (0x4B),
+`EXPP` (0x4E), `LOGP` (0x4F), `TEXDEPTH` (0x57), `BEM` (0x59). That set is
+exactly ps.1.3 minus the DX6 leftovers, matching the advertised
+`D3DPS_VERSION(1,3)`.
+
+Each handler allocates a texture-address IR node — **max 4, 0x48 bytes, at
+`container+0x4b00`, count at `container+0x4afc`** (`PARD 0x177ab0`,
+`cmp eax,0x4 ; jae fail`) — filled by `PARD 0x184b10` as
+`{+0x00 = 1 present, +0x08 = texture register number, +0x0c = D3DSIO opcode}`.
+Dead-code elimination (`PARD 0x184c30`) refuses to delete nodes whose opcode is
+`TEXKILL` (0x41) or `TEXM3x2DEPTH` (0x54) — the side-effecting ones.
+`TEXBEM`'s handler additionally requires its source t-register to have been
+defined by `TEX` or `TEXCOORD` and records the def→use edge (`0x184b90`), which
+is the D3D expression of the same dependency graph the GL blob encodes as
+`desc+0x0c[]` (§9.5.1).
+
+**Fixed function converges on the same path.** `D3DTOP_BUMPENVMAP` (0x16) and
+`D3DTOP_BUMPENVMAPLUMINANCE` (0x17) emit **no ALU instruction at all** — the
+target of the dispatch at `PARD 0x1767ee`/`0x1767fa` is not a function but a
+two-instruction branch, `0x1769e0: mov DWORD PTR [esp+0x3c],0x1 ; jmp` — a flag
+carried into the *next* stage, which turns it into a D3DSIO opcode at
+`PARD 0x17697d`:
+
+```
+17697d  cmp   eax,0x16          ; previous stage's COLOROP
+176984  setne dl
+176989  add   edx,0x43          ; 0x43 TEXBEM  /  0x44 TEXBEML
+17698e  call  0x179070          ; TexStageDescriptor::Init(stage, d3dsioOp)
+```
+
+So the fixed-function texture environment and ps.1.x reach one descriptor array.
+
+The D3D-side compiler layout, for reference (`PARD 0x174e50`, `0x178bf0`):
+
+```
++0x0058  12 x 0x9c    local copies of the D3D stage blocks
++0x091c  0x6c         pixel-setup blob (4 x 0x14 at +0x928, 4 dwords at +0x978)
++0x0988  program object:  +0x1c  4 x 0x38  texture-address hardware records
+                          +0xfc 10 x 0x28  ALU hardware instruction records
++0x0c20  4 x 0x12c    texture stage descriptors
++0x10f0  4 x 0x08     texture-unit states
++0x12a4  10 x 0x154   IR instruction records
+```
+
+Four texture-address records again — but **stride 0x38, not the GL blob's
+0x24**, because the Windows record carries the bump matrix inline (§9.5.5) while
+the GL fixed-function generator never fills one.
 
 ---
 
@@ -1269,6 +1464,21 @@ packed into `block[+0x10]`:
 `MAXMIPLEVEL` → `[+0x1c]`, the colour/alpha op and argument set →
 `[+0x2c]`-`[+0x4c]`, BUMPENVMAT → `[+0x60]`ff.
 
+The enum is the **DX6/DX7 DDI `D3DTEXTURESTAGESTATETYPE`** (with
+`D3DTSS_ADDRESS = 12`), pinned by three anchors: TSS 11 `TEXCOORDINDEX`
+(`0xaf0e2`), TSS 24 `TEXTURETRANSFORMFLAGS` (`0xaf3ff`) and TSS 12/13
+`ADDRESS`/`ADDRESSU`. The full tail of the block (**CONFIRMED**):
+
+| offset | field | dirty bit in `block[0]` |
+|---|---|---|
+| +0x0c | texture handle | 0x800 / 0x1000 |
+| +0x2c … +0x4c | COLOROP, COLORARG0/1/2, ALPHAOP, ALPHAARG0/1/2, RESULTARG — nine contiguous dwords | 0x1000 |
+| +0x60 … +0x6c | **BUMPENVMAT00 / 01 / 10 / 11** (floats) | 0x2000 |
+| +0x70 | BUMPENVLSCALE (float) | 0x2000 |
+| +0x74 | BUMPENVLOFFSET (float) | 0x2000 |
+
+`+0x70`/`+0x74` are written and never read (§9.5.5).
+
 On the older DDI (`device[+0x48] < 4`) the filter enums are normalised to DX8
 `D3DTEXF_*` numbering through `0x1d1f8c` = `{0,1,2,4,5,3}` (mag),
 `0x1d1fa4` = `{0,1,2,3}` (min), `0x1d1fb4` = `{0,0,1,2}` (mip).
@@ -1328,7 +1538,11 @@ stage states into the *same* IR that ps.1.x compiles to, then runs the packers o
   `<= 5` (`D3DTA_` selector) with high nibble `<= 0x30` (the `COMPLEMENT` /
   `ALPHAREPLICATE` flags), with a special case for ops 0x18/0x1b
   (`DOTPRODUCT3` / beyond) when a device flag is set, and dispatches
-  `D3DTOP_BUMPENVMAP`/`BUMPENVMAPLUMINANCE` (0x16/0x17) to `0x1769e0`.
+  `D3DTOP_BUMPENVMAP`/`BUMPENVMAPLUMINANCE` (0x16/0x17) to `0x1769e0` —
+  which is **not a function**: it is a two-instruction branch that sets a flag
+  and jumps to the loop tail, so a bump stage emits no ALU instruction at all.
+  The flag becomes a `D3DSIO_TEXBEM`/`TEXBEML` texture-address descriptor on
+  the *following* stage. See §9.5.8.
 * Note the shape of a D3D texture argument: `arg & 0x0f` is the source
   (`DIFFUSE 0`, `CURRENT 1`, `TEXTURE 2`, `TFACTOR 3`, `SPECULAR 4`, `TEMP 5`),
   `arg & 0x10` is `D3DTA_COMPLEMENT` and `arg & 0x20` is
@@ -1795,6 +2009,14 @@ the right registers but several wrong fields. Superseded claims:
    through a 16-entry jump table with a hole at internal code 11, and the
    kernel translates again through `mtx1411`. Both permutations matter
    (§9.5.2).
+16. **"MTXPARD's ps.1.3 table routes every D3DSIO t-op to the fallback `MOV`
+   row, [so the driver does not implement them]."** The observation is true and
+   the inference was wrong. The t-ops never reach that packer: MTXPARD has a
+   separate dispatcher (`0x188b48`), separate handlers, a separate 4-entry
+   texture-address IR, and its own D3DSIO → hardware-opcode table
+   (`.data 0x1d4388`). It implements the full ps.1.3 set (§9.5.8).
+17. **"`PARD 0x1769e0` is the `D3DTOP_BUMPENVMAP` handler."** It is a
+   two-instruction branch that sets a flag, not a function (§12.1, §9.5.8).
 
 ---
 
@@ -1811,10 +2033,13 @@ Stated explicitly rather than guessed:
   is **not** decoded. The last step needs either a disassembly of whatever
   consumes that block or a hardware capture of a bump-mapping / dependent-read
   draw.
-* **The `GL_TEXBEM_MATRIX_MTX` coefficient registers.** The coefficients are
-  located in software down to bit positions — three packed fields of 14/14/12
-  bits at `[stageState+0x30/+0x34/+0x36]`, `0x800` = 1.0 — but the engine
-  register that state block becomes was not found (§9.5.5, §9.5.7).
+* **The `GL_TEXBEM_MATRIX_MTX` coefficient register.** The *number format* is
+  settled (four S4.11 signed 16-bit values, ±16.0, 1.0 = 0x800, packed as
+  `m00|m01<<16` and `m10|m11<<16`) and so is its position in both drivers'
+  software records — but not the engine register (§9.5.5, §9.5.7).
+* **Why MTXPARD's four-coefficient packing and the Linux kernel HAL's
+  three-field 14/14/12-bit packing differ** (§9.5.5).
+* **Hardware TA opcode 0x01**, and 0x07 / 0x0F / 0x12, which no driver emits.
 * **Which of `0x11c4`'s first two 3-bit fields is min and which is mag**
   (§9.5.6 / §11.4) — the two kernel tables that feed them are identical.
 * **`0x126c` bit 16.** No writer anywhere, yet it is deliberately *preserved*
@@ -1865,17 +2090,29 @@ complete instructions, `0x1264`/`0x126c` and `0x1260`/`0x1268`, and the
 separate-alpha flag decides whether the second is emitted. This replaces the
 previous revision's guesswork about write masks and pipes.
 
-The **texture-address / dependent-read half of the ISA is now mostly
-recovered** (§9.5). The 0x24-byte descriptor is fully decoded, the GL →
-internal → hardware opcode translation is pinned by two independent tables in
-two binaries, the per-opcode channel masks and arities cross-check each other,
-the bump coefficients are located in software, and the fixed-function case is
-confirmed against hardware (§12.3). Texture addressing is a **dependency graph
-of at most four descriptors that consume shader instruction slots**, not a
-second instruction stream and not fixed function; `arg0` names the destination
-stage and `arg1..argN` its sources, strictly decreasing. What is still missing
-is the final lowering step: which register (or which bits of the texture-unit
-state) the descriptor becomes.
+The **texture-address / dependent-read half of the ISA is now recovered except
+for its register** (§9.5). The 0x24-byte GL descriptor is fully decoded; the
+**hardware opcode numbering is pinned twice over**, once through libGL +
+the kernel HAL and once through MTXPARD's independent `D3DSIO` table, and the
+two agree on all sixteen values and additionally name the two opcodes GL has no
+token for (0x06 = `PHASE`, 0x08 = `TEXM3xNPAD`); the per-opcode channel-mask
+table is byte-identical in the Windows and Linux binaries; the arity table
+cross-checks the opcode table; and the bump-matrix number format is exact
+(S4.11, ±16.0, 1.0 = 0x800, two packed dwords). The fixed-function case is
+confirmed against hardware (§12.3).
+
+Texture addressing is a **dependency graph of at most four descriptors that
+consume shader instruction slots** — not a second instruction stream, and not
+fixed function. In GL `arg0` names the destination stage and `arg1..argN` its
+sources, strictly decreasing; in D3D the same graph is expressed as def→use
+edges between t-registers, and `D3DTOP_BUMPENVMAP` lowers into it.
+
+What is still missing is the final lowering step: which register the descriptor
+becomes. Neither vendor user-space component writes it — both hand the compiled
+records over as structure images — so it is either in code neither binary
+contains or in the unaccounted bits of the §11 per-unit window. Two compatible
+leads are recorded in §9.5.7; neither should be implemented against without the
+hardware test described there.
 
 The **fixed-function lowering is fully mapped** (§12.2) and is the right place
 to start an open driver: six modes, at most one instruction per texture unit,

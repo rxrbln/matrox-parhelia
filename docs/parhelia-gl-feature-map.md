@@ -476,6 +476,38 @@ kernel pointer differs, and that varies run to run anyway). Consistent with the
   textured versus `0x11` untextured. The key drops back to `0x11` after
   `glDisable(GL_TEXTURE_2D)`.
 
+### The 1928-byte block — DECODED  [HW]
+
+Previously reported as an `UNDECODED BLOCK`. It is not one record but a
+sequence, and it is now confirmed field-for-field against the capture:
+
+| Offset | Content |
+|---|---|
+| 0x008 | **texture-upload record** — 64-bit kernel pointer, then `4, 0,0,0,0, 0x40, 0x40, 1, 0, 2, 0` and three 1.0f. The two 0x40s are the 64x64 test texture (width at +0x2c, height at +0x30, as established above) |
+| 0x060 | **4-dword header `{0x46, 1, program_id, 0}`** — verified in the capture as `00000046 00000001 00000003 00000000`, so program id = 3 |
+| 0x070 | **the 0x664-byte fragment-program blob**, padded to a 4-dword boundary |
+| 0x6e0 | pair `(0x05, 1)` -> reg 0x1014 = 1 |
+| 0x6e8 | pair **`(0x14, 3)` -> reg 0x1050 = 3 — SELECT FRAGMENT PROGRAM**, matching the header's program id exactly |
+
+The program-id match between the upload header and the `0x1050` write is the
+check that pins the whole structure: **reg 0x1050 selects which uploaded
+fragment program a draw uses.**
+
+In `tex_env_replace` the same blob appears at 0x10 rather than 0x70, because
+there the first two header dwords are the ones the driver clobbers (§2).
+`tex_env_modulate` uploads **no** blob at all — a program-cache hit — which is
+why its region-2 delta is only 12 bytes.
+
+Four instances of the blob were decoded and match the static fragment-ISA
+reading field for field (`MOV r0,v0`, `MUL r0,t0,v0`, `MOV r0,t0` plus a
+separate `MOV r0.a,v0`) — the first hardware confirmation of the combiner
+encoding in docs/parhelia-fragment-isa.md.
+
+**One caveat to reconcile:** the pair immediately before the program select is
+`0x1014 = 1`, and 0x1014 is not in the record-opcode enum listed in section 2.
+Either the enum is incomplete or this is a plain register pair that happens to
+sit there.
+
 ### Still not decoded
 
 `tex_tri_nearest` carries a **1928-byte block** the decoder cannot frame, which
