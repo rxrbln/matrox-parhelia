@@ -972,7 +972,32 @@ For `count = 4` the second produces exactly `0x4106000f`, the literal the vendor
 emits in `mtx676` — and it still desyncs. So the tag alone is not the whole
 story; the payload shape matters.
 
-**The clue not yet followed.** `mtx676`'s 16 payload dwords are *not* four vec4s
+**It is not the framing.** `mtx676`'s packet emitted **verbatim** — the exact
+`0x4106000f` tag and the exact 16 payload dwords — also stops execution. And it
+is not the WARP bind either:
+
+| stream | `0x41c` | |
+|---|---|---|
+| trilevel 1 + bind, no block packet | `0x48` | executes fine |
+| trilevel 1 + bind + verbatim block packet | `0x10` | stops |
+
+So **any `0x41`-tagged packet in our PRIMARY ring stops the engine executing**,
+in three framings, with and without a bound program.
+
+**The hypothesis this points at.** The vendor never puts a `0x41` packet in the
+primary ring. `mtx676` builds its block packets into the push-buffer object at
+`r13+0x60` and submits them through `mtx1937`, which emits a *secondary-call*
+packet — `[0x20292820][0][start|tag][end|tag][0]` into `0x10a0`/`0x10a4` — and
+rings `0x408` with the primary tail. Every `0x41` the vendor executes therefore
+lives in a **secondary buffer**, reached by a call, never inline in the primary
+ring. That would explain a packet the engine fetches and refuses to execute
+regardless of its contents.
+
+`--secondary` already places the draw packet in a secondary buffer; the test is
+to put the block loads there too. That is the next thing to try, and the
+validated fence makes it a one-run answer.
+
+**The other clue, still worth following.** `mtx676`'s 16 payload dwords are *not* four vec4s
 of data. They are `0xaaaaaaaa`x4, `0x55555555`x4, then `0, 0x40, 0x80, 0xc0,
 0x100, 0x140, 0, 0` — two vec4s of data followed by six values spaced `0x40`
 that look like destination indices, and two zeros. So a block load may carry
