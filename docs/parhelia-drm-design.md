@@ -414,8 +414,19 @@ register. Most likely a multi-field register whose init value is benign; the
 validator must allow `0x2C` from clients regardless, and the kernel must not
 assume its arm value survives a draw.
 
-Relocations, in the vendor's own model — it patches base-address registers at
-replay time, `value = surface_base + entry_offset − entry_delta` [CONF]:
+**CORRECTION (2026-09-05): the vendor has no client relocations, and neither
+should we.** The paragraph below described `value = surface_base + entry_offset −
+entry_delta` as the vendor's model; that arithmetic is not on the path. The
+vendor resolves a **32-bit buffer handle** through a `std::map` at bind time
+(record key 0x08, `mtx2530`) and emits the base-address registers itself —
+clients never place a GPU address in a command buffer. See
+`docs/parhelia-buffer-binding.md` for the decode. The struct below therefore
+stands as the **DRM ABI we propose**, not as reversed vendor format, and the
+`0x88`/`0x8a`/`0x8c`/`0x8e`/`0x77` rows in the table above should read *rejected*
+rather than *allowed with a relocation entry*: those registers are
+kernel-emitted. A bind record `(slot, bo_handle, offset)` replaces them.
+
+For reference, the proposed relocation entry, if a future path ever needs one:
 
 ```c
 struct drm_parhelia_reloc {
@@ -1088,8 +1099,36 @@ pitfall produced bad leads once already.
 Ordered by how much they block.
 
 1. **The address-space selector in SECADDRESS/SECEND / `0x408`** (§3.2). Blocks
-   putting the primary ring and command buffers in VRAM. Experiment: a known-good
-   fill stream in VRAM, sweep the two low bits.
+   putting the primary ring and command buffers in VRAM.
+
+   **Measured on hardware, 2026-09-05, 0528, X not running.** The two low bits of
+   `0x408` were swept against the known-good 2D fill with the ring in DMA32
+   system memory, each value from a fresh boot where the previous one had left
+   the engine busy:
+
+   | `0x408` low bits | pixels | `0x404` after | engine after |
+   |---|---|---|---|
+   | `3` | **120000** | advanced to `end` | idle |
+   | `2` | 0 | still at `start` | left busy |
+   | `1` | 0 | still at `start` | left busy |
+   | `0` | not measurable — the preceding run had already left the engine busy | | |
+
+   So **both bits are required** for a system-memory ring; neither alone starts a
+   fetch, and clearing either leaves the engine latched and busy rather than
+   erroring. Vendor ground truth agrees: `captures/mmio-draw-0528-decoded.txt`
+   shows `0x404 = 0x14600000` (low bits **clear**) and every `0x408` write as
+   `…|3`, advancing by `0x20` per submission, with the ring at a system physical
+   address.
+
+   This settles the system-memory case and is enough to build on. What it does
+   **not** settle is VRAM: under the MGA-lineage reading bit 1 would be
+   "fetch across the bus", so clearing it should select local video memory — but
+   the measurement above cannot distinguish that from "bit 1 is simply required",
+   because the address submitted was a system address either way, and a system
+   address read as a VRAM offset is out of range on a 256 MB card. Testing that
+   properly needs a ring built in VRAM, which previously overran and locked the
+   engine (`memory: parhelia-vram-ring-hazard`), so it needs a bounded packet and
+   a health check either side.
 2. **Which `0x8F4` bit signals engine completion** (§4.4). Blocks IRQ-driven
    fences; a polling timer is the stand-in. Experiment: unmask everything, log
    `0x8F4` against known completions.

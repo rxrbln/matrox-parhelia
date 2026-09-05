@@ -72,13 +72,15 @@ becomes hardware writes. Per entry it calls `memWriteDword(reg, value)`, then:
   trigger (matches `parhelia-3d-driving.md`).
 - After specific registers it writes **`0x384 = 0`** — the serialization flush
   between dependent register groups (also seen inline four times in engine init).
-- For base-address registers it **patches the value at replay time**:
-  `value = surface_base + entry_offset − entry_delta` before the write. This is a
-  classic relocation: the command list stores buffer-relative offsets and the
-  driver adds the real VRAM/AGP base when it submits. **A Mesa driver must do the
-  same** — never bake absolute surface addresses into a reusable command batch;
-  store them as (buffer, offset) and relocate on emit. This also explains why the
-  standalone triangle tools that hard-coded base 0 only drew at VRAM offset 0.
+- **WITHDRAWN (2026-09-05).** This bullet claimed `mtx2153` patches base-address
+  registers as `value = surface_base + entry_offset − entry_delta`. It does not:
+  `mtx2153` is a fence-and-state emitter and that arithmetic is nowhere on the
+  path. Address resolution happens at **bind** time, from a 32-bit buffer handle
+  looked up in a `std::map` (record key 0x08, `mtx2530` @0x4bf10), and the kernel
+  emits the base registers itself — see `docs/parhelia-buffer-binding.md`. The
+  practical advice survives the retraction: a Mesa driver must still store
+  surfaces as (buffer, offset) and never bake an absolute address into a reusable
+  batch. It just does so by naming a handle, not by carrying a relocation list.
 
 The fragment-shader opcode table is **not** in the kernel module (searched: no
 `0x126c`/`0x1264` refs); it is compiled in userspace `libGL`
