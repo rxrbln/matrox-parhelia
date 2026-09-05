@@ -260,6 +260,61 @@ triangle is data in the ring**, and the register interface for a draw is one
 write. The hard part is entirely the command stream, which is what the rest of
 this document decodes.
 
+## DWGSYNC as a completion signal — and what it now proves
+
+The write-back pair `0x1090`/`0x1094` from the captured draw does **not** on its
+own cause anything to be written: appended to the known-good 2D fill it changes
+nothing, and both registers read back as 0 (write-only, like the WARP bind
+registers). Adding the vendor's DWGSYNC quad from `mtx2153` does not make the
+memory write appear either, so how the write-back is armed is still open.
+
+But the DWGSYNC quad itself works, and it is the instrument this project has
+been missing:
+
+```
+[4][0xc0afafc0][0x00000c07][tag|1][tag][dwgctl_restore]
+   -> 0x1300 = 0xc07 flush, 0x12bc = tag|1, 0x12bc = tag, 0x1300 restored
+```
+
+Measured on the 0528, submitted in our own ring behind a 2D fill:
+
+| tag submitted | `0x41c` after |
+|---|---|
+| 8 | `00000008` |
+| 16 | `00000010` |
+| 64 | `00000040` |
+
+`0x41c` returns the tag of the last retired DWGSYNC. That is a per-packet
+completion signal that depends on neither VRAM scanning nor the WARP readback
+port — the two instruments that have misled this work.
+
+### What it says about our 3D draw
+
+Bracketing our own address-mode triangle with tag `0x20` before and `0x40`
+after:
+
+```
+tri: address-mode draw, 5 dw/vertex, verts in VRAM at +0x500000..+0x50003c, tags 32/64
+  bmstat=00020000 fetch 0x404=13208280 == end, consumed
+  DWGSYNC 0x41c=00000040 -- BOTH tags retired: the draw packet was consumed
+  no pixels written to the render target
+```
+
+**The post-draw tag retired.** The engine executed through the draw packet and
+out the other side, then produced no fragments.
+
+This retires a whole class of explanations. Until now "packets consumed, engine
+idle, nothing drawn" rested on `0x404 == end`, which only says the *fetch*
+pointer advanced — it is consistent with the engine skipping or mis-parsing the
+packet. DWGSYNC says execution genuinely passed the draw. So the draw packet is
+**accepted and executed as a no-op**, and the fault is in state or program:
+geometry culled or clipped away, a transform producing degenerate positions, a
+vertex format that assembles zero primitives, or a fragment program that kills
+every fragment. It is not framing, not the ring, and not the doorbell.
+
+Every future negative on this path should carry a DWGSYNC bracket; without one
+the result cannot distinguish "did nothing" from "never ran".
+
 ## Next
 
 * Relocate the mmap-class pointers (`0x00002b57…`) in command `0x05` using the
@@ -269,3 +324,8 @@ this document decodes.
 * Map the write-back page (`control+0x48`) before the first RENDER; without it
   no draw can retire.
 * Give key `0x21` a per-item stride so the state stream parses to the end.
+* Find how the write-back at `0x1090`/`0x1094` is armed — the captured draw
+  clearly relies on it, and a memory-visible completion word is better than an
+  MMIO read.
+* Diff our state against the captured record stream field by field. With the
+  draw packet now proven to execute, that diff is the whole remaining problem.
