@@ -1,5 +1,14 @@
 # Parhelia — implementing a Linux Mesa GL driver
 
+> ## STALE COMPONENT TABLE — do not lift addresses from it
+>
+> The component table below is the most concentrated collection of retracted
+> draw-path addresses in this tree: the `0x1160`/`0x1180` planes, the "`0x12bc`
+> kick", `0x1280`/`0x1284` as scissor, and "submission is pure userspace MMIO".
+> All four are superseded. Use `parhelia-3d-coverage.md` for what is actually
+> established.
+
+
 This bridges the hardware reverse-engineering (`parhelia-gl-driver.md`,
 `parhelia-vertex-isa.md`, `parhelia-fragment-isa.md`, `parhelia-accel.md`) to an
 actual Mesa driver. The hardware pipeline is largely reversed; what was missing

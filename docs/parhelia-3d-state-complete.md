@@ -1,5 +1,18 @@
 # Parhelia 3D pipeline state — consolidated RE (2026-09)
 
+> ## STALE IN TWO SPECIFIC PLACES — both would break a draw
+>
+> This file elevates itself over others ("where the two disagree, this wins")
+> while its own appendix admits part of its register list is mis-sliced payload.
+> Two concrete hazards:
+> * **Do not replay the `0x1100-0x117c = 0xffffffff` "attribute file init"
+>   after binding.** `0x1100` is the WARP entry point; replaying the sweep
+>   overwrites your entry with a bogus value.
+> * **Do not program `0x1298` as draw state.** It is `GL_POINT_SIZE_MAX`, and
+>   the address itself is refuted — the 2048.0 is a clamp folded into block
+>   `0x173`.
+
+
 Provenance: reversed from `matroxdriver-x86_64-cvs-20090511/opengl6/libGL.so.1.3.0`
 (gl64.asm), the win32 D3D driver `MTXPARD.DLL` (pard.asm), and the Linux X HAL
 `mtx_drv.so` (mtx.asm). Complements docs/parhelia-gl-driver.md,

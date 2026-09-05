@@ -1,5 +1,15 @@
 # Parhelia hardware for a new GL driver
 
+> ## PARTLY STALE — check `parhelia-3d-coverage.md` before using any address here
+>
+> The vertex-submission and "attribute-plane / latch-register model" sections
+> rest on reading `mtx3212` as a vertex template. That reading is **refuted**
+> (`parhelia-warp-codegen.md`): `mtx3212` is a texture-combiner default
+> template. The `0x1280`/`0x1284` scissor claim is also refuted — those are a
+> packed 10-bit colour constant and dead code; real scissor is
+> `0x1328`/`0x132c` plus DWGCTL bit 23.
+
+
 What a from-scratch OpenGL driver (classic Mesa/DRI-style, or a Gallium backend)
 needs from the hardware, mapped to the reverse-engineered registers. Companion
 to `parhelia-accel.md` (register catalogue) and `parhelia-3d-driving.md`

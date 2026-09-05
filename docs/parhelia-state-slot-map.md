@@ -397,7 +397,9 @@ that follows the store with the matching immediate. CONFIRMED.
 ### 5.1 The block-load packet — `mtx1342` @0x90010
 
 `mtx1342(bitmapBase, ring)` scans indices 0..0x17f, coalesces each run of
-consecutive dirty indices (max 0x40 per packet) and appends:
+consecutive dirty indices (max **0x3f** per packet -- the count field is six
+bits and is clamped at 0x901d9/0x901fd; an earlier 0x40 here was wrong) and
+appends:
 
 ```
 dword 0 : 0x41000000 | ((count << 17) & 0x007e0000) | ((count*4 + 3) & 0xffff)
@@ -514,16 +516,22 @@ disentangled (leads, not results): `mtx1322`->0x134, `mtx2588`->0x138,
 
 Useful for a from-scratch driver that must initialise the block file:
 
+> **CORRECTED 2026-09-05 — four rows here were wrong and they are in the
+> minimum constant set.** This table read the register `ebx` as 1.0 where it
+> holds 0.0. `docs/parhelia-block-state-map.md` carries the corrected values and
+> both vendor binaries agree with them. The rows are marked inline below; do not
+> program the struck values.
+
 | index | dword 0 | 1 | 2 | 3 |
 |---|---|---|---|---|
 | 0x14d | — | — | — | `0x42000000` |
-| 0x172 | 0 | 1.0f | 1.0f | 0 |
+| 0x172 | **1.0f** | **0** | **0** | **1.0f** (was `{0,1,1,0}`) |
 | 0x173 | -0.5f | -0.5f | r14 | r14 |
 | 0x174 | `0x45ff0000` | `0x45ff0000` | `0xc5ff0000` | `0xc5ff0000` |
-| 0x175 | `0x43000000` | 1.0f | 1.0f | 1.0f |
-| 0x178 | 1.0f | 1.0f | 0 | `0x49400000` |
+| 0x175 | **`0x43000000`** | **0** | **0** | **0** (was `{128,1,1,1}`) |
+| 0x178 | **0** | **0** | **0.5f** | **`0x49400000`** (was `{1,1,0,786432}`) |
 | 0x17d | `0x4b000000` (2^23) | `0x3d4ccccd` (0.05) | `0x41f80000` (31.0) | `0x3d042108` (1/31) |
-| 0x17e | 1.0f | `0x3d800000` (0.0625) | 1.0f | 1.0f |
+| 0x17e | **0** | **`0x3d800000`** (0.0625) | **0** | **0** (was `{1,0.0625,1,1}`) |
 
 (`r14`/`1.0f` per the init register allocation; CONFIRMED for the literals.)
 

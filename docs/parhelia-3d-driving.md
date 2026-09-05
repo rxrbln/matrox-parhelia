@@ -1,5 +1,23 @@
 # Driving the Parhelia hardware — submission, geometry, shading
 
+> ## STALE — DO NOT FOLLOW THIS FILE'S RECIPES
+>
+> Superseded on the draw path. Specifically wrong here:
+> * **§1 inverts the ring registers.** `0x404` is the ring base and `0x408` the
+>   doorbell (`end | 3`); `0x400` is the status write-back pointer. Authority:
+>   `parhelia-command-construction.md`, `parhelia-draw-recipe.md`.
+> * **The `0x1160`/`0x1180` "plane" model** is not a WARP vertex path.
+> * **"Fire `0x12bc`" is wrong** — `0x12bc` is DWGSYNC, a fence written as a
+>   pair. The trigger is the DRAW packet plus the ring doorbell.
+> * **"Direct MMIO first"** — the vendor's PIO replay is dead code in the kernel
+>   build; the ring is the real path.
+>
+> Current authority: binding -> `parhelia-warp-binding.md`; constants ->
+> `parhelia-block-state-map.md`; scissor/viewport/guard band ->
+> `parhelia-raster-clip.md`; submission -> `parhelia-command-construction.md`;
+> grades -> `parhelia-3d-coverage.md`.
+
+
 Working notes toward issuing a draw to the Parhelia engine from software (the
 goal: a colour triangle through the hardware). This consolidates the deep passes
 that target *how to actually drive the pipeline*, separate from the register
