@@ -367,3 +367,35 @@ Two process rules this cost:
    value the current source refuses, and then produced three "the fill no longer
    works" results that looked like a hardware discovery.
 2. The tool prints a build stamp at startup for the same reason.
+
+
+## Measurement traps that cost real time here
+
+Three of these produced results that read exactly like hardware failures.
+
+**1. Geometry must be read, not assumed.** The test box runs **1920x1200,
+pitch 2048, depth 24 / 32 bpp** (`Xorg.0.log`: "Virtual size is 1920x1200
+(pitch 2048)"), while `p3dtri` defaults to 1024x768 pitch 1024. A fill run with
+the default surface pitch is self-consistent -- the engine writes at the pitch
+it was given and a scan at the same pitch reads it back perfectly, which is why
+"120000 px" was a valid proof that the *engine* executed -- but it writes across
+the visible framebuffer in a garbled layout. The visible corruption is the
+first symptom, and it is easy to misread as the tool being broken. Always pass
+`--width 1920 --height 1200 --pitch 2048` when the target is the live screen.
+
+**2. Scan the region you actually programmed.** The fill's pixel counter was
+anchored at VRAM offset 0 regardless of the surface base. Pointing the surface
+off-screen therefore reported zero pixels -- indistinguishable from a dead
+engine -- when the fill had very likely drawn correctly where nobody was
+looking.
+
+**3. One count cannot tell three failures apart.** "0 green pixels" conflates
+"wrote nothing", "wrote another colour" and "wrote somewhere else". The fill now
+reports matches at the programmed base, matches on the visible screen, and
+non-zero dwords at the base after clearing it.
+
+And the standing one: **`bmstat` idle does not mean healthy.** After a bad
+DWGCTL the engine reads idle and draws nothing. `--health` runs a 2D fill and
+requires the full 120000 pixels; the WARP paths are gated on it. `--dmafill`
+itself is not gated, so a fill result taken without checking the engine first
+can be void -- check `0x8f0` at the top of the output, which the tool prints.
