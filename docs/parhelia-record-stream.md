@@ -218,6 +218,28 @@ the four texture units) and `movzx r8d,WORD[rbx+2]` as the **field**. So
 
 Key 0x0c ids are a **flat 32-bit** value in a different space entirely.
 
+## Slots pinned by the shading / texturing captures
+
+Three `gltri` traces differing in exactly one GL feature each
+(`parhelia-shading-texturing-capture.md`) name four things outright:
+
+| record | field | meaning |
+|---|---|---|
+| `0x0c` | id `0x09` | shade model: **1 = `GL_FLAT`, 2 = `GL_SMOOTH`** (2 is the context-arm default, so a smooth draw simply omits the id) |
+| `0x07` | payload dw0 bit 17 | **texcoord present** in the vertex (`0x10` untextured, `0x20010` textured) |
+| `0x08` | payload dw4 | **vertex stride in bytes** (20 untextured, 28 with texcoords); dw2..3 are the vertex buffer's kernel pointer |
+| `0x46` | item 375 | **texture unit 0 enable**, 0 -> 1 — the prediction in the table above, now confirmed on a draw verified pixel by pixel |
+
+Also measured there: `0x0e` carries the sampler delta (unit 0 fields `0x00` and
+`0x18` only), `0x06` unit 0 field 6 is rewritten with the integer 1000 at texture
+bind time, and `0x0a` binds the texture object, carrying its kernel pointer and
+its 64x64 dimensions. The `0x05` WARP bind is `(0x13,1) (0x14,2)` for flat,
+smooth *and* textured draws — the vertex program is not respecialised, the format
+change is entirely `0x07` plus `0x08`.
+
+The context-arm stream enumerates `0x0e` and `0x06` fields for units 0,1,2,3 in
+that order, which independently confirms the unit-in-LOW-half split above.
+
 ## Validation
 
 Parsed with `advance = 8 + count*itemsize`:

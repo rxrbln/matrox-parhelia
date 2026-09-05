@@ -34,14 +34,26 @@ missing: an operation that provably exercises the WARP, with a countable result.
   replay that draws nothing looks identical to one that works. Draw the capture
   in a distinctive colour, then overwrite it with a black triangle at the same
   coordinates before replaying.
-* **A single-buffered visual** keeps the result in the visible surface where a
-  VRAM scan finds it; with double buffering the triangle lands in a back buffer.
+* **The visual is not actually single buffered.** `glXChooseVisual` is asked for
+  `GLX_RGBA` without `GLX_DOUBLEBUFFER`, which GLX treats as a preference, and
+  this server has no single-buffered RGBA visual to give. The triangle lands in
+  a back buffer high in VRAM: an `XGetImage` of the window shows only the
+  background and a scan of the low 16 MB finds nothing. Swap before verifying.
+* **`XGetImage` reads the window back and `glReadPixels` does not.** It is the
+  exact instrument this capture work should have been using from the start --
+  `GLTRI_XCAP=1` histograms the window, no VRAM offset guessing needed. See
+  `parhelia-shading-texturing-capture.md`.
 * `GL_OUT_OF_MEMORY` is raised once at `glXMakeCurrent` and never again. It is
   the known allocator refusal (AGP down, order-9 cap) and does **not** stop the
   draw — every draw after it reports `GL_NO_ERROR`.
 * Linking against the vendor `libGL` needs `-Wl,--allow-shlib-undefined`: it
   wants `GLIBCXX_3.4` symbols this toolchain's `libstdc++` does not version.
   The 64-bit X libraries are in `/usr/X11/lib64`, not `/usr/X11/lib`.
+* **`-lm` is mandatory, not optional.** Same versioning mismatch, worse symptom:
+  `libGL` calls `ceilf` in its texture path, and without `libm` among the
+  executable's direct dependencies that binds into a `libstdc++` PLT stub which
+  never returns -- `glTexImage2D` spins in `ceilf@plt` forever. Link
+  `-lGL -lX11 -lm -Wl,--allow-shlib-undefined`.
 
 ## Shape of the capture
 
@@ -98,8 +110,16 @@ are exactly the ones `gltri.c` asks for: `(20,20)`, `(width-20,20)`,
 the window coordinates, so this capture does not by itself separate object from
 clip space — it does pin the stride, the base and the component order.
 
-No per-vertex colour appears: with `glShadeModel(GL_FLAT)` and one `glColor3f`,
-the colour travels in the state stream, not the vertex.
+**Corrected.** The last three dwords are not padding, they are the colour:
+
+    struct vertex { float x, y, r, g, b; };
+
+This capture ran with `GLTRI_RGB=0xff00ff`, and `1.0 . 1.0` above is that
+magenta with the `.` an unchanged 0.0 for green. A Gouraud capture, where the
+three vertices carry red, green and blue, pins it beyond doubt; see
+`parhelia-shading-texturing-capture.md`. The earlier reading here — "no
+per-vertex colour appears, the colour travels in the state stream" — was wrong,
+and was caused by reading `.`-flagged (unchanged) dwords as absent fields.
 
 ## The state stream, decoded
 
@@ -288,7 +308,39 @@ Measured on the 0528, submitted in our own ring behind a 2D fill:
 completion signal that depends on neither VRAM scanning nor the WARP readback
 port — the two instruments that have misled this work.
 
-### What it says about our 3D draw
+### RETRACTED (2026-09-05): the DWGSYNC bracket result was a stale read
+
+**The claim below — that our draw packet is consumed and executes — does not
+hold, and the reasoning that produced it was faulty.** From a clean boot our
+DWGSYNC packets never move `0x41c` at all: fill tags 8 and 64 both leave it
+reading `00000000`. The earlier `8 -> 8`, `16 -> 0x10`, `64 -> 0x40` sequence
+was taken in a boot where the vendor X driver had already run, and the vendor
+emits its own DWGSYNC fences constantly. Worse, our post-draw tag was `0x40`,
+the same value the preceding `--dmafill --wbtag 64` run had left behind — so
+"both tags retired" was reading our own previous experiment.
+
+That is the third instrument this project has trusted before validating it,
+after the WARP readback port and the pixel scan. The rule that keeps being
+relearned: **an instrument needs a negative control as well as a positive one.**
+Here the missing control was "does the register still read the expected value
+when the packet that should have written it is absent".
+
+**What is actually established** is smaller and more useful. After a run on a
+freshly booted engine, `0x1300` is left holding `0x00000c07` — the flush value
+our DWGSYNC quad writes first. So the packet *starts*, writes `0x1300`, and then
+stalls on `0x12bc = tag | 1`, whose bit 0 means "block until complete". It never
+completes, `0x1300` is never restored, and the engine is left busy.
+
+The likely reason is that **the engine has never been initialised**. Everything
+we drive it with runs on a card that only ever had `modprobe mtx` and our own
+register writes; the vendor's X driver performs a long init sequence on first
+start that we have never captured. A 2D fill works without it because it needs
+almost nothing; a fence and a 3D primitive do not.
+
+So the next capture is the one the method notes have always listed and we have
+never taken: **mmiotrace across `modprobe mtx` and the first `startx`**.
+
+### What the bracket appeared to say about our 3D draw (see retraction above)
 
 Bracketing our own address-mode triangle with tag `0x20` before and `0x40`
 after:
@@ -312,8 +364,9 @@ geometry culled or clipped away, a transform producing degenerate positions, a
 vertex format that assembles zero primitives, or a fragment program that kills
 every fragment. It is not framing, not the ring, and not the doorbell.
 
-Every future negative on this path should carry a DWGSYNC bracket; without one
-the result cannot distinguish "did nothing" from "never ran".
+Every future negative on this path should carry a completion signal — but only
+one that has been shown to read `0` when the packet is absent and the tag when
+it is present, in the same boot. The bracket above met neither condition.
 
 ## Next
 
@@ -329,3 +382,6 @@ the result cannot distinguish "did nothing" from "never ran".
   MMIO read.
 * Diff our state against the captured record stream field by field. With the
   draw packet now proven to execute, that diff is the whole remaining problem.
+* Gouraud and textured companions to this capture, with the vertex layout, the
+  texture upload path and the exact record deltas, are in
+  `parhelia-shading-texturing-capture.md`.
