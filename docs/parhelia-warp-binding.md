@@ -487,3 +487,44 @@ programming anything for the program to read.
 diagnostics — capture register state and any driver output to a file *before*
 the submit, so a reboot does not take the evidence with it. This attempt lost
 its output that way.
+
+## Hardware attempt 2 — no crash, still no triangle  [HW]
+
+Same setup, with the two corrections from attempt 1: viewport constants uploaded
+by a block-load packet **before** anything is bound, and only the short
+four-register bind form emitted.
+
+```
+bound WARP entry = 0x0 (instruction index 0)
+uploaded viewport constants 0x160/0x161 (512.0,-384.0 / 512.0,384.0,768.0)
+WARP tri: 64 regs, 93 words, opcode=30200c, phys=d8000000
+loaded 7 WARP programs, 2664 bytes (222 instructions)
+VRAM non-bg px = 0 : no triangle
+```
+
+**The machine survived** — uptime intact, X alive, module refcount 2, no oops.
+That validates the ordering: constants before binding, short form only. Attempt
+1's reboot was caused by binding a program with an all-zero constant store, not
+by the bind packet itself.
+
+**Still nothing rasterises, and the reason is now specific rather than vague.**
+Entry 0 is the first program in our load order, `mtx3605` — and the codegen work
+established that **`mtx3605` contains no dot-product instruction at all and is
+an output stage**, not a transform. None of the seven canned programs is a
+transform. So this attempt bound an output stage, fed it vertices, and correctly
+produced nothing.
+
+The 3077 "R/G/B pixels" the broad scan reports at `0xec00c8` are the hardware
+cursor image, as established in attempt 1 — not geometry.
+
+**What is actually required now**, and it is no longer a mystery:
+
+1. A **transform program**, which has to be written from
+   docs/parhelia-warp-codegen.md rather than borrowed — none of the canned seven
+   does the job, and the vendor fragments cannot ship in a GPL-2 driver anyway.
+2. The **full minimum constant set**, not just the viewport pair: the world-view
+   matrix with its inverse transpose at 0x000-0x006, an identity projection at
+   0x149-0x14c, and the thirteen setup rows at 0x172-0x17e.
+
+Both are specified. Neither is implemented. That is the whole remaining distance
+to a first triangle.
