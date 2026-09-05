@@ -263,10 +263,31 @@ records, ending on the key-`0x1b` DRAW record:
     0x0d 0x35 0x0c 0x12 0x46 0x05 0x26 0x36 0x0c 0x24 0x23 0x0c 0x21
     0x22 0x27 0x25 0x20 0x0c 0x07 0x08 0x1b
 
-The textured capture leaves 11 dwords on its final `0x1b`, one short of the
-48 a count-1 DRAW record needs. Either that region's dump is truncated by a
-dword or key `0x1b`'s item is 36 bytes rather than 40 in some form; not yet
-separated, and it is the only residue left in the grammar.
+**CLOSED.** The textured capture appeared to leave 11 dwords on its final
+`0x1b`, one short of the 48 a count-1 DRAW record needs. Key `0x1b` does not
+have a 36-byte form: the submit diff lists only **changed** dwords, that
+record's last dword kept its previous value, and reconstructing the region as
+`max(index)+1` therefore truncated it. Padding the tail with zero — the missing
+dwords are unchanged, and in every observed case that value is 0 — makes it
+parse exactly.
+
+**All four single-triangle captures now consume to the byte with zero residue**,
+which closes the grammar:
+
+    gltri-flat-0528-trace.txt      SUBMIT 17  21 recs, dw1124/1124  EXACT
+    gltri-gouraud-0528-trace.txt   SUBMIT 17  21 recs, dw1122/1122  EXACT
+    gltri-textured-0528-trace.txt  SUBMIT 19  20 recs, dw1054/1053  EXACT
+    gltri-0528-trace.txt           SUBMIT 17  21 recs, dw1124/1124  EXACT
+
+The DRAW record's layout is confirmed identically in both a flat and a textured
+capture, and agrees with the independent decode of `mtx2196`:
+
+    +0x00  u32  primitive mode      4 = GL_TRIANGLES
+    +0x04  u32  flags               2 flat, 0 textured
+    +0x08  u64  kernel object pointer for the command ring
+    +0x10  u64  command-chunk start byte offset
+    +0x18  u64  command-chunk end | 1
+    +0x20  u64  vertex-array base byte offset   0x40 in both
 
 ## Validation
 
