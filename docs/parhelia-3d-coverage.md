@@ -36,7 +36,8 @@ Last revised 2026-09-05.
 | area | grade | notes |
 |---|---|---|
 | Two namespaces | SOLVED | region-2 GL **state slots** via `[key][count]` records vs. DMA-ring **registers** at `0x1000 + index*4`. A state slot does **not** name a register |
-| Slot → shadow → hardware chain | SOLVED | `parhelia-state-slot-map.md`; every `reg = 0x1000 + slot*4` address derived from a region-2 slot is refuted |
+| Slot -> shadow -> hardware chain | SOLVED | full map in `parhelia-slot-translation.md`: dispatcher, 172-entry table, three delivery mechanisms, register layouts and value encodings |
+| Record stream framing | SOLVED | `parhelia-state-slot-map.md`; every `reg = 0x1000 + slot*4` address derived from a region-2 slot is refuted |
 | Key 0x05 / key 0x0c attribution | SOLVED | blend factors = key 0x05 0x09..0x0c (key 0x0c 0x13/0x14 write them in pairs); polygon mode = key 0x0c 0x08. See §7.2 of the slot map |
 | Block file layout (384 entries) | PARTIAL | `0x000..0x0df` matrix palette, `0x0e0..0x15f` WARP source registers (`r = N − 0xE0`), `0x160..0x17f` fixed-function setup. Only the middle window is established |
 | Lazy emission | SOLVED | state is emitted in validation order, not call order, and unchanged values are never re-emitted. Any differential sweep must account for this |
@@ -47,6 +48,8 @@ Last revised 2026-09-05.
 |---|---|---|
 | Render targets, pixel formats | DECODED | surface slots 0x1220..0x123c |
 | Texture storage, incl. rectangular | SOLVED [HW] | linear, proven; 32×16 occupies exactly 32*16*4, dense |
+| Sampler registers | SOLVED | `0x11c0`-`0x11e8` + `0x1200`-`0x120c` and nothing else; field layouts in `parhelia-texture-path.md` |
+| Texture upload path | SOLVED | staging ring + kernel memcpy; opcode 0x0a record, 0x48 bytes |
 | Texture formats / filtering / wrap / multitexture | DECODED | from `CDPSTextureEngine::UpdateHardware` |
 | Mipmapping | DECODED | |
 | Non-power-of-two | SPLIT | storage SOLVED [HW]; sampling capability DECODED (TextureCaps POW2 clear, static only); the GL stack **rejects** NPOT outright as a GL-1.3 artefact; `np2Conditional` unreconciled |
@@ -111,3 +114,26 @@ Use **VRAM** as the observable, not the readback port.
 Current WARP draw state, measured with the reliable observable: the engine
 consumes the whole stream, `bmstat` leaves idle so work is genuinely dispatched,
 and **0 of 32768 VRAM pages change** — the engine writes nothing anywhere.
+
+
+## Update 2026-09-05: what the parallel RE pass settled
+
+* **Record framing** -- `{key, count}` header, `size = 8 + count*itemsize`,
+  validated to 100% on two captures and against the client's own declared
+  length on four more. `parhelia-record-stream.md`.
+* **Slot to hardware** -- the full chain, with concrete register layouts for
+  depth/stencil, blend, alpha, colour mask, scissor and cull, plus the value
+  encodings. `parhelia-slot-translation.md`.
+* **Texture path** -- sampler register window, field layouts including LOD bias
+  and clamps, the staging-ring upload, and mipmaps as an explicit per-level
+  table. `parhelia-texture-path.md`.
+* **Buffer-create ABI and its failure modes** -- one input field, a live PDEV
+  handle, and three separate reasons allocation fails on this box.
+  `parhelia-kernel-abi.md`.
+* **Two vertex-delivery modes** -- index mode (`0x8f000001`, needs a bound
+  array) and address mode (`0x17000001 | flags | stride<<17`, self-contained).
+  Every from-scratch attempt here had used index mode with nothing bound.
+
+**Texture state has no register path.** Texture environment, enables and
+env colour are compiled into a WARP program; an open driver must generate it.
+That is the largest single piece of work implied by this pass.
