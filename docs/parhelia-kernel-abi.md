@@ -1167,3 +1167,71 @@ ring doorbell writes seen kernel-side.
   capturing, rather than sleeping a fixed interval.
 - The vendor stack calls `open64`/`mmap64`, not `open`/`mmap`; interposing only
   the latter logs nothing.
+
+
+## The buffer-create ioctl (nr=31) — corrected, and how to replay it
+
+**Only field +0x00 of the 56-byte request is an input.** It is a live kernel
+pointer to the X server's PDEV object. Everything a capture shows at
++0x08..+0x30 is **uninitialised caller stack**, not fields: `ICDLinkImpl::Open`
+(libGL `0x358c30`) allocates a 64-byte frame, writes only `[rsp]`, and calls.
+The kernel reads the buffer exactly once, at offset 0 (`mtx1775` `0x2698`).
+
+Output layout, written by the kernel:
+
+    +0x08  mmap cookie for the 0x238-byte control block
+    +0x10  caps0   +0x11  1 (literal)   +0x12 caps1   +0x13 caps2
+    +0x14  guard band min, IEEE float -- 0xc5ff0000 = -8160.0f, or 0 if disabled
+    +0x1c  guard band max --             0x45ff0000 = +8160.0f
+    +0x24  8       multi-pass texture-stage threshold (NOT a unit count; 4 units)
+    +0x28  0xffff  max vertices per submitted batch
+    +0x2c  0       hardware line enable
+    +0x2d  0       hardware wide-line enable
+
+The last two are **hard-coded zero in the kernel**, which independently confirms
+from a third direction that the wide-line software fallback is a driver policy
+decision rather than a hardware limit.
+
+### Where the handle comes from
+
+The X server creates the PDEV via ioctl `0xc0804614` and the handle travels to
+the client over the **GLX wire** (`X_GLXVendorPrivateWithReply`; libGL reads it
+at reply+0x0c, `0x360d69`). `mtx_drv.so` never issues nr=31; `libGL` never
+issues the create. So a GL client only borrows an address the server owns.
+
+**It cannot be replayed from a capture** -- it is a raw kernel address, invalidated
+by an X restart, a module reload or a reboot. Take it live from the current X
+session.
+
+### ⚠️ Passing an unverified handle can oops the machine
+
+`mtx3645` (`.text+0x3430`) walks the PDEV list **without NULL-checking the head**.
+A non-zero handle when no PDEV exists dereferences NULL in the ioctl path.
+Passing zero is safe (early exit, clean EINVAL). **Never sweep this field.**
+
+Other state rules: a second nr=31 on one fd returns `-EBUSY`; release with
+`ioctl(fd, 0x4620)` or close. And the returned **cookie cannot be replayed
+either** -- `mtx_mmap` validates it through `MtxRegion_FindFromBase` and, for
+region type 1, requires the mapping fd's own context id.
+
+## Vendor bug: allocation failure oopses the kernel [HW, observed]
+
+Replaying with a live handle got as far as real buffer creation and then hit
+this:
+
+    [mtx] *ERROR* Failed to create device buffer (size: 3280896, type: 1)
+    [mtx] *ERROR* Parhelia OS: Failed to allocate locked pages (nb: 801, type: 1)
+    BUG: unable to handle kernel NULL pointer dereference at 0000000000000004
+    IP: [<...>] mtx3100+0x59/0x3c0 [mtx]
+    Call Trace: mtx2428 <- mtx2032 <- mtx3627 <- mtx892
+
+The driver fails to pin 801 pages (3.2 MB, the vertex ring) on a 497 MB box and
+then **dereferences the NULL it just failed to allocate**. The process is left
+unkillable and the machine needs a reboot.
+
+Two things follow. For replay: the host must have enough free memory to pin the
+full region set -- roughly 8 MB of locked pages across the seven regions -- so
+drop caches and avoid holding large trace files in page cache. For the **open
+kernel driver this is a specification point**: every device-buffer allocation
+must be failure-checked and must unwind, because the hardware path is reachable
+on a machine that simply does not have the pages.
