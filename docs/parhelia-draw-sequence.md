@@ -265,3 +265,56 @@ vertex; a 2D solid fill of 120000 pixels.
 Note also that "CONFIRMED" in several files means "read out of the binary", not
 "works on the board" — `parhelia-vertex-pipeline.md` states outright that none
 of its part 2 has been executed on a Parhelia.
+
+
+## Hardware attempt, 2026-09-05, P690 — a controlled negative
+
+Replicating `mtx676` as exactly as the disassembly allows — streaming `mtx2785`
+itself, binding it in the vendor's short form, pushing the four walking-pattern
+packets, then reading the register file back the way `mtx612` does — produces
+**no register change at all**.
+
+    mtx2785-selftest gates: idle=1 908=1 924=1 busy0=1 (0x908=63af8001 0x924=00200100)
+    mtx2785-selftest: streamed 1203 dwords to 0x91c
+    selftest676: 83 words
+      bmstat during=00000000        <- the engine DOES go busy
+      bmstat=00020000 fetch 0x404=197d014c == end
+    selftest676: 0 registers changed -- no evidence of execution
+
+This is the strongest available isolation of the problem, because it uses the
+vendor's own program, the vendor's own data, and the vendor's own expected
+result. It is not our transform program that is at fault.
+
+**Confirmed working on this card in the same session**, so none of these is the
+cause: the system-memory ring; packet framing (a 2D solid fill draws exactly
+120000 pixels); the engine's willingness to do work (`bmstat` leaves idle on
+both the fill and the WARP submit); the microcode gates (all four pass); the
+`0x91c` stream (1203 dwords accepted).
+
+**Ruled out by measurement, each with both settings tried:**
+
+| candidate | tried | result |
+|---|---|---|
+| `0x920` bit 0 | 0 and 1, before *and* after the stream | no difference |
+| DWGCTL slot encoding | `0x07`, `0x307`, `0xc07`, `0x800007` | no difference |
+| register-write framing | bare `[tag][data]` **and** vendor `[count][tag][data]` | no difference |
+| bind order | constants-then-bind **and** bind-then-constants | no difference |
+| readback coverage | all four banks (`sel` 0..3), not just bank 0 | no difference |
+| Phase 1 engine arm | present and absent | no difference |
+
+**What has not been excluded, and is where to look next:**
+
+1. `mtx1391` does more than stream: it spins on `[dev+0x78]`, calls `mtx1937`
+   to drain the ring *before* touching `0x918`, and maintains a code-store
+   allocator at `hal[0xa3118]`. The ring-drain-before-upload ordering is not
+   replicated here.
+2. The entry value. `mtx1391` returns `base/3 + 4*entry[idx]` — note `/3`, not
+   `/12`. With `base = 0` both give 0, so this is untested, and any program
+   streamed at a non-zero offset would expose it.
+3. Whether readback `space = 3` observes what the self-test writes at all.
+   `mtx612` uses it, but we have never seen a *positive* readback from this port
+   on this card, so its ability to observe anything is itself unverified.
+
+Item 3 matters most: without one positive control through the readback port, a
+zero result cannot distinguish "the WARP did not run" from "the port does not
+show it".
