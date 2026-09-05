@@ -923,3 +923,48 @@ and `scratchpad/mtxk_r.asm` (`objdump -d -M intel -r`).
 - **Family fingerprints**: per fragment, presence of a 4×`op77` quad, reads of
   `r89`–`r108` / `r116`–`r117` / the material registers, presence of `op79`/
   `op7a`, presence of a branch, presence of `end`.
+
+## RESOLVED STATICALLY: r7-r10 are loaded from constants, not inputs
+
+Section 7 recorded the matrix-rows-versus-texcoord-inputs question as unresolvable
+by dataflow and needing a hardware readback. That was wrong — the corpus does
+answer it, in the fragments that write those registers.
+
+The transform fragment `0xf` (`mtx3632`) **reads** `r0-r3` and `r7-r10` and
+writes `a259-a262`, but it does **not write** `r7-r10`. The fragments that do are
+single-instruction loaders sitting immediately before it:
+
+```
+0x31  mtx3905   add.e.q  b8.xyzw   r86.4444, r0.xyzw, r0
+0x32  mtx561    add.e.q  b9.xyzw   r84.4444, r0.xyzw, r0
+0x33  mtx341    op75.q   b8.xyzw   r3.xyzw,  r8.xyzw, r0
+```
+
+`b8` is `r8` (port B writes the low sixteen of the source file, §1), and the
+sources `r84`/`r86` are above the `r15` boundary, so they are **constant-space**
+registers.
+
+**So `r7-r10` are neither matrix rows held in place nor texture coordinate
+inputs. They are working registers that a preceding fragment loads from the
+constant file**, after which the four `dp4`s consume them. A transform is a
+*sequence*: load the rows, then dot against them.
+
+### Why our generated program produced nothing
+
+`tools/parhelia-3dtri.c`'s `warp_gen_transform` emits only the four `dp4`s and
+`END`. With no preceding loader, `r7-r10` hold whatever the engine left there,
+so the dot products ran against undefined data. The program was structurally
+incomplete, not merely mis-parameterised — which is a better explanation of the
+empty render target than the missing constants theory, and it is consistent with
+the engine accepting the work and executing it.
+
+**Fix:** emit four loader instructions ahead of the `dp4`s, moving the
+world-view rows from constant space into `r7-r10`, in the shape fragment `0x31`
+uses.
+
+**Still unknown, and needed for that fix:** which constant-space register index
+corresponds to block store index 0x000-0x003, where the world-view matrix is
+uploaded. The block-to-register mapping is established for texture matrices
+(`r89+4i`) and materials (`r84`/`r118`) but not for the world-view rows. That is
+one readback experiment — write a recognisable value to block 0x000 and dump the
+constant-space registers to see where it lands — and it needs no draw.
