@@ -569,9 +569,15 @@ restarting X, took the box down again.
   next run fail in a way that looks like a program or state bug but is neither.
   `--probe` prints it; a healthy idle state reads `0x8f0=00020000`, `dwgctl`
   a small value. A poisoned one reads `0x8f0=03000000`, `dwgctl=00ffffff`.
-- **Reset between attempts by reloading the module**, not by restarting X — the
-  X restart path failed here and cost a reboot. `rmmod mtx; modprobe mtx;` then
-  start X, then confirm module refcount 2 *and* an idle `0x8f0`.
+- **Reset between attempts requires a REBOOT.** This was wrong when first
+  written. Measured afterwards: a stuck engine reads `0x8f0=03000000` and
+  survives `rmmod mtx; modprobe mtx` **and** a full X restart — both leave it
+  busy. Only a reboot restores `0x8f0=00020000`. That is consistent with the
+  independent RE finding that the vendor stack has **no working reset path**:
+  its reset is a PCI config strobe that is never called, and its wait-for-idle
+  contains a compiler-hoisted infinite loop. An open driver must implement the
+  strobe itself (docs/parhelia-drm-design.md), because until it does, **every
+  failed 3D attempt costs a reboot**.
 - **Always run line-buffered** (`stdbuf -oL`). An earlier attempt produced an
   empty log because stdout was still buffered when the timeout killed it, which
   wasted a cycle diagnosing the wrong thing.
