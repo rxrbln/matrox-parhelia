@@ -962,9 +962,21 @@ the engine accepting the work and executing it.
 world-view rows from constant space into `r7-r10`, in the shape fragment `0x31`
 uses.
 
-**Still unknown, and needed for that fix:** which constant-space register index
-corresponds to block store index 0x000-0x003, where the world-view matrix is
-uploaded. The block-to-register mapping is established for texture matrices
+### The loader search, and why this part really is a measurement
+
+The obvious follow-up — find the fragment that loads the matrix into `r7-r10` —
+was tried and **does not exist**. Every fragment that writes `b7`-`b10`
+(`0x31`-`0x3b`) is a lighting temporary sourcing material constants
+(`r84`/`r85`/`r86`), not a matrix row. And the larger transform variant `0xe`
+(`mtx2734`, 8 instructions) reads `r7-r10` without writing them either, exactly
+as `0xf` does.
+
+So no microcode loads those registers: **the world-view rows arrive there
+through the constant upload itself**. The transform is self-contained after all;
+what it needs is the constants landing in the right registers.
+
+**Still unknown, and this part genuinely is a measurement rather than an
+inference:** which constant-space register index The block-to-register mapping is established for texture matrices
 (`r89+4i`) and materials (`r84`/`r118`) but not for the world-view rows. That is
 one readback experiment — write a recognisable value to block 0x000 and dump the
 constant-space registers to see where it lands — and it needs no draw.
