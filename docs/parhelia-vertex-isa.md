@@ -35,6 +35,17 @@ program) completed and **cross-validate**. Two small fields — the per-source
 negate modifier and the temp-register bank code — plus the declaration-stream
 entry layout are the only residual items.
 
+
+> **CORRECTION (2026-09-05): swizzle code 4 is 0.0 and code 5 is 1.0.** An
+> earlier reading here guessed code 4 was 1.0. The correct assignment is forced
+> by a fragment whose four write-mask patch values must reproduce the GL default
+> texture coordinate `(s, 0, 0, 1)`; see docs/parhelia-warp-fragments.md.
+> Two flag readings are also withdrawn there: `f1c` is **not** a port-B enable
+> (the correlation was an artefact of counting control-class instructions), and
+> `f0a = 2` is **not** reliably "port A idle" — 681 instructions contradict it,
+> including position-output writes. Do not gate code generation on either.
+
+
 ## Program model [GL, established]
 
 A compiled shader lives in a `GLVertexShaderFunctionDX` object (728 bytes):
