@@ -151,17 +151,28 @@ With that node present the vendor OpenGL stack runs on this card:
     OpenGL renderer string: OpenGL Linux library for Parhelia
     OpenGL version string: 1.3 ICD v1.03
 
-which is the positive control the 3D work had been missing -- **but it is not
-safely usable.**
+which is the positive control the 3D work had been missing, **and it works.**
 
-**Running `glxgears` reboots the machine.** With the node present, X up and
-direct rendering active, `glxgears` took the box down: ssh dropped mid-command
-and it came back with `up 0 min`, X gone. So the vendor 3D path initialises far
-enough to report direct rendering and then crashes the machine on real geometry.
+**ioquake3 runs on this card.** Full GL init and a live process:
 
-That is consistent with the instability already recorded for the P690 elsewhere
-in this repository, and it means the obvious plan -- run the vendor stack under
-the tracer to capture a known-good draw and diff it against ours -- cannot be
-executed on this card as it stands. Either the capture has to survive a reboot
-(write the trace line-buffered to disk and reboot-loop), or the control has to
-move to the 0x0528, which is a different bus type and a different errata set.
+    ----- R_Init -----
+    ...setting mode 3: 640 480
+    GL_RENDERER: OpenGL Linux library for Parhelia
+    GL_VENDOR:   Matrox Graphics Inc.
+    GL_VERSION:  1.3 ICD v1.03
+    PIXELFORMAT: color(24-bits) Z(24-bit) stencil(8-bits)
+    MODE: 3, 640 x 480 windowed hz:N/A
+    ----- finished R_Init -----
+    --- Common Initialization Complete ---
+
+It reaches the menu and stays up, so the vendor 3D path is functional here.
+
+**`glxgears` specifically reboots the box** -- that was measured and is a real
+fault -- but it is one application, not the stack. An earlier revision of this
+file generalised it to "the vendor 3D stack reboots this P690" and concluded a
+known-good capture could not be taken here. **Both were wrong**, and the wrong
+conclusion would have sent the capture work to the 0x0528 for no reason.
+
+The consequence is the opposite of what was recorded: a known-good draw **can**
+be captured on this card, from ioquake3 under `mtxtrace`, and diffed against
+what our own tool emits.
