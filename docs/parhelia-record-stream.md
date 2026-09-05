@@ -188,7 +188,7 @@ The kernel bounds-checks `start + len <= region size` before touching anything.
 | 0x18 | 32+tail | |
 | 0x19 | 32 | | 0x1a | 24 | | 0x1b | 40 | | 0x1c | 40+tail |
 | **0x20** | **68** | **matrices** `{u32 type; float m[16]}`; kernel **transposes in place** |
-| **0x21** | **8, or 112 when op==2** | **lights**, 12 slots |
+| **0x21** | **8, or 112 when op==2 — op is the SECOND dword** | **lights**, 12 slots |
 | 0x22 | 72 | material (18 dwords) |
 | 0x23 | 16 | light-model ambient |
 | 0x24 | 8 | light-model flags |
@@ -239,6 +239,34 @@ change is entirely `0x07` plus `0x08`.
 
 The context-arm stream enumerates `0x0e` and `0x06` fields for units 0,1,2,3 in
 that order, which independently confirms the unit-in-LOW-half split above.
+
+## Correction: key 0x21's op is the second dword (2026-09-05)
+
+The note above described `mtx227` as dispatching on the item's **first** dword.
+That is the wrong way round, and a parser built on it walks off the end of any
+stream containing a lights record — which is every draw stream.
+
+The item is `{u32 light_index; u32 op}`. Verified against the captures: a
+count-24 record is 12 lights x two ops, with the first dword running
+`0,0,1,1,2,2…` and the second running `1,2,1,2…`. Only op 2 (set parameters)
+carries the 104-byte payload; ops 0 and 1 (enable/disable) are bare 8-byte
+items.
+
+With that fixed, `tools/parhelia-recdec.py` consumes three of the four
+single-triangle captures **exactly** — every dword of a 1124-dword stream, 21
+records, ending on the key-`0x1b` DRAW record:
+
+    gltri-flat-0528-trace.txt      SUBMIT 17  21 recs, dw1124/1124  EXACT
+    gltri-gouraud-0528-trace.txt   SUBMIT 17  21 recs, dw1122/1122  EXACT
+    gltri-0528-trace.txt           SUBMIT 17  21 recs, dw1124/1124  EXACT
+
+    0x0d 0x35 0x0c 0x12 0x46 0x05 0x26 0x36 0x0c 0x24 0x23 0x0c 0x21
+    0x22 0x27 0x25 0x20 0x0c 0x07 0x08 0x1b
+
+The textured capture leaves 11 dwords on its final `0x1b`, one short of the
+48 a count-1 DRAW record needs. Either that region's dump is truncated by a
+dword or key `0x1b`'s item is 36 bytes rather than 40 in some form; not yet
+separated, and it is the only residue left in the grammar.
 
 ## Validation
 
