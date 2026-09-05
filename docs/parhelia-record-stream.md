@@ -1,5 +1,9 @@
 # The region-2 record stream: grammar and item layouts
 
+> **SOLVED 2026-09-05.** The framing below supersedes every earlier attempt in
+> this repository, including one I declared solved on a single capture and had
+> to retract.
+
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
@@ -116,3 +120,123 @@ The bitmap probe indexes `id - 1` (`199c8: lea ecx,[rsi-0x1]`), so a literal
 never contain id 0 -- ids start at 0x07. So **a decoder that starts emitting
 key-0x0c id 0 is almost certainly mis-slicing the tail of a preceding
 variable-length record.** Cheap to check and worth keeping permanently.
+
+
+## THE FRAMING RULE (solved, both sides of the ABI)
+
+    record = { u32 key; u32 count; payload }
+    size   = 8 + count * itemsize(key)
+
+`itemsize` is a per-key constant baked into the reader's jump table. There is
+**no terminator**; the stream ends at a byte length the client supplies
+out-of-band in the control page.
+
+**The header is TWO dwords, not four.** Earlier notes here described a 4-dword
+header; that was coincidence -- key 0x51's item happens to be 2 dwords, so its
+payload looked like header fields. `p[0]` = key, `p[1]` = item count.
+
+That also explains the "count says 13 but 66 pairs follow" contradiction that
+falsified my earlier grammar: glxgears' first record is key 0x0d count 1, ten
+dwords long, and the *next* record (key 0x0c, count 37) is what carries the
+pairs.
+
+### Consumer: `mtx558` @ `.text+0x44ef0`
+
+    44f92: mov eax,[r13+0x0]        ; KEY
+    44f96: lea rbp,[r13+0x8]        ; PAYLOAD
+    44f9a: cmp eax,0x51
+    44f9d: ja  452b8                ; key > 0x51 -> ABORT the whole submit
+    44fa5: jmp [rax*8+.rodata+0x1b08]   ; 82-entry jump table
+
+Each case advances by `count = [r13+4]` times its own stride, e.g.
+`lea r13,[r13+rax*8+0x8]` for 8-byte items, `imul rax,rax,0x678` for key 0x46.
+**The default case aborts** -- an unknown key discards the rest of the stream,
+it is not skipped.
+
+### Producer: `alloc_record(builder, key, itemsize, count)` @ libGL `0x1c9c50`
+
+Writes `hdr[0]=key`, `hdr[1]=count`, returns the payload pointer -- **except**
+that consecutive allocations with the *same key* merge by bumping the existing
+count (`1c9d30: add [rax+0x4],r12d`) rather than opening a new record. That is
+why counts get large and why ids inside a key-0x0c record run sorted ascending.
+
+## Control page contract
+
+    +0x000  command = 1 (state submit)
+    +0x008  region cookie (u64)
+    +0x010  start byte offset into the region (0 in this build)
+    +0x230  STREAM LENGTH IN BYTES
+    +0x234  status; kernel writes 0xffffffff on entry, leaves it on abort
+
+The kernel bounds-checks `start + len <= region size` before touching anything.
+
+## Key inventory (itemsize in bytes)
+
+| key | item | carries |
+|---|---|---|
+| 0x00 | 8 | pairs (`mtx2488`) |
+| 0x05 | 8 | `(id,value)` pairs, second flat table (`mtx1734`) |
+| 0x06 | 8 | pairs, slot word split (see below) |
+| 0x07 | 24 | `mtx651` |
+| 0x08 | 32 | surface/buffer descriptor |
+| 0x0a | 72 | inline ring/fence emit |
+| **0x0c** | **8** | **flat render state `(id,value)`**, ids 0x07..0xAC, 172-entry table |
+| 0x0d | 32 | stream opener variant A |
+| **0x0e** | **8** | **per-texture-unit state**, slot word split |
+| 0x12 | 16 | rect -> hwstate+0xcd9 |
+| 0x15 | 36 | flush-class |
+| 0x18 | 32+tail | |
+| 0x19 | 32 | | 0x1a | 24 | | 0x1b | 40 | | 0x1c | 40+tail |
+| **0x20** | **68** | **matrices** `{u32 type; float m[16]}`; kernel **transposes in place** |
+| **0x21** | **8, or 112 when op==2** | **lights**, 12 slots |
+| 0x22 | 72 | material (18 dwords) |
+| 0x23 | 16 | light-model ambient |
+| 0x24 | 8 | light-model flags |
+| **0x25** | **20** | **user clip planes** `{idx, x,y,z,w}`, count 6 |
+| 0x26 | 16 | rect -> hwstate+0xcc1 |
+| 0x27 | 8 | two floats |
+| 0x35 | 16 | only the LAST item consumed |
+| 0x36 | 8 | only the LAST item consumed |
+| 0x37 | 16 | |
+| **0x40** | **12 + payload[1] + payload[2]** | inline blob, self-describing |
+| 0x41 / 0x42 | 4 (kernel) / 8 (writer) | **writer/reader disagree, unexercised** |
+| **0x43** | **8 + payload[1]*16** | constant-range upload `{first,n}` + n vec4 |
+| 0x44 | 48 | | 0x45 | 1648 | program object variant |
+| **0x46** | **1656** | combiner program object (the 414-dword layout above) |
+| 0x47 | 8 | | 0x48 | 24 | | 0x49 | 20 | | 0x50 | 16+tail | | 0x51 | 8 |
+
+Keys in range that ABORT: `01 02 03 04 09 0b 0f 10 11 13 14 16 17 1d 1e 1f
+28-34 38-3f 4a-4f`.
+
+## Correction: the slot word split is unit-in-LOW-half
+
+Earlier notes here said an array index sits in the UPPER half of the slot word.
+**That is backwards.** For keys 0x0e and 0x06 the kernel reads
+`movzx esi,WORD[rbx]` as the **unit** (bounds-checked <= 0xa, only 0..3 used --
+the four texture units) and `movzx r8d,WORD[rbx+2]` as the **field**. So
+`0x0006_0003` is **field 6 of unit 3**, not slot 6 instance 3.
+
+Key 0x0c ids are a **flat 32-bit** value in a different space entirely.
+
+## Validation
+
+Parsed with `advance = 8 + count*itemsize`:
+
+* `captures/glxgears-0528-state.txt` -- **980/980 dwords, 16 records**
+* `captures/ioq3-p690-working-draw.txt` -- **857/857 dwords, 8 records**
+
+Those are truncated dumps, so the decisive check is against complete streams
+where the trace also captured the client-declared length at `control+0x230`:
+
+| stream | parse ends at | `control[0x230]` |
+|---|---|---|
+| mtxtrace-5draws sub 5 | dw1148 | 4592 B = 1148 dw |
+| mtxtrace-5draws sub 17 | dw1122 | 4488 B = 1122 dw |
+| mtxtrace-textured-submits sub 5 | dw1148 | 4592 B = 1148 dw |
+| mtxtrace-textured-submits sub 17 | dw100 | 400 B = 100 dw |
+
+Four exact hits with zero residue, and every one of ~60 record boundaries landed
+on one of the 39 keys that have a handler -- any other value would have aborted
+the vendor's own parser. Corroborating: key 0x25 count 6 = GL's six clip planes,
+key 0x22 items are GL's default material, key 0x21 op-2 items end on 180.0 =
+default `GL_SPOT_CUTOFF`, and the rects match each app's window size.
