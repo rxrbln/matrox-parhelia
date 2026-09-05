@@ -119,3 +119,48 @@ Two facts make that tractable:
 * the six-group, stride-`0x40` structure of `mtx610` matches the block file's
   384 entries exactly, so whatever the flush emits is organised by those same
   six groups.
+
+## `mtx3699`, decoded — matrices compact, constants drain through a ring
+
+```c
+HW[0xd60] = HW + 0x1f38;                  /* published pointer, slot 1's matrix */
+n = HW[0x1ef4];                           /* active matrix slot count */
+for (slot = 0; slot <= n; slot++) {
+    src = HW[0x1c50 + slot*8];            /* per-slot source pointer */
+    dst = HW + 0x1ef8 + slot*64;
+    if (src != dst) {                     /* not already compacted */
+        LocMemCpy(dst, src, 0x40);        /* pull the matrix into the slot array */
+        HW[0x1c50 + slot*8] = dst;        /* and repoint at it */
+    }
+}
+HW[0x1ef4] = 2;                           /* reset to two active slots */
+
+c = HW[0x1e60];                           /* the constant object */
+while (c[0xa4] != c[0xa8])                /* head != tail */
+    mtx610(c);                            /* drain one group per call */
+c[0xa0] = c[0xa8];                        /* commit */
+```
+
+So the constant object carries its own **head/tail ring of 64-byte groups**
+(`+0xa0` committed, `+0xa4` head, `+0xa8` tail), and `mtx610` moves one group
+per call — its `shl $0x6` on `[rdi+0xa4]` is that index times 64.
+
+The matrix half is a **compaction**: each slot's pointer is followed and the 64
+bytes pulled into a contiguous array at `HW + 0x1ef8 + slot*64`, so that
+downstream code can treat matrices as one flat block. `HW[0xd60]` is then
+published as a pointer into it.
+
+Everything on this path is still software. The hardware emit is downstream of
+`mtx610`'s staging buffer and is the single remaining unknown in the chain —
+but the chain itself is now complete from the client record to the staging
+buffer, in both the constant and matrix directions.
+
+### Summary of the state model
+
+| what | client record | kernel shadow | dirty | flush |
+|---|---|---|---|---|
+| constants | key `0x43` | `HW[0x1e60]`, 256 slots | `0x1b44`… | `mtx610`, 6 groups x 0x40 |
+| matrices | key `0x20` | `HW+0x1ef8 + slot*64`, 32 slots | `HW[0x1bf4]` bit per slot | `mtx3699` compaction |
+
+Neither is a ring packet. An open driver that owns the ring must supply whatever
+the stage after `mtx610` emits, and that is the piece to find next.
