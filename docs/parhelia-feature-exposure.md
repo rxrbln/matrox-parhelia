@@ -107,3 +107,29 @@ Fixed-function is what the Linux stack uses, it is what our captures show, and
 it is what the seven extracted boot programs implement. Displacement mapping and
 vertex shaders are a later tier, listed here so the capability gap is not
 mistaken for a hardware limit.
+
+## Occlusion query: absent from every vendor stack (2026-09-05)
+
+Previously graded UNKNOWN because no document mentioned it.  Investigated
+directly across all three vendor stacks:
+
+| binary | stack | occlusion / query strings |
+|---|---|---|
+| `kernel/mtx_parhelia.o` | HAL/kernel | none |
+| `opengl6/lib64/libGL.so.1.3.0` | Linux GL ICD | none |
+| `xddm32.../MtxPar/MTXPARD.dll` | Windows D3D | none -- the only `Query` symbols are Windows GDI callbacks (`EngQueryDeviceAttribute` and friends), unrelated |
+
+No `GL_ARB_occlusion_query`, no `GL_HP_occlusion_test`, no `GL_NV_occlusion_query`,
+no `D3DQUERYTYPE_OCCLUSION`.
+
+**Grading: not exposed by any vendor driver.**  This is consistent with the
+part's generation -- occlusion query is a D3D9 feature and Parhelia's D3D
+support is DX8.1 plus a few DX9 items.
+
+**What this does not establish:** the absence of a string does not prove the
+absence of silicon.  A hardware pixel-pass counter could exist and simply never
+have been exposed, as happened with the vertex-shader unit (which is present and
+implemented but fenced off by one always-zero store).  Treat "no occlusion
+query" as a statement about the vendor drivers, not a proven statement about the
+hardware.  For a new open driver it is the operative fact either way: there is
+no vendor behaviour to imitate and no register usage to capture.
