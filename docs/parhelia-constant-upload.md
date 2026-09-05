@@ -188,3 +188,36 @@ fully mapped from client record to staging buffer, and every stage of it is
 software that a driver owning the ring simply would not have. What such a driver
 needs is not this chain but the *shape of what it finally emits* — and that is
 one function away, in a path already partly documented for other state.
+
+## The raster path is dirty-marking too — and what that implies
+
+`mtx3654` (`.text+0x8b510`, 7905 bytes), step 6 of the validation order and the
+one `parhelia-slot-translation.md` describes as "raster -> block file AND
+registers", calls only two functions in bulk:
+
+* `mtx2702` x15 — a **bitmap range-set**: given a base and a first/last bit pair
+  it ORs `0xffffffff << first` and `>> ~last` into the 32-bit words of a bitmap
+  at `+0x04`, walking whole words in between. Pure dirty-marking.
+* `mtx3301` x10 — four bytes: `return obj[0xc]`. An accessor.
+
+So the raster path marks dirty ranges; it does not emit.
+
+**Every stage examined is software.** Record consumers write shadows, `mtx1008`
+and `mtx2702` mark dirty bits, `mtx3699` compacts matrices and drains a
+head/tail ring, `mtx610` gathers dirty vec4s into a staging area at
+`constobj+0x230`, and `mtx3136`'s remaining seven calls are all tiny and emit
+nothing.
+
+**A hypothesis this raises, offered as such.** If no host-side code emits the
+block file, the WARP may read its constants **directly from memory** — the
+staging area being a DMA source rather than something copied through the ring.
+That would explain three otherwise awkward facts at once: no `0x41` packet
+outside a RAM self-test, no register path to the block file, and a readback port
+that is read-only. It also matches `parhelia-vertex-isa.md`'s note that the
+uploaded key-0x45 image is a *descriptor* the kernel consumes rather than
+microcode.
+
+It is not established. What would settle it: find where `constobj+0x230`'s bus
+address is handed to the hardware — most plausibly one of the write-only WARP
+registers (`0x1000`, `0x1040`, `0x10b0`, `0x1100`, `0x1104`) whose values we
+have never been able to read back.
