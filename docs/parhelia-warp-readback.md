@@ -67,6 +67,52 @@ built for the development machine's kernel (7.1.3-t2), not the box's 2.6.30, and
 the box's kernel build tree is incomplete so it cannot be rebuilt there.  The
 single-page `dma_sysbuf` path is what works.
 
+## The kind field: only kind=3 is defined, and scanning the rest locks the engine
+
+`mtx514` (`.text+0x8f7c0`) is the port accessor, and it has **exactly one caller
+in the whole vendor object**: `mtx612` (`0xa0120`), the self-test verifier, which
+always passes `kind = 3`.  Internally kinds 0/1/3/5 take one path and kinds
+2/4/8/9/10 take another.
+
+That retroactively explains the lock-ups.  The broad scan here swept kinds 0..7,
+and the "noise" it produced sat in **kind=2** -- one of the other-path kinds.
+Restricted to kind=3 the space is perfectly stable:
+
+    const-probe: baseline 1536 registers, 0 unstable and masked
+
+Zero unstable, against 65 "changing" registers when kind=2 was included.  The
+instability was never a property of the port; it was the result of driving it
+with kind values the vendor never uses.  **Scan kind=3 only.**
+
+## MEASURED: a block load leaves no trace in the kind=3 space **[HW, P690]**
+
+With framing confirmed in the same run:
+
+    const-probe: baseline 1536 registers, 0 unstable and masked, bmstat=00020000
+    const-probe: writing marker to block 0x134
+      fetch ptr 0x404=18dfb024 == end, framing OK
+    const-probe: 0 changed stable registers (of 1536 stable), bmstat=00020000
+
+The engine consumed the packet and stopped exactly at the end address, yet
+nothing in the entire kind=3 readback space changed.  A targeted probe of the
+two candidate mappings for block index `0x134` -- `0x134` itself (port indexes
+the block file) and `0x054` = r84 (port indexes the register file, the
+`N - 0xE0` rule) -- also showed no change on any of the four banks.
+
+Two readings remain open, and this run does not separate them:
+
+1. The block load needs further arming before it commits.  A candidate is the
+   WARP vertex-shader mode enable, bank 0x05 index 0x12, which the vendor's VS
+   path emits as `(0x12, 1)` while both fixed-function paths write `(0x12, 0)`.
+2. `kind=3` does not observe the constant/source file at all.  This is the more
+   likely of the two: `mtx612` uses kind=3 to verify the self-test's **port-A
+   destination** writes (`a0..a383`), so kind=3 plausibly reads the destination
+   file, and the vendor never reads a constant back through this port anywhere.
+
+Incidental observation: the four banks alias in pairs (bank0 == bank2 and
+bank1 == bank3 for every index tested), so bit 1 of the bank field appears to be
+ignored on this part.
+
 ## What has NOT been shown
 
 Uploading a marker vec4 through a block-load packet produced no change outside
