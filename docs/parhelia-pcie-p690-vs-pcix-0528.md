@@ -124,16 +124,31 @@ pagemap` and the engine fetches from them correctly on both the 0x0528 and the
 P690 -- confirmed by the fetch pointer stopping exactly at the programmed end
 address.  There is no IOMMU remap on this box, so physical == bus address.
 
-### Open
+### CLOSED: no aperture in the memory ABI
 
-Whether the vendor driver routes **surface and texture** memory through the AGP
-aperture, and whether that differs between the two cards, is **not established**.
-The direct way to answer it is the `GET_MEMORY_INFO` ioctl (nr=0), whose reply
-carries the framebuffer and MMIO base/size pairs and possibly aperture fields.
+`GET_MEMORY_INFO` (ioctl nr=0) on the P690 returns:
 
-That measurement is currently blocked: `/dev` is tmpfs so `/dev/matrox/mtx0`
-does not survive a reboot, and with the module loaded and X running on the
-vendor MTX driver, `mtx` registers **no character-device major** in
-`/proc/devices` -- so the node cannot simply be recreated with `mknod` without
-first establishing how and when the module registers it.  `mtx.ko` does call
-`register_chrdev`, so the registration exists; when it happens was not traced.
+    +0x00 = f0000000    framebuffer base
+    +0x08 = 08000000    framebuffer size (128 MB)
+    +0x10 = febfe000    MMIO base
+    +0x18 = 00002000    MMIO size (8 KB)
+    everything else 0 or 0xffffffff
+
+Structurally identical to the 0x0528 capture (`d0000000` / `10000000` = 256 MB /
+`febfe000` / `2000`). **There are no aperture fields at all**, so the ABI does
+not hand userspace a GART window on either card, and surfaces live in VRAM.
+
+The earlier claim that `mtx` registers no character-device major was **wrong** —
+a mis-read of a truncated `/proc/devices`. It registers **major 252** as `mtx`.
+The node simply does not survive a reboot because `/dev` is tmpfs; recreate it
+with:
+
+    mkdir -p /dev/matrox && mknod /dev/matrox/mtx0 c 252 0
+
+With that node present the vendor OpenGL stack runs on this card:
+
+    direct rendering: Yes
+    OpenGL renderer string: OpenGL Linux library for Parhelia
+    OpenGL version string: 1.3 ICD v1.03
+
+which is the positive control the 3D work had been missing.
