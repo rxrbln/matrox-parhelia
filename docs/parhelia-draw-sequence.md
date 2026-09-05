@@ -340,3 +340,30 @@ and at least one of them locks the engine. The idle gate caught it and aborted
 at the right place, but the right approach is to take opcode semantics from the
 binaries and test named candidates, not to enumerate a field. Do not repeat the
 sweep.
+
+
+## DWGCTL 0x11 damages the engine in a way `0x8f0` does not report
+
+Measured after a stale binary submitted `0x1300 = 0x11` (the guard existed in
+the source but the box had been rebuilt from an older copy):
+
+* `0x8f0` reads `0x00020000` — **idle**, the gate passes
+* the 2D solid fill, which draws 120000 pixels on a healthy engine, draws
+  **nothing**, repeatably
+* an off-screen fill hangs the tool outright
+
+So the busmaster idle bit is **not sufficient** to detect a damaged engine.
+`engine_idle_gate()` will happily pass and every subsequent measurement is
+worthless without saying so.
+
+**Use the 2D fill as the health check.** It is the only positive control we
+have: if it does not draw 120000 pixels, the engine is not healthy and nothing
+measured afterwards means anything. Reboot first.
+
+Two process rules this cost:
+
+1. **Verify the source on the target matches before building.** Compare md5s;
+   do not assume an earlier copy is current. A stale build here submitted a
+   value the current source refuses, and then produced three "the fill no longer
+   works" results that looked like a hardware discovery.
+2. The tool prints a build stamp at startup for the same reason.
