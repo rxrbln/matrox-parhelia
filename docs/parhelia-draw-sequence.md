@@ -425,3 +425,99 @@ This also settles a question the earlier measurement had muddied: **the surface
 base register IS honoured.** A fill to base `0x4000000` lands at `0x4000000`
 when X is not running. The earlier "0 pixels off-screen" was X contention plus a
 scan anchored at offset 0, not a hardware limitation.
+
+
+## Two-source results from the Windows D3D driver (2026-09-05)
+
+`MTXPARD.dll` is an independent second implementation for the same silicon.
+Where it and `mtx_parhelia.o` agree, treat the result as settled.
+
+### DWGCTL for a 3D primitive is the `0x10cc` family — and 0xc07/0x307/0x707 are not
+
+Windows builds it explicitly (@0x151137-0x1511b7):
+
+    DWGCTL = 0x10cc | {0x100000 | 0x180000} | [0x40000] | [0x200000]
+
+Literals present in the DLL: `0x10cc, 0x810cc, 0x1010cc, 0x1810cc, 0x2010cc,
+0x2410cc, 0x8010cc, 0xa410cc`. The Linux values `0x000010cc` and `0x002010cc`
+sit inside that family.
+
+Against the working 2D fill (`0xc0` = opcode nibble 0, bits[7:4] = 0xc), the 3D
+value is `0x10cc` = **opcode nibble 0xc, same bits[7:4] = 0xc, plus bit 12**.
+Change the opcode nibble and set bit 12; do not touch bits[7:4].
+
+**`0xc07` / `0x307` / `0x707` are one-shot flush opcodes in BOTH drivers** —
+each caches `0x1300` *unless* `(val & 0xf) == 6 || == 7`, at three sites in
+Windows and in the Linux stream interpreter. They were never triangle opcodes.
+Stop trying them.
+
+### The `0x8f` draw packet belongs in a SEPARATE buffer
+
+This is a real bug in what we emit. The draw packets live in a second-level
+buffer that the primary ring *enters*; inlined into the level-1 ring,
+`0x8f000001` is parsed as a tag dword. Entry is via `0x10a0 = start | 2`,
+`0x10a4 = end | 2` (Linux HAL usage in `mtx1937` @0x323ce, where the pair is a
+contiguous address range), with `0x109c = start` as an alternative reading from
+the Windows emulator. The two sources disagree on whether `0x10a0`/`0x10a4` are
+a range or a wait-until-equal semaphore; a "fetch until pointer == end" loop and
+a "wait until equal" loop look identical statically. **Contested — try the range
+first.**
+
+### The WARP launch is the `0x1100` write, and a third packet class follows it
+
+Windows @0x13b028 and Linux `mtx3400` @0x43bf8 emit the same shape and both
+write the program handle to `0x1100` **last**. Immediately after, Windows emits
+a **bulk inline-data word** and copies the payload behind it:
+
+    ((n/4 - 1) & 0x3f | 0x2080) << 17 | ((n - 1) & 0xffff)   then n dwords
+
+That is the vertex/constant payload riding behind the launch — a packet class we
+do not emit at all.
+
+`0x1104` is a bank/page toggle (`(flag ^ 1) << 2`, alternating 0/4), **not** a
+launch. `0x1374` (index `0xdd`) is a **data-less trigger**: both drivers name its
+index in a header and count its slot in the length but **never write the data
+dword**. Copy that literally — do not "fix" it by writing a value, as we were.
+
+### Merged one-time 3D setup (Windows `Setup3D` @0x2dc20 + Linux `mtx398` @0x32920)
+
+    load the WARP program via 0x918 / 0x91c, keep the handle
+    len=0xa : 0x1374 (no data); 0x10f0 = 0x20000000 x2; 0x10f0 = 0x80000000 or 0;
+              0x1130 = 0x2000; 0x1100 = handle; 0x1104 = handle; 0x1110 = 3
+    len=2   : 0x10b4 = 0, 0x10b8 = 0xa0000000
+    len=7   : 0x121c = 0, 0x1374 = 0, 0x1200 = 0x0001000f, 0x1204/0x1208/0x120c = 0
+    caps    : 0x1300 = 0x002010cc, 0x12f4 = 0x41f80000  (else 0x1300 = 0x000010cc)
+    x5      : 0x1264, 0x126c, 0x1260, 0x1268 = 0x200, 0x400400, 0x200, 0x400400
+    len=4   : 0x1300 = 0x008002cd, 0x1328 = 0x0fff0fff, 0x132c = 0, 0x12f4 = 0x41f80000
+    len=3   : 0x1000 = ?, 0x1040 = 4, 0x10b0 = 0x00020020
+    Linux adds: 0x11c0/0x11c4/0x11c8, 0x11e8, 0x12c0 = 0xffffffff, 0x12c4 = 0x7fffffff,
+                0x12cc/0x12d0/0x12d4/0x12d8, 0x1324 = 0xffffffff,
+                0x12b8 = 0x00070601, 0x12b0 = 0x3ff0f800
+
+Note `Setup3D` uses `0x10f0 = 0x20000000` while the per-draw bind uses
+`0x20000028`; the low nibble 8 appears only on the bind path.
+
+### Other confirmations and new registers
+
+* `0x1088` / `0x108c` are a **tag-repeat pair** — the tag dword to repeat and a
+  repeat count. Useful for streaming long constant blocks.
+* Index `0x21` terminates a header, index `0x20` pads but still consumes a data
+  dword — third independent witness.
+* `0x0940` bit 16 is an engine-idle poll; `0x940 = 1` brackets an operation and
+  `0` releases it.
+* `0x1148` is the most-emitted packet in the DLL (253 sites, data 0 or 1,
+  bracketing every entry point) — **purpose unknown**.
+* Windows flushes posted writes through PCI config space immediately before
+  writing `0x408`. On PCIe the equivalent is a read-back before the doorbell.
+  Without it the symptom is exactly "consumed but nothing drawn".
+
+### A shorter path to first pixels than the WARP
+
+The Windows legacy DDA / texture-trap path loads float gradients into
+`0x1160`/`0x1164`/`0x1168` (S/T/Q start), `0x1178`/`0x117c` (d/dX) and
+`0x118c`-`0x1198` (per-stage d/dY), then fires with the **same `0x1304`,
+`0x1308`, `0x138c` sequence the 2D fill already uses on our hardware**. This is
+a different, mutually exclusive pipeline from the WARP — consistent with our
+note that these registers fault a live WARP — but it reaches a textured triangle
+through a launch that is already proven here. Keep it strictly separate from any
+WARP attempt.
