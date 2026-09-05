@@ -41,6 +41,32 @@ re-read and is usable.
 Rule: no diff over this port is a finding until the null control has been run in
 the same session and the changed set is disjoint from the unstable set.
 
+## CONFIRMED: the block-load packet framing is correct (2026-09-05)
+
+With the ring in system memory (one page, physically contiguous by definition,
+obtained through `dma_sysbuf`) a nine-dword block-load packet submitted with
+
+    wr32(0x404, start); write_barrier(); wr32(0x408, end | 3);
+
+left the fetch pointer at exactly the end address:
+
+    const-probe: ring at phys 0x1aafe000
+      submitted 9 words [1aafe000..1aafe024), bmstat=00020000 fence=ffffff8f
+      fetch ptr 0x404=1aafe024 == end, framing OK
+
+The engine consumed the packet and stopped where it was told, and stayed idle.
+This is the first hardware confirmation that the block-load packet header
+
+    0x41000000 | (count << 17) | (count * 4 + 3)
+
+is understood by the engine, and it holds independently of anything the readback
+port does or does not show.  Reproduced across separate runs and ring addresses.
+
+Note the `dma32buf` module is NOT usable on box 56: the checked-in `.ko` was
+built for the development machine's kernel (7.1.3-t2), not the box's 2.6.30, and
+the box's kernel build tree is incomplete so it cannot be rebuilt there.  The
+single-page `dma_sysbuf` path is what works.
+
 ## What has NOT been shown
 
 Uploading a marker vec4 through a block-load packet produced no change outside
