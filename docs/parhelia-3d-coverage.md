@@ -75,6 +75,7 @@ Last revised 2026-09-05.
 | WARP readback port | SOLVED | `0x910`/`0x938`/`0x914`; **kind=3 only** — the vendor's sole use. Other kinds take a different internal path and scanning them locks the engine |
 | Vertex shader exposure | SOLVED | the unit is present and implemented in the ICD; `GL_VERTEX_SHADER_EXT` is disabled by four stores, **all writing 0**. Fenced off, not missing |
 | WARP program binding | PARTIAL | 18-entry program table; a draw binds several entry points chosen from state. Mechanism known, never validated |
+| Readback port as an execution detector | **UNUSABLE** | never shown to observe any operation we can provably execute; use VRAM instead |
 | Block load taking effect | **OPEN** | a correctly framed block load changes nothing observable in the kind=3 space. Either it needs arming, or kind=3 reads the port-A destination file rather than the constant file |
 
 ## The critical path to a first triangle
@@ -92,3 +93,21 @@ Last revised 2026-09-05.
 - Any address of the form `0x1000 + slot*4` taken from a region-2 slot id.
 - The pipeline-key bit numbering in `parhelia-draw-recipe.md` (superseded).
 - Anything that reads a differential sweep as call-ordered.
+
+
+## Instrumentation status (2026-09-05, P690)
+
+Use **VRAM** as the observable, not the readback port.
+
+* **VRAM — reliable.** The 2D fill writes exactly 120000 pixels and they are
+  read back correctly. A per-4KiB-page checksum diff taken around a submit
+  costs 128 KiB instead of a 128 MiB copy and covers the whole aperture; exclude
+  the live cursor page at `0xec0000`, and note an *absolute* colour scan finds
+  the live desktop and is useless.
+* **Readback port — unusable as an execution detector.** No stimulus we can
+  provably execute has ever moved it. Any conclusion of the form "N registers
+  changed / did not change" is a statement about the instrument.
+
+Current WARP draw state, measured with the reliable observable: the engine
+consumes the whole stream, `bmstat` leaves idle so work is genuinely dispatched,
+and **0 of 32768 VRAM pages change** — the engine writes nothing anywhere.
