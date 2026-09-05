@@ -702,3 +702,44 @@ A working GL context sets it to the value the limits doc predicts.
   worth noting against the retracted advice to replay `0x1100-0x117c =
   0xffffffff` as "the state a from-scratch draw is most likely to be missing".
   The vendor writes zeros there.
+
+
+## SOLVED: the region-2 record grammar
+
+Derived from the working ioquake3 capture and validated by exact consumption --
+five records account for all 857 dwords of the state submit with every boundary
+landing on a valid following header.
+
+    record = [count][a][key][0]   then   count x (slot, value) dword pairs
+    slot   = (instance << 16) | slot_id
+
+The **indexed slot** is what defeated every earlier attempt to read this stream.
+A slot id is 16 bits with an *array index* in the upper half, so an entry for
+light 3 or texture stage 3 appears as `0x0006_0003`. Read as a flat 32-bit slot
+id that is a nonsense value like `0x1c0003`, which is exactly the "draw, clear
+and vertex-format records are not pairs and mis-slice" symptom recorded in
+`parhelia-command-construction.md`. **They are pairs after all** -- the reader
+was wrong, not the record.
+
+The visible run at dwords 520-571 makes it unambiguous: `0x0002_0001`,
+`0x0003_0001` ... `0x0009_0001`, then `0x0001_0002`, `0x0002_0002` ... -- slots
+1..9 repeating per instance, with per-instance values `0, 2, 2, 2, 2, 1000.0f,
+-1000.0f, 1000.0f, 1.0f`.
+
+Records in a freshly initialised ioquake3 context:
+
+| # | at | count | key | instances | slot range | non-zero |
+|---|---|---|---|---|---|---|
+| 1 | 0 | 81 | `0x02` | 0 | `0x07..0x8a` | 22 |
+| 2 | 166 | 139 | `0x8c` | 0..5+ | `0x00..0xab` | 71 |
+| 3 | 450 | 1 | `0x02` | 0 | `0x04` | 0 |
+| 4 | 456 | 5 | `0x06` | 0 | `0x07..0x0b` | 3 |
+| 5 | 572 | 81 | `0x01` | 0 | `0x07..0x8a` | 22 |
+
+Records 1 and 5 are the same shape with different keys (`0x02` and `0x01`),
+which is consistent with two contexts or a front/back pair. Record 2 is the
+indexed array -- lights or texture stages, six or more instances.
+
+A parser can therefore validate itself: walk headers, and require each record to
+end exactly on another well-formed header or the end of the stream. That check
+is what pinned the boundaries here, and it is cheap enough to keep permanently.
