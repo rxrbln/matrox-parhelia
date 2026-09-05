@@ -89,3 +89,51 @@ about the 0x0528, not about "Parhelia".
 
 Any future capture or hardware claim in this repository should name the device
 id it was taken on.
+
+## 3. GART / AGP aperture **[HW]**
+
+The test board carries **two** host bridges: an nVidia nForce3 250Gb (AGP) and
+an ALi M1695 with three PCI Express root ports.  The P690 sits at `03:00.0`
+behind `00:11.0`, an **ALi PCI Express Root Port**:
+
+    +-0b.0-[04]--          nForce3 250Gb AGP Host to PCI Bridge
+    +-11.0-[03]----00.0    ALi PCI Express Root Port  <- the P690
+
+The kernel does bring up an AGP GART, but it belongs to the nForce3 bridge and
+has nothing to do with this card:
+
+    agpgart-amd64 0000:00:00.0: AGP aperture is 64M @ 0xdc000000
+
+**The vendor driver's bus messages do not describe the card.**  Both cards
+produce byte-identical text:
+
+    [mtx]   Board type detected: PCI
+    [mtx]   Chipset 0x____:0x102b was detected
+    [mtx]   AGP chipset was detected
+    [mtx]   PCI transfers available for read write
+
+"AGP chipset was detected" is emitted for a PCIe endpoint on a board whose AGP
+bridge is a different device entirely, so it is reporting the **system's**
+bridge, not the card's bus.  Do not use these lines to decide card behaviour --
+the `EOBTag` difference in §2, which comes from the device id and a bus flag, is
+the discriminator that actually varies.
+
+**No GART translation is involved in command submission, on either card.**  The
+ring is programmed with raw CPU physical addresses obtained from `/proc/self/
+pagemap` and the engine fetches from them correctly on both the 0x0528 and the
+P690 -- confirmed by the fetch pointer stopping exactly at the programmed end
+address.  There is no IOMMU remap on this box, so physical == bus address.
+
+### Open
+
+Whether the vendor driver routes **surface and texture** memory through the AGP
+aperture, and whether that differs between the two cards, is **not established**.
+The direct way to answer it is the `GET_MEMORY_INFO` ioctl (nr=0), whose reply
+carries the framebuffer and MMIO base/size pairs and possibly aperture fields.
+
+That measurement is currently blocked: `/dev` is tmpfs so `/dev/matrox/mtx0`
+does not survive a reboot, and with the module loaded and X running on the
+vendor MTX driver, `mtx` registers **no character-device major** in
+`/proc/devices` -- so the node cannot simply be recreated with `mknod` without
+first establishing how and when the module registers it.  `mtx.ko` does call
+`register_chrdev`, so the registration exists; when it happens was not traced.
