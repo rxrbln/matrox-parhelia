@@ -70,6 +70,32 @@ written by MMIO anywhere in the object** — they are ring-only registers, which
 is why every readback of them returned 0. The sole MMIO write near the block
 file is `0x10b0 = 0x10` at chipset init.
 
+## CONFIRMED ON HARDWARE (2026-09-05)
+
+The preamble is what block loads needed. Measured with the validated
+non-blocking DWGSYNC bracket, tags 0x30 / 0x48:
+
+| stream | `0x41c` | |
+|---|---|---|
+| trilevel 1, no block loads (control) | `0x48` | executes |
+| **trilevel 2, block loads WITH preamble** | **`0x48`** | **executes — first time** |
+| trilevel 2, block loads without preamble | — | engine stops, as before |
+
+**Multi-vec4 block loads execute for the first time in this project.** The
+framing was always right; the destination-select preamble was the missing
+piece, exactly as the disassembly predicted.
+
+### A hardware caveat found immediately after
+
+Following that run the card entered a state where **the 2D fill draws 0 pixels
+even across a warm reboot**, with `bmstat` reading `0x02020000` (bit 25 set)
+where it read `0x00020000` all session, and `0x1300` powering up at `0x009600c8`
+instead of `0x002004c2`. Matrox registers are known to survive a warm reset, so
+this needs a **cold power cycle**, not `reboot -f`. Do not interpret a
+zero-pixel 2D fill in that state as a driver result — it is the instrument
+being broken, and the first thing to check after any reboot is that the 2D
+baseline still draws 120000.
+
 ## `constobj` layout
 
 | offset | contents |
