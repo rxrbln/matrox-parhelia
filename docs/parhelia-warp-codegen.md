@@ -393,6 +393,21 @@ if (hasTg) {
 ```
 with `reg_j = 0x59 + 4*i + stage` and
 `mtx2929 = {0x000, 0x928, 0x948, 0xa88, 0x688, 0 …}` (`.rodata+0xc7510`).
+
+The per-unit block this reads is a *compiled* form. Its uncompiled source is the
+verbose per-stage struct written by `mtx673` (`.text+0x17260`), which is the
+**D3D8 `SetTextureStageState`** entry point — a 29-entry jump table at
+`.rodata+0xa38` on the `D3DTSS_*` token (the table is relocation-only in the
+object, so it has to be read with `objdump -r`) [CONFIRMED]. Relevant fields:
+`TEXCOORDINDEX` → byte `+0x10` bits[2:0] (index 0..7) and bits[4:3] (the TCI
+generation mode, `value>>16 & 3`); `TEXTURETRANSFORMFLAGS` → byte `+0x13`
+bits[3:1] = component count (`value & 7`) and bit 4 = `PROJECTED`
+(`value & 0x100`); `ADDRESSU/V/W`, the filters, LOD bias, max level, anisotropy
+and the six bump-environment floats occupy `+0x10`…`+0x1c` and `+0x60`…`+0x74`.
+The step that compiles that struct into `glstate[0x2a0] + 0xc + 20*i` was **not
+traced** [OPEN], so the mapping of the compiled bit-fields onto the `D3DTSS_*`
+tokens is [INFERRED]. Bits [2:0] of the per-stage key word have no reader at
+all in `mtx3483` [OPEN].
 `flag_a = ((K[0x08]&3) == 2)`, `flag_b = ((G[0x2a0]->u8[0x5c] & 0x18) != 0)`.
 
 Per-unit tail and epilogue:
@@ -442,8 +457,8 @@ descriptor for the cache comparator.
 | `K[0x04]` | u32, bytes 4/5/6 also read as u8 | see §2.2 | |
 | `K[0x08] & 0x03` | 2 | selects a `swzB` patch table entry in `mtx2177` | [OPEN] |
 | `K[0x08] & 0x1c` | 3 | texture-environment / output-format class; values `0x08`, `0x0c`, `0x10`, `0x14` are tested | [OPEN] |
-| `K[0x08] >> 5` | 3 | **number of user clip planes**, 0..6 | [INFERRED] |
-| `K[0x10]` | u32 | **transform mode**: 0 = pre-transformed vertices, 1 = one matrix, 2/3/4 = 2/3/4 blend matrices, 5 = a further variant | [INFERRED] |
+| `K[0x08] >> 5` | 3 | **number of user clip planes**, 0..6 — a popcount of the enable mask | [INFERRED, corroborated] |
+| `K[0x10]` | u32 | **vertex-blend / transform mode**: 0 = pre-transformed vertices, 1 = one matrix, 2/3/4 = 2/3/4 blend matrices, 5 = a further variant | [INFERRED, corroborated] |
 | `K[0x18]` | u32 | **number of spot lights** | [CONFIRMED] |
 | `K[0x1c]` | u32 | **number of point lights** | [CONFIRMED] |
 | `K[0x20]` | u32 | **number of directional lights** | [CONFIRMED] |
@@ -451,7 +466,16 @@ descriptor for the cache comparator.
 | `K[0x28+8i]` | u32 | **front-face colour source of material term `i`** (0..3): 0 = material constant, 1 = `r5` (primary colour), 2 = `r6` (secondary colour), 3 = absent | [INFERRED, strong] |
 | `K[0x2c+8i]` | u32 | the same for the **back face** | [CONFIRMED symmetry] |
 | `K[0x48]` | u32 | compared `== 3`; selects `0xc4` vs `0xc5` and gates a whole `mtx2884` branch | [OPEN] |
-| `K[0x4c + 0xc*i]` | u32 | per-texture-unit selector into `mtx2929` | [CONFIRMED mechanism] |
+| `K[0x4c + 0xc*i]` | u32 | per-texture-unit; also the selector into `mtx2929` (§1.7). Written by `mtx3654` @`.text+0x8ca36` in its loop over `glstate[0x2a0]` stages, and on every path reached it writes the literal **4** — plausibly the number of texture-coordinate components the vertex program must emit for that stage, but no other value was observed | [CONFIRMED writer, range UNKNOWN] |
+| `K[0x50 + 0xc*i]` | u32 | per-texture-unit, believed `D3DTSS_TEXTURETRANSFORMFLAGS`: the `(word>>6)&7` field also increments the running counter at `ctx+0x15c` and sets the sticky "some stage needs it" flag `K[0x09]` bit 0 | [INFERRED] |
+| `K[0x54 + 0xc*i]` | u32 | per-texture-unit, believed `D3DTSS_TEXCOORDINDEX`: the `(word>>3)&7` field is a plain pass-through | [INFERRED] |
+
+**Implementation warning.** `mtx332`'s per-stage loop (`.text+0xa6a45`, stride
+`0x14`) copies `glstate[0x2a0]->u32[0x08]` entries into `desc+0xf8[]` with **no
+upper bound**, while the `K[0x4c + 0xc*i]` loop immediately after it
+(`.text+0xa6a68`) is hardcoded to exactly 4 iterations. Four is the real texture
+unit count; an open driver should clamp the first loop, which the vendor code
+does not [CONFIRMED].
 
 The `K[0x10]` reading rests on fragment sizes: `0x50`/`0x51`/`0x52`/`0x53` are
 5/11/16/21 instructions — one extra 4×`dp4` block per mode step — and the
@@ -510,6 +534,13 @@ plus a normal transform per matrix.
 | `a65` | colour output | [INFERRED] |
 | `a259..a262` | transformed position output | [CONFIRMED] |
 | per-light block | **7 consecutive registers**, base `7 * slot` | [CONFIRMED] |
+
+These are the registers as they appear in the **stored** fragment, i.e. before
+relocation. A lighting fragment's operands are rewritten to `idx + 7*slot`, and
+`mtx2755` starts its walk at `slot = 1` (light 0 is consumed before the loop),
+so a relocated `r5` becomes `r12` for the first walked light. The unrelocated
+readings above therefore apply to the colour-material and transform fragments,
+which carry no relocations at all.
 
 ---
 
@@ -920,8 +951,9 @@ The full per-entry table is in the appendix.
 
 ### 5.2 Reachability
 
-Of the 574 fragments, the ones reachable by a **literal** index in a generator
-are roughly a quarter; the rest are reached through the seven runtime tables:
+**165 of the 574** fragments are reachable by a **literal** index in one of the
+generators; the remaining 409 come either from the canned-program accessor
+`mtx2475` or through one of the seven runtime tables:
 
 | table | base | size | index | selects |
 |---|---|---|---|---|
@@ -947,6 +979,13 @@ as the light table:
 All of these are filled at init by `mtx222` (`.text+0x9efe0`), which memsets the
 regions and then calls `mtx3071` (directional), `mtx1216` (point), `mtx3514`
 (spot) and `mtx3882` (the registry) with `rdi = engine`.
+
+Sixteen fragments are reached by **nothing this pass could find** — neither a
+literal index, nor a table, nor the canned accessor:
+`0x40 0x47 0x49 0x58 0x59 0x5c 0x5d 0x60 0x61 0x6b 0x6c 0xb7 0xb8 0xb9 0xba 0xbd`.
+The fog-band members among them (`0x58/0x59`, `0x5c/0x5d`, `0x60/0x61`) are the
+missing halves of the three `mode × flag` pairs of §1.6, so a second fog
+selector exists somewhere; the rest are [OPEN].
 
 ---
 
@@ -1042,7 +1081,19 @@ Relocation is used only by `mtx2755`, i.e. only for lighting.
 6. **The recipe registry's `+0x10` field is a pointer to entry offsets, not a
    "loaded" flag** — though `mtx3882` leaves it NULL and only the software-WARP
    variants of `mtx2884` dereference it (§3.7).
-7. **Four further recipe helpers exist** that no earlier document lists:
+7. **`parhelia-vertex-pipeline.md` §2.1/§3.3: `key2[0x10]` is not "lighting".**
+   It is the vertex-blend / transform mode (§2.1), and `key2[0x08][7:5]` is the
+   user-clip-plane count, not a lighting-model selector — the 7-way jump table
+   at `.rodata+0x2fd0` selects 0…6 planes. Lighting is `G[0x08]` bit 3 plus the
+   three light counts `K[0x18]`/`K[0x1c]`/`K[0x20]`. Two independent passes
+   reached this reading.
+8. **`mtx3212` (`.text+0x41fc0`) is *not* the writer of `ctx+0x128 + i*0xc`** —
+   a tempting false positive; its `rdi` is a texture-combiner default template
+   that merely shares offsets (it stores `0x5e5a6359` at `+0xe0`, where the 3D
+   context has the `K[0x04]` bitfield byte, and its fields are contiguous dwords
+   with no `0xc` stride). The real writer is `mtx3654` @`.text+0x8ca36`, which
+   forms the address with an indexed `lea` and then stores through `[rax+0x18]`.
+9. **Four further recipe helpers exist** that no earlier document lists:
    `mtx3939`, `mtx3587`, `mtx497` (32-instruction alignment padding with
    fragment `0xc9`) and `mtx569` (the per-item fragment + patch-list replay used
    by `mtx2884`). (§3.3)
@@ -1057,6 +1108,9 @@ Relocation is used only by `mtx2755`, i.e. only for lighting.
 | which of texgen modes 0–3 is `GL_SPHERE_MAP` / `GL_NORMAL_MAP` / `GL_REFLECTION_MAP` / matrix | same method, per `glTexGeni` mode |
 | `K[0x10] == 5` | it has no blend-matrix reading; check whether it is `GL_VERTEX_BLEND` tweening or a `glRasterPos` path |
 | the 12 variants inside the `0x1d7`–`0x21e` material band | they are indexed by `s` (3 bits) in `epi*_A`; `s` bit 1 is `G[0x10]&1` and bit 2 is `K[0x05]&0x10` |
+| the compile step from `mtx673`'s verbose per-stage struct to the compact `glstate[0x2a0] + 0xc + 20*i` block | find the reader of the `+0x1`/`+0x2` per-stage dirty bytes that `mtx673` sets |
+| bits [2:0] of the per-stage key word, and the `mtx3483+0x298` path that toggles `K[0x04]` bit 4 from the last stage's word bit 13 | no reader found; needs the sweep |
+| the range of `K[0x4c + 0xc*i]` — only the literal 4 is ever written | vary the texture-coordinate component count in the vendor stack and re-read the key |
 | the meaning of the `0x65+i` loop (`G[0x2a0]->u32[0x08]` items writing `a68..a70`) | the same sweep; the fragments write only the `.w` component of three consecutive output registers |
 | whether registry `+0x10` is ever non-NULL | trace `mtx2884` variants 2–5 on the software-WARP path |
 | the `0x0e5`–`0x13e` / `0x145`–`0x152` monolithic band | 104 fragments of 100–560 instructions, reached only through `mtx2884`'s 5-D table; nothing in the fixed-function path touches them |
