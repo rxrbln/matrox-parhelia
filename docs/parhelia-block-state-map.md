@@ -483,6 +483,37 @@ deduced from the arithmetic.  2-src = both binaries agree.
 > w1[1:0], `f0e` w0[26:25], `f0bc` w0[19:18]), or the low registers are a
 > separate attribute/temporary file and the linear rule only holds above them.
 > Only the `0x0e0..0x15f` window is established.
+>
+> **Refinement (2026-09-05): the block file is addressed through relocatable
+> record windows, not as a flat array.** `mtx1342` defaults its payload source
+> to the block file itself (`lea rcx,[r11+0x230]` @0x9005c), but when a tracking
+> record is in play it redirects:
+>
+>     902da:  mov edx, DWORD PTR [rcx+0x10]   ; the record's base index
+>     902ec:  src = [rec+0x8] - 16*[rec+0x10]
+>
+> So register `n` in a record's own space lands at block index
+> `[rec+0x10] + n`. There are six 64-byte tracking records. This dissolves an
+> apparent contradiction: the constant-set token (0x43) clamps its index to
+> `0..0xff` (`cmp ecx,0x100; cmovae ecx,0xff` @0x4547c), which is checked against
+> a *record* (`cmp DWORD PTR [rbx+0x10],ecx` @0x454b8), not against the 384-entry
+> file — a `0..0xff` record space and a file window based at `0xE0` are not in
+> conflict. Under this reading the `− 0xE0` rule is the identity of one record's
+> base rather than a property of the file, which is corroborated by `mtx2209`
+> @0x8e850 laying out 32 units x 7 entries from index 0 and ending at exactly
+> `0xE0`.
+>
+> The `−0xE0` rule is therefore **not refuted**, but "flat window" is the wrong
+> mental model, and the fixed slots `mtx309` marks at `0xE0+7k` and the
+> hard-coded `mtx2702` slots up to `0x17e` are best read as what a
+> driver-generated fixed-function program uses when no user record owns that
+> range. Mapping the six records at `+0xb0` is its own pass and has not been
+> done.
+>
+> Unestablished: at `0x90142` the per-record mask is indexed
+> `[record + word*4 + 0x1c]` with `word` running to 11, which for `word >= 9`
+> reads past the 64-byte record stride — either an upstream over-read or a
+> mis-assigned field.
 
 
 ## 5. Dirty-bitmap protocol
