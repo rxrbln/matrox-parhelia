@@ -564,3 +564,41 @@ program image itself (our generated transform has never been validated, and the
 canned vendor programs are not transforms), and the `0x10a0`/`0x10a4` reading,
 which the two vendor sources disagree on. The DDA/texture-trap path remains
 untried and reaches a triangle through the `0x138c` launch already proven here.
+
+
+## Isolating the failure by packet class (2026-09-05, X stopped, health-gated)
+
+Submitting progressively more of the stream and reading `0x1300` back
+afterwards:
+
+| level | stream contents | `0x1300` reads |
+|---|---|---|
+| 1 | register packets only | **`0x000010cc`** — the value written |
+| 2 | + `0x41` constant block-loads | `0x44000000` |
+| 3 | + `0x41` vertex quads | `0x44000000` |
+
+**Register writes land.** That is now directly demonstrated rather than assumed:
+with only register packets in the stream, `0x1300` reads back exactly what a
+ring packet wrote. The tag/data framing is correct.
+
+**Adding any `0x41` packet corrupts it**, and the vertices add nothing beyond
+what the constants already do. Restricting the constants to exactly the ten
+indices `mtx2209` writes into bank A — dropping `0x176`/`0x177`, which neither
+bank writes, and `0x179..0x17c`, which exist only in bank B — makes no
+difference, so it is not the bank-B entries.
+
+**The likely reading, and it is consistent with the vendor sources:** a `0x41`
+packet is a quad stream into the WARP input FIFO whose *payload contract is
+defined by the program currently bound at `0x1100`*. With no valid program
+bound, the payload is consumed by whatever the engine thinks is bound and can
+land anywhere — including on `0x1300`. On that reading the corruption is a
+**symptom of the bind not taking**, not a framing error in `block_load()`, whose
+header arithmetic checks out against the confirmed rule for every count used.
+
+**Unresolved and blocking:** the WARP bind registers `0x1000`, `0x1040`,
+`0x10b0`, `0x10f0`, `0x1100`, `0x1104`, `0x1110`, `0x1130` all read back **zero**
+after being written, while `0x1300` in the same stream reads back correctly.
+Either they are write-only — plausible for a bind FIFO — or the bind genuinely
+is not landing. Nothing available distinguishes those two, and that is the next
+thing to settle: without it there is no way to tell a failed bind from an
+unreadable one.
