@@ -1035,3 +1035,40 @@ would explain why a base-index header is rejected: there is no base index.
 This is now the single blocking unknown for a triangle, it is well localised,
 and there is a working instrument to test candidates against: put a candidate
 packet in the ring behind a DWGSYNC and see whether the tag retires.
+
+
+## SOLVED: the write-back fires, and it needs MMIO plus a space tag
+
+Two conditions, both necessary, measured 2026-09-05:
+
+```
+0x1090 = writeback_bus_addr | 2      <- space tag 2 = system memory
+0x1094 = value
+```
+
+written **from the CPU before the doorbell**, and *not* as a ring packet.
+
+| how armed | space tag | result |
+|---|---|---|
+| in-ring packet `[2][0x21212425][val][addr]` | 0 / 2 / 3 | never written, in every combination |
+| MMIO before the doorbell | 0 | never written |
+| **MMIO before the doorbell** | **2** | **`5a5a0001` — PACKET RETIRED** |
+
+So the engine writes the completion word to system memory when the ring
+retires, giving a **memory-visible completion signal** that needs no MMIO read
+and no fence register. That is the second validated instrument this project has,
+after the non-blocking DWGSYNC, and the first that can be polled from memory.
+
+**Why it was invisible for so long.** `mtx2434` lists indices `0x24`, `0x25`,
+`0x28`, `0x29` — `0x1090`, `0x1094`, `0x10a0`, `0x10a4` — as *consumed but not
+written* when it interprets a stream. Read as documentation of the hardware
+rather than of that function, it says these four are handled by the DMA engine
+itself and cannot be reached as ordinary register writes from inside a stream.
+For `0x1090`/`0x1094` that is exactly right, and setting them from the CPU is
+what makes them work.
+
+**It does not generalise to the other two.** Programming `0x10a0`/`0x10a4`
+(SECADDRESS/SECEND) by MMIO before the doorbell stops the primary ring
+executing as well — consistent with them redirecting the DMA fetch, so they must
+be reached in-stream after all. Our in-stream `0x20292820` form remains wrong
+and secondary calls remain unusable.
