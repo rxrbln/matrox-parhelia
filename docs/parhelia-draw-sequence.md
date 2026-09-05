@@ -318,3 +318,25 @@ both the fill and the WARP submit); the microcode gates (all four pass); the
 Item 3 matters most: without one positive control through the readback port, a
 zero result cannot distinguish "the WARP did not run" from "the port does not
 show it".
+
+
+## DWGCTL: what is measured, and a method note (2026-09-05, P690)
+
+Measured against the known-good 2D fill geometry, changing **only** `0x1300`:
+
+| value | result |
+|---|---|
+| `0xc0` | draws 120000 px, to offset 0 **and** to the off-screen target |
+| `0x07`, `0xc07`, `0x0030200c` | nothing |
+| `0x00`..`0x10` | nothing |
+| **`0x11`** | **locks the engine** — reboot required |
+
+So the 3D opcodes do not route through the 2D rect path at all; they need the
+WARP pipeline, and a `0x138c` LEN write does not substitute for it.
+
+**Method note, recorded because it cost a reboot.** Sweeping the whole low byte
+blind was a mistake: it is guess-and-test at scale, most values are meaningless,
+and at least one of them locks the engine. The idle gate caught it and aborted
+at the right place, but the right approach is to take opcode semantics from the
+binaries and test named candidates, not to enumerate a field. Do not repeat the
+sweep.
