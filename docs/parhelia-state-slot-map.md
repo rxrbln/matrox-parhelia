@@ -592,6 +592,35 @@ copies at `+0x7e8` and `+0x2218` (§4), which really are banks.
 Consequently there is no "bank B absolute base" to find: key 0x05's slots are
 not offsets into a register window at all.
 
+
+### 7.2 Resolving the bank attribution for blend factors and polygon mode
+
+`docs/parhelia-draw-recipe.md` §3.2 attributes both to **key 0x0c**;
+`docs/parhelia-gl-limits.md` §2.2 attributes both to **key 0x05**.  The slot
+tables in §3.1 and §3.2 above settle it, and it is a split decision -- each doc
+is right about one and wrong about the other.
+
+**Blend factors -> key 0x05, slots 0x09..0x0c (gl-limits is right).**
+Those four slots write the four shadow DWORDs individually:
+
+    key 0x05  0x09 -> [0xc3f]      key 0x05  0x0b -> [0xc47]
+    key 0x05  0x0a -> [0xc43]      key 0x05  0x0c -> [0xc4b]
+
+Key 0x0c slot 0x09 is `[0x1be4]` bits 6-7 and is not a blend factor at all.
+What key 0x0c *does* have is slots **0x13** and **0x14**, which write the same
+four fields **in pairs** (`0x13 -> [0xc3f] and [0xc43]`, `0x14 -> [0xc47] and
+[0xc4b]`).  That is the real reason a differential sweep saw the four factors
+move two at a time, and it is what made the key 0x0c attribution look plausible.
+
+**Polygon mode -> key 0x0c, slot 0x08 (draw-recipe is right).**
+`key 0x0c 0x08 -> [0x1be4]` bits 4-5, dirty `[0x1bec] |= 0x80`.  Key 0x05 slot
+0x08 cannot be it: slots 0x06..0x08 of key 0x05 are NO-OPs.
+
+The general lesson is the one gl-limits states as its own thesis -- the same
+small index means different things under different keys -- but it cuts both
+ways, and neither doc's blanket attribution survives.  Emit against the table in
+§3.1/§3.2, not against either summary.
+
 ---
 
 ## 8. Slots the kernel consumes itself (no register)
