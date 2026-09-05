@@ -76,7 +76,7 @@ dispatches on `record[0]` (bounded at `0x51`) through the jump table at
 | `0x25` | 20 | CLIP-PLANES | 6 elements `plane_id, float4` -> `ctx+0x1da0` |
 | `0x26` | 16 | VIEWPORT | `x, y, w, h`, same space as `0x12` |
 | `0x27` | 8 | DEPTH-RANGE | 2 floats; **only the last element of the batch is applied** |
-| `0x35` | 16 | **[PURPOSE UNKNOWN]** | 4 dwords, all zero in every capture |
+| `0x35` | 16 | **glBlendColorEXT** (constant blend colour) | 4 dwords, all zero in every capture -- consistent, the default blend colour is (0,0,0,0) |
 | `0x36` | 8 | LINE/POINT-SIZE | 2 floats; last element only |
 | `0x43` | 8 + n*16 | VERTEX-PROGRAM CONSTANTS | `start (<=0x100), count`, then float4s |
 | `0x45` | 0x670 | **VERTEX**-program upload | `memcpy(ctx+0x1474, payload, 0x664)` |
@@ -190,6 +190,11 @@ Notes a driver author needs:
   `0x924 & 0xfff == 0x100` -> `0x8f0 & 0x03000000 == 0`), then
   `0x918 = byteOffset / 12`, then three dwords per instruction to `0x91c`, then
   `0x920 |= 1`. Exactly one image exists: 4812 bytes, 401 instructions,
+  <!-- Reader trap: the [HW] section below reports "loaded 7 WARP programs, 2664
+  bytes (222 instructions)".  That is NOT a second microcode version -- 4812 is
+  the mtx2785 self-test image, 2664 is the seven real boot programs extracted by
+  symbol.  Both figures are right and they describe different objects.  The
+  "two microcode revisions" reading was retracted; see parhelia-vertex-isa.md. -->
   md5 `b29644ecfcfcbbc11ef97240872892ca`, extractable with
   `tools/parhelia-extract-ucode.c`. [CONFIRMED]
 * **The DMAPAD rule applies to every register write.** If the previous register
@@ -882,6 +887,13 @@ writes `width * height * 4` bytes at offset 0. [CONFIRMED — 1024 bytes for
 
 **Vertex stride.** The two captures give 28 and 32 for the same nominal case,
 because the ICD picks a texcoord entry from its stride table by the *declared*
+> **Superseded (2026-09-05): the pipeline-key bit numbering below is wrong.**
+> `docs/parhelia-gl-limits.md` §1.2 assigns `[6:4]` = diffuse colour and
+> `[10:8]` = secondary/specular/fog, and puts the texcoord sets at `[18:16]` and
+> `[21:19]`, with the shift set `{16,19,22,25}` read from `.rodata` literals at
+> `0x36ada0` and `0x369830`.  That accounts for all six captured keys with no
+> free parameters.  Use it, not the field positions in this section.
+
 texcoord dimensionality: `fmt[6:4]=3` -> 8 bytes -> stride 28
 (`x,y,r,g,b,u,v`), `fmt[6:4]=1` -> 12 bytes -> stride 32. Both were seen. The
 28-byte case was decoded vertex-by-vertex and the texcoords came out
