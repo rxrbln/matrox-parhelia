@@ -482,14 +482,82 @@ output register.
 
 ## 4. Multisampling
 
-*(section written from the dedicated sweep of libGL / mtx_drv / MTXPARD — see
-the verdict below)*
+**Verdict: `GL_ARB_multisample` is advertised but not implemented in the Linux
+stack.  Parhelia's FAA-16x hardware is real and is parameterised in the shared
+Matrox core, but no Linux component ever turns it on.**  [CONFIRMED]
 
-What this pass established independently, from the kernel core:
+### 4.1 The GL side is pure state tracking  [CONFIRMED]
 
-**There is a per-axis render-target scale factor.**  Each drawable carries two
-floats at `+0x214` (x) and `+0x218` (y), initialised to `1.0f` (`mtx3834`
-@0xe600).  `mtx2480` @0x129e0 sets them from two of the drawable's bound surfaces: it reads
+* `glSampleCoverageARB` @0x1b09b0 in `libGL.so.1.3.0` is a plain alias of
+  `glSampleCoverage` @0x1ac0f0, which dispatches through the per-context table
+  slot `+0x9b0`.  The one real implementation behind that slot is **0x128ab0**:
+  clamp the value to [0,1], store it at `ctx+0x7c80`, store `invert` at
+  `ctx+0x7c84`, `or ctx[0x10], 0x10000`, return.  **No MMIO write, no DMA
+  packet, no command-stream record.**  The other table entries are a `repz ret`
+  (no current context), a `GL_INVALID_OPERATION` setter (inside `glBegin`), and
+  the display-list recorder.
+* The multisample state block `ctx+0x7c70` is initialised once by 0x1c7380:
+  `GL_MULTISAMPLE = 1`, **`GL_SAMPLE_BUFFERS = 0`**, `GL_SAMPLES = 0x10` (a
+  vestigial FAA-16x constant), alpha-to-coverage / alpha-to-one /
+  sample-coverage = 0, coverage value 1.0.  `GL_SAMPLE_BUFFERS` and
+  `GL_SAMPLES` are **written at exactly that one site in the whole library** and
+  read only by `glGet*` / `glIsEnabled` / `glPushAttrib` / `glPopAttrib`.  By the
+  ARB_multisample spec, `SAMPLE_BUFFERS = 0` means multisample rasterisation is
+  never in effect.
+* Dirty bit `0x10000` set by every multisample state change is tested only by
+  `glPushAttrib` (0x126320) and `glPopAttrib` (0x126d49) as an attribute-group
+  mask.  **There is no hardware-emit consumer.**
+* `ctx+0x7c98` is a "state locked by driver" latch from the Windows codebase:
+  when non-zero, `glEnable`/`glDisable(GL_MULTISAMPLE)` silently skip the store.
+
+### 4.2 GLX reports nothing  [CONFIRMED]
+
+`glXGetFBConfigAttrib` @0x35d0a0 has no case for `GLX_SAMPLE_BUFFERS` (100000)
+or `GLX_SAMPLES` (100001) — both fall through to `GLX_BAD_ATTRIBUTE`.  The
+client GLX extension string is `GLX_ARB_get_proc_address GLX_EXT_visual_rating
+GLX_EXT_visual_info GLX_SGI_swap_control`; the vendor server module
+`xserver/7_4_0/libglx.so`, which builds the visual/fbconfig table
+(`glxMTXInitVisuals` / `glxMTXSetVisualConfigs`), contains **zero** references to
+100000/100001.  No sample buffer is ever allocated: `MTXGLXAllocateClientBuffer`
+in `mtx_drv.so` allocates one page-aligned type-3 buffer and nothing else.
+
+The `GL_EXTENSIONS` string is a fixed `.data` blob at 0x66e0e0 returned verbatim
+by `glGetString` (0x120e2b) — no per-chip trimming — which is why
+`GL_ARB_multisample` is advertised on every Parhelia/P650/P690 regardless.
+
+### 4.3 The FAA-16x machinery exists but is dead on Linux  [CONFIRMED]
+
+`kernel/src/MtxParhlParms.c` declares seven fragment-antialiasing tunables:
+
+```c
+reg3DAAMode                    0x52
+reg3DThresholdAA               0x007FE000   /* sort-independent AA, fragment buffer */
+reg3DFragSize                  0x3F800000   /* 1.0f */
+reg3DForceCompressedMask       TRUE   /* different AA mode when dest alpha enabled */
+reg3DForcePLNWMASK4FAA         TRUE   /* do not execute the PLNWTMASK hack in FAA mode */
+reg3DResolveAlphaBlendedFrags  FALSE  /* send FRAG_RESOLVE even with alpha blending */
+reg3DResolveOnStencilOpChange  TRUE
+```
+
+Their names appear as strings in `mtx_drv.so` (registration `mtx724` @0x60d70,
+which has **no caller**) and in `mtx_parhelia.o`, and in **no** form in
+`libGL.so.1.3.0`.  The win32 `MTXPARD.dll` really reads them (`AAMode` @0x109740
+default 0x54, `ThresholdAA` @0x1097b2, `FragSize` @0x10983e = 4.0f or ~4.35f
+depending on a chip-revision field) — so FAA is driven on Windows, through the
+D3D path, which shares nothing with the Linux ICD.
+
+The only register link recoverable statically is indirect:
+`reg3DForcePLNWMASK4FAA` ("do not execute PLNWTMASK hack in FAA mode") ties the
+FAA path to **PLNWT `0x1324`** (§3.1).  The FAA control, fragment-buffer and
+`FRAG_RESOLVE` register indices are **[OPEN]** — they have no Linux consumer at
+all, and on Windows they sit behind the MTXPARD D3D object graph.
+
+### 4.4 A separate, *live* mechanism: the per-axis render-target scale  [CONFIRMED mechanism, INFERRED purpose]
+
+Independently of all of the above, the kernel core has a scaled-render-target
+path that **is** consumed.  Each drawable carries two floats at `+0x214` (x) and
+`+0x218` (y), initialised to `1.0f` (`mtx3834` @0xe600).
+`mtx2480` @0x129e0 sets them from two of the drawable's bound surfaces: it reads
 `drawable->[0x238]->[0x210+0x20]` / `+0x24` and `drawable->[0x240]->[0x210+0x20]`
 / `+0x24` and **requires the two to be identical** (`ucomiss`, mismatch → bail
 out and leave the scale at 1.0) before storing them on the drawable.  The
@@ -500,15 +568,26 @@ surface and read its width/height/bpp from `+0x1dc`/`+0x1e0`/`+0x1d4`], and
 `+0x238`/`+0x240` are two colour buffers [INFERRED].
 
 `mtx1602` @0x11210 then multiplies every clear rectangle's four coordinates by
-those two floats before submitting, unless the clear record has bit 0x08 set.
+those two floats before submitting, unless the clear record has mask bit 0x08
+set.
 
-A per-axis scale ≠ 1.0, applied to a colour+depth pair that must agree, is a
-**supersampled render target** — the render surface is larger than the window and
-is downscaled on presentation.  [INFERRED, but the mechanism is unambiguous.]
-It is the only anti-aliasing-shaped machinery in the kernel core: there is no
-sample-count register, no sample mask, and no resolve primitive anywhere in
-`mtx_parhelia.o`.
+A per-axis scale applied to a surface pair that must agree is a **supersampled
+render target** — the render surface larger than the window, downscaled on
+presentation.  [INFERRED.]  It is the only anti-aliasing-shaped machinery in the
+kernel core that is actually wired up: there is no sample-count register, no
+sample mask and no resolve primitive anywhere in `mtx_parhelia.o`.  With
+`GL_SAMPLE_BUFFERS` pinned to 0 by the ICD (§4.1) nothing in the OpenGL path ever
+sets the scale away from 1.0, so on Linux this is dormant too — but it is the
+mechanism an open driver would use for supersampled AA, and it costs nothing:
+allocate colour and depth larger, keep the two scales equal, and scale the
+clear/scissor rectangles.
 
+### 4.5 Practical consequence
+
+Nothing in the Matrox Linux stack can serve as a reference for programming
+Parhelia FAA-16x.  For an open driver: report `GLX_SAMPLE_BUFFERS = 0` honestly,
+or implement **supersampling** on top of §4.4 and §1 (a larger colour+depth pair
+plus a scaled blit on present) — which needs no new register knowledge at all.
 
 ---
 
@@ -563,3 +642,197 @@ on DRM/TTM allocates however it likes; only the descriptor encoding matters.
 
 ## 6. Getting a finished frame on screen
 
+Traced end to end through `libGL.so.1.3.0` and `mtx_parhelia.o`.  The ICD never
+talks to the X server for a swap and never touches a register itself: everything
+goes through the same `_IO('F',0x21)` = **`0x4621`** escape doorbell, and the
+kernel does either a 2D blit or a real CRTC page flip.
+
+### 6.1 `glXSwapBuffers`  [CONFIRMED]
+
+`glXSwapBuffers` @0x35f410 resolves the drawable client-side (no GLX protocol
+round trip, no `XSync`) and tail-calls the swap at **0x35a4a0**, which:
+
+1. **flushes the pending command stream** for every context bound to the drawable
+   (0x120cc0 → 0x1c9be0 → escape command 1, the same command-list submit that
+   carries draws);
+2. emits stream opcode **0x3e** with 0/1 when the per-context flag `[gl+0xf8]`
+   disagrees — a front/back render-target toggle [CONFIRMED opcode, INFERRED
+   meaning];
+3. branches on `[drawable+0x58]`:
+   * `== 0` → **BLIT**: escape command **0x10** (kernel `mtx986` @0x50980);
+   * `!= 0` → **PAGE FLIP**: swap the device-level surface handles
+     `[dev+0x48] ↔ [dev+0x50]`, then escape command **0x1c**
+     (kernel `mtx646` @0x50680);
+4. retries while the escape returns `-4` ("flip queue full");
+5. optionally clears the new back buffer (`GL_COLOR_BUFFER_BIT`).
+
+Escape payloads:
+
+```
+FLIP (0x1c):  +0x00 u64 new-front surface handle
+              +0x08 u32 swap interval
+BLIT (0x10):  +0x00 u32 flags=1   +0x08 context id
+              +0x10 u64 SRC (back)  +0x18 u64 DST (front)
+              +0x20/+0x28 ptrs to src/dst rects {x, y, …, w@+0xc, h@+0x10}
+              +0x40 u32 0xffffffff
+```
+
+Note the escape-command namespace (`.rodata+0x1fe8`, commands 3..31, dispatched
+by `mtx3683` @0x4de50) is **distinct** from the command-list opcode namespace of
+§0.1 (`.rodata+0x1b08`).  Command 1 is the only one that reaches `mtx558`.
+
+### 6.2 The page-flip primitive  [CONFIRMED from code, not HW-verified]
+
+`mtx646` @0x50680 queues the flip; `mtx3795` @0x315b0 parks it in a 32-entry
+queue and `mtx742` @0x313e0 writes a **tag packet into the bus-master DMA
+stream** and kicks the ring at `0x408`.  The flip is then executed **from the
+vertical-blank interrupt**: `mtx987` @0xa0960 (`mtx_parhl_driver.irq_fast`,
+`.data+0x30`) → `mtx4025` @0x3a590, which bumps the per-head vblank counter,
+reads the DMA completion tag from **`0x41C`** (masked `& ~7`) and only then calls
+`mtx2073` @0x343a0 — so a queued flip fires only after the render stream that
+precedes it has retired.
+
+`mtx2073` is the actual register write:
+
+| head / plane | control register | slot field |
+|---|---|---|
+| head 0 graphics | `0x1800` | bits [8:7], bit 6 = latch-immediately, mask `&= 0xFFFFFE3F` |
+| head 1 graphics | `0x1A00` | same |
+| head 0 second plane | `0x19A8` | bits [10:9] |
+| head 1 second plane | `0x1BA8` | bits [10:9] |
+
+The buffer addresses live in a **4-deep START bank** written by `mtx3863`
+@0x34a60 as `value = offset & 0x07FFF800` (2 KB aligned):
+
+```
+head 0 graphics    : 0x1824 + slot*4
+head 1 graphics    : 0x1A24 + slot*4
+head 0 2nd plane   : 0x19C8 + slot*4
+head 1 2nd plane   : 0x1BC8 + slot*4
+```
+
+Completion test, `mtx416` @0x34170: `pending = (reg >> 7) & 3`,
+`active = (reg >> 16) & 3`, retired when they are equal.
+
+So the flip primitive is: *write the new scanout base into one of four START
+slots, then point `DC_CTRL[8:7]` at that slot*; the hardware latches at the next
+retrace unless bit 6 is set.  Bit-6 polarity is pinned by the policy plumbing:
+`reg3DFlipOnVBlank = 0` (never sync) → bit 6 = 1.
+
+Only slot 0 (`0x1824`) is hardware-confirmed in this repo; slots 1–3 are
+code-derived only.
+
+### 6.3 Vsync and swap interval  [CONFIRMED]
+
+* `mtx646` reads a policy through a device vtable and combines it with the app's
+  interval: policy 0 = never sync, 1 = always (forced to ≥1), ≥2 = application
+  defined.  That is exactly **`reg3DFlipOnVBlank`** (default **3**) in
+  `matroxdriver-x86_64-cvs-20090511/kernel/src/MtxParhlParms.c:200`.
+  `regSysVSyncInt` (default FALSE, line 279) enables the VSync interrupt.
+* `glXSwapIntervalSGI` is not an exported symbol — reachable only via
+  `glXGetProcAddress` (→ 0x35f2b0).  It rejects `n <= 0` and stores `n` at
+  `[device+0x44]`, which is what lands in the flip payload `+0x08`.
+  `GLX_SGI_swap_control` is advertised.
+* Interval > 1 counts vblanks in the ISR, not in a busy wait.
+
+### 6.4 Buffer allocation  [CONFIRMED]
+
+Once per **device** (not per drawable), in ICD `0x358ac0`, all three through
+escape command **0x0c** ("create surface", 0x1c-byte descriptor
+`{flags, ?, format, width, height, ?}`, returning an opaque kernel handle):
+
+| buffer | descriptor | ICD field |
+|---|---|---|
+| front / primary | flags `0x21` (bit5 = displayable), `+0x04 = 1` | `[device+0x48]` |
+| back | front's geometry, bit5 cleared, bit7 set | `[device+0x50]` |
+| **depth** | **format `0x4f` / `0x4b`**, front's width/height | `[device+0x58]` |
+
+The ICD never learns a VRAM offset or a pitch — it holds handles only, and the
+kernel resolves them into the `{base, cfg, dims}` descriptors of §1.  Buffering
+is **double**: the ICD allocates one back buffer, the kernel keeps two scanout
+slot indices (`[[dev+0xd8]+0x6b0] + 0x30 / + 0x34`), even though the START bank
+has four slots.  The back buffer is device-global and shared by every GLX
+drawable on that device.
+
+> **Lead for the open S8Z24 question of §2.1:** `0x4f` and `0x4b` are the ICD's
+> *depth* surface-create format enums.  They are not the 6-bit hardware code in
+> `0x1234` (which must be a 32- or 16-bit-class code from the `mtx969` table),
+> but the surface-create handler `mtx2359` (escape command 0x0c) is where one
+> is translated into the other.  That is the shortest remaining path to the
+> S8Z24 enum without a hardware capture.
+
+### 6.5 Fencing  [CONFIRMED]
+
+Two mechanisms, both already documented in `docs/parhelia-kernel-abi.md` §7 and
+re-confirmed here:
+
+* client side — the per-context stream flush before the swap is queued, plus
+  escape command 3 as an explicit "wait idle" spin (ICD 0x358783);
+* hardware — the `0x12BC` / `0x41C` tag fence.  `mtx2434` on meeting register
+  `0x12BC` in the stream waits for `0x450` bit 22, writes `tag & ~1`, and only
+  polls `0x41C` if bit 0 of the tag was set.  The flip path uses the
+  **non-blocking** half: `mtx742` embeds the tag, and the vblank ISR reads
+  `0x41C` to decide when the queued flip may be applied.
+
+So: for an open driver, "finished frame → visible" is *flush the command stream,
+emit a fence tag, then either blit slot-0-surface → scanout surface with the 2D
+engine, or write the new base into a START slot and point `DC_CTRL[8:7]` at it*.
+No CPU spin is required in either case.
+
+---
+
+## 7. Minimal implementable recipe
+
+Everything below is register-level and can be driven either by direct MMIO
+(`0x1000 + index*4`) or through the DMA ring.
+
+**Bind a colour + depth target** (one packet, header `0x8d8c8988`):
+
+```
+0x1220 = colour_base            /* VRAM byte offset; bits[1:0]=3 for AGP/system */
+0x1224 = (pitch_px & 0x3fff) | (1<<16) | (fmt << 24)
+0x1230 = depth_base
+0x1234 = (z_pitch_px & 0x3fff) | (1<<16) | (z_fmt << 24)
+```
+pitch is in **pixels, rounded up to a multiple of 32**; `fmt` from the §1.2
+table (0x30 or 0x32 for 32bpp colour, 0x20 for 16bpp, 0x10 for 8bpp).
+
+**Scissor** — `0x1328 = (top<<16)|left`, `0x132c = (bottom<<16)|right`, enabled
+by DWGCTL bit 23; open it to `0x0FFF0FFF` for a full-surface pass.
+
+**Write mask** — `0x1324 = 0xFFFFFFFF` (bit-plane mask; bpp-replicate a
+per-channel mask into it for `glColorMask`).
+
+**Clear** — either the vendor way (DWGCTL `0xC4`, PLNWT `0xFFFFFFFF`, full
+scissor, values in `0x12C8`/`0x12CC`/`0x12D0`, geometry through the WARP vertex
+planes), or, for a first driver, the already-hardware-proven 2D solid fill
+(`docs/parhelia-2d-accel-complete.md` Op 1) run once into the colour surface and
+once into the depth surface with the appropriate bit pattern.  The 2D route is
+slower and cannot clear depth+stencil in one pass, but it is known to work on
+real silicon.
+
+**Present** — flush, fence on `0x12BC`/`0x41C`, then blit or write
+`0x1824 + slot*4` and point `0x1800[8:7]` at that slot.
+
+---
+
+## 8. Open items, ranked by how much they block an open driver
+
+1. **The S8Z24 format code in `0x1234`** — blocks depth entirely.  Shortest
+   static path: escape command 0x0c handler `mtx2359`, which turns the ICD's
+   depth format enum (`0x4f` / `0x4b`) into a hardware descriptor.  Fallback: one
+   MMIO capture on a 24/8 visual.
+2. **Which of `0x12C8` / `0x12CC` / `0x12D0` is depth, stencil and colour** in
+   the clear.  One capture of a `glClearDepth(0.5)` + `glClearStencil(0x5a)`
+   clear settles it.
+3. **The state-shadow → register emitter.**  §0.1 recovered the ICD state slot →
+   software shadow mapping and §3.2 the shadow → flat array copy (`mtx1900`
+   @0x17830); the array → register step is the missing link, and it is what would
+   finally give *proven* offsets for depth test/func/mask, colour mask, blend and
+   stencil.  Until then those offsets are unproven in **every** document in this
+   repo.
+4. **DWGCTL opcode 4** — full field decode (the clear/3D-rect primitive).
+5. **`0x12FC`** — a small mode bitfield fed from `mtx2215`; bits 0, 1 and 4 are
+   manipulated, meaning unknown.
+6. **The third per-slot descriptor word** (`dev+0xb48+4i`, 14-bit width/height)
+   — no register emitter found; may be software-only.

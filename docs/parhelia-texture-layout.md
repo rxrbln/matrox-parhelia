@@ -576,3 +576,37 @@ undetermined.
 ---
 
 Copyright (C) 2026 René Rebe <rene@exactco.de>
+
+## Independent verification of the linear layout  [HW]
+
+The tiling answer is load-bearing, so it was re-checked by predicting exact
+texel values rather than by comparing periods.
+
+The `tex_tri_nearest` capture uploaded a 64x64 **GL_RGB** image whose source
+bytes are `tx[i] = (i*37) & 0xff`. If storage is linear, row-major, ARGB8888
+with an opaque alpha, then texel *t* must land at byte offset `4t` as:
+
+```
+A = 0xff,  R = 37*(3t) & 0xff,  G = 37*(3t+1) & 0xff,  B = 37*(3t+2) & 0xff
+```
+
+Checked against every captured texel in region 6: **1024 of 1024 match, zero
+mismatches.** For example texel 64 (offset 0x100) predicts `0xffc0e50a` and the
+capture reads `0xffc0e50a`.
+
+This simultaneously establishes four things: the layout is **linear row-major**
+with no tiling or swizzle, the pitch is dense (`4 * width`, no padding), the
+channel order in memory is **ARGB8888** (dword `A<<24 | R<<16 | G<<8 | B`), and
+`GL_RGB` is expanded to 32 bits with alpha forced to 0xff — which is the same
+conclusion the byte-count evidence reached from a different direction.
+
+**Caveat kept:** this proves the layout of the path the vendor driver uses
+(tiling code 0). Tiled modes exist in the hardware and are selectable
+(`reg3DUseTextiled` defaults TRUE), but their intra-tile byte order is **not**
+recovered. An open driver should use tiling code 0 until that is decoded.
+
+A note on method: a first check of this same data returned "not linear", because
+it assumed the source pattern had a 256-byte period — true for a 4-byte-per-texel
+source but not for the 3-byte `GL_RGB` source actually used, where the period is
+256 *texels*. The period test was the wrong instrument; predicting exact values
+is the right one.
