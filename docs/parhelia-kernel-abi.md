@@ -1229,9 +1229,27 @@ The driver fails to pin 801 pages (3.2 MB, the vertex ring) on a 497 MB box and
 then **dereferences the NULL it just failed to allocate**. The process is left
 unkillable and the machine needs a reboot.
 
-Two things follow. For replay: the host must have enough free memory to pin the
-full region set -- roughly 8 MB of locked pages across the seven regions -- so
-drop caches and avoid holding large trace files in page cache. For the **open
-kernel driver this is a specification point**: every device-buffer allocation
-must be failure-checked and must unwind, because the hardware path is reachable
-on a machine that simply does not have the pages.
+**It is NOT memory pressure.** Retried on a freshly booted box with **428 MB
+free** and the page cache dropped, the driver still fails -- and the first
+failure is for **2 pages, 8192 bytes**:
+
+    [mtx] *ERROR* Failed to create device buffer (size: 8192, type: 2)
+    [mtx] *ERROR* Parhelia OS: Failed to allocate locked pages (nb: 2, type: 2)
+    ... then 801 pages (3.2 MB) for type 2 and type 1, and the same oops
+
+Two pages cannot fail for capacity on a box with 428 MB free, so the `type`
+argument is what is being refused, not the amount. `type` 1 and 2 both fail.
+The allocation is made against the PDEV's heap selector (`pdev->[0x4c]`, copied
+from the create request's field +0x48 by `mtx2839`), so the likely reading is
+that a *borrowed* PDEV does not carry whatever per-client heap state a real GL
+client establishes -- a real client allocates from the same PDEV successfully,
+which is what glxgears does throughout.
+
+That is where the replay now stops, and it is a state question rather than a
+resource one. Chasing free memory is a dead end.
+
+For the **open kernel driver this remains a specification point**: every
+device-buffer allocation must be failure-checked and must unwind. The vendor
+driver dereferences the NULL it just failed to allocate, which is reachable
+whenever the allocation is refused for any reason -- as here, where the reason
+was not scarcity at all.
