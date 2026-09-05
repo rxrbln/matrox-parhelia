@@ -151,4 +151,17 @@ With that node present the vendor OpenGL stack runs on this card:
     OpenGL renderer string: OpenGL Linux library for Parhelia
     OpenGL version string: 1.3 ICD v1.03
 
-which is the positive control the 3D work had been missing.
+which is the positive control the 3D work had been missing -- **but it is not
+safely usable.**
+
+**Running `glxgears` reboots the machine.** With the node present, X up and
+direct rendering active, `glxgears` took the box down: ssh dropped mid-command
+and it came back with `up 0 min`, X gone. So the vendor 3D path initialises far
+enough to report direct rendering and then crashes the machine on real geometry.
+
+That is consistent with the instability already recorded for the P690 elsewhere
+in this repository, and it means the obvious plan -- run the vendor stack under
+the tracer to capture a known-good draw and diff it against ours -- cannot be
+executed on this card as it stands. Either the capture has to survive a reboot
+(write the trace line-buffered to disk and reboot-loop), or the control has to
+move to the 0x0528, which is a different bus type and a different errata set.
