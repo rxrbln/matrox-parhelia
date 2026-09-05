@@ -142,19 +142,28 @@ ICD gives:
 | 0x0e | 8 | `[u16 unit][u16 index][u32 value]` | per-unit register list |
 | **0x12** | **0x10** | `x, y, w, h` (int32) | **SCISSOR** |
 | 0x15 | 0x24 | 9 dwords | CLEAR |
-| 0x19 | 0x20, 0x1a | 0x18 | |
+| 0x19 | 0x20 | | |
+| 0x1a | 0x18 | | |
 | 0x1b | 0x28 | 10 dwords | DRAW |
 | 0x1c | 0xc8 | | |
 | 0x20 | 0x44 | `[u32 slot][16 floats]` | matrix / VS constant |
-| 0x21 | 8 or 0x70 | | light / material |
-| 0x22 | 0x48, 0x23 | 0x10, 0x24 | 8, 0x25 | 0x14 | |
+| 0x21 | 8 / 0x70 | | light / material |
+| 0x22 | 0x48 | | |
+| 0x23 | 0x10 | | |
+| 0x24 | 8 | | |
+| **0x25** | **0x14** | `[u32 i][float a,b,c,d]` ×6 | **USER CLIP PLANES** (§7) |
 | **0x26** | **0x10** | `x, y, w, h` (int32) | **VIEWPORT** |
 | **0x27** | **8** | 2 floats | **DEPTH RANGE (scale, bias)** |
-| 0x35 | 0x10, 0x37 | 0x10 | |
+| 0x35 | 0x10 | | |
 | **0x36** | **8** | 2 floats | **eye-space near, far** (§5) |
+| 0x37 | 0x10 | | |
 | 0x41–0x43 | 8 | | |
-| 0x44 | 0x30, 0x48 | 0x18, 0x49 | 0x14, 0x50 | 0x20, 0x51 | 8 | |
-| 0x45 | 0x670, 0x46 | 0x678 | fragment-program upload |
+| 0x44 | 0x30 | | |
+| 0x45 / 0x46 | 0x670 / 0x678 | | fragment-program upload |
+| 0x48 | 0x18 | | |
+| 0x49 | 0x14 | | |
+| 0x50 | 0x20 | | |
+| 0x51 | 8 | | |
 
 Self-check against the capture's priming frame (`captures/glsweep-0528-raw.txt`,
 region 2 of `clear_color`): the stream frames exactly as
@@ -183,11 +192,26 @@ Three consequences, all of which retire "unresolved" entries elsewhere:
 **Two banks, two address spaces.** Bank A (opcode 0x0c) and bank B (opcode 0x05)
 are *not* the same register file: bank-A index `0x1C` is fog enable
 (capture-confirmed), while bank-B index `0x1C` is the back-face polygon mode
-(§10). `reg = 0x1000 + index*4` is CONFIRMED for the **DMA tag byte** namespace
+(§10).
+
+`reg = 0x1000 + index*4` is CONFIRMED for the **DMA tag byte** namespace
 (0x21 = end, 0x20 = pad → 0x1080, 0x24/0x25 → 0x1090/0x1094 fence, 0x2C →
-0x10B0 primitive, 0xCA/0xCB → 0x1328/0x132C scissor, 0xBD → 0x12F4) and is only
-**assumed** for bank A and bank B indices. Treat every "0x10xx/0x12xx" address
-in this document that comes from a bank index as INFERRED.
+0x10B0 primitive, 0xCA/0xCB → 0x1328/0x132C scissor, 0xBD → 0x12F4), and
+independently so by [WIN]: MTXPARD's register-packet decoder at
+`pard.asm:0x91840` unpacks the same stream and computes the offset literally —
+
+```
+918ed  and edi,0xff                ; index = low tag byte
+918f5  lea edi,[edi*4+0x1000]      ; offset = 0x1000 + index*4
+9192c  shr edx,0x8                 ; next tag byte
+```
+
+storing at `[regAperture + offset]` (`0x1b703`). Its `[opcode][count]` 8-byte
+record header matches the ICD's too.
+
+It is only **assumed** for bank A and bank B indices, which are the ICD's own
+shadow indices. Treat every "0x10xx/0x12xx" address in this document that comes
+from a bank index as INFERRED.
 
 ---
 
@@ -327,8 +351,7 @@ above.
 
 ---
 
-## 5. Bonus: the `(0x36, 1)` record is the eye-space near/far pair, not
-point/line size
+## 5. The `(0x36,1)` record is the eye-space near/far pair, not point/line size
 
 docs/parhelia-gl-feature-map.md guesses `(0x36,1)` = "line width + point size
 (1.0, 1.0)". It is not. Emitter `0x114ec3`; the payload is recovered **from the
@@ -701,12 +724,25 @@ read directly off the branches (CONFIRMED):
 | (reset path) | | | 1 | 0xf4348 |
 
 So **`glFrontFace` is folded into the 0x1058 value**: the register selects a
-*window-space winding* to discard, not a GL face. `2` and `3` are the two
-windings; which is clockwise is INFERRED (2 = discard clockwise fits the
-capture, where `glCullFace(GL_BACK)` with the default CCW front face gave 2).
-The capture's `glDisable(GL_CULL_FACE) → 1` and `glCullFace(GL_BACK) → 2` are
-both reproduced. `GL_FRONT_AND_BACK` is not separately encoded here and must be
-handled by dropping the primitive — UNRESOLVED, verify before relying on it.
+*window-space winding* to discard, not a GL face. The capture's
+`glDisable(GL_CULL_FACE) → 1` and `glCullFace(GL_BACK) → 2` are both reproduced.
+
+**The encoding is Direct3D's `D3DCULL`.** CONFIRMED by [WIN]: MTXPARD stores
+`D3DCULL_NONE / D3DCULL_CW / D3DCULL_CCW` = **1 / 2 / 3** verbatim, with no
+remap table (`pard.asm:0xadc9b`). So
+
+```
+0x1058 = 1  no culling
+       = 2  discard clockwise-wound triangles
+       = 3  discard counter-clockwise-wound triangles
+```
+
+which is exactly consistent with the table above — `glCullFace(GL_BACK)` with
+the default `GL_CCW` front face means "discard the clockwise ones" → 2. The
+Linux ICD is computing a D3D-shaped cull mode from the GL pair.
+
+`GL_FRONT_AND_BACK` is not separately encoded here and must be handled by
+dropping the primitive — UNRESOLVED, verify before relying on it.
 
 Note the surprising row: with culling **off** but different front/back polygon
 modes, the ICD still programs `0x1058 = 2`, and swaps which face's mode goes to
@@ -729,9 +765,18 @@ its consumer was not located. UNRESOLVED.
 | back | bank B (0x05) | 0x1C | same enum, or **0x7fffffff = none** |
 
 Emitters `0x112237` (front) and `0x1122a1` (back). CONFIRMED, including the
-capture's `GL_LINE → 2` / `GL_FILL → 3`. The `0x7fffffff` sentinel is written to
-the back register whenever culling is enabled (`0x11216b` presets it), i.e.
-"there is no back face to rasterise". CONFIRMED.
+capture's `GL_LINE → 2` / `GL_FILL → 3`. Like the cull mode, this is the
+Direct3D enum: [WIN] stores `D3DFILL_POINT / _WIREFRAME / _SOLID` = 1 / 2 / 3
+verbatim (`pard.asm:0xadc11`). CONFIRMED.
+
+The `0x7fffffff` sentinel is written to the back register whenever culling is
+enabled (`0x11216b` presets it), i.e. "there is no back face to rasterise".
+CONFIRMED in the ICD — but note it is **Linux-ICD-specific**: MTXPARD packs fill
+and cull into 2-bit fields of one dword (`ctx+0x1f3c`, fill bits 4–5, cull bits
+8–9) and `0x7fffffff` appears nowhere in its 3D state code. Since MTXPARD's
+`ctx+0x1f3c` is a driver-side shadow that is never seen as a register write in
+that binary, the two are not necessarily in conflict, but the sentinel is only
+attested from one source.
 
 Because the two faces have independent registers, differing modes do **not**
 force a software fallback by themselves — but the ICD does have
@@ -782,9 +827,18 @@ available / (1) Enables Hardware PolygonOffset", default TRUE) — and **the
 driver does no scaling at all**: `factor` and `units` are copied through as the
 application gave them, so the implementation-dependent `r` (the smallest
 resolvable depth difference, `1/2^24` for a 24-bit buffer) and the
-maximum-depth-slope term `m` are both computed in silicon. No `5.96e-8`
-constant or equivalent exists anywhere on this path. CONFIRMED by absence over
-the whole emission chain.
+maximum-depth-slope term `m` are both computed in silicon. CONFIRMED by absence
+over the whole emission chain, and corroborated by [WIN]: MTXPARD keeps
+`D3DRS_DEPTHBIAS` (`ctx+0x2104`) and `D3DRS_SLOPESCALEDEPTHBIAS`
+(`ctx+0x2100`) as **raw float bits** (`0xadd55`, `0xadd8a`), maps the legacy
+`D3DRS_ZBIAS` into both (`0xadcec`, slope-scale = `zbias * 0.25f`), and never
+computes `factor × max-depth-slope` either.
+
+The one place `1/2^24` (`0x33800000`) *is* used as a number is
+`libGL64.asm:0xe78f0`, in the ICD's own CPU path — i.e. the software offset
+applied when `glPolygonMode` decomposed a polygon into points or lines and the
+corresponding `GL_POLYGON_OFFSET_POINT` / `_LINE` enable is set. CONFIRMED
+(it is referenced by no instruction at all in MTXPARD).
 
 The coupling with the depth range is deliberate: when dirty bit 2 (polygon
 offset) is set, the generic depth-range emission at `0x1118b1`/`0x112833` is
@@ -801,21 +855,33 @@ base with one capture (§14).
 
 ### Fill rules and subpixel precision
 
-**The raster grid is 1/16 pixel.** The ICD's snap helper `0xea420` is
+**Important scope caveat first:** everything in this subsection lives inside the
+ICD's *software* primitive block (`0xea000`–`0xeb000`), next to
+`GLPrimitiveSoftwareClipDispatch::ValidateState` and the CPU window-space
+transform, and **MTXPARD contains no equivalent** — no `x*16+0.5` snap, no
+odd/even point rule, no half-pixel bias anywhere in its 3D path. So these are
+almost certainly rules the ICD applies to **CPU-generated window-space
+vertices** (wide lines, sized points, software-clipped primitives) and not
+something the hardware setup engine needs from object-space vertices.
+[INFERRED] — the callers of `0xea420` were not traced. An open driver should
+not pre-snap coordinates on the hardware path on this evidence alone.
+
+**The CPU raster grid is 1/16 pixel.** The snap helper `0xea420` is
 
 ```
 snap(f) = floorf(f * 16.0f + 0.5f) * 0.0625f
 ```
 
 with `16.0f` at `.rodata:0x36acf8` and `0.0625f` at `0x36acfc` — four subpixel
-bits. CONFIRMED. `0.03125f` (half a subpixel, `0x36ad08`) is used alongside it.
+bits. CONFIRMED as the code. `0.03125f` (half a subpixel, `0x36ad08`) is used
+alongside it.
 
 **The tie-break bias is `0.5f + 1 ulp`.** `.rodata:0x36ad00 = 0x3f000011 =
 0.5000010132789612`, added to the window x after the viewport transform at
 `0xea4f2`. A half-pixel offset deliberately perturbed by one ulp is the standard
 way to make an exactly-on-boundary sample fall consistently to one side, i.e.
-the driver's fill-rule tie-break. CONFIRMED as the constant and its use;
-INFERRED as to which edges it favours.
+a fill-rule tie-break. CONFIRMED as the constant and its use; INFERRED as to
+which edges it favours.
 
 **Point centring parity.** `0xea4a3`: `size_i = (int)(pointSize + 0.5f)`, then
 `test al,1` — odd and even rounded point sizes take different centring paths, the
@@ -833,8 +899,12 @@ thought to carry them is the near/far pair (§5). What exists is:
   `0xa6` (→0x1298) = point size max (`0x114302`, `0x1143a1`, `0x1143ea`), with
   `max = max(pointMax, pointMin)` computed first, and for antialiased points an
   extra clamp to `[0.25, 10.0]` (`.rodata 0x36bc88`, `0x36bc8c`). CONFIRMED as
-  the emission; whether the hardware actually rasterises sized points, or these
-  only feed the point-parameter (attenuation) computation, is UNRESOLVED.
+  the emission. **The hardware does rasterise sized points**: [WIN] keeps
+  `POINTSIZE` / `POINTSIZE_MIN` / `POINTSIZE_MAX` / `POINTSCALE_A,B,C` at
+  `ctx+0x20e8..0x20fc` and `POINTSPRITEENABLE` / `POINTSCALEENABLE` as bits 8/9
+  of `ctx+0x1f38` (`0xae0d9`–`0xae15f`) as pure hardware state and does **no**
+  CPU point expansion at all. So the Linux ICD's "any size ≠ 1.0 → CPU
+  renderer" is a **driver policy choice, not a hardware limit**. CONFIRMED.
 * bank-A `0x9e/0x9f/0xa0` = `GL_POINT_DISTANCE_ATTENUATION` `(a,b,c)` each times
   the viewport height squared (§3).
 
@@ -908,6 +978,10 @@ viewport transform on the CPU first (`0xe77e0`, §3).
 | parhelia-gl-feature-map.md §5 item 9 | "0x10d8 is not part of a contiguous stencil block" | It is stencil; the two-float payload was the `(0x36,1)` record in the opcode namespace (§1) |
 | parhelia-gl-feature-map.md §2 | region 2 is "pairs plus block opcodes", first two dwords lost | It is a uniform `[opcode][count][count×elemsize]` stream; the "lost" dwords are just the first record's header (§1) |
 | parhelia-command-construction.md §"Scissor" | `[2][0x2121a1a0]…` "confirms the documented guard-band scissor encoding" | It confirms a colour-constant write (§0) |
+| parhelia-gl-driver.md §"Rasterizer state" | "polygon offset (depth bias in triangle setup)" is software-handled with no register | Polygon offset is a hardware feature: five bank-B registers, factor/units unscaled (§10) |
+| parhelia-gl-driver.md §"Rasterizer state" | "glDepthRange + viewport scale/bias are CPU-applied … no dedicated engine registers" | Both are hardware; a viewport rect record and a z scale/bias record (§3, §4) |
+| parhelia-3d-state-complete.md §3 | guard band `0x12f4` = 31.0/15.0/32.0 "distinct from the ±1024 clip clamp" | Correct about 0x12F4, and now confirmed in the Linux kernel core too; the ±1024 clamp is not a clip clamp at all (§0, §6) |
+| parhelia-accel.md | "Depth range (fed to shader consts) 0x1268/0x126C/0x1298" | 0x1268/0x126C/0x1298 are point size / point size min / point size max; depth range is record `(0x27,1)` (§3, §4, §11) |
 
 ---
 
@@ -933,16 +1007,65 @@ Minimum, in submission order, for correct clipping and raster setup:
    `glFrontFace` folded in).
 7. **Polygon mode** — bank-A index 0x08 for the front face, bank-B index 0x1C
    for the back, `1/2/3` = point/line/fill and `0x7fffffff` = none.
-8. **Points and lines** — hardware for width/size that round to 1; CPU expansion
-   above that, submitting window-space vertices.
-9. **Fill rule** — snap to 1/16 pixel, bias by `0.5f + 1 ulp`.
+8. **Polygon offset** — send `factor` and `units` as raw floats plus the three
+   enable flags, and re-send the depth range with them; do no scaling.
+9. **User clip planes** — six, in **eye space**
+   (`(M_modelview^-1)^T · plane`), uploaded as six `{index, a, b, c, d}`
+   entries plus a 6-bit enable mask. On a first driver, clipping them on the
+   CPU (as the ICD's own `0xe9a00` pass does) is a legitimate shortcut.
+10. **Points and lines** — hardware for width/size that round to 1; CPU
+    expansion above that, submitting window-space vertices, `N = round(width)`
+    parallel lines at offsets `0, ±1, … , −(N/2)`.
+11. **Fill rule** — snap to 1/16 pixel, bias by `0.5f + 1 ulp`.
 
-Everything above except items 5 and the exact 0x1328/0x132C ordering is
-reachable with the record/DMA formats already documented in
+Everything above except item 5, the exact 0x1328/0x132C ordering and the bank-B
+base is reachable with the record/DMA formats already documented in
 docs/parhelia-command-construction.md.
+
+A minimal but correct first driver can go further and simply set the scissor to
+the drawable, `gx = gy = gz = 1.0` (no guard band), and clip every primitive on
+the CPU against `0 ≤ {x,y,z} ≤ w` plus the user planes — the ICD contains a
+complete implementation of exactly that and falls back to it whenever the
+hardware cannot express the state.
 
 ---
 
 ## 14. Open items and the experiments that would close them
 
-*(pending)*
+1. **Which of 0x1328 / 0x132C is the min corner.** [KMOD] and [WIN] disagree,
+   and both write it with clipping disabled, so neither settles it.
+   *Experiment:* under X, call `ParhlXAASetClippingRectangle` (or run any XAA
+   op with a clip) and read back 0x1328/0x132C; or `glScissor` a small box and
+   dump both registers.
+2. **The base of register bank B.** Bank A is `0x1000 + index*4` for every index
+   the capture pins by GL semantics; bank B's base is unknown, and its indices
+   collide with bank A's (index 0x1C is fog enable in bank A and the back-face
+   polygon mode in bank B). *Experiment:* `glPolygonOffset(3.0f, 7.0f)` writes
+   two raw floats to bank-B indices 0x15 and 0x16 — two unmistakable bit
+   patterns; mmiotrace the draw and find where `0x40400000` and `0x40e00000`
+   land. That pins the base with one run and simultaneously confirms the
+   polygon-offset registers.
+3. **Guard-band pixel extents.** The formula `g = (guardExtent − origin)/viewport`
+   is CONFIRMED but the numerator comes from a virtual device-caps call
+   (singleton `*[0x65cd78]`, vtable slot +0x48) that was not located. Do not
+   assume ±2048. *Experiment:* set a small viewport, draw a triangle far
+   outside it, and bisect the coordinate at which the driver switches from
+   trivial-accept to CPU clipping.
+4. **What register 0x12F4 actually means.** The values (32/16, programmed as
+   31/15) and the dependence on the active texture-stage count are CONFIRMED in
+   two binaries; the unit is not.
+5. **`w ≤ 0` and near-plane behaviour in silicon.** The ICD always computes
+   outcode bits 0 and 1 and rejects on them, and `gz` is pinned to 1.0, so the
+   vendor stack never asks the hardware to survive a negative `w`. Assume it
+   cannot.
+6. **The consumer of record 0x25 (clip planes) and bank-A index 0x98 (the
+   6-bit enable mask).** Both are ICD→kernel tokens; the kernel-side translation
+   into WARP microcode or registers was not traced.
+7. **`GL_FRONT_AND_BACK` culling.** Not distinctly encoded in the 0x1058 value;
+   presumably the primitive is dropped earlier. Verify before relying on it.
+8. **`CullNoneMode`** (registry switch, default 1) — its consumer was not found.
+9. **The `0x12C0`–`0x12D4`, `0x12E4`, `0x12E8`, `0x1324` limit constants** the
+   kernel programs next to the scissor and guard band (§6). Values known,
+   meanings not.
+10. **`GLVSClipPlaneDesc`'s parameter kind `0x87c2`** (`0x1696b0`) — the
+    binding slot user clip planes occupy in a WARP vertex program.

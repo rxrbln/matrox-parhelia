@@ -39,9 +39,10 @@ values in the live capture and for their vertex strides, exactly.
 `{key, 0, 0, ffffffff, ffffffff, ffffffff}`. Both halves of the stack agree on
 that shape [CONFIRMED]:
 
-* ICD: emitted by `reserve(buf, opcode=0x07, elemsize=0x18, count=1)` — two emit
-  sites, `libGL64 0xc5113` (fixed-function path) and `0xf3461`
-  (`GLPrimitiveSoftware` path). Both copy six dwords from a cached struct.
+* ICD: emitted by `reserve(buf, opcode=0x07, elemsize=0x18, count=1)` — three
+  emit sites, `libGL64 0xc5113` and `0xc76b8` (fixed-function paths) and
+  `0xf3461` (`GLPrimitiveSoftware` path). All three copy six dwords from a
+  cached struct, which is the only place the key ever comes from.
 * Kernel: command-list opcode 0x07 → handler `.text+0x45d02` → `mtx651`
   (`0x471c0`) → **`mtx1763` (`0x1b8d0`)**, which copies exactly **24 bytes**
   into the device state block at `+0x1e04` and sets dirty bit 0x20 in the byte
@@ -88,6 +89,16 @@ The four texture-stage shifts **{16, 19, 22, 25}** are not inferred — they are
 read from literal tables in `.rodata`: `0x36ada0` (used by the software builder,
 `0xf31a5` and `0xf3895`) and `0x369830` (used by the fixed-function builder,
 `0xc4112`). Both contain `16, 19, 22, 25` [CONFIRMED].
+
+The fixed-function builder reads its inputs from a small byte array of
+"requested attributes" at `ctx+0xa530`, which is where a future pass should look
+to name the remaining fields: `+0xa530 & 3` → position code (`0xc3f88`),
+`+0xa53a` → normal (`0xc3fc9`), `+0xa538`/`+0xa539` → colour (`0xc4011`,
+`0xc4020`), `+0xa531` bit 2 and bit 7 → secondary-colour selectors (`0xc4062`,
+`0xc40b6`), `+0xa540` → the bits[30:29] selector (`0xc40d1`), `+0xa534` → a
+6-bit-per-stage texture word read with the shift table `0x369840 = {0,6,12,18}`
+(`0xc4140`). In the software builder the bit-28 attribute comes from
+`obj+0x2688` (`0xf3208`, and the matching per-vertex store at `0xf381d`).
 
 Field values [3:2], [6:4] and [10:8] are *codes*, not component counts — the
 builder ORs in a constant per case (`|1`, `|5`, `|0x12`, …) and later uses the
@@ -232,6 +243,27 @@ Left: every `reserve()` call site in the ICD (279 of them), grouped by
 | 0x50 | 0x20 | 1 | `mtx3996` | |
 | 0x51 | 8 | 1 | `mtx4017` | |
 
+**Opcodes 0x45 and 0x46 are the same program object, defined two ways**
+[CONFIRMED]: both carry a **0x664-byte** blob (the fragment/shader program
+object of `docs/parhelia-fragment-isa.md`). `0x45` (`libGL64 0x1137d4`) is
+`memcpy(payload, blob, 0x664)` with no header — elemsize 0x670 is the padded
+size. `0x46` (`0x113a34`, and four more sites) prepends an 8-byte header holding
+a **program id taken from an incrementing counter** at `[[ctx+0x20]+0x7c00]+0x68`
+(`0x113a5b`: `id = ++counter`), then the same 0x664 bytes — elemsize 0x678. That
+is the `{0x46, 1, program_id, 0}` header the capture found with `program id = 3`,
+and it explains why `tex_env_modulate` uploaded nothing: the id is only minted
+when a *new* program object is created, so a cache hit re-selects an existing id
+through the program-select write instead.
+
+The two texture-stage banks are sized by the ICD's own reset routine
+(`libGL64 0x10a812`–`0x10aaa6`), which emits opcode 0x0e with `count = 0x70` as
+**4 stages × 28 states** (`group = 0..3`, `sub = 0..0x1c`, stage struct stride
+0x80 at `ctx+0x400`), and opcode 0x06 with `count = 0x24` as **4 stages × 9
+states** (`0x10acb9`–`0x10ad95`, stage stride 0x28). So the kernel's `group ≤
+10` is a generous validity bound, not evidence of more than four stages — 4
+agrees with `GL_MAX_TEXTURE_UNITS_ARB` and with D3D `MaxTextureBlendStages`
+[CONFIRMED].
+
 Corrections this makes to `docs/parhelia-gl-feature-map.md` §2:
 
 * the light/material element is **0x70 = 28 dwords**, not 30;
@@ -264,6 +296,19 @@ handlers say otherwise [CONFIRMED]:
   `ctx+0xa74`, both ≤ 10 — D3D-style texture-stage state.
 * **op 0x0e** → inline (`0x459dc`): `(group ≤ 10, sub, value)` into 130-byte
   per-stage structs at `ctx+0xdd7 + group*130`.
+
+**Worked example — the depth group.** The live capture maps
+`glEnable(GL_DEPTH_TEST)` to index 0x07, `glDepthMask` to 0x0e and
+`glDepthFunc` to 0x17 in bank 0x0c. In `mtx2617`'s table those three land on
+`0x19bbe`, `0x19c8d` and `0x19dc0` — and all three **set the same dirty bit 0x4
+in `ctx+0xc87`** while writing three adjacent fields: `ctx+0xc9b` (dword,
+enable), `ctx+0xc9f` (**byte**, write mask) and `ctx+0xca0` (dword, function)
+[CONFIRMED]. The GL semantics the capture established are exactly right; what
+they name is a driver state group, and the field widths (a byte for the mask, a
+dword for the enum) are not the uniform 32-bit registers the
+`0x1000 + index*4` model implies. Indices that need no immediate side effect —
+0x00, 0x04, 0x0b and 0x1e–0x21 among them — dispatch to the shared no-op stub
+at `0x199b0`, which only updates the shadow.
 
 Nothing in any of these paths touches MMIO. The register programming is a
 *second* pass in the kernel — `mtx3712` (`0x188f0`) walks the dirty words
@@ -473,6 +518,12 @@ those really are hardware limits, not conservative declarations.
 | 9 | fog listed as CPU-side in `docs/parhelia-gl-driver.md` | `RasterCaps` 0x07F309A7 sets **FOGVERTEX, FOGTABLE, FOGRANGE, WFOG, ZFOG**, plus **SCISSORTEST, DEPTHBIAS, SLOPESCALEDEPTHBIAS, ANISOTROPY** (`0x1d1ee4`) | Fog, scissor and polygon offset are hardware. The live capture already shows fog enable and fog mode as emitted state, so the old "software fog / software polygon offset" note is wrong. |
 | 10 | `GL_ARB_multisample` advertised, `GL_SAMPLES` read from the drawable | multisample word rewritten per format at `0x86f90` from the `AAMode` registry setting: `0x0009`, `0x8001` or 0 | FAA is a driver/mode option, not a fixed cap. |
 
+Two more D3D scalars with no GL counterpart, worth having: **`MaxTextureRepeat`
+= 255** (`.data 0x1d1e24`) — the texture-coordinate wrap range, which bounds how
+far a `GL_REPEAT` coordinate may run before the addresser loses precision — and
+**`MaxVertexW` = 0.0f** (`.data 0x1d1e58`), i.e. the driver declares no
+w-range limit. `MaxTextureAspectRatio` is 2048, so 1×2048 textures are legal.
+
 Two D3D declarations worth recording for a modeset/2D driver as well:
 `dwDeviceRenderBitDepth` = 0x500 (16 and 32 bpp only) and
 `dwDeviceZBufferBitDepth` = 0x400 (16 bpp) in the legacy DX7 desc, versus the
@@ -633,7 +684,8 @@ that walks them and programs the hardware.
 Only seven call sites reach the flush `0x1c9be0` [CONFIRMED]:
 `0x1c9d13` (reserve found the buffer full), `0x1c9d7c`, `0x1c9f06` (buffer
 helpers), `0x1b21c6` and `0x1b2406` (vertex-heap helpers), `0x1ba5a2`, and
-`0x35897e`. So a submission happens on **buffer exhaustion** or an explicit
+`0x35897e` (an explicit end-of-frame path in the GLX layer, which first calls
+the device's `vtbl[0xa8]`). So a submission happens on **buffer exhaustion** or an explicit
 end-of-frame/finish, not per draw. That matches the capture, where each
 `glFinish` produced exactly one submission and `region0+0x230` held the whole
 stream length.

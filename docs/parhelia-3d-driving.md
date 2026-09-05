@@ -81,8 +81,8 @@ not. Re-capture on an AGP board before claiming AGP support.
 > (`captures/mmio-draw-0528.txt`) shows the draw submitted through the DMA ring,
 > and the captured command buffer (`captures/cmdbuf-draw-0528-decoded.txt`) is a
 > flat stream of **(register-index, value) dword pairs** that initialises the
-> whole attribute file `0x1100–0x117c = 0xffffffff` and sets a viewport scale
-> `0x1298 = 0x45000000` (2048.0f). Vertices carry **`[x, y, r, g, b]`**, stride 20
+> whole attribute file `0x1100–0x117c = 0xffffffff` and sets `0x1298 = 0x45000000` (2048.0f — GL_POINT_SIZE_MAX,
+> not a viewport scale as first read). Vertices carry **`[x, y, r, g, b]`**, stride 20
 > bytes (z/w are pipeline constants). Prefer the captured sequence; treat this
 > section as background on the register meanings.
 
