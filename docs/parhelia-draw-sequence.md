@@ -602,3 +602,60 @@ Either they are write-only — plausible for a bind FIFO — or the bind genuine
 is not landing. Nothing available distinguishes those two, and that is the next
 thing to settle: without it there is no way to tell a failed bind from an
 unreadable one.
+
+
+## GROUND TRUTH: a working ioquake3 draw on the P690 (2026-09-05)
+
+ioquake3 runs on this card with the vendor ICD, and `mtxtrace` captured 349 MB
+of a live GL session: all **7 regions** mapped, 27 ioctls, 1383 doorbells.
+Extract kept at `captures/ioq3-p690-working-draw.txt`.
+
+### The draw packet IS inline in the command ring
+
+Region `0x8993000` (the 672 KB command ring), first submit, verbatim:
+
+    D 000000 8f000001     DRAW header
+    . 000004 00000000     first = 0
+    D 000008 00000004     count = 4
+    D 00000c 00000002     register-list header, 2 registers
+    D 000010 21212425     tag: indices 0x25, 0x24, then 0x21 0x21 terminate
+    D 000014 00000002     0x1094 = fence value, increments per draw
+    D 000018 1a9bc000     0x1090 = fence address (a mapped region)
+
+**This retracts two things.** The claim that the `0x8f` packet must live in a
+second-level buffer entered via `0x10a0`/`0x10a4` is **wrong** — it is inline in
+the level-1 ring, immediately followed by its fence register-write packet. And
+the payload is `first, count`, **not** `first, last`; the ambiguity in
+`parhelia-command-construction.md` is resolved in favour of count.
+
+Each ring submit occupies a fresh 8 KB stride (`0x0`, `0x2000`, `0x4000`, ...)
+and contains **only** the draw and its fence — 24 bytes changed.
+
+### 3D state does NOT go through the ring — it goes through the record stream
+
+Region `0x788000` (136 KB) carries the state, as `(slot, value)` dword pairs:
+
+    D 000000 00000051     count = 0x51 pairs
+    . 000004 00000001
+    D 000008 00000002     key = 2
+    . 00000c 00000000
+    D 000010 0000000c / 0000006c      slot 0x0c = 0x6c
+    D 000018 00000007 / 00000000      slot 0x07 = 0
+    D 000020 00000008 / 00000003      slot 0x08 = 3   (polygon mode = fill)
+    D 000028 00000009 / 00000002
+    D 000030 0000000a / 0001ffff
+    ...
+    D 0000c8 00000025 / 3f800000      slot 0x25 = 1.0f
+
+**This is the structural reason our from-scratch WARP draw does nothing.** The
+tool writes hardware registers directly into the DMA ring. That is sufficient
+for 2D — the solid fill draws 120000 pixels that way — but the vendor never
+programs 3D state that way. It sends **state slots** into the record stream and
+the kernel translates them into the register writes and opcode-0x41 block loads
+the engine actually needs. Bypassing that skips whatever the translation does,
+which `parhelia-state-slot-map.md` already showed is not a simple
+`reg = 0x1000 + slot*4` mapping but a shadow structure combined across slots.
+
+So the correct shape for a from-scratch 3D driver is either to reproduce the
+kernel's slot translation faithfully, or to drive the slot interface and let the
+kernel do it. Emitting registers into the ring and hoping is neither.
