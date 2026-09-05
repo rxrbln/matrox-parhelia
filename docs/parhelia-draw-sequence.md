@@ -704,7 +704,7 @@ A working GL context sets it to the value the limits doc predicts.
   The vendor writes zeros there.
 
 
-## SOLVED: the region-2 record grammar
+## The region-2 record grammar -- RETRACTED, see the correction below
 
 Derived from the working ioquake3 capture and validated by exact consumption --
 five records account for all 857 dwords of the state submit with every boundary
@@ -782,3 +782,51 @@ answers there; replaying the recorded bytes reproduces the question and the
 stale answer, but never asks the kernel to allocate. A replay has to *perform*
 that handshake -- write the request, ring the doorbell, then read the cookie the
 kernel publishes -- rather than replaying both sides of it.
+
+
+## CORRECTION: the record grammar above is wrong
+
+The grammar was declared solved on the strength of one capture, where five
+records consumed all 857 dwords with every boundary landing on a valid header.
+A second capture falsifies it.
+
+glxgears on the 0x0528, state submit of 3908 bytes, header:
+
+    0000000d 00000001 00000002 00000000
+
+and then **66 consecutive well-formed `(slot, value)` pairs** -- an unmistakable
+run including `0x40..0x5b` all set to `0xffffffff` -- while the header's first
+field says **13**. The count field is therefore **not** the pair count.
+
+The exact-consumption check that seemed to validate the grammar is weaker than
+it looked: with a loose "is this a plausible header" test, a walk can consume a
+stream exactly by chance and still be wrong at every boundary. Applied to
+glxgears the same walk yields impossible slots (`0xcccd`, instance 15948) while
+still consuming the stream.
+
+**What survives:**
+
+* `(slot, value)` dword pairs are real and directly readable -- the
+  `0x40..0x5b = 0xffffffff` run leaves no doubt.
+* Records begin with a 4-dword header containing a key field.
+* Some records carry an array index in the upper half of the slot word.
+
+**What does not:** the meaning of the header's first field, and therefore where
+one record ends and the next begins. That is still open, and it is what a
+from-scratch driver needs in order to emit a stream the kernel will accept.
+
+### Two findings from the glxgears capture
+
+**`0xa6` is confirmed a third time.** It reads `45000000` = **2048.0f** here and
+`45800000` = **4096.0f** in the ioquake3 capture -- exactly the two values the
+limits documentation gives for `GL_POINT_SIZE_MAX` (4096 default, 2048 as
+declared). Two different applications, both landing on documented values for
+that reading, from live contexts.
+
+**Slots `0x40..0x5b` = `0xffffffff` in glxgears, but `0` in ioquake3.** This is
+the slot-level form of the `0x1100-0x117c = 0xffffffff` "attribute file init"
+that `parhelia-3d-state-complete.md` recommended and that was retracted here as
+a *register* claim. The retraction of the register addresses stands, but the
+pattern itself is real at slot level and is **application-dependent** -- so
+neither "always write 0xffffffff" nor "the vendor writes zeros there" is correct
+as a general statement. Ours earlier said the latter, on one capture.
