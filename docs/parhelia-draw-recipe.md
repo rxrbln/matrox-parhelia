@@ -1533,3 +1533,47 @@ and the region-2 indices are GL state slots rather than MMIO register offsets.
 This recipe, the render-target pass and the fragment-operations pass reached
 that conclusion separately, and a mechanical re-walk of a capture consumes a
 stream exactly under that grammar.
+
+## Hardware attempt, 2026-09-05 — microcode correct, still no triangle  [HW]
+
+First run with the **seven real WARP programs** loaded instead of the mtx2785
+self-test (tools/warp_programs.h, extracted by symbol).
+
+**What now works, verified on a live 0x0528:**
+
+```
+mtx3605 gates: idle=1 908=1 924=1 busy0=1  (0x908=63af8041 0x924=00200100)
+  ... all seven streamed to 0x91c ...
+loaded 7 WARP programs, 2664 bytes (222 instructions)
+```
+
+Every gate passes, all seven programs stream cleanly at consecutive offsets, the
+byte and instruction counts match the RE'd figures exactly, no kernel errors, X
+survives. The `--physbuf` path was wired into the ring submitter so the
+pushbuffer can live in VRAM — this removes the dependency on our `dma32buf`
+module, which cannot be built on the test box because its kernel build tree is a
+dangling symlink.
+
+**What still does not work:** the draw submits without faulting and rasterises
+**nothing**. `VRAM non-bg px = 0`.
+
+**A false positive to be aware of:** the broad full-VRAM scan reported "3077
+R/G/B px, first byte 0xec00c8". That address is `0xec0000`, the **cursor
+aperture** documented in docs/parhelia-cursor-capture.md — it is the hardware
+cursor image, not a triangle. Any future scan must exclude it.
+
+**Why it almost certainly still fails**, given what the RE now says:
+
+1. **Program binding is not implemented.** Loading the images is only half the
+   job. The engine keeps an 18-entry program table and a draw binds *several*
+   programs at once by entry point (`prog[0x0c]`), chosen from state. Nothing in
+   the tool tells the WARP which entry point to run, so a loaded program is
+   never invoked. See docs/parhelia-vertex-pipeline.md.
+2. **State goes through the block-load path, not raw register writes.** Raster
+   state reaches the hardware as a computed 16-byte block entry shipped by an
+   opcode-0x41 block-load packet, not as the individual register writes the tool
+   emits. See docs/parhelia-state-slot-map.md.
+
+Both are now understood well enough to implement; neither was implemented at the
+time of this run. The value of the run is that it isolates the remaining gap to
+those two items and confirms the microcode half is correct.
