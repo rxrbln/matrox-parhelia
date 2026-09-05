@@ -34,9 +34,41 @@ MtxEscape.dll `virtual displacement map'
 MTXPARD.dll   VertexShader, VertexShaderOptions
 ```
 
+## CORRECTION (same day): the vertex-shader implementation IS in the Linux ICD
+
+The string search above was accurate but the conclusion drawn from it was wrong.
+Searching for the *extension string* found nothing, and that was taken to mean
+the capability was absent. It is not — the **whole implementation is compiled
+in and deliberately disabled**:
+
+| Symbol in the Linux 64-bit ICD | Count |
+|---|---|
+| `GLVSInstruction*` classes (Add, Clamp, Cross, Dot, …) | **32** |
+| `GLPrimitiveHardwareVS` (a third, hardware-VS pipeline) | 1 |
+| `GLSendStateHardwareTnLVS` | 1 |
+| `GLStateInsideVSBegin` | 1 |
+| `GL_EXT_vertex_shader` **advertised as an extension string** | **0** |
+
+So the ICD ships a vertex-shader compiler, ~30 instruction classes, the state
+recorder and a complete third pipeline — and then never lets you reach them.
+The gate is one byte: every writer of the enable flag stores **zero**, including
+the `glEnable`/`glDisable` cases for `GL_VERTEX_SHADER_EXT`, so the flag the
+pipeline selector tests can never become set. `GL_FRAGMENT_SHADER_MTX`, by
+contrast, writes 1/0 correctly. The hardware-VS pipeline also emits a distinct
+mode register that the other two pipelines write as 0, and submits geometry with
+its own opcode.
+
+**What this means:** programmable vertex shading is not a Windows-only hardware
+feature. It is present in the Linux stack, wired up, and switched off. An open
+driver does not need to invent this path — it needs to *not* disable it, and it
+has the WARP instruction encoding to generate programs for it.
+
+Displacement mapping remains Windows-only on the evidence above.
+
 ## Conclusions
 
-**Programmable vertex shading: Windows only.** The Linux ICD has no vertex
+**Programmable vertex shading: present on Linux but fenced off** (see the
+correction above; the original reading below was wrong). The Linux ICD has no vertex
 program or vertex shader extension of any kind. This is independently
 corroborated by our own RE of the vertex pipeline: program selection there is
 driven purely by fixed-function state — light count and type, texgen mode, fog,
