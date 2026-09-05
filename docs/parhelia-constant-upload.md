@@ -74,3 +74,48 @@ the four single-triangle captures contains a key `0x43` record — the fixed
 function path uploads its constants some other way, or they are already resident
 from device init. Establishing which would say whether an open driver needs this
 path at all for a first triangle.
+
+## The matrix path — key 0x20, fully decoded
+
+The cross-check above turned out to be the important part: none of the four
+single-triangle captures contains a key `0x43` record, but every one contains a
+key **`0x20`** — matrices. That is how the fixed-function path gets its
+transform to the hardware, and it is not a block load either.
+
+`mtx558` table entry 0x20 (`.text+0x458cb`), per item:
+
+```c
+type = item[0];                            /* item is {u32 type; float m[16]} */
+if ((type - 0x100) <= 0x1f) {              /* the WARP matrix slots */
+    slot = type - 0x100;                   /* 32 slots */
+    dst  = HW + 0x1ef8 + (slot + 2) * 64;  /* 64 bytes per slot */
+    LocMemCpy(dst, &item[1], 0x40);        /* 16 floats, verbatim */
+    HW[0x1bf4] |= 1 << slot;               /* per-slot dirty bit */
+}
+```
+
+`HW[0x1bf4]` is one of the five dirty words `mtx1008` resets, which ties the
+matrices into the same flush machinery as the constants.
+
+So **both** kinds of WARP state — constants via key `0x43` and matrices via key
+`0x20` — land in kernel-side shadows with per-slot dirty bits, and a later stage
+moves them to hardware. Neither travels as a `0x41` block-load packet, and the
+only `0x41` in the object is the self-test.
+
+### What this means for the open driver
+
+The block-load format recorded in `parhelia-block-state-map.md` and used by
+`tools/parhelia-3dtri.c` has no counterpart in the vendor kernel. A userspace
+driver that owns the ring has to reproduce whatever the flush stage emits, and
+that emitter is the one piece of this chain still not identified — `mtx610`
+packs dirty vec4s into a staging buffer with `LocMemCpy` and the buffer's
+consumer has not been traced.
+
+Two facts make that tractable:
+
+* the matrix shadow is at a **fixed offset**, `HW + 0x1ef8 + (slot+2)*64`, so a
+  live capture with `MTXTRACE_BUFS=1` around a matrix change will show the
+  bytes moving;
+* the six-group, stride-`0x40` structure of `mtx610` matches the block file's
+  384 entries exactly, so whatever the flush emits is organised by those same
+  six groups.
