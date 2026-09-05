@@ -575,3 +575,52 @@ restarting X, took the box down again.
 - **Always run line-buffered** (`stdbuf -oL`). An earlier attempt produced an
   empty log because stdout was still buffered when the timeout killed it, which
   wasted a cycle diagnosing the wrong thing.
+
+## Attempt 5 — our own program runs on the hardware  [HW]
+
+First run in which everything up to the draw succeeded:
+
+```
+engine idle check: 0x8f0=00020000 (idle 1)      <- verified before starting
+bound WARP entry = 0x0
+uploaded identity transform at 0x000..0x003
+uploaded viewport constants 0x160/0x161
+gen-transform: streamed 15 dwords to 0x91c      <- OUR program, on the hardware
+loaded OUR transform: 15 dwords (5 instructions) at index 0
+```
+
+Before this run the generator was corrected against the spec rather than by
+trial. Decoding the vendor's transform showed the **port-B write mask lives in
+`w0[13:10]`** and steps 8/4/2/1 across the four instructions — one clip-space
+component each. Our generator had held a constant template, so all four
+instructions wrote `b3.w`. With that fixed, and with `f0bc` and `w2[31]` set to
+the values every vendor dp4 carries rather than left zero on a guess, all four
+generated instructions match the vendor's field for field:
+
+```
+1874e23f 28022303 bb9a21a2   MATCH
+1084d24f 28022303 bb9a21a2   MATCH
+0894ca5f 28022303 bb9a21a2   MATCH
+00a4c66f 28022303 bb9a21a2   MATCH
+```
+
+Every field was derived from the documented layout; landing on the same bits is
+what should happen when two encoders implement one documented encoding for the
+same operation.
+
+**What changed on the hardware.** After the submit the engine reads
+`0x8f0=03000000 (idle 0)` and the fence has moved from `ffffff8f` to
+`ffabff0d`. The engine **accepted the work and started executing** — every
+earlier attempt either refused to stream, produced nothing, or reset the box.
+The tool then hangs waiting for a fence that never retires, and the engine is
+left busy, which is why the next run must reset it first.
+
+**Still no pixels**, and the likely reason is the constant set is incomplete.
+Only the viewport pair and an identity world-view were uploaded; the minimum set
+in docs/parhelia-block-state-map.md is 26 entries — it also needs the identity
+projection at 0x149-0x14c and the thirteen setup rows at 0x172-0x17e. A program
+reading unwritten constants reads zeroes, which is consistent with a draw that
+starts, never completes, and emits nothing.
+
+**Next step, specific:** upload the full 26-entry minimum set before binding,
+reset the engine first, and re-run.
