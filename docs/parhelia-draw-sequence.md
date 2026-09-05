@@ -521,3 +521,46 @@ a different, mutually exclusive pipeline from the WARP — consistent with our
 note that these registers fault a live WARP — but it reaches a textured triangle
 through a launch that is already proven here. Keep it strictly separate from any
 WARP attempt.
+
+
+## Verified state after the corrections (2026-09-05, P690, X stopped)
+
+Everything below was measured in runs where the engine proved itself healthy in
+the same run (`--health`: 2D fill draws 120000/120000) and with **X not
+running**, so these are valid measurements rather than contended ones.
+
+**Confirmed working:**
+
+* The DMA ring: packets are consumed, the fetch pointer stops exactly at the
+  programmed end, every time.
+* **Register writes land.** After writing `0x1300 = 0x008002cd` through a ring
+  packet, `0x1300` reads back `0x008002cd`. The tag/data framing reaches the
+  register file.
+* The surface base is honoured: a 2D fill to base `0x4000000` lands at
+  `0x4000000`.
+* `0x920 = 0`, the Phase 1 arm block, and the microcode gates all pass; 1203
+  dwords stream to `0x91c` without complaint.
+* The engine survives every 3D DWGCTL in the vetted table -- `0x10cc`,
+  `0x2010cc`, `0x8002cd` all leave it idle.
+
+**Still not rasterising.** With all of the following applied together, a WARP
+draw writes nothing anywhere in VRAM (0 of 32768 pages):
+
+* DWGCTL `0x000010cc` (the real family, not the old `0x0030200c` guess)
+* a read-back of `0x404` to post the ring writes before the `0x408` doorbell
+* the merged Setup3D list from both drivers
+* the bind short form with `MODE = 0x20000028` and the launch written to `0x1100`
+* vertices as `0x41` bulk-data quads riding behind the launch
+* the `0x8f` draw range in a second-level buffer entered via `0x10a0`/`0x10a4`
+* X stopped, engine health proven in the same run
+
+The 3D opcodes also do not rasterise through the 2D rect geometry
+(`0x1304`/`0x1308`/`0x138c`), which is consistent with them requiring the vertex
+pipeline rather than the blit path.
+
+**What that leaves.** The remaining candidates are the vertex payload contract
+(the 16 dwords we push are a guess at what the bound program consumes), the
+program image itself (our generated transform has never been validated, and the
+canned vendor programs are not transforms), and the `0x10a0`/`0x10a4` reading,
+which the two vendor sources disagree on. The DDA/texture-trap path remains
+untried and reaches a triangle through the `0x138c` launch already proven here.
