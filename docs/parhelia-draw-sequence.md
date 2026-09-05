@@ -993,9 +993,37 @@ lives in a **secondary buffer**, reached by a call, never inline in the primary
 ring. That would explain a packet the engine fetches and refuses to execute
 regardless of its contents.
 
-`--secondary` already places the draw packet in a secondary buffer; the test is
-to put the block loads there too. That is the next thing to try, and the
-validated fence makes it a one-run answer.
+**Tested, and the hypothesis does not survive — but the control is what matters.**
+Putting the block loads in the secondary buffer still stops the engine. The
+control run then showed why that measurement was meaningless:
+
+| stream | `0x41c` | |
+|---|---|---|
+| trilevel 1, inline (control) | `0x48` | executes |
+| trilevel 1, secondary call, NO block loads | `0x10` | **stops** |
+| trilevel 3, block loads in the secondary buffer | `0x10` | stops |
+| secondary call with space tag 0 / 2 / 3 | `0x10` | stops in all three |
+
+**Our secondary-call packet itself stops the engine**, so the block-load result
+through it says nothing. Two packet types are now known to stop execution in our
+ring, independently:
+
+```
+0x41......    block load       - 3 framings incl. mtx676's verbatim
+0x20292820    secondary call   - 3 address-space tags
+```
+
+Both are consistent with `mtx2434`, which lists indices `0x24`, `0x25`, `0x28`,
+`0x29` (`0x1090`, `0x1094`, `0x10a0`, `0x10a4`) as **consumed but not written**
+by the software DMA interpreter. Every one of those is a register our packets
+try to reach and the engine declines to act on — the write-back pair that never
+fires, and now SECADDRESS/SECEND. That is unlikely to be a coincidence and is
+where to look next: those four indices may require a mode or privilege our ring
+does not have.
+
+What executes in our primary ring, proven: register-write packets, the
+address-mode draw packet, and DWGSYNC. What does not: block loads and secondary
+calls.
 
 **The other clue, still worth following.** `mtx676`'s 16 payload dwords are *not* four vec4s
 of data. They are `0xaaaaaaaa`x4, `0x55555555`x4, then `0, 0x40, 0x80, 0xc0,
