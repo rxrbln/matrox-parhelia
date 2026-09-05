@@ -473,3 +473,42 @@ The mmap offsets differ between runs (`0xc822000` in one capture, `0x7d4000` and
 Identify regions by **size** (0x1000 control pages, 0x22000 command stream,
 0x320000 vertex ring, 0xa8000 command ring, 0x400000 texture heap), never by a
 remembered offset.
+
+## Replay status — partial, and what it proved  [HW]
+
+`tools/parhelia-replay.c` replays a captured frame onto the device without the
+vendor stack. This is the from-scratch procedure's phase-2 exit criterion, and
+it is **not yet met**. What the first version establishes:
+
+**Works.** The ioctl layer replays: `GET_MEMORY_INFO` and the buffer-create
+ioctl both succeed, the returned cookie differs from the recorded one exactly as
+expected, the replayer learns that old-to-new substitution automatically, and
+mmap of the *new* cookie succeeds. Two of the seven regions map correctly and
+423 recorded writes land. The doorbell is accepted.
+
+**Fails, informatively.** Five of seven mappings fail with EINVAL because their
+cookies are stale, and those cookies cannot be recovered from the capture:
+
+- the trace contains only **two** non-doorbell ioctls but **seven** mappings, so
+  five buffers are not created by an observable ioctl at all;
+- searching the recorded buffer data for each stale cookie finds it **only in
+  the MMAP line itself**, never published in any captured region.
+
+So **buffer creation is in-band**: the client requests it through a doorbell
+control-block record (opcode 0x05 per the draw recipe) and the kernel returns
+the cookie somewhere the current tracer does not capture. That is a real
+protocol fact the replay attempt surfaced, and it is why "capture the ioctls and
+replay them" is insufficient for this driver.
+
+**The concrete fix**, in order:
+1. Make the tracer dump the **full control pages** at every doorbell rather than
+   only their changed spans, so a cookie written by the kernel is visible even
+   if it lands in bytes that were previously non-zero.
+2. Split the replayer into parse and execute passes, so cookie publication sites
+   can be located across the whole trace before any mmap is attempted.
+3. Re-run: with the publication site known, read the live cookie from the same
+   offset instead of replaying the recorded one.
+
+Until that lands, treat the submission protocol as **understood but unproven** —
+which is exactly the distinction the procedure draws, and the reason the first
+triangle should not be attributed to a state bug before replay works.

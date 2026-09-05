@@ -75,14 +75,14 @@ Recovered from three independent places that all agree:
 | [3:2] | **normal** | 0 = absent, 1 = present (`nx,ny,nz`) | 0 / 12 B |
 | [6:4] | **diffuse colour** | 0 = absent, 1 = `r,g,b`, 5 = `r,g,b,a` | 0 / 12 / 16 B |
 | 7 | unused in every path seen | 0 | — |
-| [10:8] | **secondary / specular colour** | 0 = absent; 1 (fixed-function) / 5 (software) = present | 0 / 16 B |
+| [10:8] | **secondary colour / specular / fog coordinate** — one shared slot, see §5.1 | 0 = absent; 1 (fixed-function) / 5 (software) = present | 0 / 16 B |
 | 11 | software-T&L / pre-transformed marker | set only by the `GLPrimitiveSoftware` builder | — |
 | [15:12] | unused | 0 | — |
 | [18:16] | **texcoord set 0** | 0 = stage off, else component count (2 fixed-function, 4 software) | n × 4 B |
 | [21:19] | **texcoord set 1** | same | |
 | [24:22] | **texcoord set 2** | same | |
 | [27:25] | **texcoord set 3** | same | |
-| 28 | one extra 32-bit per-vertex attribute (packed dword) | from `obj+0x2688` | +4 B |
+| 28 | **per-vertex point size** — one extra dword [INFERRED, see below] | from `obj+0x2688` | +4 B |
 | [30:29] | 2-bit selector, kernel default 2, fixed-function sets 1 | | [AMBIGUOUS] |
 
 The four texture-stage shifts **{16, 19, 22, 25}** are not inferred — they are
@@ -98,7 +98,16 @@ to name the remaining fields: `+0xa530 & 3` → position code (`0xc3f88`),
 `0xc40b6`), `+0xa540` → the bits[30:29] selector (`0xc40d1`), `+0xa534` → a
 6-bit-per-stage texture word read with the shift table `0x369840 = {0,6,12,18}`
 (`0xc4140`). In the software builder the bit-28 attribute comes from
-`obj+0x2688` (`0xf3208`, and the matching per-vertex store at `0xf381d`).
+`obj+0x2688` (`0xf3208`, and the matching per-vertex store at `0xf381d`, which
+writes a single dword from an array at `ctx+0x25a8+0x240`). That flag is set at
+`0xfce1c` when a byte in the point-parameter block, `state+0xad1`, is on **and**
+either polygon mode is `GL_POINT` (0x1b00) or `obj+0x284` is zero. The
+neighbouring bytes of that block are named by `glGet`: `state+0xad0` =
+`GL_POINT_SMOOTH` (0x0B10), `+0xad4` = `GL_POINT_SIZE` (0x0B11), `+0xad8/+0xadc`
+= `GL_POINT_SIZE_MIN/MAX`, `+0xae0..0xae8` = `GL_POINT_DISTANCE_ATTENUATION`
+(0x8129). So key bit 28 is **a per-vertex point size**, the attribute
+`GL_ARB_point_parameters` needs, and it matches D3D's `FVFCaps` PSIZE bit
+[INFERRED, but from two independent directions].
 
 Field values [3:2], [6:4] and [10:8] are *codes*, not component counts — the
 builder ORs in a constant per case (`|1`, `|5`, `|0x12`, …) and later uses the
@@ -339,7 +348,7 @@ kernel's jump tables are the specification for it.
 | `GL_VENDOR` | `"Matrox Graphics Inc."` | `.rodata 0x36be5a` |
 | `GL_RENDERER` | `"OpenGL Linux library for Parhelia"` | `.rodata 0x36be38` |
 | `GL_VERSION` | `"1.3 "` + `"ICD v1.03"` | literal `"1.3 "` at `0x120dfe`; the suffix is appended by `0x364ec8` — `movabs rdx,"ICD v1.0"` at `0x364ed4` plus `mov dword [end+8], 0x33` (`'3'`) at `0x364ee6` |
-| `GL_EXTENSIONS` | pointer in `0x65c930` | see §5 |
+| `GL_EXTENSIONS` | pointer in the global `0x65c930`; the candidate string literal is in **writable** `.data` at vaddr `0x66e5a0` (file 0x46e5a0) | §5 |
 
 The version string is a hardcoded constant with no chip dependency
 [CONFIRMED], and it matches the "1.3 ICD v1.03" ground truth exactly.
@@ -434,8 +443,8 @@ Answered by `glGetIntegerv` but with no public enum names. Values [CONFIRMED]:
 | 0x8A8C | 4 | 4.0 | |
 | 0x8A8D | **2** | 2.0 | |
 
-See §5 for the naming of these against the fragment-shader compiler's own
-limit checks.
+Naming these against the fragment-shader compiler's own limit checks is
+**still open** — see §5.3 item 2.
 
 ### 3.5 Limits the ICD does **not** answer
 
@@ -496,7 +505,7 @@ a registry option or one chip-class bit test (§6).
 | user clip planes | `GL_MAX_CLIP_PLANES` 6 | `MaxUserClipPlanes` 6 (`0x1d1e5c`) |
 | lights | *(not answered)* — real limit 12 | `MaxActiveLights` **12** (`0x1d1e54`) |
 | S3TC | 4 GL formats (DXT1/DXT1a/DXT3/DXT5) | DXT1–DXT5, all five, as 2D **and** cube **and** volume |
-| blend factors | full enum ZERO…1−CONSTANT_ALPHA | `SrcBlendCaps` = `DestBlendCaps` = 0x1FFF, every factor |
+| blend factors | full enum ZERO…1−CONSTANT_ALPHA | `SrcBlendCaps` = `DestBlendCaps` = 0x1FFF — every factor **up to `BOTHINVSRCALPHA`**; `BLENDFACTOR` (0x2000) and `INVBLENDFACTOR` (0x4000) are **clear** |
 | depth/alpha compare | 8 functions each | `ZCmpCaps` = `AlphaCmpCaps` = 0xFF |
 | stencil ops | KEEP…DECR incl. wrap | `StencilCaps` = 0xFF |
 
@@ -508,7 +517,7 @@ those really are hardware limits, not conservative declarations.
 | # | GL says | D3D says | assessment |
 |---|---|---|---|
 | 1 | **power-of-two only** (`GL_INVALID_VALUE` otherwise, §3.6) | `TextureCaps` = 0x1EC4D with **`D3DPTEXTURECAPS_POW2` clear**, and `CUBEMAP_POW2` / `VOLUMEMAP_POW2` / `SQUAREONLY` also clear (`.data 0x1d1efc`) | **The hardware does non-power-of-two textures — 2D, cube and volume, mipmapped.** The GL restriction is the ICD being a GL 1.3 driver (where POT is required by spec) and never adding `GL_ARB_texture_non_power_of_two` or `GL_ARB_texture_rectangle`. An open driver can expose NPOT. **Biggest single win in this comparison.** |
-| 2 | no vertex-program extension advertised, but the ICD answers 512-instruction `GL_EXT_vertex_shader` limits (§3.3) | `VertexShaderVersion` = **`0xFFFE0101` = vs_1_1**, `MaxVertexShaderConst` = **256**, `D3DDEVCAPS_HWTRANSFORMANDLIGHT` and `D3DDEVCAPS_PUREDEVICE` set (`0x86c7a`, `0x87650`, `0x87678`) | **The part has a programmable vertex unit and hardware T&L, and the Linux ICD does not advertise it.** See §5 Q3. |
+| 2 | no vertex-program extension advertised, but the ICD answers 512-instruction `GL_EXT_vertex_shader` limits (§3.3) | `VertexShaderVersion` = **`0xFFFE0101` = vs_1_1**, `MaxVertexShaderConst` = **256**, `D3DDEVCAPS_HWTRANSFORMANDLIGHT` and `D3DDEVCAPS_PUREDEVICE` set (`0x86c7a`, `0x87650`, `0x87678`) | **The part has a programmable vertex unit and hardware T&L, and the Linux ICD does not advertise it.** See §5.3 item 1. |
 | 3 | `GL_MTX_fragment_shader` only | `PixelShaderVersion` = **`0xFFFF0103` = ps_1_3** (`0x86c8a`), `PixelShader1xMaxValue` 1.0f | The MTX extension is the GL door onto a ps_1_3-class combiner; the limits in §3.4 should be read against `docs/parhelia-fragment-isa.md`. |
 | 4 | `GL_ARB_texture_env_combine` / `dot3` | `TextureOpCaps` = 0x03FEFFFF: additionally **BUMPENVMAP, BUMPENVMAPLUMINANCE, MULTIPLYADD, LERP** (`.data 0x1d1e4c`) | Bump mapping and LRP/MAD are hardware but have no fixed-function GL path. Reachable through the fragment ISA (`MAD`, `LRP` are in the opcode table already). |
 | 5 | `GL_POINT_SIZE_RANGE` / `GL_LINE_WIDTH_RANGE` 0.25–**10.0** | `MaxPointSize` = **2048.0f** (`0x86bda`) | The 10.0 is a *software* rasteriser limit, consistent with the capture's CPU-expanded wide-line path. `GL_ALIASED_*_RANGE` already reports 1–2048. |
@@ -517,6 +526,9 @@ those really are hardware limits, not conservative declarations.
 | 8 | 4 texture units | `FVFCaps` TEXCOORDCOUNTMASK = **8** texcoord sets (`0x1d1e48` + `or 0x100000` at `0x86b94`), `MaxVertexBlendMatrices` 4, `MaxVertexBlendMatrixIndex` 31 | 8 texcoord *sets* can be delivered to 4 sampling stages; also 4-matrix vertex blending exists with no GL exposure (no `GL_ARB_vertex_blend`). |
 | 9 | fog listed as CPU-side in `docs/parhelia-gl-driver.md` | `RasterCaps` 0x07F309A7 sets **FOGVERTEX, FOGTABLE, FOGRANGE, WFOG, ZFOG**, plus **SCISSORTEST, DEPTHBIAS, SLOPESCALEDEPTHBIAS, ANISOTROPY** (`0x1d1ee4`) | Fog, scissor and polygon offset are hardware. The live capture already shows fog enable and fog mode as emitted state, so the old "software fog / software polygon offset" note is wrong. |
 | 10 | `GL_ARB_multisample` advertised, `GL_SAMPLES` read from the drawable | multisample word rewritten per format at `0x86f90` from the `AAMode` registry setting: `0x0009`, `0x8001` or 0 | FAA is a driver/mode option, not a fixed cap. |
+| 11 | advertises `GL_EXT_blend_color`, and `docs/parhelia-gl-driver.md` lists `CONSTANT_COLOR`=0xe … `1−CONSTANT_ALPHA`=0x11 in the factor enum | `SrcBlendCaps`/`DestBlendCaps` = 0x1FFF, i.e. **`D3DPBLENDCAPS_BLENDFACTOR` is not set** | Direction of the gap is **reversed** here — GL claims more than D3D. Either the constant-colour factors are a GL-side emulation or the D3D driver under-declares. [AMBIGUOUS] — settle it with one `glBlendColorEXT` + `glBlendFunc(GL_CONSTANT_COLOR, …)` capture. |
+| 12 | advertises `GL_EXT_blend_func_separate`, and the capture shows **four** independent factor state ids (src RGB / src A / dst RGB / dst A) | `PrimitiveMiscCaps` = 0x00102CF3, **`SEPARATEALPHABLEND` (0x20000) clear** | Same reversed direction. The four separate factor slots in the live stream are strong evidence the hardware has it and the D3D driver simply never declared it. [AMBIGUOUS] |
+| 13 | advertises `GL_EXT_texture_lod_bias`, `GL_MAX_TEXTURE_LOD_BIAS_EXT` = 2 | `D3DPRASTERCAPS_MIPMAPLODBIAS` is added **only** when the `MipmapLodBias` registry value is non-zero (`0x8785d`), i.e. off by default | The Windows driver treats LOD bias as opt-in; the GL driver exposes it unconditionally. Worth a look before relying on it. |
 
 Two more D3D scalars with no GL counterpart, worth having: **`MaxTextureRepeat`
 = 255** (`.data 0x1d1e24`) — the texture-coordinate wrap range, which bounds how
@@ -533,7 +545,99 @@ D3D8/9 depth format list D16 / D15S1 / D24X4S4 / D24S8 (`.data 0x1d14d8`).
 
 ## 5. Extensions: hardware, software, or absent
 
-*(section filled from the ICD extension analysis — see below)*
+### 5.1 What the secondary-colour slot really is
+
+Before the table, one result that settles three extensions at once. The
+`GLPrimitiveSoftware` key builder allocates the bits[10:8] slot (an extra 4-float
+vertex attribute, `stride += 0x10`) under a three-way condition at
+`libGL64 0xf3163`–`0xf3192` [CONFIRMED]:
+
+```
+if (light_model_color_control == 0x81FA)          /* GL_SEPARATE_SPECULAR_COLOR */
+        enable_secondary_slot();
+else if (state[0xa20]                              /* GL_FOG enabled            */
+         && (state[0xa21] || state[0xa3c] != 0x8452))   /* fog source != GL_FRAGMENT_DEPTH */
+        enable_secondary_slot();
+else if (state[0x9ac] == 0 && state[0xa54])        /* GL_COLOR_SUM_EXT          */
+        enable_secondary_slot();
+```
+
+Those state offsets are named by `glGetIntegerv` itself: `+0xa20` = `GL_FOG`
+(0x0B60), `+0xa34` = `GL_FOG_MODE`, `+0xa3c` = `GL_FOG_COORDINATE_SOURCE`
+(0x8450), `+0xa48/+0xa4c` = start/end, `+0xa54` = `GL_COLOR_SUM_EXT` (0x8458),
+and `0x81FA` is `GL_SEPARATE_SPECULAR_COLOR`.
+
+So **one hardware vertex slot serves the specular colour, the secondary colour
+and the fog coordinate**, and all three of `GL_EXT_separate_specular_color`,
+`GL_EXT_secondary_color` and `GL_EXT_fog_coord` are hardware features that cost
+16 bytes of vertex each. An open driver gets them from the same attribute.
+
+### 5.2 Classification
+
+Evidence codes: **[D3D]** the Windows driver declares the capability for this
+silicon (§4); **[KEY]** the pipeline-key/vertex-layout decode shows a real
+hardware attribute (§1); **[CAP]** the live sweep shows emitted state;
+**[RTTI]** a `GLPrimitiveSoftware*` class does the work on the CPU.
+
+| extension | verdict | evidence |
+|---|---|---|
+| `GL_ARB_multitexture`, `GL_SGIS_multitexture` | **hardware**, 4 stages | [D3D] `MaxSimultaneousTextures` 4; [KEY] four texcoord fields; the ICD's reset emits 4 stages × 28 texture-stage states |
+| `GL_ARB_texture_env_add`, `GL_EXT_texture_env_add` | **hardware** | [D3D] `TextureOpCaps` ADD |
+| `GL_ARB/EXT_texture_env_combine` | **hardware** | [D3D] `TextureOpCaps` 0x03FEFFFF (all MODULATE/ADD/BLEND forms); [CAP] fragment programs uploaded per env mode |
+| `GL_ARB/EXT_texture_env_dot3` | **hardware** | [D3D] `TextureOpCaps` DOTPRODUCT3; `DP3` is in the fragment ISA opcode table |
+| `GL_ARB/EXT_texture_cube_map` | **hardware** | [D3D] `TextureCaps` CUBEMAP + MIPCUBEMAP; `GL_MAX_CUBE_MAP_TEXTURE_SIZE` 2048 |
+| `GL_EXT_texture3D` | **hardware** | [D3D] `TextureCaps` VOLUMEMAP + MIPVOLUMEMAP, `MaxVolumeExtent` 2048; the ICD validates 3D dims against 2048/POT like 2D |
+| `GL_ARB_texture_compression`, `GL_EXT_texture_compression_s3tc`, `GL_S3_s3tc` | **hardware** | [D3D] DXT1–DXT5 declared as texture, volume **and** cube |
+| `GL_EXT_texture_filter_anisotropic` | **hardware**, max 2 | [D3D] `RasterCaps` ANISOTROPY + `TextureFilterCaps` MINF/MAGFANISOTROPIC; the ICD clamps to 2.0f at `0x132062` |
+| `GL_ARB_texture_border_clamp`, `GL_EXT_texture_edge_clamp` | **hardware** | [D3D] `TextureAddressCaps` 0x3F = WRAP\|MIRROR\|CLAMP\|BORDER\|INDEPENDENTUV\|MIRRORONCE |
+| `GL_EXT_blend_minmax`, `GL_EXT_blend_subtract` | **hardware** | [D3D] `PrimitiveMiscCaps` BLENDOP |
+| `GL_EXT_blend_func_separate` | **hardware** [INFERRED] | [CAP] four independent factor state ids in the live stream; [D3D] does **not** declare it (§4.2 #12) |
+| `GL_EXT_blend_logic_op` | **hardware** [INFERRED] | [D3D] `RasterCaps` ROP2 + XOR |
+| `GL_EXT_blend_color` | **[AMBIGUOUS]** | [D3D] `BLENDFACTOR` bit clear (§4.2 #11) |
+| `GL_EXT_stencil_wrap` | **hardware** | [D3D] `StencilCaps` includes INCR/DECR, the wrapping ops |
+| `GL_EXT_secondary_color`, `GL_EXT_separate_specular_color`, `GL_EXT_fog_coord` | **hardware**, one shared vertex slot | §5.1 [CONFIRMED]; [D3D] `ShadeCaps` SPECULARGOURAUDRGB, `RasterCaps` FOGVERTEX/FOGTABLE/FOGRANGE/WFOG/ZFOG |
+| `GL_ARB_point_parameters`, `GL_EXT_point_parameters` | **mixed** — the per-vertex point size is a real attribute, the sized-point *rasterisation* is CPU | [KEY] key bit 28 (§1.2); [D3D] `FVFCaps` PSIZE; [RTTI] `GLPrimitiveSoftwareClip_*_to_Sizedpoint` |
+| `GL_EXT_polygon_offset` (and core polygon offset) | **hardware** | [D3D] `RasterCaps` DEPTHBIAS + SLOPESCALEDEPTHBIAS — this contradicts the "software polygon offset" note in `docs/parhelia-gl-driver.md` |
+| `GL_NV_texgen_reflection` | **hardware** | [D3D] `VertexProcessingCaps` TEXGEN; `TextureCaps` PROJECTED |
+| `GL_EXT_rescale_normal` | **hardware** [INFERRED] | part of fixed-function T&L, which is hardware ([D3D] HWTRANSFORMANDLIGHT) |
+| `GL_SGIS_texture_lod` | **hardware** [INFERRED] | per-texture LOD clamp is texture-stage state |
+| `GL_EXT_texture_lod_bias` | **[AMBIGUOUS]** | §4.2 #13 — D3D gates `MIPMAPLODBIAS` behind a registry option |
+| `GL_ARB_multisample` | **hardware when enabled** | [D3D] the per-format multisample word is rewritten from the `AAMode` setting (FAA); `GL_SAMPLES`/`GL_SAMPLE_BUFFERS` come from the drawable, not a constant |
+| `GL_MTX_fragment_shader` | **hardware** — the ps_1_3-class combiner | §3.4 limits; program objects uploaded with opcodes 0x45/0x46; `docs/parhelia-fragment-isa.md` |
+| `GL_EXT_bgra`, `GL_EXT_packed_pixels` | **free** — B,G,R,A *is* the native texel order | [D3D] the format list is A8R8G8B8 / X8R8G8B8 / R5G6B5 / A1R5G5B5 / A4R4G4B4 / A2R10G10B10 |
+| `GL_EXT_texture_object`, `GL_EXT_subtexture`, `GL_EXT_vertex_array`, `GL_EXT_compiled_vertex_array`, `GL_EXT_draw_range_elements`, `GL_EXT_multi_draw_arrays`, `GL_ATI_element_array`, `GL_EXT_element_array`, `GL_ATI_vertex_array_object`, `GL_EXT_vertex_array_object`, `GL_ARB_transpose_matrix`, `GL_EXT_clip_volume_hint`, `GL_Autodesk_valid_back_buffer_hint`, `GL_KTX_buffer_region` | **client-side API only** — no pipeline state exists for them; they change how the ICD packs and submits, not what the GPU does | mechanical: they have no counterpart in any cap word and nothing in §2.1's opcode set |
+| wide lines, sized points, `glPolygonMode(GL_LINE/GL_POINT)`, selection and feedback | **CPU** | [RTTI] the `GLPrimitiveSoftwareClip_*_to_Wideline` / `_to_Sizedpoint` / `_Selection_*` / `_Feedback_*` family; [CAP] the wide-line op expands one line into four pre-transformed 1-pixel lines |
+
+### 5.3 Still open
+
+Three questions this pass did not settle, with what would settle them:
+
+1. **Are the exported `GL_EXT_vertex_shader` entry points real?** The ICD
+   exports the complete set (`glBeginVertexShaderEXT`, `glEndVertexShaderEXT`,
+   `glGenVertexShadersEXT`, `glBindVertexShaderEXT`, `glShaderOp1/2/3EXT`,
+   `glSetInvariant*EXT`, …), answers all its limit enums (§3.3), and carries the
+   classes `GLVertexShaderFunction` / `GLVertexShaderDeclaration` /
+   `GLVertexShaderFunctionDX` / `GLVertexShaderDeclarationDX` and a whole third
+   pipeline `GLPrimitiveHardwareVS` / `GLSendStateHardwareTnLVS` — yet does not
+   advertise the extension. D3D declares vs_1_1 with 256 constants for the same
+   silicon. Following `glBeginVertexShaderEXT` and `glShaderOp3EXT` into the
+   real code, and finding whether anything ever constructs
+   `GLPrimitiveHardwareVS` (vtable at `.data.rel.ro` file offset 0x465ac8,
+   typeinfo name "21GLPrimitiveHardwareVS" at file offset 3581376), decides
+   whether the Parhelia's programmable vertex unit is merely under-declared.
+   **This is the single highest-value follow-up.**
+2. **Names for the `GL_MTX_fragment_shader` enums 0x8A81–0x8A8D** (§3.4). The
+   ICD contains a run of `"Error in Matrox Fragment Shader - …"` strings from
+   file offset 3595720 ("Too many color instructions", "Too few instructions",
+   "Do not meet the minimum number of texture coordinates required", …); each
+   raise site is checking exactly one of these limits, so matching value to
+   check names the enum. Cross-check against
+   `docs/parhelia-fragment-isa.md` §9.3.
+3. **ICD-side variant branching.** A byte search of `libGL.so.1.3.0` finds no
+   `vendor:device` dword (`0x0527102b`, `0x0528102b`, `0x2537102b`,
+   `0x2539102b` all absent), so the ICD does not appear to switch on the PCI id
+   directly; if it varies at all it must be through a capability word obtained
+   from the kernel module (whose classifier is §6.1). Undetermined.
 
 ---
 
@@ -583,7 +687,8 @@ vertex shaders, guard-band clipping and NPOT-conditional textures switchable at
 runtime, all defaulting to on.** None of those switches exists in the Linux GL
 declaration.
 
-*(ICD-side variant branching — see §5.)*
+*(ICD-side variant branching: see §5.3 item 3 — undetermined, but no PCI-id
+constant appears in the ICD at all.)*
 
 ---
 
@@ -725,8 +830,11 @@ value:
 1. **Non-power-of-two textures** — the hardware has them (2D, cube, volume,
    mipmapped); the ICD hard-rejects them.
 2. **A programmable vertex unit with hardware T&L** — declared as vs_1_1 with
-   256 constants on Windows, present as a complete but unadvertised
-   `GL_EXT_vertex_shader` implementation on Linux (§5 Q3).
+   256 constants on Windows; on Linux the ICD ships the whole
+   `GL_EXT_vertex_shader` entry-point set, its limit enums and a third
+   `…HardwareTnLVS` pipeline, but never advertises the extension. Whether those
+   entry points are functional is the one thing this pass did not settle
+   (§5.3 item 1) — verify before relying on it.
 3. **12 lights**, not 8, and `GL_MAX_LIGHTS` is not answerable at all.
 4. **BUMPENVMAP / BUMPENVMAPLUMINANCE / MULTIPLYADD / LERP** texture ops with
    no fixed-function GL path.
