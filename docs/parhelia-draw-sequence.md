@@ -857,3 +857,43 @@ Consequences for a replay tool, and for the open kernel driver:
 * For the open kernel driver this is a specification point, not just a bug to
   avoid: the wait-for-idle **must** be bounded and must return an error, because
   the hardware genuinely does reach states where idle never arrives.
+
+
+## Address-mode draw tried on hardware (2026-09-05, 0x0528)
+
+The Windows driver never emits `0x8f000001`. Its draw is
+
+    [0x17000001 | flags | ((vertexDwords-1) << 17)] [start] [end]
+
+with the vertices sitting in the command buffer but **excluded from the
+submitted range**, so the command processor never parses them. Both encodings
+are the same packet class -- `low16 = payloadDwords-1` holds for each -- and they
+differ in what the payload means:
+
+* **index mode** (`0x8f`): `[first, end)` indices into a separately bound vertex
+  array. Bits [22:17] are zero.
+* **address mode** (`0x17|flags`): absolute `[start, end)` addresses, with the
+  **stride in bits [22:17]**. Nothing external to bind.
+
+**Every from-scratch attempt in this repository had used index mode with no
+array bound**, which is a complete explanation for "the ring consumes every
+packet, the engine leaves idle, and nothing rasterises".
+
+### Two results
+
+**Passing a CPU physical address of system memory took the machine down hard** --
+no ping, cold boot. The addresses are not CPU-physical: the documented encoding
+elsewhere in this hardware is a *byte offset within a pool* with an
+address-space tag in the low two bits (0 = local frame buffer). Do not pass a
+system address here.
+
+**With the vertices in VRAM and addressed as an offset, the draw is safe** -- the
+engine stays healthy, the 2D fill still draws 120000 px afterwards -- and still
+produces **0 of 65536 VRAM pages changed**.
+
+So address mode removes the unbound-array explanation without producing
+geometry, and the remaining gap is elsewhere: most likely the WARP program
+itself (ours is hand-written and has never been validated), or the fragment
+program, which per `parhelia-slot-translation.md` is not optional -- texture and
+combiner state exist only as a compiled program, and there is no register path
+that a draw can fall back on.
