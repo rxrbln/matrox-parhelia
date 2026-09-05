@@ -399,3 +399,29 @@ DWGCTL the engine reads idle and draws nothing. `--health` runs a 2D fill and
 requires the full 120000 pixels; the WARP paths are gated on it. `--dmafill`
 itself is not gated, so a fill result taken without checking the engine first
 can be void -- check `0x8f0` at the top of the output, which the tool prints.
+
+
+## X owns the engine: every prior WARP result was void
+
+Measured on the P690, same 2D fill through our own ring, nothing else changed:
+
+    == fill BEFORE X ==  green px at base 0x4000000 = 120000   drew
+    == fill AFTER X  ==  green px at base 0x4000000 = 0        nothing
+
+`0x8f0` reads `0x00020000` (idle) in **both** cases, so nothing announces the
+difference. Starting the vendor MTX X driver stops our submissions taking
+effect; it owns the DMA ring and writes `0x404`/`0x408` itself.
+
+**Consequence: every WARP experiment recorded before this was run with X up and
+is void.** "The engine consumes the packets but rasterises nothing", "0 WARP
+registers changed", the DWGCTL comparisons, the bind-order comparisons -- all of
+them measured a contended ring rather than the WARP. They are withdrawn as
+evidence about the 3D path.
+
+**Procedure from here: run engine experiments with X stopped.** Boot,
+`modprobe mtx`, submit. Do not start X.
+
+This also settles a question the earlier measurement had muddied: **the surface
+base register IS honoured.** A fill to base `0x4000000` lands at `0x4000000`
+when X is not running. The earlier "0 pixels off-screen" was X contention plus a
+scan anchored at offset 0, not a hardware limitation.
