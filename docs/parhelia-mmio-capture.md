@@ -76,9 +76,14 @@ W 0x0408 ... 0x146003c3    ; each write submits one command packet
 - So the open driver's WARP draw = arm (0x12b8/0x10b0/0x300/0x384/0x308) + build
   the tokenised command buffer in a ring buffer + submit via 0x404/0x408 (the
   path we already have working for 2D fills), NOT the --warpstream 0x91c path.
-- STILL TO CAPTURE: the command-buffer CONTENTS (the tokenised state+vertex
-  packets the GPU DMA-reads from 0x14600000) - mmiotrace doesn't see DMA reads;
-  dump the mapped DMA buffer (userspace ICD fills it) or the bus memory.
+- ~~STILL TO CAPTURE: the command-buffer CONTENTS~~ **CAPTURED (2026-09-05).**
+  `tools/parhelia-mtxtrace.c` snapshots the mapped regions around every
+  doorbell, which is where the ICD writes those packets, and `tools/gltri.c`
+  reduces a whole 3D draw to 936 KB of trace. Both the ring packet and the
+  record stream for a single triangle are decoded in
+  `docs/parhelia-minimal-triangle.md`. The register side of the same draw is
+  `captures/mmio-gltri-0528.txt`: 33 writes and 19 reads, no `0x404` and no
+  `0x91c` — a 3D draw is one doorbell.
 
 ## Next captures to build the full GPU-access map
 - Modeset (record modprobe+startx) = display bring-up sequence.

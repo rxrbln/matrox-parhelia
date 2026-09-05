@@ -205,6 +205,61 @@ in the *context management* commands, and none of it is needed to issue the draw
 above. The draw packet, the vertex layout and the state stream in this document
 are complete and self-contained.
 
+## The register side: a 3D draw touches almost no MMIO
+
+Same client, captured with mmiotrace (`captures/mmio-gltri-0528.txt`). This is
+the capture `parhelia-mmio-capture.md` lists as "STILL TO CAPTURE" — it was not
+practical with glxgears, and is trivial with `gltri`.
+
+The trace is 296120 lines, of which **33 writes and 19 reads** are register
+accesses; the other 296058 are `UNKNOWN` single-steps of framebuffer traffic
+through a 4 KB `ioremap` of VRAM at offset `0xf00000`. The complete BAR1
+sequence for one triangle:
+
+```
+W 0x0030 = 00000000
+W 0x0408 = 182c0c23        doorbell
+R 0x08f0, R 0x08f0, R 0x0450
+W 0x0408 = 182c0c43
+W 0x0314 = 00000001        front-end kick
+W 0x0030 = 10f00000        pull-aperture descriptor
+W 0x0034 = 018e8000
+W 0x0038 = 32030020
+W 0x003c = 00010020
+W 0x0030 = 00000000        cleared either side
+W 0x0408 = 182c0c63
+W 0x0314 = 00000001
+W 0x0030 = 10f00000        ... and again with 09002000 / 32030010 / 00010001
+W 0x0408 = 182c0c83 .. 182c0e63    16 more doorbells, +0x20 each
+W 0x0408 = 182c1043        one +0x1e0 jump: the big state payload
+R 0x08f0 / R 0x0450 x3     wait for idle
+R 0x1800 = 00000001
+```
+
+**Findings:**
+
+* **There is no separate 3D launch register.** No `0x404`, no `0x918`/`0x91c`,
+  no `0x1100`, no `0x1300` — not once in the whole draw. The ring base is set at
+  init and every submission is `0x408 = end | 3`. The draw packet *in the ring*
+  is the launch, and the doorbell is the trigger. This closes the open question
+  "find the real 3D launch mechanism": the answer is that the 2D recipe already
+  documented in `memory: parhelia-dma-ring-working` is the 3D recipe unchanged.
+* `0x408` advances by exactly `0x20` per write, confirming the 32-byte
+  submission granularity the arm trace showed and the `0x14` write-pointer
+  increment in `mtx1937` does not contradict — the doorbell is padded.
+* `0x0030`–`0x003c` is a four-register descriptor written twice, each time
+  bracketed by `0x0030 = 0`. `0x0030 = 0x10f00000` is the VRAM offset
+  `0xf00000` with bit 28 set, matching the 4 KB `ioremap` at `0xd0f00000` — so
+  this is the pull aperture, programmed per transfer and disarmed after.
+* `0x314 = 1` appears exactly twice, both times immediately before an aperture
+  program, which narrows its "purpose unknown" note: it is tied to the aperture
+  path, not to the doorbell.
+
+For an open driver this is the reassuring result: **everything that makes a
+triangle is data in the ring**, and the register interface for a draw is one
+write. The hard part is entirely the command stream, which is what the rest of
+this document decodes.
+
 ## Next
 
 * Relocate the mmap-class pointers (`0x00002b57…`) in command `0x05` using the
