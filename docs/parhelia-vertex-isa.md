@@ -524,17 +524,29 @@ and only **one operand per instruction** may carry the high three bits —
 `extsel` names it. Highest extended index actually observed in the vendor
 library: **121**.
 
-**Tension with the 5-bit source field, recorded [UNRESOLVED].** §2 shows the
-source selects are 5-bit fields, yet the relocator only ever touches their low
-4 bits plus `exthi`. Either the source address is `{exthi(3):idx(4)}` and the
-5th bit (w1[6] / w0[31] / w0[24]) is a per-source modifier that the vendor's
-patch API happens to write together with the index, or it is a genuine address
-bit that the relocator never needs because relocated operands always have it
-clear. The corpus is consistent with both: the 5th bit is set in 9 % / 3 % /
-11 % of instructions respectively and is essentially never combined with a
-non-zero `exthi` (e.g. `src2[4]=1` occurs 4485 times, 4483 of them with
-`extsel=2, exthi=0`). Deciding this needs one hardware experiment: write a
-known value to a high register and read it back through the port in §11.
+**RESOLVED (2026-09-05): the 5th source bit is the negate modifier.** The
+source address is `{exthi(3):idx(4)}` -- **7 bits, 128 registers** -- and
+w1[6] / w0[31] / w0[24] is a per-source negate, not an address bit.
+
+Two independent lines settle it:
+
+- *Positive.* Fragment `0xb5` (`mtx3352`, `.data+0x22c00`) needs six consecutive
+  registers 12..17 and encodes 16 and 17 as `exthi=1, idx=0/1` -- **not** as
+  `idx=0x10/0x11`. A contiguous run that crosses the 16-boundary through `exthi`
+  can only mean the 5-bit field is `{negate:idx(4)}`.
+- *Negative.* If the bit were address bit 7, the 8-bit histogram over the whole
+  fragment library would light up on the block entries above `0x15f` that the
+  driver actually writes. It does not: the ">=128" hits land on 128-133/136/143,
+  i.e. `r0..r5` with the bit set (1002 of them on `r5` alone), clustered on
+  exactly the registers that dominate the plain histogram, and they include
+  `0x162..0x165` which no validator ever writes. That is a modifier
+  distribution, not an address distribution.
+
+This also agrees with the libGL token-IR note that the negate lowers to source
+bit 24 (`w0[24]` = bit 4 of `src2`).
+
+Consequence: a WARP program can name **128 vec4 and only 128**, and one operand
+per instruction may carry the `exthi` high bits (which is what `extsel` selects).
 
 The relocation step is `7` registers per unit, i.e. the driver's per-stage
 constant blocks are 7 registers wide [INFERRED].

@@ -1045,12 +1045,17 @@ hardware cannot express the state.
    patterns; mmiotrace the draw and find where `0x40400000` and `0x40e00000`
    land. That pins the base with one run and simultaneously confirms the
    polygon-offset registers.
-3. **Guard-band pixel extents.** The formula `g = (guardExtent − origin)/viewport`
-   is CONFIRMED but the numerator comes from a virtual device-caps call
-   (singleton `*[0x65cd78]`, vtable slot +0x48) that was not located. Do not
-   assume ±2048. *Experiment:* set a small viewport, draw a triangle far
-   outside it, and bisect the coordinate at which the driver switches from
-   trivial-accept to CPU clipping.
+3. **Guard-band pixel extents — CLOSED (2026-09-05): ±8160.0f.** The formula
+   `g = (guardExtent − origin)/viewport` was already CONFIRMED; the numerator is
+   now pinned by three independent sources, two of them different binaries:
+   `MTXPARD .data 0x1d1e30..0x1d1e3c` and inline in the clipper at `0xd6cf6`;
+   the kernel's capability blob handed to the ICD (`caps[0x04..0x10]`, "0 or
+   ±8160.0f", zeroed by the `GuardBandClipping` registry switch); and block index
+   **0x174** = guard-band clip limits `{8160, 8160, −8160, −8160}`, init only,
+   byte-identical in both binaries. Still DECODED (no hardware test), but no
+   longer an unknown, and the earlier "do not assume ±2048" caution is resolved
+   in the other direction. **Do not conflate this with `0x12f4`** (31.0/15.0),
+   which is a different quantity.
 4. **What register 0x12F4 actually means.** The values (32/16, programmed as
    31/15) and the dependence on the active texture-stage count are CONFIRMED in
    two binaries; the unit is not.

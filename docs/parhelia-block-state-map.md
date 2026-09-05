@@ -409,7 +409,7 @@ deduced from the arithmetic.  2-src = both binaries agree.
 | index | holds | layout | writer |
 |---|---|---|---|
 | **0x000..0x0df** | **matrix palette**: 32 slots of 7 entries — `world[k]*view` at `7k..7k+3`, its 3x3 inverse-transpose at `7k+4..7k+6` | 4x4 + 3x3 | `mtx1394`; CONFIRMED, 2-src on the geometry |
-| **0x0e0..0x133** | **12 texture stages**, 7 entries each at `0xe0 + 7k` | | `mtx309` @0x89cb0; CONFIRMED, 2-src (DLL loop 0x121b81) |
+| **0x0e0..0x133** | **12 light slots**, 7 entries each at `0xe0 + 7k` (NOT texture stages -- see note) | `r 7k` | `mtx309` @0x89cb0; CONFIRMED, 2-src (DLL loop 0x121b81) |
 | **0x134..0x137** | **front material**: Diffuse, Ambient, Specular(w=Power), Emissive | 4 vec4 | `mtx1322`/`mtx2441`; CONFIRMED, naming INFERRED |
 | **0x138** | **ambient product** `globalAmbient * materialAmbient` | vec4 | `mtx2588`; CONFIRMED |
 | **0x139..0x148** | four 4x4 matrices at `0x139 + 4k` — per-unit texture transforms | 16 floats each | `mtx3654` @0x8c360; CONFIRMED, role INFERRED |
@@ -435,6 +435,55 @@ deduced from the arithmetic.  2-src = both binaries agree.
 | 0x17f | one dword from a state block (DLL setter 0x11d58d); never written on the GL side | | INFERRED |
 
 ---
+
+
+> **Correction (2026-09-05): `0x0e0..0x133` is the light array, not texture
+> stages.** `mtx309` (@0x89cb0) walks `count = [HWREG+0x478]` pointers at
+> `[HWREG+0x480 + 8n]` and dispatches on `*ptr` in {1,2,3} -- the D3DLIGHTTYPE
+> enum, point / spot / directional (`cmp $0x2 -> 0x8a4e0`, `jle -> 0x8a693`,
+> `cmp $0x3 -> 0x89ea4`) -- marking `mtx2702(bitmap, 0xe0+7n, 0xe6+7n)` from
+> three separate `+= 7` cursors (spot base 0 @0x89e52, point base `7*nspot`
+> @0x89e6d, directional base `7*(nspot+npoint)`). Twelve slots x 7 vec4 =
+> `0xe0..0x133`. This is also *why* the relocator's stride is 7: the light block
+> is 7 registers wide and sits at `r 7k`.
+>
+> **The 384-entry block file is not a flat constant store.** It is a mixed state
+> block, and only its middle window is addressable by a shader:
+>
+> | range | size | what it is | shader-addressable |
+> |---|---|---|---|
+> | `0x000..0x0df` | 224 | matrix palette, 32 slots x 7 (`world[k]*view` + normal matrix), `mtx1394` | no |
+> | `0x0e0..0x15f` | 128 | **the WARP source register file, `r = N - 0xE0`** | yes |
+> | `0x160..0x17f` | 32 | fixed-function setup/clip/raster state: viewport scale+bias, six user clip planes, guard band +/-8160, point/line size and clamp, polygon offset, sub-pixel/sample, EXP/LOG tables | no |
+>
+> The source address is 7 bits (see `parhelia-vertex-isa.md` §4, resolved), so
+> **at most 128 of the 384 entries can be named by any WARP operand.** The tail
+> is consumed by units downstream of WARP, which is why the guard band, the
+> point-size clamp and the polygon-offset scale live in this file without ever
+> being read by a shader instruction.
+>
+> The `- 0xE0` rule rests on six anchors with a writer on the host side and a
+> reader in the microcode (lights `0xe0+7k` <-> `r7k`; front material
+> `0x134`/`0x137` <-> `r84`/`r87`; ambient product `0x138` <-> `r88`; texture
+> matrices `0x139+4k` <-> `r0x59+4k`; **projection matrix `0x149..0x14c` <->
+> `r105..r108`**; fog `0x154`/`0x155` <-> `r116`/`r117`; back material
+> `0x156..0x159` <-> `r118..r121`), plus a statistical check: the two dead bands
+> in register use (`r111..r115`, `r122..r127`, zero uses across 24,156
+> arithmetic instructions) line up exactly with the two never-written block holes
+> (`0x14f..0x153`, `0x15a..0x15f`).
+>
+> **Still open:** extending the same line down to `r0` collides. `mtx309` puts
+> light 0 at `0xe0..0xe6` = `r0..r6`, but the unlit transform fragment `0x50`
+> (`mtx1621`) reads `r3,r2,r1,r0` and `r7..r10`, and the colour-material
+> epilogue reads `r5`/`r6` as vertex colour. Clip planes are worse: `mtx2522`
+> writes them to `0x16c..0x171`, which the rule puts at `r140..r145` --
+> unreachable with a 7-bit source -- while the fragments that structurally *are*
+> the clip-plane test read `r12..r17`. So either there is an undecoded file/bank
+> select (candidates: the 2-bit fields adjacent to each source field, `f1a`
+> w1[1:0], `f0e` w0[26:25], `f0bc` w0[19:18]), or the low registers are a
+> separate attribute/temporary file and the linear rule only holds above them.
+> Only the `0x0e0..0x15f` window is established.
+
 
 ## 5. Dirty-bitmap protocol
 
@@ -579,7 +628,7 @@ are the ones the validators keep self-consistent) and emit them.
 * Which physical bank `[HWSTATE+0x1e60]` names in the direct-constant path — its
   store is in a different object file.  INFERRED to be the run-time-selected
   bank.
-* `mtx309` @0x89cb0 writes 0x14e and the `0xe0..0xe6` texture-stage group; only
+* `mtx309` @0x89cb0 writes 0x14e and the `0xe0..0xe6` light-slot group; only
   its index set was read here.
 * The byte-index → MMIO `0x1000 + index*4` mapping is *not* re-derived here; it
   still rests on the earlier Linux-side work.  The D3D driver confirms the packet
