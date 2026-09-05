@@ -66,6 +66,41 @@ pointer table are **client leftovers in a part of the control page the kernel
 never reads for this command**. The page is 4 KB, the request is 0x28 bytes, and
 the ICD does not clear the rest.
 
+### The request layout, from the allocator itself
+
+`mtx938` (`.text+0x4c470`) is called as `mtx938(obj, dev, request)` and its first
+two instructions settle the layout beyond argument:
+
+```c
+ebx = *(u32 *)(request + 0x00);          /* SIZE  */
+eax = *(u32 *)(request + 0x08);          /* TYPE  */
+ebx = (ebx + 0xfff) & ~0xfff;            /* page-rounded */
+switch (eax) { case 1: AGP; case 2: __get_free_pages; case 4: vmalloc; }
+```
+
+With `request = control + 0x10`, the captured control page reads
+`control+0x10 = 0x00022000` and `control+0x18 = 4`. **0x22000 is 136 KB — exactly
+the size of the record-stream region.** So the first field is a size that gets
+page-rounded, not an address, and the retraction above is now proven rather than
+argued.
+
+### A replay bug this exposed
+
+The tracer classified each changed dword as client-authored (`D`) or
+kernel-authored (`K`) by comparing three snapshots. A dword can be **both** — the
+client sets up a request field and the kernel writes its result back over the
+same dword — and the old logic flagged those `K` and reported the kernel's value.
+The replay then skipped them as kernel-owned.
+
+`control+0x10` for command `0x05` is exactly that: the client writes the
+allocation size, the kernel overwrites it. So the replay was **never sending a
+size at all**, and the kernel allocated against whatever happened to be in the
+page. That is a strong candidate for the doorbell-4 hang.
+
+Fixed on both sides: the tracer now emits `B` for both-authored dwords and
+reports the **client's** value, and the replay applies `B` like `D` rather than
+skipping it. The kernel overwrites it with its own result afterwards regardless.
+
 ### What this means for the replay
 
 * **No pointer rebuilding is needed for command `0x05`.** Replaying those bytes
