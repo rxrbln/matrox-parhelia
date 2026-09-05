@@ -171,7 +171,7 @@ Then, before any command can be fetched:
  8  R 0x8f0  until bit 17 (0x00020000) set   primary DMA idle
  9  R 0x450                                  FIFO drain check
 10  W 0x404 = ringBase                       PRIMADDRESS, & ~3
-11  W 0x400 = ringLimit                      [PURPOSE UNKNOWN — only ever written here]
+11  W 0x400 = statusWriteBackAddr            engine write-back pointer, see §4.6
 12  W 0x314 = 1            (x8)
 13  W 0x920 = 1                              WARP enable
 14  W 0x0000..0x0130                         aperture / surface descriptor bank,
@@ -198,6 +198,9 @@ Notes a driver author needs:
 * **`0x408` advances by 0x20 per submission in the trace** (`0x14600023`,
   `…43`, `…63`, …), while `mtx1937`'s disassembly increments the ring write
   pointer by `0x14`. One of the two readings is incomplete. [UNRESOLVED]
+* **`0x400` is not a limit.** It receives the physical address of the shared
+  status page, giving the engine a write-back target — see §4.6, which corrects
+  `docs/parhelia-kernel-abi.md` §6.4.
 * The GL client **never maps BAR1**: `captures/mtxtrace-userspace-writes.txt`
   shows seven mappings, none of them the register region. All register traffic a
   GL client causes goes through the command stream and the kernel. [CONFIRMED]
@@ -375,9 +378,9 @@ Decoded end to end; the framing lands exactly on `0x11f0`. [CONFIRMED]
 ```
 0x0000  (0x51,  1)   TARGET-SELECT  index 2
 0x0010  (0x0c,108)   core render state          -- 108 pairs, table below
-0x0378  (0x0e,112)   texture environment        -- 4 stages x 28 sub-indices
+0x0378  (0x0e,112)   texture environment        -- 4 units x 28 sub-indices
 0x0700  (0x05, 24)   state group 05             -- 24 pairs
-0x07c8  (0x06, 36)   sampler state              -- 4 stages x 9 sub-indices
+0x07c8  (0x06, 36)   sampler state              -- 4 units x 9 sub-indices
 0x08f0  (0x51,  1)   TARGET-SELECT  index 1
 0x0900  (0x0c,108)   ... the identical four blocks again, for target 1
 0x0c68  (0x0e,112)
@@ -580,25 +583,45 @@ state; the WARP unit runs transform *and* lighting, so a driver that wants the
 vendor's pipeline must supply them. Matrix ids `0x10..0x13` are the four texture
 matrices. [INFERRED from the ids and the identity contents]
 
-### 2.2 The DRAW record — `(0x1b, 1)`, 40-byte payload
+### 2.2 The DRAW record — `(0x1b, 1)`, 40-byte element
 
 ```
-+0x00  u32   primitive     the raw GL enum: POINTS 0, LINES 1, TRIANGLES 4,
-                           TRIANGLE_STRIP 5, TRIANGLE_FAN 6, QUADS 7
++0x00  u32   primitive     the raw GL enum: POINTS 0, LINES 1, LINE_LOOP 2,
+                           LINE_STRIP 3, TRIANGLES 4, TRIANGLE_STRIP 5,
+                           TRIANGLE_FAN 6, QUADS 7, QUAD_STRIP 8, POLYGON 9
 +0x04  u32   flags         [PURPOSE UNKNOWN] observed 0, 1, 2, 4, 6, 0x18
-+0x08  u64   kernel pointer to the draw/context object (from buffer create)
-+0x10  u64   descriptor offset in the command ring      = slot
-+0x18  u64   descriptor end                             = slot + 0x1d
-+0x20  u64   vertex data offset in the vertex ring      = slot + 0x40
++0x08  u64   pointer to a u64 holding the client descriptor base
++0x10  u64   descriptor start offset in the command ring   = slot
++0x18  u64   descriptor end offset,  **bit 0 = hybrid mode** = slot + 0x1c + 1
++0x20  u64   vertex data offset in the vertex ring          = slot + 0x40
 ```
 
 `slot = draw_index * 0x2000` in **both** rings. Verified across five consecutive
 draws: `0x0000, 0x2000, 0x4000, 0x6000, 0x8000, 0xa000`. [CONFIRMED]
 
 The ICD passes the GL primitive enum straight through; it does **not** decompose
-strips, fans or quads. The kernel turns the enum into the `0x10b0` value listed
-in `docs/parhelia-command-construction.md`. Only wide lines are CPU-emulated.
-[CONFIRMED]
+strips, fans or quads. Only wide lines are CPU-emulated. [CONFIRMED]
+
+**The kernel does not write a primitive register directly.** `mtx2455` @0x471d0
+translates the GL enum into three shadows and lets the dirty-state emitter build
+the packets. The translation tables, dumped from `.rodata`:
+
+| GL prim | 0 PTS | 1 LINES | 2 L_LOOP | 3 L_STRIP | 4 TRI | 5 TSTRIP | 6 TFAN | 7 QUADS | 8 QSTRIP | 9 POLY |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `ctx+0x1be4` low nibble | 0 | 2 | 3 | 4 | 5 | 6 | 7 | 9 | 0xa | 1 |
+| `ctx+0x297c` | 0 | 2 | 3 | 4 | 5 | 6 | 7 | 9 | 0xa | 1 |
+| class (`.rodata+0x1f20`) | 6 | 7 | 7 | 7 | 8 | 8 | 8 | 8 | 8 | 6 |
+| splittable (`.rodata+0x1f54`) | 1 | 1 | 1 | 1 | 1 | 0 | 0 | 1 | 1 | 0 |
+
+with a coarse class `{0,1}` point, `{2,3,4}` line, `{5..8}` triangle, `{9,10}`
+quad. `splittable = 1` marks primitives a batch may be broken at freely; strips,
+fans and polygons are 0. [CONFIRMED]
+
+This **contradicts** `docs/parhelia-command-construction.md`, which reads the
+`0x10b0` primitive value as emitted by the ICD as a standalone register packet.
+Both may be true on different paths — the ICD does contain the `0x10b0` encoder —
+but on the path the captures exercise, the enum reaches the kernel inside the
+DRAW record and the kernel decides. [UNRESOLVED which path a real workload takes]
 
 ### 2.3 The vertex data (region 4, vertex ring)
 
@@ -637,7 +660,10 @@ DMA header bytes are consumed LSB first and each names register
 dword is a new header — while index `0x20` (`0x1080`, DMAPAD) is the mid-packet
 filler that consumes a data dword and discards it. Getting these the wrong way
 round produces a stream the engine mis-parses.
-[CONFIRMED — `mtx2434` @0x398e0, the vendor's own software replay of this stream]
+[CONFIRMED — `mtx2434` @0x398e0, the vendor's own software replay of this stream.
+Note `mtx2434` is **dead code in the kernel build** — no relocation anywhere in
+the object references it — and is live only in the X driver, selected by
+`pStatus[0x8fc] == 1`. It is still the authoritative spec for the format.]
 
 ### 2.4a How the kernel turns that into ring traffic
 
@@ -724,6 +750,12 @@ emitted only when the corresponding GL state is dirty.
 
 ## 3. Adding one feature at a time
 
+**Read the register names in this section through §0.** The records carry
+driver *state ids*; the `0x1000 + id*4` register name is kept for
+cross-reference and is unverified. Where a driver reproduces the vendor stack it
+emits the id; where it drives registers itself it must first resolve the id
+through the kernel's 172-arm table.
+
 Each subsection lists **only the delta** against §2. All of it comes from
 single-feature captures, so the attribution is direct — with the one caveat that
 the ICD flushes state lazily, so a capture's stream also carries the *cleanup* of
@@ -734,7 +766,7 @@ the previous operation. Those cleanup writes are marked.
 `glEnable(GL_DEPTH_TEST)` + `glVertex3f`, total stream `0x88` bytes:
 
 ```
-(0x0c, 1)   reg 0x101c = 1                depth test enable
+(0x0c, 1)   id 0x07 (0x101c) = 1          depth test enable
 (0x07, 1)   PIPELINE-KEY = 0x00000011     was 0x10
 (0x08, 1)   VERTEX-FORMAT stride = 24     was 20 — z appears
 (0x1b, 1)   DRAW
@@ -744,9 +776,9 @@ Related, each a single PAIRS-CORE pair:
 
 | GL call | record | register | value |
 |---|---|---|---|
-| `glDepthFunc(f)` | `(0x0c,1) (0x17, v)` | `0x105c` | `f - GL_NEVER + 1`, i.e. NEVER 1 … ALWAYS 8 |
-| `glDepthMask(FALSE)` | `(0x0c,1) (0x0e, 0)` | `0x1038` | 0 / 1 |
-| `glDisable(GL_DEPTH_TEST)` | `(0x0c,1) (0x07, 0)` | `0x101c` | 0 |
+| `glDepthFunc(f)` | `(0x0c,1)` id `0x17` | `0x105c` | `f - GL_NEVER + 1`, i.e. NEVER 1 … ALWAYS 8 |
+| `glDepthMask(FALSE)` | `(0x0c,1)` id `0x0e` | `0x1038` | 0 / 1 |
+| `glDisable(GL_DEPTH_TEST)` | `(0x0c,1)` id `0x07` | `0x101c` | 0 |
 
 The **vertex stride grows to 24** and the position attribute becomes `x,y,z`;
 the colour follows it. The DRAW record and the ring packet are unchanged.
@@ -758,13 +790,13 @@ the colour follows it. The DRAW record and the ring packet are unchanged.
 total stream `0xd0` bytes:
 
 ```
-(0x0c, 6)   reg 0x106c = 1        blend enable
-            reg 0x1014 = 4        [PURPOSE UNKNOWN — blend equation? always 4 here]
-            reg 0x1028 = 5        source alpha factor   = GL_SRC_ALPHA
-            reg 0x1024 = 5        source RGB factor
-            reg 0x1030 = 6        dest alpha factor     = GL_ONE_MINUS_SRC_ALPHA
-            reg 0x102c = 6        dest RGB factor
-(0x0c, 3)   reg 0x101c = 0 ; reg 0x105c = 2 ; reg 0x1038 = 1   [previous op's cleanup]
+(0x0c, 6)   id 0x1b (0x106c) = 1   blend enable
+            id 0x05 (0x1014) = 4   [PURPOSE UNKNOWN — blend equation? always 4 here]
+            id 0x0a (0x1028) = 5   source alpha factor   = GL_SRC_ALPHA
+            id 0x09 (0x1024) = 5   source RGB factor
+            id 0x0c (0x1030) = 6   dest alpha factor     = GL_ONE_MINUS_SRC_ALPHA
+            id 0x0b (0x102c) = 6   dest RGB factor
+(0x0c, 3)   ids 0x07 = 0, 0x17 = 2, 0x0e = 1        [previous op's cleanup]
 (0x07, 1)   PIPELINE-KEY = 0x00000051      = 0x11 | 0x40
 (0x08, 1)   VERTEX-FORMAT stride = 28      alpha appears (glColor4f)
 (0x1b, 1)   DRAW
@@ -782,10 +814,10 @@ depth teardown.
 Alpha test, for completeness (no key and no vertex-format change):
 
 ```
-(0x0c, 4)   reg 0x103c = 1        alpha test enable
-            reg 0x1064 = 5        alpha func GREATER (same 1..8 enum as depth)
-            reg 0x1060 = 0x80     reference, 8-bit: round(0.5 * 255)
-            reg 0x106c = 0        [previous op's cleanup]
+(0x0c, 4)   id 0x0f (0x103c) = 1     alpha test enable
+            id 0x19 (0x1064) = 5     alpha func GREATER (same 1..8 enum as depth)
+            id 0x18 (0x1060) = 0x80  reference, 8-bit: round(0.5 * 255)
+            id 0x1b (0x106c) = 0     [previous op's cleanup]
 ```
 
 ### 3.3 A texture
@@ -795,12 +827,12 @@ Both decode identically in structure:
 
 ```
 (0x0a, 1)   TEXTURE-DEF        80-byte record, layout below
-(0x0e, 1)   TEXENV  stage0 sub 0x00 = 4
+(0x0e, 1)   texture unit 0, sub 0x00 = 4
 (0x46, 1)   FRAGPROG-UPLOAD    progid, then a 0x664-byte blob; record padded to 0x680
-(0x05, 2)   index 0x13 = 1 ; index 0x14 = progid      SELECT FRAGMENT PROGRAM
-(0x0c, 1)   reg 0x1224 = 0
+(0x05, 2)   ids 0x13 = 1 and 0x14 = progid            SELECT FRAGMENT PROGRAM
+(0x0c, 1)   id 0x89 = 0
 ... the usual light / material / matrix / clip-plane revalidation ...
-(0x0e, 1)   TEXENV  stage0 sub 0x18 = 2
+(0x0e, 1)   texture unit 0, sub 0x18 = 2
 (0x07, 1)   PIPELINE-KEY = 0x00020011      bit 17 set
 (0x08, 1)   VERTEX-FORMAT stride = 28 or 32
 (0x1b, 1)   DRAW
@@ -885,7 +917,7 @@ layout and instruction encoding. [CONFIRMED]
 
 All are `(0x0c, N)` pair records unless noted. [CONFIRMED]
 
-| GL | index | register | value |
+| GL | state id | published reg | value |
 |---|---|---|---|
 | `glEnable(GL_STENCIL_TEST)` | 0x34 | 0x10d0 | 1 |
 | `glStencilFunc` ref | 0x39 | 0x10e4 | ref |
@@ -900,10 +932,13 @@ All are `(0x0c, N)` pair records unless noted. [CONFIRMED]
 | `glViewport(x,y,w,h)` | — | `(0x26,1)` rect | same space |
 | `SwapBuffers` | 0x3e | 0x10f8 | toggles 1 / 0 |
 
-`glClear` is a `(0x15, 1)` record:
-`[mask][ARGB8888][depth float][stencil][0x80808080][x][y][w][h]`, mask
-1 = colour, 2 = depth, 3 = both, rect in screen pixels. The `0x80808080` dword
-is constant in every clear. [PURPOSE UNKNOWN]
+`glClear` is a `(0x15, 1)` record, 36-byte element:
+`[mask][ARGB8888][depth float][stencil][0x80808080][x1][y1][x2][y2]`, mask
+1 = colour, 2 = depth, 3 = both. **The last four dwords are a corner pair, not
+`w, h`**, and the kernel adds the render target's origin to all four before
+blitting (`mtx3513` @0x4a0b0) — a correction to the earlier "x, y, w, h" reading.
+`payload[0] & 0x10` selects a second pass. The `0x80808080` dword is constant in
+every clear. [PURPOSE UNKNOWN]
 
 Wide lines are **CPU-emulated**: `glLineWidth(4.0)` emits pipeline key `0x852`,
 stride 32, *window-space* pre-transformed vertices, and four parallel 1-pixel
@@ -913,45 +948,90 @@ lines. Do not look for a width register.
 
 ## 4. Synchronisation
 
-Four distinct mechanisms, at four different levels. A driver needs all four.
+There are exactly **seven** distinct wait primitives in the vendor core, found by
+enumerating every backward branch enclosing a register read. **None of them has
+a timeout.** They are listed here in the order a driver meets them.
 
-### 4.1 The indexed-write FIFO — `0x450` bit 22
+### 4.1 `WaitBusMastering` — the composite "engine drained" wait
 
-Registers `0x1000–0x13FF` go through a **16-entry** write FIFO. The vendor
-counts writes in the shared register shadow (`pRegShadow[0x90]`) and, on reaching
-16, polls `0x450` until bit 22 (FIFO empty) is set, then resets the count.
-Also polled at ring rewind, where the wait is `0x450 == pRegShadow[0x9c]`
-(an expected value the driver maintains). [CONFIRMED — `mtx3863` @0x34e04,
-`mtx3948`, `mtx2434`]
-
-**When:** before any register write that would be the 17th outstanding one, and
-before emitting a `0x12BC` fence tag.
-
-### 4.2 The engine fence — `0x12BC` write / `0x41C` read
+The one every teardown, every buffer free and every ring wrap goes through.
+Inlined at `mtx2508` @0x31880, `mtx2095` @0x321e0, `mtx479` @0x44d50,
+`mtx2667` @0x4c5c0, `mtx3677` @0x4f8c0, `mtx935` @0x4fcf0, `mtx1391` @0x9f781;
+un-inlined in `mtx_drv.so` as `CDPSHwManager::WaitBusMastering` @0x6c750.
+[CONFIRMED]
 
 ```
-tag = value & ~1
-poll 0x450 until bit 22 set            (drain the indexed FIFO first)
-write 0x12BC = tag                      SOFTRAP: emit the tag
-if (value & 1)
-    do { read 0x41C } while (result != tag);
+1  while (pStatus[0x78] != 0) ;                       /* pending-submit counter */
+2  do { v = read(0x8f0); } while (!(v & (1 << 17)));  /* primary DMA finished   */
+3  do { v = read(0x450); } while (v != pStatus[0x9c]);
+   pStatus[0x90] = 0;                                 /* reset the FIFO counter */
 ```
 
-Tags come from `pStatus[0x44]`, **incremented by 8** each time and **skipping
-0**; **bit 0 means "block until complete"**. The fence commit block is nine
-dwords:
+Two things about step 3 that matter and are not obvious:
+
+* the test is a **full 32-bit equality**, not a masked bit test;
+* `pStatus[0x9c]` is a **snapshot of register `0x450` taken once at device init**
+  (`mtx3229` @0x2460 reads `0x450` and stores it at `+0x9c`). The idle criterion
+  is literally "`0x450` has returned to the value it had at init". A driver must
+  take the same snapshot; there is no documented mask to use instead.
+  [CONFIRMED]
+
+**Step 1 is a bug — do not copy it.** The field is not `volatile`, the compiler
+hoisted the load, and the emitted code is `cmp DWORD PTR [rdx+0x78],0 / jne
+<itself>`: if the counter is ever non-zero the CPU spins forever *without
+re-reading memory*. All seven sites are affected (0x318a0, 0x321e4, 0x44d76,
+0x4c5e6, 0x4f8e3, 0x4fd41, 0x9f785). [CONFIRMED]
+
+### 4.2 The indexed-write FIFO — `0x450` bit 22
+
+Registers `0x1000–0x13FF` go through a 16-entry write FIFO. The exact rule, read
+off `mtx2434` @0x399cf:
 
 ```
-0x21c0c0c0  0x0307  0x00000004  0x0707
-0xc0afafdd  0x00000000  fence1|1  fence2|1  shadow(0x1300)
+n = ++pStatus[0x90];
+if (n <= 16) { pStatus[0x90] = n; }                    /* no wait */
+else         { pStatus[0x90] = 0;
+               do { v = read(0x450); } while (!(v & 0x400000)); }
+write(reg, data);
 ```
 
-which decodes as `0x1300 <- 0x0307, 4, 0x0707`, packet end, then
-`0x1374 <- 0`, `0x12BC <- fence1|1`, `0x12BC <- fence2|1`, `0x1300 <- saved`.
-Padding to a `0x1000` boundary uses `0x21212121`. [CONFIRMED — `mtx3144`
-@0x31c30]
+So the drain fires on the **17th** write since the last drain, and the counter is
+not re-checked afterwards. Roughly 25 inline sites. [CONFIRMED]
 
-### 4.3 The per-submission serial — how completion reaches user space
+**`0x450` therefore has two unrelated uses** — full-equality idle (§4.1 step 3)
+and bit-22 FIFO-empty here. Do not conflate them.
+
+### 4.3 The engine fence — `0x12BC` write, `0x41C` read
+
+Tag allocation: `tag = pStatus[0x44] += 8`, **skipping 0**; **bit 0 of the value
+written to `0x12BC` means "block until complete"**. The tag is emitted into the
+command stream as register index `0xaf`; `mtx2434`'s handling is
+
+```
+<FIFO drain, §4.2>
+write(0x12BC, val & ~1);
+if (val & 1) do { v = read(0x41C); } while (v != (val & ~1));
+```
+
+The wait the *driver* performs (`mtx508` @0x38888, `mtx984` @0x4e890,
+`mtx3616` @0x4ec70, and `ParhlXAASync` @0x534d7 in `mtx_drv.so`) is wrap-safe and
+has two sources:
+
+```
+for (;;) {
+    completed = pStatus[0x8fc] ? (read(0x41C) & ~7)      /* poll the register    */
+                               : (pStatus[0x10] & ~7);   /* host write-back slot */
+    latest = pStatus[0x44];
+    if ((completed >= myTag) != (completed > latest)) break;   /* mtx177 @0x4dc80 */
+}
+```
+
+`pStatus[0x8fc]` is the submission-mode word: 0 = ring, 1 = emulated DMA,
+2 = direct PRIMEND. `pStatus[0x10]` is a **hardware DMA write-back slot**, usable
+only once `0x400` points at a DMA-coherent page (§4.6). Prefer the `0x41C` poll
+until that is set up. [CONFIRMED, the write-back reading INFERRED]
+
+### 4.4 The per-submission serial — how completion reaches user space
 
 This is the mechanism a GL client actually waits on, and it needs **no ioctl and
 no interrupt**. Every draw packet carries:
@@ -961,50 +1041,466 @@ reg 0x1090 = bus address of a 4-byte completion word
 reg 0x1094 = the value to write there
 ```
 
-`0x1090` is the mmap cookie of the PCI_LOCKED serial page created by
+`0x1090` is the mmap cookie of the PCI_LOCKED fence page created by
 control-block op `0x0a` (§1.2) — for that memory class the cookie *is* the
 physical/bus address. `0x1094` is a monotonic submission serial. Across five
-draws the packets carried 3, 4, 5, 6, 7 and the serial page read back exactly
-those values. `glFinish` is "spin until `*serialPage >= myValue`".
+draws the packets carried 3, 4, 5, 6, 7 and the page read back exactly those
+values. `glFinish` is "spin until `*fencePage >= myValue`".
 [CONFIRMED, both halves observed in the same capture]
 
-**A driver must therefore allocate one DMA-visible page per context, hand its
-bus address to `0x1090` in every packet, and poll it.** There is no completion
-ioctl in this ABI.
+**A driver must therefore allocate one DMA-visible page per context, hand its bus
+address to `0x1090` in every packet, and poll it.** There is no completion ioctl
+in this ABI.
 
-### 4.4 Ring-level status
+### 4.5 The pre-submit bus gate — `0x318` / `0x31C`
 
-| register | test | used for |
-|---|---|---|
-| `0x8f0` bit 17 | set | primary DMA finished — before a ring rewind and before a ucode load |
-| `0x8f0` bits 24–25 | zero | WARP idle |
-| `0x908` | `(v & 0xfff7ffbf) == 0x63a78001` | WARP idle signature |
-| `0x924` | `(v & 0xfff) == 0x100` | WARP pipe ready |
-| `0x318` / `0x31c` | `(v & mask) == want`, mask/want `1`/`1` or `0x57`/`0x50` | pre-submit gate on the non-DMA post path |
-| `0x8f4` / `0x8f8` / `0x8fc` | read / write-back-to-ack / enable mask | interrupts |
-
-Ring rewind (`mtx2508` @0x31880) is the full sequence: spin on the shared lock
-`pRegShadow[0x78]`, wait `0x8f0` bit 17, wait `0x450 == pRegShadow[0x9c]`, reset
-the FIFO counter, write `0x404 = ringBase & ~3`, write `0x400 = limit`.
-
-### 4.5 What the ICD itself does per frame
-
-From the capture, in order, around `glFinish`:
+Taken only when the ring buffer's address-space selector is 0
+(`mtx3144` @0x31db2, `BmPrimInt::Start` @0x8943e):
 
 ```
-CB[0x00] = 1        RENDER
-CB[0x234] = 0xffffffff   client clears the result slot
+mask = 0x57; expect = 0x50;
+if (CommonData[0x2440] & 0x7e000) { mask = 1; expect = 1; }
+do { reg = (CommonData[0x2440] & 0x70000) ? 0x31C : 0x318;
+     v = read(reg); } while ((v & mask) != expect);
+write(0x408, PRIMEND);
+```
+
+`CommonData[0x2440]` is a cached bus-master capability word; the masks line up
+approximately with the `AGPINFO_*` flags in `kernel/src/mtx_agp_flags.h`.
+[CONFIRMED code, flag mapping INFERRED]
+
+### 4.6 `0x400` is a write-back pointer, not a limit — correction
+
+`docs/parhelia-kernel-abi.md` §6.4 records `0x400` as an unexplained
+"limit or wrap pointer", and `pStatus[0x40]` as "ring limit value". Both are
+wrong. `mtx3229` @0x24ad stores the **low 32 bits of the shared-locked page's own
+physical address** into `pStatus[0x40]` (with `pStatus[0x4c] = phys + 0x20`), and
+`BmPrimInt::Reset` (`mtx2508`) writes that to `0x400`. So `0x400` gives the
+engine a **status write-back address**, which is what makes `pStatus[0x10]` and
+`pStatus[0x20]` readable by the CPU. [INFERRED, high confidence]
+
+Still unexplained: the value is masked `& ~0x1f` when a capability query returns
+bit 2 (`CommonData[0x2198][0x608]->vtbl[0x20]() & 4`, at 0x319e8). [PURPOSE
+UNKNOWN]
+
+### 4.7 The WARP idle wait, before a microcode load
+
+`mtx1391` @0x9f6b0, in this exact order. A driver reloading the microcode after a
+fault must reproduce all six steps. [CONFIRMED]
+
+```
+1  mtx1937(...)                                   commit whatever is pending (writes 0x408)
+2  WaitBusMastering                               all three steps of §4.1
+3  do v = read(0x908); while ((v & 0xfff7ffbf) != 0x63a78001);
+4  do { v908 = read(0x908); v924 = read(0x924); }
+     while ((v924 & 0xfff) != 0x100 || (v908 & 0xfff7ffbf) != 0x63a78001);
+5  do v = read(0x8f0); while (v & 0x03000000);    WARP busy bits 24-25 clear
+6  write(0x918, byteOffset / 12); then 3 dwords per instruction to 0x91C
+```
+
+The one bounded error path in the whole engine: at 0x9f6f2,
+`if (curOffset + size > 0x17ff) { flag = 1; return FALSE; }` — the instruction
+store is `0x1800` bytes (512 x 12-byte instructions) and overflow is reported
+rather than waited on.
+
+### 4.8 Locks
+
+* `pStatus[0x70]` — per-ring submit lock. `mtx3144` @0x31d17 spins on
+  `OsInterlockedExchange(&p[0x70], 1)` with **no yield and no timeout**. On
+  release, if the old value was **2** the holder was asked to re-kick: it does
+  `p[0x78]--` and rewrites `0x408 = p[0x74]`. Nothing in the kernel core ever
+  stores 2 there, so the writer is the X driver or the ICD. [PURPOSE UNKNOWN]
+* `pStatus[0x7c]` — global hardware-access lock. The GL doorbell `mtx903`
+  @0x1d40 spins **with `OsSchedule()`**; `ParhlXAASync` @0x53441 spins without.
+
+### 4.9 Ring wrap
+
+Everywhere a packet is appended:
+`if (writePtr + packetSize > ring[0x70]) ring->vtbl[0x20](ring);` =
+`BmPrimInt::SwitchToNewBuffer` (`mtx2095` @0x31fc0). With a multi-buffer pool it
+picks a free buffer and emits a buffer-switch packet — no stall. **With a single
+buffer it runs §4.1 in full and then `BmPrimInt::Reset`** — a complete CPU stall
+on every wrap, which is a good reason to allocate more than one. [CONFIRMED]
+
+`BmPrimInt::Reset` (`mtx2508` @0x31880) is the restart sequence:
+
+```
+WaitBusMastering (§4.1)
+addr = (buffer.phys + ring.writePtr) | buffer.addressSpaceFlags;
+pStatus[0x74] = addr;
+write(0x404, addr & ~3);                 /* PRIMADDRESS */
+v = pStatus[0x40];
+if (caps & 4) v &= ~0x1f;
+write(0x400, v);                         /* write-back pointer, §4.6 */
+```
+
+### 4.10 What the ICD itself does per frame
+
+```
+CB[0x00] = 1                RENDER
+CB[0x234] = 0xffffffff      the client clears the result slot
 ioctl 0x4621
-                    kernel writes CB[0x234] = 0 on success, -1 invalid op, -3 not ready
-                    kernel overwrites the stream's first record header with (0xff, 1)
-                    the engine writes the serial page
+                            kernel writes CB[0x234]: 0 ok, -1 invalid op, -3 not ready
+                            kernel re-seeds the stream header with (0xff, 1)
+                            the engine writes the fence page
 ```
 
-`CB[0x234] == -3` means the context is not ready (no bound render target); the
-kernel returns 0 from the ioctl anyway, so **the ioctl return value is not the
-error channel — `CB[0x234]` is**. [CONFIRMED — `mtx903` @0x1c60]
+`CB[0x234]`, **not the ioctl return value, is the error channel** — `mtx903`
+returns 0 even when it refuses (§5.3). [CONFIRMED]
 
-Also observed but not explained: control-block op `0x1e` is issued immediately
-before the first RENDER and again after the last draw, with `CB[0x10] = 1`, and
-it writes four bytes at offset 0 of region 1. It is the only op that touches
-region 1. [PURPOSE UNKNOWN]
+Control-block op `0x1e` brackets the whole session: issued before the first
+RENDER to **attach** the drawable (`CB[0x10]` = context index, `CB[0x18]` =
+drawable handle) and again after the last draw to **detach** (`CB[0x18] = 0`).
+Kernel side it is `mtx1470` @0x4ffb0 -> `mtx1305` @0x463d0, which drops the old
+surface's refcount before binding the new one — a MakeCurrent. The four bytes it
+writes at offset 0 of region 1 are the only traffic that region ever sees, and
+their meaning is [PURPOSE UNKNOWN].
+
+---
+
+## 5. Teardown, fault and reset
+
+### 5.1 The normal teardown order — client side
+
+Read off the tail of `captures/mtxtrace-5draws.txt` and the ICD's destructors.
+Each step is `ioctl(fd, 0x4621)` with the control-block opcode shown. [CONFIRMED]
+
+```
+1  op 0x1e   detach the drawable       CB[0x10] = context handle, CB[0x18] = 0
+2  op 0x0d   destroy each surface resource   CB[0x10] = handle
+              (the texture first, then front/back/Z)
+3  op 0x06   free each device buffer   CB[0x10] = the buffer handle from op 0x05
+              -- the ICD munmaps the region *before* issuing this
+4  op 0x0b   destroy the rendering context    CB[0x10] = context handle
+              -- the ICD munmaps the 4-byte fence page first
+5  ioctl(fd, _IO('F',32) = 0x4620)     destroy the ICD link
+6  munmap the control block; close(fd)
+```
+
+The unmap-then-free ordering is the ICD's, and it is the right way round: the
+kernel frees the backing pages in the op, so a still-mapped region would leave a
+dangling user mapping.
+
+### 5.2 The kernel-side teardown chain
+
+Three ioctls, in the order the X driver issues them.
+
+**`LnxDevice::Stop`, ioctl `0x40044617` (nr 23) -> `mtx3446` @0x10f0**
+[CONFIRMED]
+
+```
+mtx508(dev);          /* the Sync primitive, §5.3 -- SOFTRAP + wait for retirement */
+dev[0x6b8] = 0;       /* "stopped": makes the GL doorbell answer -3 from now on   */
+for each client whose link belongs to this device
+    mtx1204(link, dev);   /* soft detach, no fence wait -- the Sync already ran;
+                             ends with link[0x14c] = 1, "orphaned"               */
+```
+
+No register writes beyond those inside `mtx508`.
+
+**`ParhlDisableDevice`, ioctl `0xc0084615` (nr 21) -> `mtx1612` @0x1070 ->
+`mtx3470` @0x2970** [CONFIRMED]
+
+```
+for each client link on this device { mtx984(link); delete link; }   /* §5.6 */
+mtx3486(dev);   /* the device destructor */
+delete dev;
+```
+
+`mtx3486` @0x38a20 is: if the device was ever started and the engine is dirty,
+run `mtx508` first; then walk the **22-entry init/undo table** at
+`.rodata + 0x1860` (`{init_fn, cleanup_fn, name}`, 0x18 bytes each) **backwards**
+from the last successfully completed step. Step **19** is the WARP unit
+(`mtx3810` init / `mtx3191` cleanup); the other 21 are anonymous in this release
+build — every `name` string is empty — so the semantic order of teardown is only
+recoverable by disassembling all 22 cleanup functions. [CONFIRMED / [PURPOSE
+UNKNOWN] for the 21]
+
+Start is the same table forwards, and **a failed init step immediately runs the
+full Sync before unwinding**.
+
+**ICD link destroy, ioctl `0x00004620` (nr 32) -> `mtx2376` @0x1bf0**: calls the
+real destructor `mtx984` and deletes the link object.
+
+**`mtx1700` (core cleanup @0x640)** runs the C++ static destructors and
+unregisters its 14 ioctls. **`mtx547` (core disable @0x8d0)** walks the device
+list and calls `mtx3470` on each. **Neither touches a register.** [CONFIRMED]
+
+### 5.3 `mtx508` — the Sync primitive every teardown goes through
+
+`mtx508` @0x387a0. This is the sequence a driver must copy to bring the engine to
+a known-quiet state. [CONFIRMED]
+
+```
+tag = pStatus[0x44] += 8;  if (tag == 0) tag += 8;
+if (ring.wp + 0x10 > ring.limit) SwitchToNewBuffer(ring);
+ring[0] = 0x21AFDDC0;        /* header: C0 -> 0x1300, DD -> 0x1374,
+                                        AF -> 0x12BC, 0x21 -> end of packet */
+ring[1] = 0x00000707;        /*   0x1300 = 0x707 */
+ring[2] = 0x00000000;        /*   0x1374 = 0     */
+ring[3] = tag | 1;           /*   0x12BC = tag, bit 0 = block until complete */
+ring.wp += 0x10;
+<submit: mtx3144 fence path, or write(0x408, ringBias + wp)>
+<fence wait, §4.3 -- unbounded>
+/* only once the engine is idle: */
+mtx3091(interruptManager);                  /* IRQ refcount--; at 0 -> write(0x8fc, 0) */
+mtx3630(leaveSceneCounter);
+for (i = 15; i >= 0; i--)                   /* 16 binding slots, CommonData+0x2228, stride 0x20 */
+    if (slot[i]) unbind(slot[i]);
+this[0x40] = 0;                             /* engine no longer dirty */
+```
+
+The longer 9-dword fence block emitted by `mtx3144` @0x31c30 is
+
+```
+0x21C0C0C0   0x00000307  0x00000004  0x00000707
+0xC0AFAFDD   0x00000000  tagA|1      tagB|1      pStatus[0x8c]
+```
+
+= `0x1300 <- 0x307, 4, 0x707`, end of packet; then `0x1374 <- 0`,
+`0x12BC <- tagA|1`, `0x12BC <- tagB|1`, and `0x1300` **restored** from the
+shadow. That restore is why `0x1300` values whose low nibble is 6 or 7 are
+deliberately not mirrored into the shadow — they are a transient framing state.
+[CONFIRMED]
+
+### 5.4 What is *not* quiesced
+
+| what | teardown does |
+|---|---|
+| IRQ mask | `write(0x8fc, 0)` on the last IRQ-reference release (`mtx3091` @0x3ac20) |
+| IRQ line | `free_irq()` in `mtx_irq_cleanup`, **before** `core->disable` |
+| ring pointers `0x400`/`0x404`/`0x408` | **never zeroed** — only rewritten on restart |
+| bus-master enable | **never disabled**. No PCI `COMMAND` bus-master clear, no undo of `0x10b0`, `0x300` or `0x308` |
+
+So the vendor leaves the engine armed and merely guarantees the ring is drained.
+An open driver that wants a genuinely quiet device has to add the disable itself;
+the mmiotrace of a clean shutdown shows `0x8fc = 0` followed by zeroing the whole
+`0x0000..0x0130` aperture bank, which is the closest thing to a template.
+
+### 5.5 If the client just dies
+
+The generic layer handles it, so a crash does not leak the GPU. `mtx_release`
+(`kernel/src/mtx_fops.c`) calls `mtx_ctx_cleanup`:
+
+```
+dev->core->close(dev->core_data, ctx->core_data);
+for each region in dev->memory_regions
+    if (region->ctx_id == ctx->unique_id) MtxRegion_Free(ctx, region);
+mtx_ctx_unregister(dev, ctx->unique_id);
+```
+
+and when the last reference goes, `mtx_dev_cleanup` (`kernel/src/mtx_dev.c`) runs
+`mtx_irq_cleanup` -> `core->disable` -> free the context bitmap -> free every
+remaining region -> `mtx_agp_disable`. [CONFIRMED, open source]
+
+### 5.6 Buffer release — the kernel gives you no protection
+
+`RELEASE_BUFFER` (`0x40184602`, `kernel/src/mtx_ioctl.c:178`) performs **no
+synchronisation at all**: it validates the descriptor, decrements the refcount
+and calls `MtxRegion_Free`, which unlinks the region and hands the pages back to
+the allocator. The only nod to safety is a `MTX_DEBUG("WARNING: Freeing a buffer
+still in use …")` that is compiled out of release builds. **A DMA buffer the
+engine is still reading can be returned to the page allocator.** [CONFIRMED]
+
+The ordering constraint is enforced entirely on the client side, and every free
+path in the core does it the same way:
+
+* `mtx479` @0x44d50 (`BmBuffer::FreeMemory`) — **first** runs §4.1
+  WaitBusMastering in full, *then* releases the surface. Same shape in
+  `mtx2667` @0x4c5c0 and `mtx935` @0x4fcf0 (control-block op 18: wait, then
+  virtual destructor).
+* Context destroy `mtx984` @0x4e7c0 — unregisters, frees its two buffers, and
+  only then, at 0x4e890, performs the §4.3 fence wait on **this context's last
+  submitted tag** before tearing down the surface tree.
+
+**Rule for an open driver:** hold every buffer that a submitted command list has
+ever referenced until either the ring is drained (§4.1) or the fence tag recorded
+at submission time has retired, *before* issuing `RELEASE_BUFFER`.
+
+### 5.7 The fault path — there isn't one
+
+This is the most important negative result in the document, so it is stated
+flatly.
+
+* **No timeouts.** Every wait in §4 is an unbounded spin. No iteration counter,
+  no jiffies check, no bail-out. The only bounded loops in the whole tree are
+  display-side (`WaitForMemoryIdle` @0xe3d20, 100 000 iterations, **silent**
+  timeout; `HWPARFSWaitLock` @0xe4510, 100 samples). [CONFIRMED — exhaustive
+  loop scan]
+* **No error reporting.** `mtx_parhelia.o` contains exactly ten message strings,
+  all allocation failures, plus `[mtx] Parhelia patches applied: %s`. Nothing
+  matching hang, timeout, lockup, recover or reset. The open-source layer's 29
+  `MTX_ERROR` sites are likewise all allocation and registration errors.
+  [CONFIRMED — exhaustive string scan]
+* **The WARP microcode is never reloaded after a fault.** `mtx1391` has exactly
+  two callers, both inside init step 19. [CONFIRMED]
+* **A malformed command stream is not detected.** `mtx2434` writes every index
+  byte `0x00–0xFF` straight to `0x1000 + idx*4`; its one range check is
+  unreachable by construction. A SOFTRAP carrying a bogus tag with bit 0 set
+  hangs the interpreter permanently. (Note `mtx2434` is **dead code in the kernel
+  build** — zero relocations reference it; it is live only in the X driver, chosen
+  by `pStatus[0x8fc] == 1`.) [CONFIRMED]
+* **`MTX_IOCTL_HARD_RESET` (`0x00004607`) does not touch the hardware.** Its body
+  is `#ifdef DEBUG`, the release module never registers it, and all it does is
+  force-decrement the module use count and call `mtx_dev_cleanup` so a wedged
+  module can be unloaded after a client crash. `kernel/src/reset.c` says so in
+  its own comment. [CONFIRMED]
+
+What the vendor *does* have, and does not use, is a real reset.
+
+### 5.8 The real hardware reset — PCI config register `0xE0`
+
+`HSLPARHardwareReset` @0xc5580 in `mtx_drv.so`. It is an exported HAL entry point
+with **no caller anywhere in the driver** — it is never invoked from any hang
+path. It is also the only genuine reset that exists, so an open driver's
+watchdog should use it. [CONFIRMED]
+
+```
+1  bail out if (pdev[8] & 0xc0000000) is set and != 0x40000000
+2  HSLPARSaveCriticalData(pdev)
+3  save PCI config dwords 0x04, 0x0c, 0x10, 0x14, 0x30, 0x3c, 0x40
+     (plus 0xf4, 0xf8 when (pdev[0x3a8] & 0xe0) != 0x80)
+4  if device is 0x0528 or 0x2537..0x2539:  write_reg(0x308, 3)
+5  read 0x300; rebuild it from PCI config 0x04; write it back with bit 9 cleared
+6  write_config_dword(0xE0, 3);  write_config_dword(0xE0, 0);      <-- the strobe
+7  wait 10 ms
+8  restore all saved config dwords, restore register 0x300,
+     HSLPARRestoreCriticalData(pdev)
+```
+
+Note it is **not** an MMIO reset bit, and it is not `0x1e40` — that address in
+this driver is a MAVEN/TV I2C path.
+
+### 5.9 The "lost link" state — the vendor's actual fault response
+
+In place of recovery there is a **latched lost/orphaned flag**, enforced
+identically on both sides of the ABI:
+
+* ICD `Submit` @0x358820: `if (this->IsLost() && op != 3) return -3;`
+* kernel `mtx903` @0x1cb8: if the link is orphaned (`link[0x14c] != 0` and its
+  state != 3) **or** the device has been stopped (`dev[0x6b8] == 0`, cleared by
+  `LnxDevice::Stop`), then `CB[0x234] = -3` and the ioctl returns 0 **without
+  touching the hardware**.
+
+So once a context is lost, **the only control op that still works is `0x03`
+(Flush/Finish)**. Result codes seen: `0` success, `-1` invalid opcode, `-3` not
+ready / lost, `-4` retry (the ICD spins on this for ops `0x10` and `0x1c`),
+`-12` ENOMEM and `-14` EFAULT from the `copy_from_user` marshalling wrappers.
+[CONFIRMED]
+
+### 5.10 What an open driver must do instead
+
+1. **Bound every wait** in §4 — `0x8f0` bit 17, `0x450` equality, `0x450` bit 22,
+   `0x908`, `0x924`, `0x41C`, and both locks. Make the `pStatus[0x78]` read
+   `volatile` (§4.1).
+2. **On timeout, stop feeding the engine**: mask interrupts (`0x8fc = 0`), stop
+   appending to the ring, mark every context lost per §5.9 — after a reset every
+   fence value and every ring offset a client holds is stale.
+3. **Reset via PCI config `0xE0`** (§5.8), restoring config space *and* register
+   `0x300` afterwards.
+4. **Re-run the whole init**: §1.1 in full, including re-streaming the WARP
+   microcode, because nothing reloads it independently. The ucode loader is
+   written to be re-runnable — `bReset` clears the load pointer and the overflow
+   flag — which is the one piece of evidence the vendor anticipated this.
+5. **Never release a buffer before its fence has retired** (§5.6).
+
+### 5.11 Things in these paths whose purpose is not established
+
+Listed rather than omitted; treat them as candidate errata workarounds and
+replicate them.
+
+* **`pStatus[0x84]` gates the whole `0x384` DMAPAD workaround.** `mtx3229`
+  @0x24e0 defaults it to **1**, and `mtx2839` @0x38cef then overwrites it with a
+  byte the *client* supplies in the 0x80-byte `START` payload (ioctl
+  `0x40084616`). When it is 0 the driver skips the last-register tracking and
+  every `0x384` write. Whether an open driver may leave it off is unknown; the
+  vendor default is on.
+* **`mtx3376` @0xa80** prints `Parhelia patches applied: %s` and the patch names
+  live in `.rodata.str1.1`: `PowerM`, `EOBTag`, `Cap66Mhz`, `CompBypass`,
+  `BmLocal`, `PciRead`. They map onto the arm sequence of §1.1 — `0x10b0 = 0x10`
+  is *PowerM*, `0x12b8 = 0x00070601` is *EOBTag*, `0x308` is *CompBypass*, the
+  Intel host-bridge quirk bit in `0x300` is *PciRead* — but the bit semantics of
+  all four registers remain unknown. [mapping INFERRED]
+* **`mtx514` @0x8f7c0**, the `0x910`/`0x914`/`0x938` port: writes
+  `0x910 = ((arg << 9 | sub) & 0xfff) | ((idx & 0xf) << 24)`, then
+  `0x938 = 0xfffffffc`, then reads `0x914` **exactly four times**, keeping the
+  last. A fixed-count read, not a poll — presumably a read-pipeline latency
+  requirement.
+* **`pStatus[0x70] == 2`** (§4.8) — nothing in the core writes it.
+* **`0x400`'s `& ~0x1f` masking** when a capability bit is set (§4.6).
+* **`0x314 = 1`**, written in bursts of four and eight during the arm sequence and
+  17 times over a full session, from the X driver's own BAR1 mapping.
+* **`0xbc0 = 0x4087`**, a memory-configuration value from a capability vtable.
+* **`pStatus[0xc0]`** holds an MMIO base pointer inside the *shared* page (used by
+  `mtx508`, `mtx984`, `ParhlXAASync`), with `+0xc8`/`+0xcc` holding the register
+  BAR's physical address and size. Storing a mapping pointer in a page shared
+  with user space is unusual; whether it is per-process or kernel-only is not
+  determined.
+* **The 21 anonymous init/undo steps** (§5.2).
+* **The `0x00000004` count prefix** on some ring elements but not others (§2.4a).
+* **Control-block op `0x04`'s second effect**: after the idle wait the ICD stamps
+  *all* per-8 KB-page fence tags free. Whether the wait is what makes that safe,
+  or the driver is simply discarding pending work, is not established.
+* **Record opcodes `0x0d`** (32-byte element `2,0,3,0,0,0,8,3`) and **`0x35`**
+  (16-byte element, all zero) — byte-identical in every capture, emitted as the
+  first two records of every state-carrying stream.
+* **Record `0x24`**, always `3, 5`.
+* **The `0x80808080` dword** in every CLEAR record.
+* **Why the 32-entry attribute block** is initialised to `0` in the default-state
+  stream and to `0xffffffff` at the first draw.
+
+### 5.12 A stream-grammar conflict worth resolving
+
+Two independent readings of `mtx2434`'s header-repeat feature disagree on which
+indices carry it:
+
+* `docs/parhelia-kernel-abi.md` §6.2: index `0x2a`/`0x2b` (`0x10a8`/`0x10ac`).
+* This pass: index `0x22`/`0x23` (`0x1088` = saved header template,
+  `0x108c` = repeat count), with `0x108c` additionally forcing a header reload
+  when written.
+
+Both are reads of the same function. Settle it before using stream compression;
+neither reading affects the draw path documented here, which uses no repeats.
+
+## 6. Open items this document does not settle
+
+Ordered by how much they block an open driver.
+
+1. **The state-id to register mapping** (§0). Until the 172 arms of
+   `.rodata+0xba0` in `mtx2617` @0x19950 are dumped, no driver can go from a GL
+   call straight to a register write. This is the single highest-value next step
+   and it is a mechanical read of one jump table.
+2. **The 21 anonymous init/undo steps** of the device start table at
+   `.rodata+0x1860` (§5.2). Only step 19, the WARP unit, is identified. A
+   from-scratch bring-up needs to know what the other 21 program.
+3. **A second texture unit** (§3.4) — entirely uncaptured, and the cheapest gap
+   to close: one more sweep run.
+4. **The `0x51` record** — one `(index, 0)` pair, index 2 then 1, splitting the
+   default-state stream into two identical halves. Read here as a render-target
+   selector; unproven.
+5. **Which fence counter is authoritative** — the client's descriptor tail or the
+   kernel's `mtx558` epilogue (§2.4a).
+6. **The header-repeat indices**, `0x22`/`0x23` versus `0x2a`/`0x2b` (§5.12).
+7. **The DRAW record's `flags` field** at `+0x04`, observed 0, 1, 2, 4, 6, 0x18.
+8. **`0x408` advancing by `0x20`** per submission versus a `0x14` ring-pointer
+   increment (§1.1).
+9. **Whether `pStatus[0x84] = 0`** — turning the `0x384` DMAPAD workaround off —
+   is safe (§5.11).
+10. **Vertex programs.** Control op `0x13` and record opcode `0x45` both exist
+    and neither is exercised by any capture; the fixed-function path runs on the
+    resident WARP microcode instead.
+11. **The TEXTURE-DEF tail**, bytes `+0x30..+0x44`, which differ between the two
+    texture captures (§3.3) and must contain the filter and border state.
+
+## 7. Reproducing the decodes in this document
+
+```
+python3 tools/parhelia-glsweep-decode.py captures/glsweep-0528-raw.txt
+```
+
+is the existing decoder and predates the record grammar in §0 — it will
+reproduce the per-feature deltas but mis-frames `(0x0c, N)` and `(0x05, N)`
+headers as register pairs. The framing used here is the one described in §0:
+`(opcode, count)` plus `count` elements of the per-opcode stride, validated by
+requiring the stream to end exactly at `region0 + 0x230`. Any re-implementation
+should keep that check as its self-test — it is what caught every mis-framing.
