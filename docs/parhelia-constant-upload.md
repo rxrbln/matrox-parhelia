@@ -164,3 +164,27 @@ buffer, in both the constant and matrix directions.
 
 Neither is a ring packet. An open driver that owns the ring must supply whatever
 the stage after `mtx610` emits, and that is the piece to find next.
+
+## `mtx3136` is not the emitter either — a useful negative
+
+`mtx3699` is called from `mtx3136` (`.text+0x1b670`), which is a straight-line
+sequence of flush calls:
+
+    mtx3699  mtx3924  mtx580  mtx950  mtx273  mtx1230  mtx3143  mtx912
+
+Every one of the seven after `mtx3699` is tiny — 9, 57, 46, 40, 35, 12 and 12
+bytes — and none contains anything with the shape of a register tag or a packet
+literal. The whole chain is **software state management**: shadows, dirty bits,
+pointer compaction.
+
+So the hardware emit is downstream of `mtx3136` altogether, not inside it. That
+narrows where to look next: the validation path `mtx3712` (`.text+0x188f0`),
+which `parhelia-slot-translation.md` already documents as running in fixed order
+immediately before every ring submit, and which is where the register packets
+for depth, blend, raster and the rest are actually built.
+
+**Where this leaves an open driver.** The constant and matrix data model is now
+fully mapped from client record to staging buffer, and every stage of it is
+software that a driver owning the ring simply would not have. What such a driver
+needs is not this chain but the *shape of what it finally emits* — and that is
+one function away, in a path already partly documented for other state.
