@@ -448,3 +448,42 @@ which is byte-for-byte the packet `mtx693` builds at `0x43748`.
 None of this has been executed on a Parhelia. The cheapest confirmation is the
 §5 short form on top of the instruction-FIFO streaming that already passes its
 gates: five dwords into the ring, then the existing triangle submission.
+
+## Hardware attempt 1 — the binding sequence took the machine down  [HW]
+
+Recorded because a failure that reboots the box is worth as much as a success,
+and because the likely cause is now identifiable.
+
+**What was tried.** After streaming the seven canned programs (which works —
+see docs/parhelia-draw-recipe.md), the tool emitted the pipe preamble plus the
+full stage-binding set from section 5: the strobe, `0x10f0` twice, `0x1100 =
+entry` with `entry = 0`, `0x10f8 = 2`, `0x10c0 = 2`, and `0x10c8`-`0x10d8` all
+set to `entry`. Then the draw.
+
+**Result: the machine rebooted.** Not a hang, not a fault the driver logged —
+the box went down and came back with an uptime of one minute, mtx unloaded and X
+gone. The PCI device was still enumerated afterwards, so the card survived; a
+`modprobe` and X restart brought everything back.
+
+**The most likely cause, from the block-state work that landed the same day:**
+the WARP constant store powers on as **all zeroes**, and a bound program reads
+its constants from it. In particular the viewport pair is described as the one
+entry that cannot be omitted. This attempt bound a program and started feeding
+it vertices while every constant it reads was zero. Binding was done without
+programming anything for the program to read.
+
+**Revised order for the next attempt**, safest first:
+
+1. Upload the constants **before** binding — at minimum the viewport pair, and
+   preferably the full 26-entry minimum set from
+   docs/parhelia-block-state-map.md.
+2. Use the **short bind form only** — the single four-register packet
+   (`0x1374` strobe, `0x10f0` twice, `0x1100 = entry`) that `mtx693` builds
+   verbatim. Do not write the six stage registers until the short form is
+   proven; that is six more chances to put the engine somewhere undefined.
+3. Only then submit the draw.
+
+**Operational note:** each attempt of this kind can cost a reboot, so batch the
+diagnostics — capture register state and any driver output to a file *before*
+the submit, so a reboot does not take the evidence with it. This attempt lost
+its output that way.
