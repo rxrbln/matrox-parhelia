@@ -937,3 +937,48 @@ correct by the table above), and a DWGSYNC with the block bit never retires.
 Without one, "the program ran and emitted nothing" and "the program never ran"
 remain indistinguishable, and further register-level variation is enumeration
 rather than measurement.
+
+## The block-load packet is what stops the engine, and its framing is unsolved
+
+Measured 2026-09-05 with a **validated** fence (positive control: four exact tag
+matches; negative control: unchanged with no packet). See the DWGSYNC section
+above — the fence works only with bit 0 **clear**.
+
+Seeding `0x41c` to `0x10` with a 2D run, then bracketing the 3D draw with tags
+`0x30` and `0x48`:
+
+| stream | `0x41c` after | meaning |
+|---|---|---|
+| trilevel 1 (no block loads) | `0x48` | **both tags retired, draw packet executed** |
+| trilevel 2 (`warp_init_constants`) | `0x10` | neither retired |
+| trilevel 3 | `0x10` | neither retired |
+| `--oldconsts` (`warp_min_constants`) | `0x30` | pre retired, post did not |
+| one count-4 load, our framing | `0x10` | neither retired |
+| one count-4 load, header-less vendor tag `0x4106000f` | `0x10` | neither retired |
+
+`0x404 == end` in every case. **The engine fetches the ring to completion and
+does not execute it.** That is not the same failure as "the draw runs and emits
+nothing", and every conclusion previously drawn from "packets consumed, engine
+idle, nothing drawn" was about the wrong thing.
+
+Two framings tried, both rejected by the hardware:
+
+```
+ours:    [0x41000000 | count<<17 | count*4+3][count][start][1][0] + count*4 data
+vendor:  [0x41000000 | (count-1)<<17 | count*4-1] + count*4 data
+```
+
+For `count = 4` the second produces exactly `0x4106000f`, the literal the vendor
+emits in `mtx676` — and it still desyncs. So the tag alone is not the whole
+story; the payload shape matters.
+
+**The clue not yet followed.** `mtx676`'s 16 payload dwords are *not* four vec4s
+of data. They are `0xaaaaaaaa`x4, `0x55555555`x4, then `0, 0x40, 0x80, 0xc0,
+0x100, 0x140, 0, 0` — two vec4s of data followed by six values spaced `0x40`
+that look like destination indices, and two zeros. So a block load may carry
+**data plus a scatter list of destinations**, not a base index and a run. That
+would explain why a base-index header is rejected: there is no base index.
+
+This is now the single blocking unknown for a triangle, it is well localised,
+and there is a working instrument to test candidates against: put a candidate
+packet in the ring behind a DWGSYNC and see whether the tag retires.
