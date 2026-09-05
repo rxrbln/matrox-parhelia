@@ -121,10 +121,23 @@ glDepthRange + viewport scale/bias are **CPU-applied** in the fixed-function
 path — no dedicated engine registers (a hardware-VS path may use VS constants;
 capture 0x1268/0x126c/0x1298 on glDepthRange to confirm/deny).
 
-**Software-handled (no register)** [DRV]: fog (per-vertex factor computed on the
-CPU, `0xf96f0`, GL_EXP/EXP2/LINEAR), point size, line width (points/lines drawn
-as CPU-expanded triangles), and polygon offset (depth bias in triangle setup). A
-master 3D pipeline-control bitfield lives at **0x1000**/0x1004 (highest write
+**RETRACTED (2026-09-05): fog, scissor and polygon offset are hardware.**
+`RasterCaps = 0x07F309A7` (`MTXPARD .data 0x1d1ee4`) sets **FOGVERTEX, FOGTABLE,
+FOGRANGE, WFOG, ZFOG, SCISSORTEST, DEPTHBIAS, SLOPESCALEDEPTHBIAS** and
+**ANISOTROPY**.  The live capture independently shows fog enable and fog mode
+emitted as state, and polygon offset resolves to block register `0x178` via the
+`regOGLPolygonOffset` switch and the `mtx740` chain.  The CPU fog routine at
+`0xf96f0` is a fallback path, not evidence of missing silicon.
+
+**Point size and line width are software by policy, not by hardware limit.**
+`caps[0x1c]` and `caps[0x1d]` are hard-coded 0 in the capability blob the kernel
+hands the ICD, and that is what forces the CPU line-expansion path the capture
+recorded.  The Windows driver does no CPU point expansion at all.  **Nothing
+about the silicon is established by that fallback.**  Point distance-attenuation
+coefficients are never emitted; key bit 28 instead turns on a CPU loop that
+fills a per-vertex size.
+
+A master 3D pipeline-control bitfield lives at **0x1000**/0x1004 (highest write
 fan-out; full bit decode incomplete).
 
 **Register banks** [GL]: libGL emits state as `(key, index, value)` packets;

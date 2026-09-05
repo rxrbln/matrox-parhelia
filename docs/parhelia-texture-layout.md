@@ -610,3 +610,31 @@ it assumed the source pattern had a 256-byte period — true for a 4-byte-per-te
 source but not for the 3-byte `GL_RGB` source actually used, where the period is
 256 *texels*. The period test was the wrong instrument; predicting exact values
 is the right one.
+
+## Non-power-of-two: three separate questions, three different answers
+
+Added 2026-09-05.  "Does this hardware do NPOT" was previously graded as one
+item; it is three, and they do not agree.
+
+1. **NPOT/rectangular storage — SOLVED [HW].** The captured 32x16 texture
+   occupies exactly `32*16*4` bytes, dense, with no vertical padding.  A
+   non-square, non-power-of-two image is stored without waste.
+
+2. **NPOT sampling capability — DECODED, static only.** `TextureCaps = 0x1EC4D`
+   (`MTXPARD .data`) has **`D3DPTEXTURECAPS_POW2` clear**, and `CUBEMAP_POW2`,
+   `VOLUMEMAP_POW2` and `SQUAREONLY` are clear as well.  Read literally: the
+   silicon samples non-power-of-two textures in 2D, cube and volume, mipmapped.
+   This is a headline claim resting on one `.data` bit and it has **not** been
+   tested on hardware.
+
+3. **The GL stack forbids it — SOLVED (static, enforcement read).**
+   `glTexImage2D`/`glTexImage3D` validate `(dim-1) & dim == 0` for every
+   dimension at `0x14a28d` / `0x14b078` and return `GL_INVALID_VALUE` otherwise.
+   That is a GL-1.3 specification artefact in the ICD, not a hardware limit.
+
+**Unreconciled:** a registry switch `np2Conditional` defaults to 0 and in that
+state *withholds* `NONPOW2CONDITIONAL`.  That is not obviously consistent with
+`POW2` being clear.  Resolve this before exposing
+`ARB_texture_non_power_of_two` in a new driver -- the conservative reading is
+that unconditional NPOT may carry restrictions (wrap modes, mipmapping) that the
+conditional cap is there to express.
