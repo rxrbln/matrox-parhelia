@@ -103,9 +103,25 @@ like `0x12bc` and `0x10a0`/`0x10a4`.
 
 ## Still open on this path
 
-* The **address-space selector** in the low bits of the emitted base values —
-  whether a base in AGP or DMA32 memory carries a tag the way SECADDRESS/SECEND
-  do. Unresolved, and it is the same open item as ring placement.
+* ~~The address-space selector in the low bits of the emitted base values.~~
+  **SOLVED**, and by two independent readings of the same function. `mtx1132`
+  (`.text+0x4c730`) is the address resolver every emitter goes through:
+
+  ```c
+  addr = offset + obj[0x18];
+  switch (obj[0x20]) {          /* the region's memory type */
+      case 1:  return addr | 2;         /* system heap 1 */
+      case 2:  return addr | 3;         /* system heap 2 */
+      default: return addr;             /* 0 = local framebuffer */
+  }
+  ```
+
+  **The low two bits of every GPU address are the memory-space tag**, and it is
+  the same tag that appears in `SECADDRESS`/`SECEND`'s low bits and in register
+  `0x1000`. This also explains the PRIMEND measurement in
+  `parhelia-drm-design.md` §10: a ring in DMA32 system memory needs `|3` because
+  3 *is* its space tag, not because two independent enables happen to be
+  required.
 * Which of the eight bind slots is which target. Four colour/depth surfaces are
   visible in the `i = 0..3` arrays; the other four are presumably the texture
   units, but that is inference.

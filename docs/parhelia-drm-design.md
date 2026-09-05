@@ -1120,8 +1120,17 @@ Ordered by how much they block.
    `…|3`, advancing by `0x20` per submission, with the ring at a system physical
    address.
 
-   This settles the system-memory case and is enough to build on. What it does
-   **not** settle is VRAM: under the MGA-lineage reading bit 1 would be
+   **RESOLVED (2026-09-05), and it reframes the measurement.** The low two bits
+   are not two enables — they are the **memory-space tag** that `mtx1132`
+   (`.text+0x4c730`) ORs into every resolved GPU address: `0` = local
+   framebuffer, `2` and `3` = the two system-memory classes. A DMA32 ring needs
+   `|3` because 3 is its space; clearing either bit names a different space, and
+   a system address read as a VRAM offset is out of range on a 256 MB card,
+   which is exactly the stall observed. A VRAM ring should therefore take
+   tag `0`. See `docs/parhelia-buffer-binding.md`.
+
+   The original note follows. What it does
+   **not** settle by itself is VRAM: under the MGA-lineage reading bit 1 would be
    "fetch across the bus", so clearing it should select local video memory — but
    the measurement above cannot distinguish that from "bit 1 is simply required",
    because the address submitted was a system address either way, and a system
