@@ -489,12 +489,15 @@ What this pass established independently, from the kernel core:
 
 **There is a per-axis render-target scale factor.**  Each drawable carries two
 floats at `+0x214` (x) and `+0x218` (y), initialised to `1.0f` (`mtx3834`
-@0xe600).  `mtx2480` @0x129e0 sets them from the *bound surfaces*: it reads
-`colour_surface->[0x210+0x20]` / `+0x24` and `depth_surface->[0x210+0x20]` /
-`+0x24`, **requires the colour and depth scales to be identical** (`ucomiss`,
-mismatch → bail), and only then stores them on the drawable
-(`drawable+0x238` = colour surface, `drawable+0x240` = depth surface
-[CONFIRMED by that same comparison]).
+@0xe600).  `mtx2480` @0x129e0 sets them from two of the drawable's bound surfaces: it reads
+`drawable->[0x238]->[0x210+0x20]` / `+0x24` and `drawable->[0x240]->[0x210+0x20]`
+/ `+0x24` and **requires the two to be identical** (`ucomiss`, mismatch → bail
+out and leave the scale at 1.0) before storing them on the drawable.  The
+drawable holds six surface pointers, zeroed together by `mtx3834` @0xe600:
+`+0x220`, `+0x228`, `+0x230`, `+0x238`, `+0x240`, `+0x248`; of these **`+0x248`
+is the depth surface** [CONFIRMED — `mtx237` and `mtx1602` take it as the Z
+surface and read its width/height/bpp from `+0x1dc`/`+0x1e0`/`+0x1d4`], and
+`+0x238`/`+0x240` are two colour buffers [INFERRED].
 
 `mtx1602` @0x11210 then multiplies every clear rectangle's four coordinates by
 those two floats before submitting, unless the clear record has bit 0x08 set.
@@ -505,4 +508,58 @@ is downscaled on presentation.  [INFERRED, but the mechanism is unambiguous.]
 It is the only anti-aliasing-shaped machinery in the kernel core: there is no
 sample-count register, no sample mask, and no resolve primitive anywhere in
 `mtx_parhelia.o`.
+
+
+---
+
+## 5. Render to texture / off-screen surfaces
+
+**Nothing in the render-target path is tied to scanout.**  A surface descriptor
+is `{VRAM byte offset, pitch|type|format|tiling, dims}`; the 3D pipeline reaches
+it only through slot 0 (colour) and slot 2 (depth).  Pointing the engine at an
+off-screen surface is therefore exactly the same three-register write as pointing
+it at the screen:
+
+```
+0x1220 = offscreen_vram_byte_offset
+0x1224 = (pitch_px & 0x3fff) | (1 << 16) | (fmt << 24)      /* pitch mult. of 32 px */
+0x1230 = z_vram_byte_offset
+0x1234 = (z_pitch_px & 0x3fff) | (1 << 16) | (z_fmt << 24)
+```
+
+plus a full-surface scissor (`0x1328 = 0`, `0x132c = 0x0fff0fff`) instead of the
+X clip-rectangle loop of §1.4.  [CONFIRMED that this is the whole mechanism —
+the vendor's own off-screen paths (`mtx1637` blit, `mtx3388` host transfer,
+`mtx2954` clear) do nothing else; [INFERRED] that a WARP draw needs no extra
+step, since the clear already draws WARP geometry into a slot-0/slot-2 pair that
+is programmed the same way.]
+
+Surface memory comes from ioctl **`0xc0804618`** (`mtx1545` @0x12a0,
+`OsAllocSurfaceBlockMemory`): a 128-byte argument whose `arg[0x20] == 1` selects
+a 0x78-byte *surface* record from heap `pDev->[0x2138]`, returning physical
+address, pitch and size (see `docs/parhelia-kernel-abi.md` §3.2).  An open driver
+on DRM/TTM allocates however it likes; only the descriptor encoding matters.
+
+**Consequences for a future FBO implementation.**
+
+* There is exactly **one** colour slot bound per draw and one fragment output
+  register, so `GL_ARB_draw_buffers`-style MRT is not available. [CONFIRMED]
+* Colour and depth are independent surfaces with independent pitches; they do
+  **not** have to be the same size, but the vendor requires their per-axis scale
+  factors (§4) to match. [CONFIRMED]
+* The vendor stack itself exposes no FBO: `GL_EXT_framebuffer_object` is absent
+  from the extension string, `glXCreatePbuffer` / `glXDestroyPbuffer` and
+  `glCopyTexImage*` / `glCopyTexSubImage*` are the only off-screen entry points
+  exported by `libGL.so.1.3.0`.  So there is no vendor precedent to copy for
+  render-to-texture; there is also no hardware obstacle. [CONFIRMED for the
+  exports, [INFERRED] for "no obstacle"]
+* Textures are addressed by a *different* register file (`0x11dc` base,
+  `0x11e0` control, `0x11e4` height — `docs/parhelia-fragment-isa.md` §11), whose
+  pitch rule is the same 32-pixel alignment.  Rendering to a surface and then
+  sampling it needs only that the same VRAM offset and pitch be programmed into
+  both descriptors, with a fence in between. [INFERRED]
+
+---
+
+## 6. Getting a finished frame on screen
 

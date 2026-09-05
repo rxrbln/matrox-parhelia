@@ -174,71 +174,168 @@ Notes a driver author needs:
 ### 1.2 The seventeen pre-draw submissions
 
 Every one of these is `ioctl(fd, 0x4621)` — zero-sized, no argument. The payload
-is the 4096-byte control block (region 0), whose opcode field is `CB[0x00]`.
-The table is read directly out of `captures/mtxtrace-5draws.txt`; the textured
-run produces the identical sequence. [CONFIRMED]
+is the 4096-byte control block (region 0). Ordering, opcodes and payload values
+are read out of `captures/mtxtrace-5draws.txt`; the textured run produces the
+identical sequence. The ICD-side function names come from the RTTI type strings
+embedded in `libGL.so.1.3.0` (`11ICDLinkImpl`, `12GLBufferImpl`,
+`14GLResourceImpl`, `21GLObjectBufferManager`, `19GLPrimitiveHardware`).
+[CONFIRMED]
 
-| # | `CB[0x00]` | key inputs | result | what it does |
-|---|---|---|---|---|
-| — | — | — | — | `open("/dev/matrox/mtx0")` |
-| — | — | — | — | `ioctl 0x80304600` GET_MEMORY_INFO — fb base/size, reg base/size |
-| — | — | — | — | `ioctl 0xc038461f` (nr=31) ICD link create; returns the control-block cookie at out+8 |
-| — | — | — | — | `mmap64(cookie, 0x1000)` — the control block, region 0 |
-| 0 | `0x0c` | `CB[0x10]=0x610590` | `CB[0x18]=1` | create object, returns handle 1 |
-| 1 | `0x0c` | `CB[0x10]=0x6105e0` | `CB[0x18]=2` | create object, returns handle 2 |
-| 2 | `0x0c` | `CB[0x10]=0x610630` | `CB[0x18]=3` | create object, returns handle 3 |
-| — | — | — | — | `mmap64(0x1000)` — region 1, a second control/status page |
-| 3 | `0x05` | `CB[0x10]=0x22000` size, `CB[0x18]=4` type | `CB[0x20]`=kernel VA, `CB[0x28]`=**mmap cookie** | **create device buffer** — the 136 KB command-record stream |
-| — | — | — | — | `mmap64(CB[0x28], 0x22000)` — region 2 |
-| 4 | `0x0a` | `CB[0x18]`=kernel VA of region 2, `CB[0x20]=2`, `CB[0x28]=3` | `CB[0x48]`=**mmap cookie** | **create the fence / serial page** and bind it to region 2 |
-| — | — | — | — | `mmap64(CB[0x48], 0x1000)` — region 3, the serial page |
-| 5 | `0x14` | `CB[0x10..0x14]` = a kernel object pointer, `CB[0x18]=0xa0` | — | object create/bind #1 |
-| 6 | `0x14` | a second kernel object pointer | — | object create/bind #2 |
-| 7 | `0x1e` | `CB[0x10]=1` | writes 4 bytes at region 1 + 0 | sync / flush |
-| 8 | `0x1d` | `CB[0x08]=1`, `CB[0x10]=0x800002`, **`CB[0x230]=0x11f0`** | — | select target 1 and publish the stream length |
-| 9 | **`0x01`** | `CB[0x08]=1`, `CB[0x10]=0` (stream offset) | serial page -> 1 | **RENDER: execute the 0x11f0-byte default-state stream** |
-| 10 | `0x05` | `CB[0x10]=0x320010`, `CB[0x18]=1` | fails | 3 MB vertex ring, contiguous/AGP class — **fails** |
-| 11–12 | `0x05` | — | — | retries |
-| 13 | `0x05` | `CB[0x10]=0x321000`, `CB[0x18]=4` | `CB[0x28]` cookie | 3 MB vertex ring, SYS class — succeeds |
-| — | — | — | — | `mmap64(0x320000)` — region 4 |
-| 14 | `0x05` | `CB[0x10]=0xa9000`, `CB[0x18]=4` | cookie | 672 KB command ring |
-| — | — | — | — | `mmap64(0xa8000)` — region 5 |
-| 15 | `0x05` | `CB[0x10]=0x401000`, `CB[0x18]=4` | cookie | 4 MB texture heap |
-| — | — | — | — | `mmap64(0x400000)` — region 6 |
-| 16 | `0x04` | — | — | final small op; only `CB[0x00]` changes |
+#### The two submission wrappers
+
+`ICDLinkImpl` has one generic control-op submit and one dedicated RENDER.
+[CONFIRMED — `libGL.so.1.3.0` @0x358820 and @0x3589b0, vtable @0x696d50]
+
+```
+/* @0x358820 -- every control op goes through here */
+int Submit(ICDLinkImpl *this, u32 op, void *payload220)
+{
+    if (this->IsLost() && op != 3)                 return -3;
+    pthread_mutex_lock(&g_lock);
+    if (op > 0x1f || !((1u << op) & 0xf07ffe78))   goto fail;
+    CB[0x00] = op;
+    if (payload) memcpy(CB + 0x10, payload, 0x220);
+    ioctl(fd, 0x4621, NULL);
+    if (payload) memcpy(payload, CB + 0x10, 0x220);
+    pthread_mutex_unlock(&g_lock);
+    return CB[0x234];
+}
+
+/* @0x3589b0 -- RENDER */
+int Render(ICDLinkImpl *this, GLContext *ctx, void *base, u32 cmdLen)
+{
+    if (this->IsLost()) return -3;
+    lock;
+    ctx[0xbc84] = ctx[0xbc70];        /* publish this submission's fence value */
+    CB[0x10]  = 0;                    /* the command list always starts at 0   */
+    CB[0x230] = cmdLen;
+    CB[0x00]  = 1;
+    CB[0x08]  = ctx[0xbc58];          /* the rendering-context handle          */
+    if (drawable needs validation) { Validate(); goto retry; }   /* emits op 0x1d */
+    ioctl(fd, 0x4621, NULL);
+    unlock;
+    return CB[0x234];
+}
+```
+
+Two consequences a driver author will trip over otherwise:
+
+* **A control op writes only `CB[0x00]` and `CB[0x10..0x22f]`.** `CB[0x08]` and
+  `CB[0x230]` are never touched by anything but RENDER, so a control op observed
+  carrying them in a trace is showing leftovers.
+* **The op-0x1d in the middle of the init sequence is nested inside `Render`** —
+  it is drawable revalidation issued from the retry path, which is exactly why it
+  appears with `CB[0x08]` and `CB[0x230]` already filled in.
+* The payload stack buffer in `GLBufferImpl::Alloc` is **not** zeroed, which is
+  why unused control-block slots hold garbage (`CB[0x14] = 0x7fff`).
+
+#### The sequence
+
+| # | op | ICD function | key inputs | outputs | what it does |
+|---|---|---|---|---|---|
+| — | — | — | — | — | `open("/dev/matrox/mtx0")` |
+| — | — | — | — | — | `ioctl 0x80304600` GET_MEMORY_INFO |
+| — | — | `ICDLinkImpl::Open` @0x358c30 | — | cookie at out+8 | `ioctl 0xc038461f` (nr=31), then `mmap64(cookie, 0x238)` -> **region 0**, the control block |
+| 0 | `0x0c` | `GLResourceImpl::Create` @0x357d20 | `CB[0x10]` = user pointer to a 0x1c-byte descriptor | `CB[0x18]` = handle **1** | create the **front** window surface |
+| 1 | `0x0c` | ditto | | handle **2** | the **back** surface |
+| 2 | `0x0c` | ditto | | handle **3** | the **Z/aux** surface |
+| — | — | — | — | — | `mmap64(0x1000)` -> region 1 |
+| 3 | `0x05` | `GLBufferImpl::Alloc` @0x3579c0 | `CB[0x10]` = `0x2106c` size, `CB[0x18]` = 4 (SYS) | `CB[0x10]` = `0x22000` rounded size, `CB[0x20]` = buffer handle, `CB[0x28]` = **mmap cookie** | allocate the 136 KB command-record buffer |
+| — | — | — | — | — | `mmap64(cookie, 0x22000)` -> **region 2** |
+| 4 | `0x0a` | GLX context create @0x35ac60 | `CB[0x18]` = a qword from the new context object, `CB[0x20]` = 2, `CB[0x28]` = 3 (the back and Z surface handles) | `CB[0x30]` = **context handle**, `CB[0x48]` = **mmap cookie of a 4-byte page** | create the rendering context and its shared fence word |
+| — | — | — | — | — | `mmap64(CB[0x48], 4)` -> **region 3**, the fence/serial page |
+| 5 | `0x14` | `GLObjectBuffer::Create` @0x1c8ee0 | `CB[0x10]` = host pointer, `CB[0x18]` = `0xa0` size | `CB[0x10]` = device address written back | register a 160-byte host block as a device-readable object buffer |
+| 6 | `0x14` | ditto | | | the second one |
+| 7 | `0x1e` | GLX bind @0x35b44a | `CB[0x10]` = context handle 1, `CB[0x18]` = `0x800002` drawable id | — | **attach the drawable to the context** |
+| 8 | `0x1d` | drawable validate @0x35a120 | `CB[0x10]` = `0x800002`, plus the rect | — | validate/refresh the X drawable (nested in `Render`) |
+| 9 | **`0x01`** | `Render` @0x3589b0 | `CB[0x08]` = 1, `CB[0x10]` = 0, `CB[0x230]` = `0x11f0` | serial page -> 1 | **execute the default-state stream** (§1.3) |
+| 10 | `0x05` | `Ring::Init` @0x1b1ec0 | `CB[0x10]` = `0x320010`, `CB[0x18]` = 1 | fails | 3 MB vertex ring, VRAM class |
+| 11 | `0x05` | ditto | `CB[0x18]` = 2 | fails | retry, PCI-locked |
+| 12 | `0x05` | ditto | `CB[0x18]` = 3 | fails | retry, AGP |
+| 13 | `0x05` | ditto | `CB[0x10]` = `0x321000`, `CB[0x18]` = 4 | cookie | retry, SYS — **succeeds** |
+| — | — | — | — | — | `mmap64(0x320000)` -> **region 4**, vertex ring |
+| 14 | `0x05` | ditto | `CB[0x10]` = `0xa9000`, `CB[0x18]` = 4 | cookie | 672 KB command ring |
+| — | — | — | — | — | `mmap64(0xa8000)` -> **region 5** |
+| 15 | `0x05` | ditto | `CB[0x10]` = `0x401000`, `CB[0x18]` = 4 | cookie | 4 MB texture heap |
+| — | — | — | — | — | `mmap64(0x400000)` -> **region 6** |
+| 16 | `0x04` | `Ring::Reset` @0x1b2260 | none | — | **wait for engine idle**, then mark every 8 KB ring page's fence tag free |
 
 Then, and only then, the application's first GL call runs.
 
-Four things in that table are worth calling out.
+Five things in that table are worth calling out.
 
-**Buffer create is opcode `0x05`, and `CB[0x28]` is the mmap cookie.** The
-cookie is not a physical or GPU address; it is a handle the kernel hands back
+**Buffer create is opcode `0x05`; `CB[0x28]` is the mmap cookie.** The cookie is
+not a physical or GPU address — it is a handle the kernel hands back
 (`mtx_mmap` matches `vm_pgoff << PAGE_SHIFT` against `region->base` with `==`).
-Requested size is always the mapped size plus one page. The class in `CB[0x18]`
-follows the kernel's `mtx938` numbering — 1 = AGP, 2 = PCI_LOCKED, 4 = SYS.
-[CONFIRMED, cookies matched against the following `mmap64` in both captures]
+The ICD asks for `size + 0x10` and the **kernel writes the page-rounded size back
+into `CB[0x10]`**, which the ICD then reuses on a retry: that is why the vertex
+ring appears first as `0x320010` and afterwards as `0x321000`. `CB[0x20]` is the
+buffer handle, the key for the free op `0x06`; in practice it is a kernel virtual
+address (`0xffffc200_…`). [CONFIRMED — the cookies match the following `mmap64`
+in both captures]
 
-**Submission 10's failure is the vendor's own fallback, not a bug.** The 3 MB
-request as class 1 fails — `MTX_MAX_ORDER` is 9, so 801 pages is over the limit
-— and the driver logs
+**The memory-type enum in `CB[0x18]` is the kernel's `mtx_memory_type` plus one**
+(`kernel/src/mtx_mem_type.h`: IO/LOCAL 0, PCI_LOCKED 1, AGP 2, SYS 3), so the
+ICD's preference list 1, 2, 3, 4 means VRAM -> PCI-locked -> AGP -> system, and
+`4` = system memory. [INFERRED, but consistent at every call site]
+
+**Submissions 10–12 are the vendor's own fallback walk, not a bug.** The 3 MB
+request fails as class 1, 2 and 3 in turn — `MTX_MAX_ORDER` is 9, so 801 pages is
+over the contiguous limit, and the box has no AGP — and the kernel logs
 `Failed to allocate locked pages (nb: 801, type: 2)` /
-`Failed to create device buffer (size: 3280896, type: 1)`. `3280896 == 0x321000`,
-the exact size the ICD retries with as class 4. An open driver should allocate
-the vertex ring from vmalloc'd (scatter) memory and not chase the contiguous
-path. [CONFIRMED — log text, sizes and retry all line up]
+`Failed to create device buffer (size: 3280896, type: 1)`.
+`3280896 == 0x321000`, exactly the size submission 13 succeeds with. An open
+driver should allocate the vertex ring from vmalloc'd (scatter) memory and not
+chase the contiguous path. [CONFIRMED — log text, sizes, class numbers and the
+retry count all agree]
 
-**The fence page is created by opcode `0x0a`, bound to the command-stream
-buffer, and its mmap cookie doubles as its bus address.** It is
-`MTX_MEMTYPE_PCI_LOCKED`, for which `region->base = __pa(kaddr)`, and the value
-that later reaches register `0x1090` in every draw packet is *exactly* that
-cookie (`0x188a4000` in the 5-draw run, `0x18c4a000` in the textured run).
-[CONFIRMED — the cookie, the mmap offset and the `0x1090` payload are the same
-dword]
+**The fence page comes from the context-create op `0x0a`, and its mmap cookie
+doubles as its bus address.** It is `MTX_MEMTYPE_PCI_LOCKED`, for which
+`region->base = __pa(kaddr)`, and the value that later reaches register `0x1090`
+in every draw packet is *exactly* that cookie (`0x188a4000` in the 5-draw run,
+`0x18c4a000` in the textured run). [CONFIRMED — the cookie, the mmap offset and
+the `0x1090` payload are the same dword]
 
-**Submission 9 is the one that matters.** It executes a 4592-byte
-(`0x11f0`) default-state stream that the ICD has written into region 2. That
-stream is the largest single command-stream write of the whole run, and it is
-what §1.3 documents.
+**Op `0x14` is not what it looks like.** The largest command-stream write of the
+run (3372 bytes) lands in the snapshot attributed to submission 5, and op `0x14`
+was the obvious suspect. It is not: op `0x14` is `GLObjectBuffer::Create`, the
+driver-internal implementation of `ATI_vertex_array_object` — the enum checks in
+`glNewObjectBufferATI` (`GL_STATIC_ATI 0x8760` / `GL_DYNAMIC_ATI 0x8761`) settle
+it — and its payload is a 160-byte *host* block, allocated twice for the two
+`GLPrimitiveHardware` objects the context binds. The 3372 bytes are ordinary
+command-list construction by plain CPU stores into region 2, which is only ever
+flushed by op `0x01`. Snapshot-based attribution to a submit is an artefact.
+[CONFIRMED]
+
+#### The full control-op vocabulary
+
+For completeness, since a driver must implement the kernel side of whichever ops
+it wants to support. Ops `1`, `3`–`6`, `0x0a`–`0x16`, `0x1c`–`0x1f` are the ones
+this ICD can emit; op `0x09` passes the client-side mask but has no call site.
+[CONFIRMED]
+
+| op | meaning |
+|---|---|
+| `0x01` | RENDER — execute the command list |
+| `0x03` | Flush/Finish; publishes the fence value. **The only op allowed while the link is lost** (§5) |
+| `0x04` | wait for engine idle |
+| `0x05` / `0x06` | allocate / free a device buffer |
+| `0x0a` / `0x0b` | create / destroy a rendering context |
+| `0x0c` / `0x0d` | create / destroy a surface resource |
+| `0x0e` / `0x0f` | lock / unlock a resource (returns an mmap cookie + offset) |
+| `0x10` | 2D blit or fill between resources |
+| `0x11` / `0x12` | create / release a vertex-stream binding object |
+| `0x13` | upload a compiled **vertex** program |
+| `0x14` / `0x15` / `0x16` | create / free / update an object buffer |
+| `0x1c` | page-flip present |
+| `0x1d` | validate the X drawable |
+| `0x1e` | attach (`CB[0x18]` = drawable) or detach (`CB[0x18]` = 0) a drawable |
+| `0x1f` | read back a rect from a resource into host memory |
+
+Note the split: the **fragment** program travels in-band as a `(0x46,1)` record
+in the command stream (§3.3), while the **vertex** program has its own control op
+`0x13`. The capture never exercises `0x13` — the fixed-function path uses the
+resident WARP microcode.
 
 ### 1.3 The default-state stream (`0x11f0` bytes, executed by submission 9)
 
