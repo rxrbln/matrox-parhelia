@@ -897,3 +897,43 @@ itself (ours is hand-written and has never been validated), or the fragment
 program, which per `parhelia-slot-translation.md` is not optional -- texture and
 combiner state exist only as a compiled program, and there is no register path
 that a draw can fall back on.
+
+## The failure is inside the 3D pipeline, and everything around it is proven
+
+Measured 2026-09-05 on the 0528, engine healthy throughout, no reboots.
+
+Two of the three false-negative causes that plagued this work — looking at the
+wrong VRAM offset, and a render target that was never bound — are now
+**definitively excluded**, using the only instrument on this card that has ever
+been independently confirmed:
+
+    ./3dtri --dmafill --fillrt     green px: at base 0x400000 = 120000
+    ./3dtri --dmafill              green px: at base 0x0      = 120000
+
+`--fillrt` points the 2D fill at `g_rtoff`, the same VRAM offset the 3D path
+renders to, and it is found by the same scan the 3D path uses. So the surface
+base and pitch programming is correct at that offset, and the observation method
+sees what lands there.
+
+Independently verified around the 3D draw, each in the same session:
+
+| component | evidence |
+|---|---|
+| ring, submit, doorbell | `0x404 == end` every run; the 2D fill draws through it |
+| engine arm | `0x300` reads back `0x140`, matching the vendor |
+| render target base/pitch | 2D fill draws 120000 px at that exact offset |
+| VRAM observation | same scan finds the 2D fill |
+| microcode upload gates | all four pass, dwords accepted at `0x91c` |
+| draw packet framing | consumed to the end, engine returns idle |
+
+And the draw still produces zero fragments. So the fault is **inside the 3D
+pipeline proper** — vertex fetch, the transform, or the raster setup — and not
+in any of the plumbing around it.
+
+**The one thing still missing is an execution signal.** All three candidates are
+now known broken on this card: the WARP readback port shows nothing for any
+provable operation, the pixel scan was anchored wrong (fixed, and now proven
+correct by the table above), and a DWGSYNC with the block bit never retires.
+Without one, "the program ran and emitted nothing" and "the program never ran"
+remain indistinguishable, and further register-level variation is enumeration
+rather than measurement.
