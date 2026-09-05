@@ -830,3 +830,30 @@ a *register* claim. The retraction of the register addresses stands, but the
 pattern itself is real at slot level and is **application-dependent** -- so
 neither "always write 0xffffffff" nor "the vendor writes zeros there" is correct
 as a general statement. Ours earlier said the latter, on one capture.
+
+
+## Replay hazard: a doorbell can spin forever in the kernel
+
+Replaying a captured trace against the live driver reliably produces an
+**unkillable process**: state `R` (spinning in kernel mode, not blocked on I/O),
+`kill -9` has no effect, 28 minutes of CPU and counting, and it holds
+`/dev/matrox/mtx0` open so no other client can use the device -- which silently
+breaks any capture attempted afterwards. Only a reboot clears it.
+
+The explanation is already in this repository: the vendor driver's wait-for-idle
+contains a **compiler-hoisted infinite loop**, recorded when the engine-reset
+path was investigated. A doorbell rung with control-page state the kernel does
+not expect enters that wait and never leaves.
+
+Consequences for a replay tool, and for the open kernel driver:
+
+* **Bound every replay and verify the bound actually fires.** `timeout` does not
+  help -- the process is unkillable, so the timeout process simply waits
+  alongside it. The bound has to be inside the replay, before the ioctl.
+* **Check the device is free before capturing.** A stuck replay holding the node
+  makes a subsequent capture produce a 49-byte file with only a header, which
+  reads as "the app did not use the GPU" rather than "the device was busy".
+  That cost a confusing round here.
+* For the open kernel driver this is a specification point, not just a bug to
+  avoid: the wait-for-idle **must** be bounded and must return an error, because
+  the hardware genuinely does reach states where idle never arrives.
