@@ -31,83 +31,114 @@ registers), `docs/parhelia-command-construction.md` (submission model),
 
 ---
 
-## 0. The record grammar — settled, and it corrects earlier readings
+## 0. The record grammar — settled from both ends
 
-Everything in §1–§3 is expressed in one format, so it is stated first.
+Everything in §1–§3 is expressed in one format, so it is stated first. It was
+derived independently from the captures and from the kernel's own interpreter,
+and the two agree.
 
 The 136 KB region ("command record stream") is rebuilt **from byte offset 0 on
 every submission**. It is a flat sequence of records:
 
 ```
-record := u32 opcode ; u32 count ; count * <element>
+record := u32 opcode ; u32 count ; count * <element of a per-opcode size>
 ```
 
-with a **per-opcode element size**. This framing was validated by decoding four
-independent streams end-to-end and landing exactly on the byte length the driver
-publishes in `region0 + 0x230`: `0x11f0`, `0x1188`, `0x1078`, `0x190`, `0x30`.
-[CONFIRMED]
+Some opcodes are variable-length: their handler returns an extra byte count that
+the interpreter adds on top of `8 + count*stride`.
 
-| opcode | element | name | payload |
+Capture side: this framing decodes five independent streams end-to-end and lands
+exactly on the byte length the driver publishes in `region0 + 0x230` —
+`0x11f0`, `0x1188`, `0x1078`, `0x190`, `0x30`. Code side: `mtx558` @`.text+0x44ef0`
+dispatches on `record[0]` (bounded at `0x51`) through the jump table at
+`.rodata+0x1b08`, and every arm advances the pointer by `8 + count*stride`.
+[CONFIRMED, both]
+
+| opcode | stride | name | payload |
 |---|---|---|---|
-| `0x05` | 8 | PAIRS-05 | `(index, value)` in state group 05 |
-| `0x06` | 8 | SAMPLER | `((sub << 16) | stage, value)` |
-| `0x07` | 24 | PIPELINE-KEY | `key, 0, 0, ffffffff, ffffffff, ffffffff` |
-| `0x08` | 32 | VERTEX-FORMAT | `0, 0, u64 kptr, stride, 0, mask, 0` |
-| `0x0a` | 72 | TEXTURE-DEF | see §3.3 |
-| `0x0c` | 8 | PAIRS-CORE | `(index, value)`, register `0x1000 + index*4` |
-| `0x0d` | 8 | PAIRS-0D | `(index, value)` in state group 0D |
-| `0x0e` | 8 | TEXENV | `((sub << 16) | stage, value)` |
+| `0x00` | 8 | NOP / skip | |
+| `0x05` | 8 | PAIRS-05 | `(id, value)`, `mtx1734` @0x1abf0 |
+| `0x06` | 8 | SAMPLER | `(id, value)`, `mtx3081` |
+| `0x07` | 24 | PIPELINE-KEY | `key, 0, 0, ffffffff x3`; copied verbatim to `ctx+0x1e04`, **the kernel does not interpret it** |
+| `0x08` | 32 | VERTEX-FORMAT | `0, 0, u64 key, stride, 0, mask, 0` |
+| `0x0a` | 72 | TEXTURE-DEF | §3.3 |
+| `0x0c` | 8 | STATE | `(state id, value)` — see the correction below |
+| `0x0d` | 32 | ? | 8 dwords, constant in every capture |
+| `0x0e` | 8 | TEXTURE-UNIT | `(u16 unit, u16 sub), value` |
 | `0x12` | 16 | SCISSOR-RECT | `x, y, w, h` — screen pixels, **Y from the bottom** |
-| `0x15` | 36 | CLEAR | `mask, ARGB, depth_f, stencil, 0x80808080, x, y, w, h` |
-| `0x1b` | 40 | DRAW | see §2 |
-| `0x20` | 68 | MATRIX | `matrix_id, 16 floats` |
-| `0x21` | 60 | LIGHT | two elements per 0x78-byte light block |
+| `0x15` | 36 | CLEAR | see §3.5 |
+| `0x1b` | 40 | DRAW | §2.2 |
+| `0x20` | 68 | MATRIX | `sub_op, float m[16]`; **transposed in place by the kernel** |
+| `0x21` | 8 + body | LIGHT | `(index, kind)` + a kind-dependent body |
 | `0x22` | 72 | MATERIAL | `face, diffuse4, ambient4, specular4, emission4, shininess` |
 | `0x23` | 16 | LIGHTMODEL-AMBIENT | 4 floats |
 | `0x24` | 8 | **[PURPOSE UNKNOWN]** | always `3, 5` |
-| `0x25` | 20 | CLIP-PLANES [INFERRED] | 6 elements `plane_id, 0,0,0,0` |
+| `0x25` | 20 | CLIP-PLANES | 6 elements `plane_id, float4` -> `ctx+0x1da0` |
 | `0x26` | 16 | VIEWPORT | `x, y, w, h`, same space as `0x12` |
-| `0x27` | 8 | DEPTH-RANGE | 2 floats, `(0.5, 0.5)` for the GL default |
-| `0x36` | 8 | LINE/POINT-SIZE | 2 floats |
-| `0x46` | — | FRAGPROG-UPLOAD | `progid, 0` then a **0x664-byte** blob, record padded to `0x680` |
-| `0x51` | 8 | TARGET-SELECT [INFERRED] | one `(index, 0)` pair; index = render-target id |
+| `0x27` | 8 | DEPTH-RANGE | 2 floats; **only the last element of the batch is applied** |
+| `0x35` | 16 | **[PURPOSE UNKNOWN]** | 4 dwords, all zero in every capture |
+| `0x36` | 8 | LINE/POINT-SIZE | 2 floats; last element only |
+| `0x43` | 8 + n*16 | VERTEX-PROGRAM CONSTANTS | `start (<=0x100), count`, then float4s |
+| `0x45` | 0x670 | **VERTEX**-program upload | `memcpy(ctx+0x1474, payload, 0x664)` |
+| `0x46` | 0x678 | **FRAGMENT**-program upload | `u32 progid, u32 flags, u8 body[0x670]` |
+| `0x51` | 8 | ? | one `(index, 0)` |
 
-### Three corrections this framing forces on the existing docs
+The full 82-entry table is in `mtx558`'s jump table; the rows above are the ones
+that appear in a real draw.
 
-1. **`(0x0c, N)` is a record header, not `reg 0x1030 = N`.** Index `0x0c` maps
-   to register `0x1030`, so a `0x0c` header decodes as a plausible-looking
-   register write. This is the whole of the "`0x1030` (index 0x0c) is
-   multiplexed or mis-sliced" ambiguity in `docs/parhelia-gl-feature-map.md` §6:
-   `scissor`, `cullface`, `fog` and `lighting` show "`0x1030 = 1`" because each
-   emits a one-entry PAIRS-CORE record; `polygon mode` shows "= 2" because it
-   emits a two-entry one. [CONFIRMED]
+### The single most important correction: `0x0c` pairs are NOT register writes
+
+Both `docs/parhelia-gl-feature-map.md` and
+`docs/parhelia-command-construction.md` decode a `0x0c` pair `(index, value)` as
+"write `0x1000 + index*4`". **The kernel does not do that.** `mtx2617`
+@`.text+0x19950` treats the first dword as a **driver state id**:
+
+```
+if (id in 1..0x100)   { ctx[0x10 + id*4] = value;            /* cached, skipped if unchanged */
+                        if (id <= 0xab) <jump table .rodata+0xba0, 172 arms>(...); }
+if (id in 0x101..0x200) { set/clear bit (id - 0x101) in the bitmap at ctx+0x414; }  /* glEnable/glDisable */
+```
+
+Each of the 172 ids has its own arm updating its own hardware shadow; the actual
+register packets are built later by the dirty-state emitters
+(`mtx3712` @0x188f0, `mtx606` @0x4200, `mtx2372` @0xcc30). **There is no
+identity mapping from state id to register index.** [CONFIRMED]
+
+The `0x1000 + index*4` path is real, but it lives one level lower: it is the
+**DMA packet header encoding** (`mtx2434` @0x398e0), where a header byte *is* a
+register index. Those are the bytes in `0x21212425`, not the dwords in a `0x0c`
+record.
+
+**Practical consequence.** The per-feature tables in
+`docs/parhelia-gl-feature-map.md` are correct as *state ids* — `glDepthFunc`
+really does emit id `0x17` with value `f - GL_NEVER + 1`, and that is what a
+driver reproducing the vendor stack must emit. But the register names attached
+to them (`0x105c` for depth func, and so on) rest on an assumption the kernel
+contradicts, so a driver that skips the command stream and writes registers
+directly **cannot** use them without first dumping the 172 arms of
+`.rodata+0xba0`. This document therefore writes state as `id`, with the
+previously published register name in parentheses and marked as unverified.
+Two other consequences of the framing:
+
+1. **`(0x0c, N)` is a record header, not `reg 0x1030 = N`.** This is the whole of
+   the "`0x1030` (index 0x0c) is multiplexed or mis-sliced" ambiguity in
+   `docs/parhelia-gl-feature-map.md` §6: `scissor`, `cullface`, `fog` and
+   `lighting` show "`0x1030 = 1`" because each emits a one-entry STATE record.
+   [CONFIRMED]
 2. **`(0x05, N)` is likewise a header, not `reg 0x1014 = N`.** Feature-map
    contradiction #5 ("`glEnable(GL_BLEND)` writes `0x1014 = 4`") is a mis-framed
-   `(0x05, 4)` header. The blend op's real writes are listed in §3.2.
-   [CONFIRMED]
-3. **`reg 0x1050` is reached through state group `0x05`, index `0x14`.** The
-   published reading `(0x14, 3) -> 0x1050 = 3` came from framing a
-   `(0x05, 2)` record as two pairs. The real record is
-   `(0x05, 2) { (0x13, 1), (0x14, progid) }`. The *value* claim survives —
-   it still matches the fragment program's own id — but the record shape does
-   not. [CONFIRMED]
-
-**Groups `0x05`, `0x0c` and `0x0d` all carry small `(index, value)` pairs whose
-index ranges overlap.** Only group `0x0c` is proven to map to
-`0x1000 + index*4` (eight independent GL calls land on exactly the predicted
-registers). Treat `0x05` and `0x0d` as *separate state groups* whose register
-mapping is [UNRESOLVED]; do not assume `0x1000 + index*4` for them.
+   `(0x05, 4)` header. The real writes are in §3.2. [CONFIRMED]
 
 ### The clobbered first record — resolved
 
 `glsweep` reads the stream after `glFinish` and always sees `(0xff, 1)` in the
-first two dwords. That is the kernel overwriting the record header after
-consuming the stream: it is visible in `mtxtrace` as a lone 4-byte change to
-offset `0x000` in every submission that *follows* a render. `mtxtrace` snapshots
-around the doorbell instead and therefore captures the **real** first opcode.
-The "unrecoverable first token" caveat in
-`docs/parhelia-command-construction.md` no longer applies to mtxtrace captures.
-[CONFIRMED]
+first two dwords. That is the ICD re-seeding the buffer with the empty-list
+sentinel after the flush returns (`libGL` @0x1c9be0); it is visible in
+`mtxtrace` as a lone 4-byte change to offset `0x000` in every submission that
+*follows* a render. `mtxtrace` snapshots around the doorbell instead and
+therefore captures the **real** first opcode. The "unrecoverable first token"
+caveat in `docs/parhelia-command-construction.md` does not apply to mtxtrace
+captures. [CONFIRMED]
 
 ---
 
@@ -352,7 +383,7 @@ Decoded end to end; the framing lands exactly on `0x11f0`. [CONFIRMED]
 0x0c68  (0x0e,112)
 0x0ff0  (0x05, 24)
 0x10b8  (0x06, 36)
-0x11e0  (0x0c,  1)   reg 0x10f8 = 1
+0x11e0  (0x0c,  1)   state id 0x3e = 1
 ```
 
 So: **the whole default state is emitted twice, once per render target**, and
@@ -360,55 +391,97 @@ the `0x51` record selects which. `CB[0x08]` at the RENDER is 1, matching the
 second block. [INFERRED — the two-copies-with-a-selector structure is plain in
 the capture; that the selector means "render target" is the reading, not a proof]
 
-`reg 0x10f8` closes the block with 1, and is the register `SwapBuffers` toggles
-(§4.4). [CONFIRMED]
+State id `0x3e` closes the block with 1, and is the id `SwapBuffers` toggles
+(§3.5). [CONFIRMED]
 
-#### Core render state, group `0x0c` (register = `0x1000 + index*4`)
+#### Default render state, record `0x0c`
 
-Emit all 108, in this order. Values are the GL defaults.
+Emit all 108 entries in this order. `id` is what the record carries; "published
+reg" is the register name earlier documents attach to it, kept here for
+cross-reference only — see the correction in §0, it is **not verified** and the
+kernel does not perform that mapping.
 
-```
-0x101c=0          depth test off        0x1020=3          polygon mode FILL
-0x1024=2          blend src RGB = ONE   0x1028=0x0001ffff
-0x1030=0x0000000c                       0x1038=1          depth write enable
-0x103c=0          alpha test off        0x1040=0
-0x104c=2                                0x1050=1          fragment program select
-0x1058=3          cull: disabled        0x105c=4          depth func LEQUAL
-0x1060=0          alpha ref             0x1064=8          alpha func ALWAYS
-0x1068=1                                0x106c=0          blend off
-0x1070=0          fog off               0x1074=0
-0x1078=0                                0x1088=0
-0x108c=0                                0x1090=0          fence address
-0x1094=1.0f       fence value           0x1098=1
-0x10a0=0                                0x10a4=0
-0x10bc=0                                0x10c0=0
-0x10d0=0          stencil off           0x10d4=1
-0x10d8=1                                0x10dc=1          stencil op
-0x10e0=8                                0x10e4=0          stencil ref
-0x10e8=0xffffffff stencil mask          0x10ec=0xffffffff
-0x10f0=0
-0x1100..0x117c = 0    (32 registers, the vertex/attribute file)
-0x1200..0x121c = 0    (8 registers)
-0x1220=1          0x1224=1          0x1228=0          0x122c=0
-0x1230=0          0x1234=0          0x1238=1          0x123c=0
-0x1244=0          0x1248=0          0x124c=0          0x1250=0
-0x125c=0          0x1260=0          0x1264=0          0x1268=1.0f
-0x126c=1.0f       0x1270=0          0x1274=0          0x1278=1.0f
-0x127c=0          0x1280=0          0x1284=0          0x1288=0xffffffff
-0x128c=0          0x1290=0          0x1298=4096.0f    0x129c=0
-0x12a0=0x0000000f 0x12a8=1.0f       0x12ac=1
-```
+| id | published reg | value | meaning |
+|---|---|---|---|
+| 0x07 | 0x101c | 0x0 | depth test off |
+| 0x08 | 0x1020 | 0x3 | polygon mode FILL |
+| 0x09 | 0x1024 | 0x2 | blend src RGB = ONE |
+| 0x0a | 0x1028 | 0x1ffff |  |
+| 0x0c | 0x1030 | 0xc |  |
+| 0x0e | 0x1038 | 0x1 | depth write enable |
+| 0x0f | 0x103c | 0x0 | alpha test off |
+| 0x10 | 0x1040 | 0x0 |  |
+| 0x13 | 0x104c | 0x2 |  |
+| 0x14 | 0x1050 | 0x1 | fragment program select |
+| 0x16 | 0x1058 | 0x3 | cull face disabled |
+| 0x17 | 0x105c | 0x4 | depth func LEQUAL |
+| 0x18 | 0x1060 | 0x0 | alpha reference |
+| 0x19 | 0x1064 | 0x8 | alpha func ALWAYS |
+| 0x1a | 0x1068 | 0x1 |  |
+| 0x1b | 0x106c | 0x0 | blend off |
+| 0x1c | 0x1070 | 0x0 | fog off |
+| 0x1d | 0x1074 | 0x0 |  |
+| 0x1e | 0x1078 | 0x0 |  |
+| 0x22 | 0x1088 | 0x0 |  |
+| 0x23 | 0x108c | 0x0 |  |
+| 0x24 | 0x1090 | 0x0 | fence write-back address |
+| 0x25 | 0x1094 | 1f | fence value |
+| 0x26 | 0x1098 | 0x1 |  |
+| 0x28 | 0x10a0 | 0x0 |  |
+| 0x29 | 0x10a4 | 0x0 |  |
+| 0x2f | 0x10bc | 0x0 |  |
+| 0x30 | 0x10c0 | 0x0 |  |
+| 0x34 | 0x10d0 | 0x0 | stencil off |
+| 0x35 | 0x10d4 | 0x1 |  |
+| 0x36 | 0x10d8 | 0x1 |  |
+| 0x37 | 0x10dc | 0x1 | stencil op |
+| 0x38 | 0x10e0 | 0x8 |  |
+| 0x39 | 0x10e4 | 0x0 | stencil reference |
+| 0x3a | 0x10e8 | 0xffffffff | stencil mask |
+| 0x3b | 0x10ec | 0xffffffff |  |
+| 0x3c | 0x10f0 | 0x0 |  |
+| 0x40..0x5f | 0x1100..0x117c | 0x0 | |
+| 0x80..0x87 | 0x1200..0x121c | 0x0 | |
+| 0x88 | 0x1220 | 0x1 |  |
+| 0x89 | 0x1224 | 0x1 | lighting off |
+| 0x8a..0x8d | 0x1228..0x1234 | 0x0 | |
+| 0x8e | 0x1238 | 0x1 |  |
+| 0x8f | 0x123c | 0x0 |  |
+| 0x91..0x94 | 0x1244..0x1250 | 0x0 | |
+| 0x97 | 0x125c | 0x0 |  |
+| 0x98 | 0x1260 | 0x0 |  |
+| 0x99 | 0x1264 | 0x0 |  |
+| 0x9a | 0x1268 | 1f |  |
+| 0x9b | 0x126c | 1f |  |
+| 0x9c | 0x1270 | 0x0 |  |
+| 0x9d | 0x1274 | 0x0 |  |
+| 0x9e | 0x1278 | 1f |  |
+| 0x9f | 0x127c | 0x0 |  |
+| 0xa0 | 0x1280 | 0x0 |  |
+| 0xa1 | 0x1284 | 0x0 |  |
+| 0xa2 | 0x1288 | 0xffffffff |  |
+| 0xa3 | 0x128c | 0x0 |  |
+| 0xa4 | 0x1290 | 0x0 |  |
+| 0xa6 | 0x1298 | 4096f | guard band / viewport scale |
+| 0xa7 | 0x129c | 0x0 |  |
+| 0xa8 | 0x12a0 | 0xf |  |
+| 0xaa | 0x12a8 | 1f |  |
+| 0xab | 0x12ac | 0x1 |  |
 
-Note `0x1100–0x117c = 0` here, whereas the *first draw* stream sets the same
-32 registers to `0xffffffff` (§2). Both values are real; the attribute file is
-written twice with different content. [CONFIRMED, purpose of the difference
-UNKNOWN]
+Note `id 0x40..0x5f = 0` here, whereas the *first draw* stream sets the same 32
+ids to `0xffffffff` (§2). Both values are real; that block of state is written
+twice with different content. [CONFIRMED, purpose of the difference UNKNOWN]
 
 #### Texture environment, group `0x0e`
 
-112 entries = **4 stages x 28 sub-indices**. The index dword is
-`(sub << 16) | stage`; sub runs `0x00..0x1c` skipping `0x0c`. Emission order is
-sub-major: all four stages of sub 0, then all four of sub 1, …
+112 entries = **4 units x 28 sub-indices**. The index dword is
+`(sub << 16) | unit`; sub runs `0x00..0x1c` skipping `0x0c`. Emission order is
+sub-major: all four units of sub 0, then all four of sub 1, …
+
+The kernel keeps **eleven** such units, `0x82` bytes of state each, at
+`ctx + 0xdd7 + unit*0x82`, and the same record type also carries the
+texture-object bind (`[+0x0c] = handle`, dirty bit `|= 0x08`). Only four units
+are programmed at init. [CONFIRMED — handler at `mtx558+0x459dc`]
 
 Stage 0 defaults differ from stages 1–3:
 
@@ -433,8 +506,8 @@ Stage 0 defaults differ from stages 1–3:
 
 #### Sampler state, group `0x06`
 
-36 entries = **4 stages x 9 sub-indices** (sub `0x01..0x09`), identical for all
-four stages:
+36 entries = **4 units x 9 sub-indices** (sub `0x01..0x09`), identical for all
+four units:
 
 ```
 sub 0x01 = 0
@@ -473,33 +546,30 @@ Emission order, exactly as captured. Every record is mandatory in the sense that
 the vendor emits it; the ones a minimal driver can plausibly drop are noted.
 
 ```
-0x0000  64-byte prologue                     [PURPOSE UNKNOWN, framing ambiguous]
-                                             byte-identical in every capture:
-                                             0000000d 00000001 00000002 00000000
-                                             00000003 00000000 00000000 00000000
-                                             00000008 00000003 00000035 00000001
-                                             00000000 00000000 00000000 00000000
-0x0040  (0x0c, 36)  core state:
-            reg 0x105c = 2                   depth func LESS
-            reg 0x1098 = 1.0f
-            reg 0x126c = 0
-            reg 0x1298 = 2048.0f             guard-band / viewport scale
-            reg 0x1100..0x117c = 0xffffffff  the 32-register attribute file
+0x0000  (0x0d,  1)  32-byte element  2, 0, 3, 0, 0, 0, 8, 3   [PURPOSE UNKNOWN]
+0x0028  (0x35,  1)  16-byte element  0, 0, 0, 0                [PURPOSE UNKNOWN]
+                    -- byte-identical in every capture; emit verbatim
+0x0040  (0x0c, 36)  state:
+            id 0x17 = 2                      depth func LESS
+            id 0x26 = 1.0f
+            id 0x9b = 0
+            id 0xa6 = 2048.0f                guard band / viewport scale
+            id 0x40..0x5f = 0xffffffff        the 32-entry attribute block
 0x0168  (0x12,  1)  SCISSOR-RECT   0, 0, 256, 256
 0x0180  (0x46,  1)  FRAGPROG-UPLOAD  progid 2, 0x664-byte blob
-0x0800  (0x05,  2)  group 05: index 0x13 = 1 ; index 0x14 = 2  (select progid 2)
+0x0800  (0x05,  2)  record-05 ids 0x13 = 1 and 0x14 = 2   (select fragment program 2)
 0x0818  (0x26,  1)  VIEWPORT       0, 0, 256, 256
 0x0830  (0x36,  1)  LINE/POINT-SIZE  1.0, 1.0
-0x0840  (0x0c,  1)  reg 0x1230 = 1
+0x0840  (0x0c,  1)  state id 0x8c = 1
 0x0850  (0x24,  1)  3, 5                     [PURPOSE UNKNOWN]
 0x0860  (0x23,  1)  light-model ambient 0.2, 0.2, 0.2, 1.0
-0x0878  (0x0c,  2)  reg 0x1238 = 0 ; reg 0x1224 = 0
+0x0878  (0x0c,  2)  state ids 0x8e = 0 and 0x89 = 0
 0x0890  (0x21, 24)  12 light blocks of 0x78 bytes, GL defaults
 0x0e38  (0x22,  2)  materials, front and back, GL defaults
 0x0ed0  (0x27,  1)  depth range 0.5, 0.5
 0x0ee0  (0x25,  6)  six clip planes, all zero
 0x0f60  (0x20,  6)  six 4x4 identity matrices, ids 1, 3, 0x10, 0x11, 0x12, 0x13
-0x1100  (0x0c,  1)  reg 0x1058 = 1           cull face off
+0x1100  (0x0c,  1)  state id 0x16 = 1        cull face off
 0x1110  (0x07,  1)  PIPELINE-KEY = 0x00000010
 0x1130  (0x08,  1)  VERTEX-FORMAT  stride = 20
 0x1158  (0x1b,  1)  DRAW
@@ -551,20 +621,73 @@ record — see `docs/parhelia-command-construction.md` for the full table.
 slot+0x00   0x8f000001    DRAW packet: opcode 0x8f, count = payload dwords - 1
 slot+0x04   first         first vertex index                     = 0
 slot+0x08   last          one-past-end vertex index              = 3
-slot+0x0c   0x00000002    register-write list, 2 registers
-slot+0x10   0x21212425    index tag: 0x25 -> reg 0x1094,
-                                     0x24 -> reg 0x1090,
-                                     0x21 -> END OF PACKET (twice)
+slot+0x0c   0x00000002    register-write element: 2 data dwords follow
+slot+0x10   0x21212425    DMA header: index 0x25 -> reg 0x1094,
+                                      index 0x24 -> reg 0x1090,
+                                      index 0x21 -> filler/terminator (twice)
 slot+0x14   fence value   -> reg 0x1094   = the submission serial
-slot+0x18   fence address -> reg 0x1090   = the serial page's bus address
+slot+0x18   fence address -> reg 0x1090   = the fence page's bus address
 ```
 
 Captured verbatim for five consecutive draws with only the fence value changing
 (2, 3, 4, 5, 6, 7) and the address constant. [CONFIRMED]
 
-Index `0x21` **terminates** a packet; index `0x20` (`reg 0x1080`, DMAPAD) is the
-mid-packet filler. Getting these the wrong way round produces a stream the
-engine mis-parses.
+DMA header bytes are consumed LSB first and each names register
+`0x1000 + index*4`. Index `0x21` (`0x1084`) **terminates** the header — the next
+dword is a new header — while index `0x20` (`0x1080`, DMAPAD) is the mid-packet
+filler that consumes a data dword and discards it. Getting these the wrong way
+round produces a stream the engine mis-parses.
+[CONFIRMED — `mtx2434` @0x398e0, the vendor's own software replay of this stream]
+
+### 2.4a How the kernel turns that into ring traffic
+
+This is the piece a from-scratch driver has to reimplement, and it is not
+symmetric: **the 7-dword descriptor is split in two.** `mtx2196` @`.text+0x4acb0`
+reads the DRAW record's `end` field and branches on its **bit 0**:
+
+* **bit 0 clear — pure DMA jump.** `mtx1937(cmdbuf, start, end & ~1, 2, 2)`
+  appends the 5-dword secondary-buffer call to the primary ring:
+  `{ 0x20292820, 0, start|2, end|2, 0 }`, i.e.
+  `DMAPAD=0; SECADDRESS=start|2; SECEND=end|2; DMAPAD=0`.
+* **bit 0 set — jump plus inline copy**, which is what every captured draw does
+  (`end = slot + 0x1d`). The kernel jumps to `[start, (end & ~1) - 0x10)` — that
+  is `[slot, slot + 0x0c)`, exactly the three draw dwords — and then
+  `LocMemCpy`s the last 16 bytes of the descriptor
+  (`{0x00000002, 0x21212425, value, address}`) **straight into the primary ring**.
+
+So `slot + 0x1d` is not "end plus a stray bit": **bit 0 selects the hybrid
+submission mode**, and the client must set it for the packet shape documented
+above to work. [CONFIRMED]
+
+Per RENDER call the ring receives, in this order:
+
+```
+(a)  cache-flush packet, 6 dwords:
+         0x00000004, 0xc0afafc0, mode|7, fence|1, fence, saved(0x1300)
+     0xc0afafc0 decodes as {0x1300, 0x12bc, 0x12bc, 0x1300}
+(b)  one jump (+ optional inline copy) per DRAW record
+(c)  the kernel's own 3-dword fence element:
+         0x21212425, fence, fenceWriteBackAddress
+     fence = ++*(u32 *)(ctx[0x10] + 0x50), 32-bit wrapping, skipping 0
+(d)  memWriteDword(0x408, ringBusBias + ringWritePointer)     the doorbell
+```
+
+[CONFIRMED — `mtx558` epilogue @0x451dd, `mtx1937` @0x32360, `mtx3468` @0x3bd5b]
+
+Note that the fence element appears **twice**: once as the tail of the client's
+own descriptor (inlined by the kernel in the hybrid path) and once appended by
+the kernel from its own counter. Whether these are the same counter, or the
+client's is redundant, is [UNRESOLVED]. The observed serial page increments by
+exactly 1 per draw and matches the value in the client's descriptor, so at
+minimum they stay in lockstep.
+
+One more [UNRESOLVED] item worth a single capture: the client's stream prefixes
+each register element with an explicit dword count (`{2, 0x21212425, value,
+address}`) and the kernel's flush packet has the matching `0x00000004` prefix,
+but `mtx1937`'s jump packet and the kernel's own 3-dword fence do not — and
+`mtx2434` reads no count field at all. Dump the ring bytes around a `0x20292820`
+to settle whether the count word is on the wire or is a client-side convention
+the `0x21` terminator makes redundant.
 
 ### 2.5 Steady state — what a repeat draw actually costs
 

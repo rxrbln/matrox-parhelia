@@ -10,6 +10,30 @@ Register model (triple-confirmed): engine register at MMIO `0x1000 + (index<<2)`
 driven by **direct MMIO** (`ExecuteEmulDma` replays each write) or the DMA
 busmaster ring; sync by polling `0x8f0` bit17 idle + fence `0x450`.
 
+> ## CORRECTION (2026-09-05): region 2 indices are GL STATE SLOTS, not registers
+>
+> **Do not read `reg = 0x1000 + index*4` on region-2 pairs.** That mapping
+> belongs to the *DMA ring* (region 5), not to the ICD's state stream.
+>
+> The ICD stream is `[opcode][count][payload]`, dispatched by a jump table in
+> the kernel. Opcode **0x0c** carries `(index, value)` pairs where the index is
+> a **GL state-slot id (1..0x100)** routed through a 172-entry per-slot handler
+> table that pokes a packed software shadow. **No register offset appears in
+> that path at all.**
+>
+> Confirmed against the captures: register-index tags (`0x2121xxxx`) occur 28
+> times in region 5 and **zero** times in region 2 — the two namespaces never
+> mix.
+>
+> **Consequence:** every register offset below that was derived from a region-2
+> index is **unproven**, not merely the ones above index 0x80. The *values* are
+> still good — the depth-func 1..8 enum, the blend-factor enum, the 8-bit alpha
+> reference — and so are findings derived from region 5 tags or from literal
+> DMA register indices emitted by the kernel. This also explains the anomalies
+> logged here earlier: `glFogi` "writing 0x1230" and `glEnable(GL_LIGHTING)`
+> "writing 0x1224" were state slots 0x8c and 0x89, and the `0x1030` that seemed
+> multiplexed across scissor, cull, fog and lighting was never a register.
+
 ## Command submission & sync — DONE
 
 Direct MMIO: `*(bar1 + 0x1000 + index*4) = value`, then poll `0x8f0` bit17.

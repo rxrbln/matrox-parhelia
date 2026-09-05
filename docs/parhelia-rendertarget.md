@@ -18,6 +18,22 @@ binaries agree; **[INFERRED]** = best reading, self-consistent, not proven;
 
 ---
 
+## Answers at a glance
+
+| question | answer | §  |
+|---|---|---|
+| colour RT registers | **`0x1220` base / `0x1224` cfg** (surface slot 0) — the 3D engine **reuses the 2D descriptor file**, it has none of its own | 1 |
+| pitch / format / tiling | all inside cfg: pitch px [13:0] (mult. of 32), type [18:16], **format [29:24] — 6 bits**, tiling [31:30] | 1.2 |
+| depth/stencil | **`0x1230` / `0x1234`** (slot 2), one surface for both, no separate stencil base; exact S8Z24 code still open | 2.1 |
+| depth clear | a **3D rectangle**: `DWGCTL = 0xC4`, PLNWT forced `0xFFFFFFFF`, values in `0x12C8`/`0x12CC`/`0x12D0`, geometry through the WARP vertex planes — *not* a 2D fill | 2.3 |
+| clear mask | 1 = colour, 2 = depth, **4 = stencil**, 8 = rect already in surface space | 2.2 |
+| colour write mask | **`0x1324` PLNWT**, a 32-bit bit-plane mask (`0x12a0` is unproven) | 3.1 |
+| multisample | **advertised, not implemented**; `GL_SAMPLE_BUFFERS` hard-wired to 0; FAA-16x is Windows-only | 4 |
+| render to texture | just point `0x1220`/`0x1224` at the off-screen surface — nothing else is scanout-specific; no MRT | 5 |
+| present | flush → `0x12BC`/`0x41C` fence → 2D blit (windowed) or CRTC page flip: `0x1824 + slot*4` then `0x1800[8:7]` | 6 |
+
+---
+
 ## 0. The framing correction that everything else depends on
 
 Two structural facts had to be fixed before any `0x12xx` claim could be trusted.
@@ -836,3 +852,8 @@ real silicon.
    manipulated, meaning unknown.
 6. **The third per-slot descriptor word** (`dev+0xb48+4i`, 14-bit width/height)
    — no register emitter found; may be software-only.
+7. **The FAA-16x control / fragment-buffer / `FRAG_RESOLVE` registers** — no
+   Linux consumer exists at all (§4.3).  Only reachable by reversing
+   `MTXPARD.dll`'s D3D path from the `AAMode` / `ThresholdAA` / `FragSize` switch
+   consumers, or by an MMIO trace under Windows.  Not needed if supersampling
+   (§4.4) is used instead.
