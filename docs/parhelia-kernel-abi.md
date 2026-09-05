@@ -1253,3 +1253,87 @@ device-buffer allocation must be failure-checked and must unwind. The vendor
 driver dereferences the NULL it just failed to allocate, which is reachable
 whenever the allocation is refused for any reason -- as here, where the reason
 was not scarcity at all.
+
+
+## Why device-buffer allocation fails, decoded (2026-09-05)
+
+Three independent causes, none of them memory pressure. All from `mtx.ko`,
+which still carries **real symbol names** for the OS glue (`OsAllocLockedPages`,
+`MtxRegion_Alloc`, `mtx_mem_alloc_agp/pci`, `mtx_open`, `mtx_ioctl*`) even
+though `mtx_parhelia.o` is fully obfuscated. That layer is where the answers are.
+
+### Three heaps, chosen by the client
+
+`mtx938` dispatches on the request's memory-type field:
+
+| request type | wrapper | internal region type | backing |
+|---|---|---|---|
+| 1 | `mtx3583` | 2 | `agp_allocate_memory` + `agp_bind_memory` |
+| 2 | `mtx586` | 1 | `__get_free_pages(GFP_KERNEL\|__GFP_DMA32)` |
+| 4 | `mtx3185` | 3 | `vmalloc` (not DMA-able) |
+
+The `nb` and `type` in "Failed to allocate locked pages" are the **page count**
+and the **internal** region type, not the request type.
+
+### Cause 1: AGP never came up, and it fails silently
+
+`mtx_mem_alloc_agp` (`0xc39a0`) bails out before allocating if `agp_drv` is NULL
+or `agp_drv->[0x6c]` (the enabled flag) is zero -- **returning 0 with no
+message**. Neither of its two error strings appears in our logs, so it never got
+as far as trying.
+
+**Verified on hardware.** `GET_MEMORY_INFO` (nr=0) carries the driver's AGP
+aperture at `+0x20` (base) and `+0x28` (size), and on this box both read
+**zero**, with no `[mtx] AGP aperture at ...` line in dmesg. The kernel's own
+agpgart has an aperture (64M @ 0xc8000000); **mtx's AGP state does not**. So
+every request-type-1 allocation is doomed here, quietly.
+
+That makes `nr=0` a cheap pre-flight check: if `+0x20`/`+0x28` are zero, do not
+expect AGP-backed buffers to work.
+
+### Cause 2: the DMA32 path caps at 2 MiB
+
+`mtx_mem_alloc_pci` (`0xc37a0`) searches orders 0..9 and gives up at
+**order 9 = 2 MiB**, returning NULL *without printing anything*. Our failing
+request is 3,280,896 bytes -- the 3 MB vertex ring -- which needs order 10. No
+amount of free memory helps.
+
+(Note: an order-9 cap was once guessed at in this project as the cause of an
+unrelated `glTexImage2D` hang and correctly retracted -- that symptom really was
+a missing `-lm`. The cap is real, but it explains *this* failure, not that one.)
+
+### Cause 3: request type 2 is broken in the vendor driver
+
+`mtx938`'s type-2 branch calls `mtx586` and then jumps to a `xor eax,eax`
+return-false, **never copying the returned pointers out**. So request type 2
+always reports failure and leaks whatever it allocated. Do not model an open
+driver on that path.
+
+### The oops is a separate defect: an unresolved pixel format
+
+The NULL dereference at `mtx3100+0x59` (`movzx edx,[rax+4]`) is **not** a
+consequence of the allocation failures. `desc->[8]` is NULL, and it traces back
+through `mtx263` (`desc[8] = req[0]`) to `mtx3061`, where
+`req[0] = mtx1431(pdev->[0x6c0], userreq->[8])`.
+
+`mtx1431` -> `mtx473` validates the format code against a jump table covering
+**0x14..0x50**, returning 0 for anything else; `mtx957` then linear-scans the
+device's format table and returns NULL on a miss. Nothing checks the result
+before `mtx3100` dereferences it.
+
+The fault address being 4 rather than 0x178 also proves the format *table*
+pointer was valid -- the table exists and the **lookup missed**.
+
+So a client can oops this kernel with a bad format enum. For the open driver
+that is a hard requirement: **range-check the format code and NULL-check the
+table lookup before use.**
+
+### Contract for an open driver
+
+* Offer the three heaps, but **do not cap DMA allocations at MAX_ORDER** -- a
+  3 MB vertex buffer is ordinary for GL. Use scatter-gather through the
+  GART/IOMMU rather than one contiguous block. This is the single most important
+  correction to the vendor design.
+* Fail loudly when the GART is unavailable instead of returning NULL silently.
+* Validate every userspace-supplied enum before dereferencing anything derived
+  from it.
