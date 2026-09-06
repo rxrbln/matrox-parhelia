@@ -116,6 +116,50 @@ that use them exist verbatim in `mtx_parhelia.o` `.data` at `0x1643c0`,
 `0x1646a0`, `0x1641e0`, with a 346-instruction corpus in `MTXPARM.sys`
 `0x627b8`. No binary names any WARP mnemonic as text. [BIN]
 
+## 6b. Measured since this document was first written
+
+**GL state to command bits** — a synthetic variant matrix
+(`tools/gltest.c`, `tools/capture-gl-matrix.sh`, `tools/diff-gl-variants.py`)
+measured the encodings directly; full table in
+`parhelia-gl-state-attribution.md`. All seven captured primitives match
+`0x10b0 = mtx734[prim] | topology<<12 | 0x60000`, and the primitive **class**
+is replicated in three places: `0x10f0`'s low nibble, `0x1130[25:24]` and
+`0x1300`'s low nibble. Cull is `0x1130` bit 0 (not `0x12fc`), flat shading
+`0x1130` bit 12, depth test `0x12c8` bit 0, blend `0x12e8`, alpha test
+`0x12e4`, scissor max `0x132c = (h<<16)|w`. Point size is `c[0x172].w` =
+half the size; polygon offset is `c[0x178]`; lights are 7-vec4 blocks from
+`c[0x0E0]`. [HW]
+
+**The steady state is four packets.** Between consecutive draws the vendor
+emits only `0x10b0`, `0x1000 = 3`, `0x1040 = 4` and the draw — byte-identical
+in 931 of 956 measured gaps. Everything else in a frame (529 writes across 104
+registers, ten block loads, the priming pseudo-draws, X's 2D blits, the
+flushes and the fence) is context or redundant. [CAP]
+
+**Block loads are consumed through the vertex-fetch frontend.** The
+`[count][first][1][0]` sub-header is the `v0` the constant-loader microprogram
+reads, so a one-attribute pipe must be programmed immediately before them
+(`0x1000=0, 0x1040=4, 0x10b0=0x0002305c, 0x10b4=0, 0x10b8=0x83c00000`) and the
+real vertex format restored after. Omitting this is what stalled our generated
+stream at its first block load. [BIN][HW]
+
+**Gouraud interpolates in hardware.** A per-vertex-colour client's own frame
+shows a genuine gradient. An earlier three-colour draw of ours came out
+uniform because it replayed `gltri`'s state, and `gltri` uses one flat colour —
+so nothing in that capture configures interpolation. With all three vertices
+the same colour, flat and smooth are indistinguishable, which is why every
+single-colour test had looked correct. [HW] See
+`parhelia-gouraud-interpolates.md`.
+
+**Coordinate space when replaying.** A replayed stream carries the captured
+client's projection, so vertices must be supplied in ITS window coordinates
+(0..320 x 0..240 for `gltri`), not NDC. NDC vertices are clipped away entirely
+and draw nothing. [HW]
+
+**The render target is per client, not merely per boot.** `gltri` renders at
+~`0x2f654f8`; a different client at ~`0xee7c60`. A diff aimed at the wrong one
+reports a silent zero. Derive it per client (`tools/prep-draw.sh`). [HW]
+
 ## 7. Open, in the order they are being closed
 
 1. Bind **our** generated program instead of the vendor's heap entry (the
@@ -148,6 +192,15 @@ that use them exist verbatim in `mtx_parhelia.o` `.data` at `0x1643c0`,
 
 ## 9. Method lessons that cost the most time
 
+- **A VRAM diff includes our own clear.** A diff that exactly matches a
+  triangle-sized footprint may be the clear *erasing* the previous frame; the
+  pixel VALUES are the evidence, never the diff alone. This produced one false
+  positive in this project.
+- **Check that a binary is non-empty before trusting a null result.** A crash
+  during a build left a 0-byte client that ran, printed nothing and rendered
+  nothing; two capture attempts were spent before the file size was checked.
+- **Bench one variant per run and persist each result** before starting the
+  next; the box crashes often enough that batches lose everything.
 - A pixel count at a guessed address proves nothing. Judge a draw by a
   **full-VRAM diff with a changed input** (colour or position); a same-input
   diff changes nothing even when the draw works.

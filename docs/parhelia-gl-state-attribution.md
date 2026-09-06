@@ -21,6 +21,9 @@ Baseline (one smooth-shaded triangle, 320×240 window):
 | GL_LINES | `0x0006103d` | `1` | `0x0100200c` | `0x00a60ec5` |
 | GL_TRIANGLES | `0x0006305c` | `2` | `0x0200200c` | `0x00a60ec4` |
 | GL_QUADS | `0x0006605c` | `2` | `0x0200200c` | `0x00a60ec4` |
+| GL_LINE_STRIP | `0x0006203d` | `1` | `0x0100200c` | `0x00a60ec5` |
+| GL_TRIANGLE_STRIP | `0x0006405c` | `2` | `0x0200200c` | `0x00a60ec4` |
+| GL_TRIANGLE_FAN | `0x0006505c` | `2` | `0x0200200c` | `0x00a60ec4` |
 
 So, confirming and extending the `mtx734`/`mtx3178` tables:
 - **`0x10b0`** = `mtx734[prim]` in bits [6:0] (`0x20` point, `0x3d` line, `0x5c` triangle)
@@ -44,6 +47,21 @@ So, confirming and extending the `mtx734`/`mtx3178` tables:
 
 `0x1130` therefore packs at least three independent things: class in [25:24],
 flat shading at bit 12, cull enable at bit 0.
+
+## Method: spans must be self-identifying
+
+The ring is circular, so "newest by address" is not newest in time - an early
+variant's window reached into another run and the BASELINE came back with a
+textured draw header. Every variant therefore renders at a unique window width
+and a span is accepted only if its scissor matches; spans with no 3D primitive
+word are reported as unusable rather than silently falling back to another
+frame. The width marker itself is excluded from the reported diffs.
+
+Still unmeasured: GL_LINE_LOOP, GL_QUAD_STRIP and GL_POLYGON (client support
+added, not yet captured); the texture variants (their 2D upload traffic
+crowded the 3D draws out of the window); and every indexed draw path - all
+captures so far use the `0x97` address-mode draw, so `0x8f`, `0x1b`, `0x1f`,
+their index buffers and `0x1060`/`0x1064` remain unexercised.
 
 ## Notes
 
