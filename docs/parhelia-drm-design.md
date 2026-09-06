@@ -2,6 +2,7 @@
 
 # A from-scratch open kernel driver for Matrox Parhelia — design
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** `0x1130` bit 9 is not a WARP disable — the vendor ORs `0x200` in on every draw.
 The vendor kernel module (`matroxdriver-x86_64-cvs-20090511`) builds only against
 Linux 2.6.30. Everything below is written to replace it, not to wrap it.
 

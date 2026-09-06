@@ -3,6 +3,7 @@ SPDX-License-Identifier: GPL-2.0
 
 # Parhelia WARP vertex ISA — the complete encoding, from the vendor's own assembler
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** "f2b = 1 on every arithmetic instruction" is wrong: the stage/clipper class runs `f2b = 0` (see `parhelia-warp-programs-decoded.md`).
 This document closes the open items of `docs/parhelia-vertex-isa.md` PART 2 and
 `docs/parhelia-warp-binding.md` by reading the **DirectX vs_1_x → WARP
 assembler inside the Windows D3D driver** `xddm32_210_00_105_se_u_nowhql/MtxPar/MTXPARD.dll`

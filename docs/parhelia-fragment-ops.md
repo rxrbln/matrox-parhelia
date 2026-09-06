@@ -1,5 +1,6 @@
 # Parhelia fragment operations — depth, stencil, alpha test, blend, masks, dither, ROP
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** The `reg = 0x1000 + slot*4` rule is refuted.
 Everything the hardware does to a fragment **after** the fragment program has
 produced a colour.  The fragment program / combiner ISA itself is a separate
 document (`docs/parhelia-fragment-isa.md`) and is not repeated or revised here.

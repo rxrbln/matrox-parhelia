@@ -1,5 +1,6 @@
 # Parhelia-512 fragment / pixel-shader ISA
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** The `reg = 0x1000 + slot*4` rule is refuted; `0x1130` bit 9 is not a WARP disable.
 Reverse-engineering of the Parhelia **pixel (fragment) combiner** — the block the
 Windows D3D driver targets when it compiles ps.1.x, the block the Linux GL ICD
 exposes as `GL_MTX_fragment_shader`, and the block the X driver's

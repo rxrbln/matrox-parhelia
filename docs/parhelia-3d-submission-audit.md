@@ -1,5 +1,6 @@
 # Parhelia 3D command submission — consolidated model and claim audit
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** Its "opcodes only via a secondary buffer" reading is half right: the call's START low bits select the section framing (`|2` header-ful, `|0` header-less). `0x12b0 = 0x3ff0f800` and the `reg = 0x1000 + slot*4` registers are refuted.
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 

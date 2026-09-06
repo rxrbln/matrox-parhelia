@@ -1,5 +1,6 @@
 # Parhelia-512 engine bring-up and GL/D3D context creation — the complete sequence
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** "A value like `0x08a57183` cannot be an entry" is **refuted**: it decodes to instruction index 96, the first non-zero row of its slot. `0x400` as the ring limit is contested — measured as a status/write-back page.
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 

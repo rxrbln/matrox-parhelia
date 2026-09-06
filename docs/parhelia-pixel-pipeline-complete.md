@@ -1,5 +1,6 @@
 # Parhelia-512 pixel pipeline — the complete register model, from the Windows assembler
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** Where it cites `reg = 0x1000 + slot*4` registers, that rule is refuted.
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 

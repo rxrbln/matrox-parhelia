@@ -1,5 +1,6 @@
 # Matrox Parhelia — vendor kernel driver ABI (device init, memory, submission)
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** The `reg = 0x1000 + slot*4` rule is refuted; `0x400` is contested (measured as a status/write-back page under a live context).
 Provenance, three sources:
 
 1. **Open C source.** `matroxdriver-x86_64-cvs-20090511/kernel/src/*.c` and

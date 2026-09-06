@@ -1,5 +1,6 @@
 # Matrox Parhelia — render target, depth/stencil and framebuffer state
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** The `reg = 0x1000 + slot*4` rule is refuted. The render target of a live GL client was measured at `0x2f654f8`, not at the `0x1220` value.
 Reverse-engineered for a from-scratch open driver, 2026-09.
 
 **Primary source for this document: the vendor kernel core

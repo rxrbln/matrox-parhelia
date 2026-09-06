@@ -3,6 +3,7 @@ SPDX-License-Identifier: GPL-2.0
 
 # Parhelia vertex fetch and GPU memory-space classes
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** `0x1040` does not carry the byte stride on the copy path a GL client uses — it is the placeholder `4`, with the per-vertex size in draw-header bits [22:17].
 What the low two bits of every GPU address mean, how the vendor stack picks
 them, what the vertex-fetch unit (`0x1000..0x1064`, `0x10b0..0x10b8`) is
 programmed with, how the draw packets are framed, and — the reason this was

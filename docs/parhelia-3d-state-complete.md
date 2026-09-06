@@ -1,5 +1,6 @@
 # Parhelia 3D pipeline state — consolidated RE (2026-09)
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** The `reg = 0x1000 + slot*4` rule is refuted (`0x12a0` is named in no vendor binary).
 > ## STALE IN TWO SPECIFIC PLACES — both would break a draw
 >
 > This file elevates itself over others ("where the two disagree, this wins")

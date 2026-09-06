@@ -1,5 +1,6 @@
 # Parhelia hardware for a new GL driver
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** The `reg = 0x1000 + slot*4` rule is refuted.
 > ## PARTLY STALE — check `parhelia-3d-coverage.md` before using any address here
 >
 > The vertex-submission and "attribute-plane / latch-register model" sections

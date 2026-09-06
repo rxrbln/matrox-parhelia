@@ -1,5 +1,6 @@
 # Parhelia state-slot → hardware-register translation
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** The `reg = 0x1000 + slot*4` rule is refuted.
 How a GL state change travels from the ICD's region-2 record stream to a
 hardware register, recovered from `matroxdriver-x86_64-cvs-20090511/kernel/mtx_parhelia.o`
 (unstripped, `mtxNNNN` symbols; disassembly in `scratchpad/mtxk_r.asm`).

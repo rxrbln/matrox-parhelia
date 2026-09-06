@@ -1,5 +1,6 @@
 # Parhelia draw recipe — the complete ordered sequence for one triangle
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** The `reg = 0x1000 + slot*4` rule and `0x1130` bit 9 as WARP-disable are both refuted.
 Copyright (C) 2026 René Rebe <rene@exactco.de>
 
 What a driver must emit, in order, from `open("/dev/matrox/mtx0")` to a rendered

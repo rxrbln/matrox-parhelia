@@ -1,5 +1,6 @@
 # Driving the Parhelia hardware — submission, geometry, shading
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** The `reg = 0x1000 + slot*4` rule is refuted; `0x12a0`/`0x1058`/`0x1020`/`0x103c`/`0x101c` are not registers the vendor writes.
 > ## STALE — DO NOT FOLLOW THIS FILE'S RECIPES
 >
 > Superseded on the draw path. Specifically wrong here:

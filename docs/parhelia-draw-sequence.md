@@ -1,5 +1,6 @@
 # The authoritative Parhelia draw sequence
 
+> **Superseded in part — see `parhelia-3d-integrated.md` §8.** `0x12b0 = 0x3ff0f800` is a transcription error for `0x3fff8000`; the `0x300` arm formula is wrong (`0x300` is 16-bit).
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 

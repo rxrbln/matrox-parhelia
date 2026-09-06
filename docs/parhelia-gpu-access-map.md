@@ -1,5 +1,7 @@
 # Parhelia GPU-access map for the open low-level driver
 
+> **Start here for 3D command submission: `parhelia-3d-integrated.md`** — the consolidated, hardware-verified model.
+
 Goal: reverse and capture ALL GPU access a from-scratch open driver needs —
 kernel device init, memory management, modeset, 2D, 3D/GL, and command
 construction. This is the index; details live in the per-area docs and captures/.
