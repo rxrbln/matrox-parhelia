@@ -1585,3 +1585,61 @@ Still not implemented: HAL step 7 (`0x1c50` from PInS), step 12's tail
 0x0e1c` do not decode under the DC-clock field layout (they give VCO1 =
 1350 MHz, outside the documented window), so those values are currently copied
 rather than solved.
+
+
+## 1.2h COLD 3D COMMAND SUBMISSION WORKS (2026-09-07)
+
+With `mtx` never loaded, X down, and a genuine power cycle, the whole 32-packet
+3D stream is now consumed and the engine stays healthy:
+
+```
+cold 2D                              120000 px
+writeback: 0x400 = 16c95000 (readback ok)
+warpprog: on-chip store, 11 instructions, 9 placeholders patched
+ringreplay: 43 packets kicked, all idle
+engine: idle 1
+```
+
+Four defects had to be fixed, in this order. Each was found by decoding the
+stalling packet, not by permuting flags.
+
+**1. Only one of nine WARP entry registers was patched.** `0x10c0`-`0x10d8`
+and two earlier `0x1100` writes carried `075579bf`-style bus addresses of the
+vendor's programs *from the capture boot*. On any other boot they point at
+memory holding no program. `gen-stream.py` now emits a placeholder for every
+entry above `0x01000000` (values below that are counts/classes in the same
+registers); the tool patches all nine to our on-chip entry, which is
+boot-independent.
+
+**2. The constant-file zeroing was emitted in the wrong place.** `--zeroblocks`
+put the twelve zeroing loads at the *head* of the stream, before the register
+writes that configure the WARP unit. The block file belongs to that unit, and
+a block load submitted to an unconfigured one stalls a cold engine at the very
+first packet - confirmed with a minimal 133-dword stream containing nothing but
+one block load, which stalls under **every** init condition. The zeroing is now
+inserted immediately before the recipe's own first block load.
+
+**3. `0x400`, the write-back page, was never armed.** It is the physical
+address of the driver's shared status structure. Cold it reads 0, and the
+DWGSYNC drain and surface fences cannot retire without it. `--writeback400`
+parks a page-aligned scratch page in our own DMA buffer and programs it.
+
+**4. The stream armed BLOCK-UNTIL-RETIRE and then waited forever.** The
+stalling packet was not a sync opcode - it was the vertex-fetch/surface group,
+which *contains* `0x1300 = 0x407` followed by `0x12bc = tag|1` then `tag`. The
+odd `0x12bc` write arms block-until-retire; `0x41c` sat at `0x1a0` waiting for
+`0x1a8`, forever. The sync is ordering only and not needed to draw, so
+`--nosync` drops the whole group (31 register writes).
+
+**What still does not work: the draw rasterises nothing.** All packets retire,
+the engine is idle, and no pixels appear at the bound colour surface
+(`0x1220 = 0x02000000`) or anywhere else scanned. Proven not to be ours by
+colour rotation: two different vertex files give byte-identical VRAM content,
+so the 8051 non-zero dwords at `0x2000000` are static, not rendered.
+
+**Method note.** `reboot -f` is a WARM reboot: the VBIOS re-POSTs enough to
+restore 2D, but the WARP instruction store and the constant file are not
+touched, so consecutive runs are **not** independent cold samples. A result
+that reached packet 41 was later shown to be residual state - on a genuine
+power cycle the same stream stalled at packet 0. Any cold-3D claim needs a real
+power cycle, or at least must be reproduced after one.
