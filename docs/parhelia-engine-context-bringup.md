@@ -1705,3 +1705,58 @@ A 3D draw with the target at `0x2f00000` (47 MB) renders: cleared to 0 px, then
 8051 px after the draw, 43 packets all idle. §1.2h's placement constraint was
 an artefact of the same bad measurement - the earlier attempt cleared with
 `--vramzero` and never verified the clear took.
+
+
+## 1.2j The WARP does not execute - what is excluded, and what is left
+
+Cold, with the full stream retiring and a triangle appearing, **our WARP
+program never runs**. The decisive test: a program whose only change is
+`add o1, v0, ...` (write POSITION into the colour output) instead of
+`add o1, v5, ...` produces **byte-identical output**. Nothing the program does
+reaches the framebuffer.
+
+The output is the **legacy DDA path** (`0x1160`/`0x1180`), which our own notes
+describe as "a legacy DDA engine that faults a live WARP":
+
+* geometry follows the vertex buffer and every rendered pixel lies **inside**
+  the ideal triangle - the fetch and the raw positions are correct
+* coverage is only 2.5-28%, in bands - the DDA interpolator planes are all zero
+  except `0x1180 = 11.0f`
+* colour is a fixed `ff00XXYY` gradient with red always 0 and green+blue = 255,
+  **identical for all-red and all-blue vertices** - no vertex colour reaches it
+
+**Excluded by hardware test, each on its own run:**
+
+| candidate | result |
+|---|---|
+| program contents (two different programs) | identical output |
+| the perspective divide (`smul` without its `sop3` companion) | identical |
+| entry instruction index (0, 32, 64) | identical |
+| entry class tag (0, 2, 3) | identical |
+| program source: on-chip store **and** system-memory heap with a class-3 entry | identical |
+| `0x10f0` MODE bit 29 restored on the final write | identical |
+| the §1.9 idle wait before touching `0x918` | identical |
+| alpha test, scissor, blend, plane write mask, depth | all already off/full |
+| de-tiling (30 vs 32 tiles per row) | 30 is correct, 100% inside the ideal |
+
+**Setup and interpolator state is byte-identical to the vendor's** across
+`0x1000`-`0x1004`, `0x1040`-`0x1064`, `0x10b0`, `0x1110`, `0x1118`, `0x1130`
+and every `0x1160`-`0x1198` plane. The *only* differing register is `0x1100`,
+the entry itself.
+
+**Measured facts about the bind path:**
+
+* `0x918` reads back 0 whatever is written - most likely write-only, so it
+  proves nothing either way.
+* `0x908 & 0xfff7ffbf == 0x63a78001` and `0x924 & 0xfff == 0x100`: the WARP
+  **is** idle by the documented signature.
+* The vendor's steady-state draws contain **no bind sequence at all** - only
+  `0x10b0 = 0x0006305c` before each draw. The program is bound once at context
+  create, by the kernel, outside the command stream. The bind sequence our
+  recipe carries was captured from a different region and may not be the real
+  mechanism.
+
+**What is left:** the binding almost certainly happens as part of the kernel's
+3D context create (`ICD_CREATE`), which does work we have not replicated, and
+replaying a captured bind sequence is not equivalent. That is the thread to
+pull, not more permutations of the entry value.
