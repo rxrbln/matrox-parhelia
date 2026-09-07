@@ -4401,6 +4401,59 @@ that was *reported* was never checked against a number that was *expected*.
 `(0 writes patched)`, `RT 975 dwords`, and `rt.txt = 0x2f00000` were each
 printed plainly and each read as agreement.
 
+### 11.4e SOLVED: slot 0, and the surface base is a POOL OFFSET
+
+Patching each surface slot in turn in the captured stream and looking for the
+pixels settles both open questions at once. `--rtslot 0 --rtbase 0x2900000`,
+diff at `0x3800000`:
+
+```
+  slot 0, look at 0x3800000 (= base + 0xf00000)   30129 dwords
+  slot 0, look at 0x2900000 (the base itself)         0 dwords
+  slots 1, 2, 3, look at the base                     0 dwords
+```
+
+**Surface slot 0 (`0x1220`/`0x1224`) is the destination.** §11.4d's reading -
+that DWGCTL `[11:10]` selects it, and therefore slot 3 - is **wrong and
+reverted**; patching slot 3 moves nothing.
+
+**The base register is a pool offset, not a physical address.** The capture
+binds `0x02000000` and its pixels land at `0x2f00000`; patching the register to
+`0x2900000` puts them at `0x3800000`. A constant **`+0xf00000`** in both, so
+
+```
+  physical VRAM address = (0x1220 value) + 0xf00000
+```
+
+on a live vendor context. That resolves the long-standing note in
+`parhelia-render-target-location` that the triangle appears at `0x2f654f8` and
+"NOT at the 0x1220 value 0x02000000" - the two differ by exactly the pool base.
+It also contradicts `docs/parhelia-surface-address-translation.md` §1.1, which
+calls the base a literal byte address and marks it PROVEN from an internally
+consistent set of allocator arithmetic; that reasoning never had a
+base-versus-pixels measurement to check itself against, and this one does.
+
+Where the `0xf00000` comes from is not yet decoded - presumably a heap base the
+vendor's kernel programs at context create. It was the same across three boots.
+
+### 11.4f OUR OWN STREAM DRAWS
+
+With the target in slot 0 and the pool offset applied, `gen-minimal-draw.py`'s
+own 44-packet stream renders:
+
+```
+  --rt-base 0x2900000, NDC vertices +/-0.9, viewport 1024x768
+  -> 317914 dwords changed at 0x3800000
+```
+
+`0.5 * 921 * 691 = 318205` is the area those vertices ask for after the
+viewport transform, so the count is the triangle, to within the edge rule.
+
+Every earlier "our stream retires 27 packets and draws nothing" measurement was
+this: the colour target was bound to a register the engine reads as an offset
+into a pool whose base we did not know, so the pixels were written 15 MB away
+from wherever we looked.
+
 ### 11.5 Operational
 
 * **Never run two `hw-run.sh` invocations against the board concurrently.** One
