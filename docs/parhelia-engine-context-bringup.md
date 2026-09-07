@@ -3053,3 +3053,41 @@ Closing it means either recovering the remaining programs from
 `mtx_parhelia.o` `.data` (three are already there, so more may be), or
 capturing the `0x918`/`0x91c` upload stream at context create, which needs the
 vendor module loaded.
+
+### 3.1ai The vendor's WARP program library IS in the binary — 25 recovered
+
+§3.1ah said the remaining pipeline programs live only in the kernel's heap.
+That is wrong: they are in `mtx_parhelia.o`, and searching for the `end`
+instruction's 12 bytes (`00000200 00040000 14c00000`) finds them.
+
+```
+  28 'end' instructions in the object, 26 of them in one contiguous cluster
+  at file offsets 0x162f5c..0x1647e4
+```
+
+Carving between consecutive terminators and trimming filler yields **25
+programs**, all of which disassemble sensibly with `parhelia-warpdis2.py`.
+They are in `captures/warp-programs/vprog-<offset>.warp.hex`. The three
+addresses previously on record (`0x1641e0`, `0x1643c0`, `0x1646a0`) sit inside
+this cluster and are three of these 25.
+
+**Classified by the opcodes they use:**
+
+| class | programs | markers |
+|---|---|---|
+| constant loaders | `163f14` (56 instr), `1641c8` (13), `16427c` (15) | `getc`, `mov cN`, `getidx`, `br` |
+| register writers | `164488` (15), `164554` (25), `164688` (28) | `getc` + `streg` |
+| constant reader | `16439c` (19) | `getc` |
+| per-vertex programs | the 16 plain ones, `163014` through `163d74`, 9 to 34 instructions | arithmetic only, no constant access |
+
+The sixteen plain arithmetic programs are the per-vertex variants - one per
+vertex-format and feature combination - which is what the four successive
+`0x1100` binds of §3.1d are choosing between.
+
+**A caveat before binding them.** `vprog-163014` reads `v0` and `v2`
+(`add T0, v0.www0, v0.xyz0`, `add T1, v2.www0, v2.xyz0`) where our descriptors
+declare position in `v0` and colour in `v5`. So these programs expect the
+vendor's own attribute assignment, and picking one means matching its input
+registers to the `0x10b8` descriptors, not just binding it. That mapping is the
+next piece of work, and it is now a finite search over a known set rather than
+an unknown.
