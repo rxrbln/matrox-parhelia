@@ -1464,3 +1464,49 @@ per-chipset `mtx3376` fixups, HAL step 7, and the aperture block. Also unproven:
 whether the per-packet doorbell stepping (`--polls`, default 200000) is itself
 declaring a false stall - the first cold 3D attempt wedges the engine, so each
 data point costs a reboot.
+
+
+## 1.2e Comparing our init against the vendor's by register state diff
+
+**mmiotrace cannot see the vendor's engine init.** It hooks only kernel
+`ioremap` regions, and the vendor X driver maps the BAR from userspace, so its
+HAL writes never fault through the tracer. Two capture attempts across
+`modprobe` and across X startup both returned **zero** writes. `mtx1373` is
+reachable by static RE only.
+
+What does work is a **state diff**: `3dtri --dumpregs` prints a curated set of
+registers (the documented init and engine ranges - not a blind sweep), so cold,
+post-our-init and post-vendor-X states can be compared. Measured on the 0x0528:
+
+| | registers |
+|---|---|
+| we set, **matching the vendor** | `0x300`, `0x308`, `0x1c08` |
+| we set to a **different** value | `0x1c00` - ours `0080e0e2`, vendor `0080f1e2` (bits 0 and 4) |
+| the vendor sets, **we do not** | `0x004`, `0x008`, `0x00c`, `0x0304`, `0x0e10`, `0x0e14`, `0x0e1c`, `0x1a00`, `0x1c04` |
+
+This confirms the §1.4 pair: `0x308 = 0x83` on the 0x0528 and the `0x300`
+read-modify-write both land exactly where the vendor leaves them.
+
+### The aperture block is not the hazard we recorded
+
+The vendor programs `0x004/0x008/0x00c`, and our gated-off step 17-21 code
+already writes **exactly those values**. Run cold with `mtx` unloaded and X
+down, `--initaperture` leaves the register file matching the vendor
+(`10000000 00000000 10000020 00010001`) and the 2D instrument still draws
+120000/120000 px. The earlier "the aperture block RESETS THE MACHINE" note
+holds only under a **live VBE console**, whose scanout is fed through the
+apertures it disarms. Cold, it is safe and correct.
+
+### Do not copy the remaining values
+
+Forcing the other seven registers to the vendor's measured values after our
+init takes the 2D instrument from 120000 px to **0**. The FS PLL words
+(`0x0e10/0x0e14/0x0e1c`) need their programming protocol - hold, strobe,
+divider fields, as `parhelia_program_dc_clock` does in the open driver - not a
+raw write, and `0x1a00` enables a display head whose timing has not been
+programmed. `[XDRV] mtx769` only *reads* these to compute frequencies; the
+writer has not been located yet.
+
+**Remaining gap for cold 3D, precisely:** `0x0304`, the FS PLL trio, `0x1a00`,
+`0x1c04` bit 8, and `0x1c00` bits 0 and 4 - each to be implemented with its own
+sequence, plus HAL step 12's tail (§1.2b).
