@@ -1793,3 +1793,41 @@ The two candidate routes forward, neither yet done:
 2. Drive the legacy DDA path deliberately - load the vertex slots
    (`0x1160`+) and the colour planes rather than leaving them zero - which
    would give correct colours and coverage without the WARP.
+
+
+## 1.2l The DDA path also renders nothing - all three routes exhausted
+
+`--warpring` (`dma_warp_via_ring`) implements the legacy DDA vertex-plane
+protocol: per vertex stage `w/z/y` into `0x1160+4v` / `0x1174` / `0x1178`,
+latch the position plane by writing `x` to `0x1180`, then stage `a/b/g` and
+latch the diffuse plane at `0x1184`; the triangle rasterises on the third
+vertex's latch.
+
+It forced `g_dmadev`, i.e. the `dma32buf` device buffer, which is not loadable
+on this box - the run died with "WARP: buffer alloc failed". Fixed to use the
+sysbuf path like everything else.
+
+With that fixed it runs cleanly and still draws nothing:
+
+```
+mtx458 gates: idle=1 908=1 924=1 busy0=1 (0x908=63af8001 0x924=00200100)
+loaded 7 WARP programs, 2664 bytes (222 instructions)
+VRAM non-bg px = 0 : no triangle
+```
+
+Note it uploads **seven vendor programs** through `0x91c` with every gate
+passing, and still nothing rasterises - further evidence that the store upload
+alone does not bind anything.
+
+**Summary of the three routes, all tried:**
+
+| route | result |
+|---|---|
+| captured-recipe replay (`ns`) | geometry correct and inside the ideal triangle, but 2.5-28% coverage and no vertex colours |
+| `--passthrough` address-mode draw | submits cleanly, writes nothing anywhere |
+| `--warpring` legacy DDA planes | gates pass, 7 programs uploaded, writes nothing |
+
+The one path that rasterises at all is the replay, and there the WARP is
+bypassed. Everything points at the bind being part of the kernel's
+`ICD_CREATE` context create, which is not reproducible by replaying captured
+register writes.
