@@ -2234,3 +2234,34 @@ result repeats exactly - 120/120/120 without re-init, 118/118/118 with
 `--engineinit` before each draw. The 52-vs-120 spread is *between* boots with
 different prologues, not run-to-run noise. A/B comparison is valid provided
 both arms run in the same boot after the same prologue.
+
+### 3.1k CORRECTION — the null-program result was a stalled submission
+
+§3.1k above is **wrong and is withdrawn.** The `end`-only program did not
+complete its submission:
+
+```
+warpprog: on-chip store, 2 instructions, entry 00000000, 9 placeholders patched
+ringreplay: STALL at packet 39 (dw 195..200): 20292820 ... 0x41c=00000000
+ringreplay: 40 packets kicked, stalled
+ringreplay: 66 pixels drawn
+```
+
+40 of 43 packets, then a stall - and it left the engine locked, which is why
+the passthrough arm of that batch never ran and reported nothing. The 66
+pixels are from a partial run, not a comparable draw.
+
+So the comparison never happened. A passthrough program completes all 43
+packets; the null program stalls at 39. **The program contents therefore do
+change behaviour, which is evidence that the WARP does execute** - a program
+that writes no outputs plausibly starves the setup unit and stalls it. The
+opposite conclusion drawn in §3.1k - that WARP output never reaches setup, and
+that the WARP does not run cold - is not supported.
+
+What §3.1j (the register cross-reference) established is unaffected: our
+stream writes a strict subset of the vendor's registers and every shared final
+value matches except the boot-specific fence pair and `0x1130` bit 12.
+
+**Method note:** always check for `STALL at packet` and `N packets kicked,
+stalled` before comparing pixel counts. A stalled run is not a measurement,
+and it poisons every later run in that boot.
