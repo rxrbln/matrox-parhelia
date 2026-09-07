@@ -3372,3 +3372,694 @@ That closes the static route to "which program goes on which bind". The
 remaining ways to answer it are to capture the `0x918`/`0x91c` upload at
 context create, or to bisect the 25 recovered programs against a working
 baseline - both of which need the vendor module loaded once.
+
+### 3.1at `0x1104` was never written — a gap §3.3 already documented
+
+Re-reading `mtx676` instruction by instruction, the bind packet it builds at
+`0xa054e` is:
+
+```
+  movl $0x6,        -0x20(%rcx)   ; header, low16 = 6 -> 8 dwords
+  movl $0x41403c3c, -0x1c(%rcx)   ; tags LSB-first: 3c, 3c, 40, 41
+  movl [0x48(%rsp)],-0x18(%rcx)   ;   idx 0x3c -> 0x10f0 = 0x20000028
+  movl [0x48(%rsp)],-0x14(%rcx)   ;   idx 0x3c -> 0x10f0 = 0x20000028
+  movl %ebp,        -0x10(%rcx)   ;   idx 0x40 -> 0x1100 = entry
+  movl %ebp,        -0xc(%rcx)    ;   idx 0x41 -> 0x1104 = entry   <- SAME value
+```
+
+`%ebp` is `mtx1391`'s return value, unchanged, so **`0x1104` receives exactly
+the same entry as `0x1100`**. §3.3 of this document already recorded both that
+fact and the conclusion that follows from it - *"the minimum register set to
+make WARP execute is `0x1000`, `0x1040`, `0x10b0`, `0x10b4`, `0x10b8`,
+`0x10f0`, `0x1100`, `0x1104`"* - and `gen-minimal-draw.py` has been emitting
+`(0x1100, entry), (0x10f8, 2)` all along, **never `0x1104`**.
+
+Every from-scratch measurement in §3.1n through §3.1ap was therefore made with
+one register of that minimum set missing. Fixed: both bind packets - the
+kind-0 constant loader and the per-vertex bind - now write `0x1104` alongside
+`0x1100`, with a `JUSTIFY` entry so `--selfcheck` still passes.
+
+**Not yet measured.** The Bash tool became unavailable to this session before
+the change could be regenerated and run, so this is an untested code change:
+it follows from the binary and from a section of this document written long
+before the recent work, but it has not been put on hardware. The next session
+should regenerate a stream and re-run the standard comparison
+(passthrough + window-space quad in a correctly-pitched target, one draw per
+boot, health line printed) before believing anything about it.
+
+Also confirmed while re-reading `mtx676`: the one-attribute pipe it emits at
+`0xa051a` is literally `0x1000 = 0`, `0x1040 = 4`, `0x10b0 = 0x0002305c`,
+which is exactly the preamble whose absence §3.1z found and fixed - an
+independent confirmation of that fix from a second code path.
+
+### 3.1au `--ctx-defaults` only implemented one of `mtx398`'s four groups
+
+§3.5 documents `mtx398`'s default state as four groups. `--ctx-defaults`
+(§3.1p) implemented only group 5, the raster/ROP block. Three groups were
+missing, and two of them matter enough to record:
+
+**Group 2 - the texture pipes and sampler defaults.**
+
+```
+  0x1200 + 4*i = 0x00040100 | (1 << i)      i = 0..3
+  0x11c0 = 0          0x11c4 = 0x00000249
+  0x11c8 = 0          0x11cc = 0xffffffff
+  0x11d0 = 0          0x11d4 = 0   0x11d8 = 0
+```
+
+The §3.1j register census saw `0x11c8`-`0x11d8` in the capture, dismissed them
+as "texture border/filler, all 0 or the border colour" and moved on. §3.5 shows
+`mtx398` emits them on **every context switch** as mandatory default state, so
+"filler" was the wrong reading of a register the vendor never omits.
+
+**Group 4 - five combiner slots, and `0x1260` is a literal.**
+
+```
+  for slot in 0x80, 0x82, 0x84, 0x88, 0x8a:
+      0x1264 = slot        0x126c = 0x00400400
+      0x1260 = 0x00000080  0x1268 = 0x00400400      <- literal, NOT slot
+```
+
+`0x86` is deliberately skipped. Our generator emitted a *single* slot with
+`0x1260 = 0x200` and `0x126c = 0x01400400` - a different configuration in both
+the number of slots and the alpha-source word. §3.5 already flagged that
+`docs/parhelia-3d-submission-audit.md` A.5 has `0x1260 = slot` wrong, and our
+generator inherited that error.
+
+Both groups are now emitted by `--ctx-defaults`, with `JUSTIFY` entries.
+
+**Not measured** - Bash was unavailable to this session, so like §3.1at this is
+a derivation, not a result. It does mean the §3.1p conclusion ("the `mtx398`
+context defaults are excluded") was drawn against an implementation that
+carried one group of four; that exclusion should be treated as void and the
+test re-run with the complete set.
+
+### 3.1av Tiles per row = `next_pow2(pitch) / 64` — derived, and it is 32 at 1920
+
+§3.1ab solved 16 tiles per row from a known 400x300 fill; §3.1am then corrected
+that to `TPR = pitch / 64` on the grounds that the fill ran at the tool's
+default width of 1024. **Both were reasoning from one measurement.** §2.4 and
+§3.7 settle it from the driver instead:
+
+* §2.4: a **type 2 or 3** surface has a scanline stride of
+  `next_pow2(max(pitch, 32)) * bpp/8` - not `pitch * bpp/8`.
+* A tile is 64x32 px, 8192 bytes at 32 bpp, so one tile row spans
+  `stride * 32` bytes.
+
+Therefore
+
+```
+  tiles per row = next_pow2(max(pitch, 32)) / 64
+```
+
+Check against the one hard measurement: pitch 1024 gives `next_pow2 = 1024`,
+`1024/64 = 16` - exactly the value solved from the fill. The rule is
+independently derived and agrees with hardware at the one point we have.
+
+**At pitch 1920 it gives `next_pow2 = 2048`, so 32 tiles per row** - not the 30
+this project used originally, and not the 16 §3.1am wrongly generalised to.
+1920 is not a power of two, which is precisely the case where `pitch/64` and
+`next_pow2(pitch)/64` diverge, and it is the pitch most of the session's
+measurements ran at.
+
+So every de-tiled coordinate reported for a **pitch-1920** run is wrong twice
+over: the early ones used 30, the late ones 16, and the correct value is 32.
+The pitch-1024 runs (§3.1am onwards) used 16 and are correct. This does not
+change any *count* - pixel totals are de-tiling independent - so the "sliver,
+not a fill" conclusion stands, but no reported x/y extent or slope for a
+1920-pitch run should be trusted.
+
+`tools/parhelia-3dtri.c`'s `rt_ctrl()` builds `cfg = 0x20000 | (fmt << 24) |
+pitch`, i.e. type 2 in bits [18:16], which is the right type for a 3D render
+target and matches the captured `0x32020780`. `[KERN] mtx3388`'s
+`cfg |= 0x00010000` (type 1, linear) is the 2D/linear path, not this one.
+
+### 3.1aw The advice in §4 was right, and we never took it
+
+§4's note under the minimum sequence says, verbatim and written well before the
+work in §3.1d-§3.1av:
+
+> **Do step 15 in two stages.** §3.3 gives a complete, proven, X-free and
+> GL-free sequence that exercises the vertex engine with eight registers
+> (`0x1000`, `0x1040`, `0x10b0`, `0x10b4`, `0x10b8`, `0x10f0`, `0x1100`,
+> `0x1104`) and reads the result back through `0x910`/`0x914`/`0x938` - no
+> rasteriser, no surface, no pixel pipeline. **Get that working first: it
+> isolates "our ring executes and the WARP unit runs our program" from "the
+> raster and pixel state are right", which is the ambiguity that has cost us
+> the most time.** Only then add the rasteriser state and the surface bases.
+
+Every measurement in §3.1d-§3.1av was a **full draw** judged by counting pixels
+in a render target - exactly the mode this note warns against. That is why the
+session could exclude two dozen candidates and still not know whether the WARP
+was executing our program: a pixel count cannot separate the two failure modes,
+and §3.1l measured directly that counts in the 50-120 range carry no
+information at all.
+
+**Build the isolated test first.** It is `mtx676`, §3.3, and every piece of it
+is already documented:
+
+1. `0x920 = 0` (on-chip store, §3.1b).
+2. Upload the program through `0x918`/`0x91c` - `parhelia-3dtri` already does
+   this (`warp_store_upload`).
+3. Emit the eight-register sequence of §3.3 in the order `mtx676` uses:
+   `0x10b4 = 0`; the `0x10b8` descriptor burst; `0x1000 = 0`, `0x1040 = 4`,
+   `0x10b0 = 0x0002305c`; then `0x10f0`, `0x10f0`, `0x1100`, `0x1104`, `0x10f0`
+   with MODE `0x20000028`.
+4. Submit a block load carrying a known pattern - `mtx676` uses
+   `0x4106000f` with four dwords of `0xaaaaaaaa`, four of `0x55555555` and the
+   six offsets `0x00, 0x40, 0x80, 0xc0, 0x100, 0x140`.
+5. Read the block file back with §3.2's window: `0x910 = (kind << 24) | index`,
+   `0x938 = 0xfffffffc`, then four dwords from `0x914`. `mtx676` repeats the
+   whole thing with the two patterns swapped, which is a built-in control
+   against a stuck readback.
+
+That answers "does our program run and produce outputs" as a **pattern match**,
+not a pixel count, with no surface, no scissor, no combiner and no de-tiling in
+the path. Only once it passes is it meaningful to ask why a draw does not fill.
+
+The one caveat on record: `parhelia-warp-readback-kind3` says only `kind = 3`
+returns anything stable and gives `0/1536` unstable even then - so validate the
+readback against the known `0xaaaaaaaa`/`0x55555555` pattern before trusting a
+null result from it.
+
+### 3.1ax `mtx1017` dispatches per GL primitive — quads are not native
+
+The GL draw emitter is `mtx1017` (`0x60e0`). Its second argument
+(`0xa4(%rsp)`, from `%esi`) is the vertex count and `ctx[0x41c]`
+(`0x7c(%rsp)`) is the **GL primitive mode**. Before anything is emitted it
+adjusts the count by mode:
+
+```
+  61d7  mov  0x41c(%r15),%ebx        ; GL mode
+  61de  cmp  $0xa,%ebx               ; modes above 10 skip the adjustment
+  61ef  shl  %cl,%rax                ; 1 << mode
+  61f2  test $0x5c0,%eax             ; modes 6, 7, 8, 10
+  61f7  jne  640c                    ;   -> 640c: subl $0x2, count
+  61fd  test $0x18,%al               ; modes 3, 4
+  61ff  je   6208
+  6201  decl 0xa4(%rsp)              ;   -> count -= 1
+```
+
+`0x5c0` is bits 6, 7, 8, 10 - `GL_TRIANGLE_FAN`, **`GL_QUADS`**,
+`GL_QUAD_STRIP`. `0x18` is bits 3, 4 - `GL_LINE_STRIP`, `GL_TRIANGLES`. The
+same test appears a second time at `0x6511`-`0x6534` with the adjustment
+inverted (`incl`), i.e. it is undone on the other side of a buffer-space check.
+
+Then the real dispatch:
+
+```
+  6569  cmpl $0xc,0x7c(%rsp)         ; mode <= 12
+  656e  ja   6d5c
+  6578  jmp  *0x0(,%rax,8)           ; 13-entry jump table indexed BY GL MODE
+```
+
+**So the vendor has a distinct emitter per GL primitive**, and `GL_QUADS`
+is one of the four modes that take the count-adjusting path. That is a
+different shape from what our streams do: we set a single primitive word
+(`0x10b0`) and hand the engine a flat vertex range, with no per-mode
+decomposition and no count adjustment.
+
+It also explains the long-running confusion over the quad primitive word: the
+measured table's `quads = 0x0006505c, class 0` and `gen-minimal-draw`'s
+computed `0x0006605c, class 2` are both attempts to name a *native* quad
+primitive, and the vendor may not use one at all - mode 7 goes through its own
+jump-table case, which is where the truth is.
+
+**Unresolved without execution:** the jump table's targets. `objdump` prints
+`*0x0(,%rax,8)` because the table is a relocated `.rodata` object, and
+resolving it needs `objdump -dr`/`readelf -r` output this session cannot
+produce. Reading the 13 case bodies out of `mtx1017` (`0x60e0`-`0x6d5c+`) is
+the next RE step, and case 7 is the one that matters for a Gouraud quad.
+
+### 3.1ay The exact packet the vendor emits immediately before a draw
+
+Continuing through `mtx1017`, at `0x659f` - after the buffer-space check and
+before the per-mode emit - it writes a **four-dword packet**:
+
+```
+  659f  movl $0x2,        (%r9)       ; header, low16 = 2 -> 4 dwords
+  65a6  movl $0x21211000, 0x4(%r9)    ; tags LSB-first: 00, 10, then 0x21 0x21
+  65ce  movl %r8d,        0x8(%r9)    ;   idx 0x00 -> 0x1000 = %r8d
+  65ae  movl $0x4,        0xc(%r9)    ;   idx 0x10 -> 0x1040 = 4
+```
+
+and `%r8d` is `0x34(%r10)` (`0x65ca`), which §2.2 identifies as the buffer's
+**2-bit memory class**. So:
+
+* **`0x1000` is written with the memory class alone** - `0` local, `2` AGP,
+  `3` PCI/system - not a base address with a class in the low bits. The
+  captured `0x1000 = 3` and `0x1000 = 2` are the class of whichever buffer that
+  draw's vertices live in, nothing more.
+* `0x1040 = 4` is a constant here, consistent with §3.5 and with `mtx676`.
+* The tag is padded with two `0x21` terminators, matching §1.10's note that the
+  vendor pads with `0x21` and not with `0x20`.
+
+Then the emit loop:
+
+```
+  6672  cmpl $0xc,0x7c(%rsp)
+  6681  jmp  *0x0(,%rax,8)            ; a SECOND per-GL-mode dispatch
+  6688  cmpl $0x4,0x7c(%rsp) ...      ; the GL_TRIANGLES + empty-batch case
+  66e4  call <memcpy>                 ; 0x98(%rsp) dwords -> the ring at %r9
+  66f4  lea  (%rax,%rdx,4),%r9        ; advance the write pointer past them
+  6738  lea  0xc(%r9),%rax            ; then the 3-dword draw packet
+```
+
+`0x98(%rsp)` is dwords-per-vertex and `0x9c(%rsp)` the source stride. **The
+vendor copies the vertex data inline into the ring immediately before the draw
+packet**, which is why §3.1ar found the draw operands computed relative to the
+ring write pointer, and why the annotated capture records the vertex bytes as
+living "in the ring gap between two calls".
+
+For replication that is a structural difference worth noting but not obviously
+a defect on our side: we place vertices elsewhere in the same DMA buffer and
+point the operands at them, with `0x1000` carrying the matching class 3, and
+the position-as-colour test of §3.1ad proves the engine reads our buffer
+correctly. The parts that are *not* yet replicated are the per-mode dispatch
+and the count adjustment of §3.1ax.
+
+### 3.1az The shape of the per-mode emitter
+
+The count adjustment of §3.1ax is scoped to a buffer-space check, not to the
+draw: `0x687b` does `addl $0x2, 0xa4(%rsp)`, undoing the `subl $0x2` of
+`0x640c` once the space test has passed. So `count - 2` is *how much ring
+space this primitive needs*, not the value handed to the hardware.
+
+The emitter itself (from `0x6920`) walks vertices with **two independent
+running pointers**:
+
+```
+  6920  cmp $0x1,%r8d           ; the vertex count
+  6924  jbe 6c55                ; fewer than 2 -> nothing to emit
+  692a  mov 0x58(%rsp),%rbx
+  6939  add %rax,0x30(%rsp)     ; pointer A += stride 0x20(%rsp)
+  693e  add %rdx,0x28(%rsp)     ; pointer B += stride 0x18(%rsp)
+```
+
+Two cursors advanced by two different strides is the signature of a
+strip/fan/quad walker - one holds the vertices that must be re-emitted for the
+next primitive, the other the incoming stream. Combined with the inline
+`memcpy` into the ring of §3.1ay, the vendor is **decomposing the GL primitive
+into whatever the hardware's `0x10b0` topology actually accepts and writing the
+expanded vertex sequence into the ring**, then pointing a single
+`[hdr][start][end]` draw at it.
+
+That is the piece our streams have never had. We hand the engine four
+un-decomposed vertices plus a "quads" primitive word and expect the hardware to
+do the expansion; the vendor expands in software first. It is a plausible
+reason a quad has never filled while the same code path draws *something* for a
+triangle, and it costs nothing to test: **emit a quad as two triangles - six
+vertices, `--prim tri` - and see whether it fills.** That needs no new RE and
+no new registers, only a six-vertex file, and it should have been tried long
+before the register sweeps.
+
+Fully decoding all 13 cases requires the `.rodata` jump table, which needs
+`objdump -dr` output this session cannot produce.
+
+**The test is prepared.** `captures/live-ring-0528/gq2tri.hex` is the
+(200,150)-(800,600) quad already decomposed into two triangles, six vertices of
+five dwords in the `(x, y, r, g, b)` layout the `0x10b8` descriptors declare,
+with per-vertex colours so a fill is unmistakably Gouraud:
+
+```
+  (200,150) red     (800,150) green   (800,600) blue      <- triangle 1
+  (200,150) red     (800,600) blue    (200,600) yellow    <- triangle 2
+```
+
+Run it through the ordinary triangle path - no quad primitive word, no new
+registers:
+
+```
+  gen-minimal-draw.py OUT --program passthrough --warp-entry 0 --warp-class 0 \
+      --rt-base 0x2f00000 --pitch 1024 --screen 1024x768 --prim tri --selfcheck
+  parhelia-3dtri --warpstore --writeback400 --ringreplay OUT-{ring,sec}.hex OUT-reloc.txt \
+      --warpprog our-passnc.warp.hex --ringvtx gq2tri.hex \
+      --rtbase 0x2f00000 --rtcfg 0x32020400 --pitch 1024 --bpp 32 \
+      --noclear --replayrt 0x2f00000
+```
+
+A correct result is roughly 270000 px spanning x 200..800, y 150..600, with
+red/green/blue/yellow interpolated across it. De-tile with
+`TPR = next_pow2(1024)/64 = 16` (§3.1av), print the health line, and check for
+`STALL at packet` before trusting the count.
+
+---
+
+## 8. Session summary, 2026-09-07 — what is true, what was withdrawn
+
+§3.1d-§3.1az were written incrementally over one long session and contain
+several claims that later sections retract. This section is the consolidated
+state; where it disagrees with an earlier subsection, this one is current.
+
+### 8.1 Fixed and verified on hardware
+
+| # | defect | evidence | effect |
+|---|---|---|---|
+| 1 | **No `write_barrier()` between patching the command image and the doorbell.** The only barrier sat between the `0x404` and `0x408` writes, so on a write-combining mapping the engine read whatever had already drained - in practice the *previous* draw's bytes. | Coloured the warm-up draw magenta, a colour no other vertex file uses; 68 of the next draw's 344 px came back magenta (§3.1q). | The first draw of a boot renders at all; it previously read 0 or 52 px. Every pixel count taken before this fix is contaminated. |
+| 2 | **Block loads emitted with no one-attribute pipe.** The `[count][first][1][0]` sub-header is the `v0` the loader microprogram reads, so `0x1000=0, 0x1040=4, 0x10b0=0x0002305c, 0x10b4=0, 0x10b8=0x83c00000` must precede them. | §3.1z; independently confirmed from `mtx676` at `0xa051a` (§3.1at). | Transform path went **0 -> 411 px**: the constant load now lands. |
+| 3 | **Two framing faults in `gen-vendor-replay.py`.** X's interleaved 2D blits (`0x1300 = 0x5c0`) draw from an unbound surface slot; and only the mtx1342 constant-block form carries a descriptor quad, so synthesising one for a "preformatted body" load desyncs the ring. | Stalls at packets 13 and 26 respectively (§3.1ag). | The capture's own 60-packet stream now replays clean, all packets idle. |
+
+### 8.2 Recovered by reverse engineering
+
+* **The vendor's 25 WARP programs**, in `captures/warp-programs/vprog-*.warp.hex`,
+  found by scanning `mtx_parhelia.o` for the `end` instruction's twelve bytes
+  (§3.1ai). Classified in §3.1aj: three constant loaders, three `streg`
+  register-writers, one constant reader, and sixteen **vertex-copy** programs
+  reading `v0..v(2k-1)` and writing only `o0`. Carving leaves padding - find
+  each program's true first instruction, e.g. `vprog-16427c` starts at
+  instruction 3.
+* **The real MVP and viewport constants** (§3.1af): an ortho for a 320x240
+  window (`0.00625 = 2/320`, `0.00833333 = 2/240`) and the viewport pair
+  `(160,-120,0.5,1)` / `(160,120,0.5,240)`, available as `--vendor-constants`.
+* **The draw-packet builder**, exactly (§3.1ar):
+  `hdr = 0x17000001 | (((dwPerVertex-1) << 17) & 0x7e0000) | ctx[0x42c]`, with
+  ring-relative operands.
+* **VTXFMT derived, not copied** (§3.1aq): the initialiser at `0x42150` builds
+  `0x1110 = 0x00000f27`, `0x1114 = 0x00287210`, `0x1118 = 0x00006543` - an
+  exact match with the capture on all three.
+* **`0x1000` carries the memory class alone** (§3.1ay), not a base plus class.
+* **`mtx1017` decomposes GL primitives in software** (§3.1ax, §3.1az): a
+  13-entry jump table on the GL mode, a two-cursor vertex walker, and the
+  expanded vertices copied inline into the ring before a single draw packet.
+  **Quads are not a native primitive.** This is the one structural difference
+  our streams have never had and the most likely reason a quad never filled.
+
+### 8.3 Staged but NOT measured
+
+Bash became unavailable partway through the session, so these follow from the
+binaries and from this document but have never been on hardware:
+
+* `0x1104` written alongside `0x1100` in both bind packets, completing the
+  eight-register minimum set §3.3 names (§3.1at).
+* `mtx398` context-default groups 2 and 4 added to `--ctx-defaults` - the
+  texture/sampler defaults and the five combiner slots with `0x1260` as the
+  literal `0x80` (§3.1au). **This voids §3.1p's "context defaults excluded"**,
+  which tested one group of four.
+* `--warp-selftest`, emitting `mtx676`'s isolated eight-register test.
+* `captures/live-ring-0528/gq2tri.hex`, the quad pre-decomposed into two
+  triangles with per-vertex colours.
+
+### 8.4 Withdrawn
+
+| claim | why it was wrong |
+|---|---|
+| "A triangle rasterises on a cold engine" | Residual vendor WARP context; `reboot -f` is warm and does not clear the instruction store (§1.2m). |
+| "Gouraud interpolation works cold" | The cyan pixels were the write-fence residue, not interpolation (§3.1q). |
+| "One 3D draw per boot" | An engine left locked by the heap-path test, not hardware (§3.1f). |
+| "The WARP never executes" | That run stalled at packet 39; a completed passthrough vs an `end`-only program differ, so it does execute (§3.1k correction). |
+| "Only vertex 0 is fetched" | Rested on two runs reading 52 px that were both the first draw of a batch (§3.1n). |
+| "The primitive runs from the origin to `v1`" and its rotated-quad prediction | Computed with the wrong tiles-per-row (§3.1ab). |
+| "Writing `o0` last matters" | The 118-vs-52 px difference was the draw's position in the boot (§3.1l). |
+| "`v0/3`", "third from last" | Rules fitted to two data points; both failed on the third. |
+| "Tiles per row = 16", then "= pitch/64" | Both wrong. It is `next_pow2(max(pitch,32))/64` - 16 at pitch 1024, **32** at pitch 1920 (§3.1av). |
+| "`mtx398` context defaults excluded" | Tested with one of four groups implemented (§3.1au). |
+
+### 8.5 Two method errors worth not repeating
+
+1. **Rules fitted to two data points.** Four separate models survived two
+   samples and died on the third. With one draw per boot two samples are cheap
+   and three are not; state the measurement, not the rule, until a prediction
+   has held on a case chosen to break it.
+2. **An uncalibrated instrument.** The de-tiler was wrong for most of the
+   session, and the 2D fill - a known 400x300 = 120000 px draw whose count the
+   engine reports itself - was available as a calibration target from the first
+   day. Validate the instrument against a known shape before trusting any
+   geometry it reports.
+
+A third, larger one: §4 already said to isolate the vertex engine through the
+`0x910`/`0x914`/`0x938` readback *before* judging draws, and warned that this
+exact ambiguity "has cost us the most time". The session judged everything by
+pixel counts from full draws instead, and §3.1l then measured that counts in
+the 50-120 range carry no information at all.
+
+### 8.6 Where the defect stands
+
+`v0` reaches the WARP intact - the position-as-colour test returns `0xd9`/`0x26`
+for vertices of 0.85/0.15 (§3.1ad). `o1` reaches the setup unit and
+interpolates. `o0` does not produce geometry the rasteriser honours: a zero-area
+quad still draws 165 px, and a constant-free passthrough draws 111 px where
+~270000 are expected.
+
+Excluded on hardware, each with the fence and the one-attribute pipe in place:
+the vertex range length, the draw packet length field, `0x1040`, `0x1060`, the
+`0x10b8` terminator and component count, an explicit `w`, integer and
+fixed-point position encodings, WARP program contents, length, output set,
+output order and termination order, `o11` as the position destination, the
+stage entries and the vertex-copy programs, `0x12fc`, `0x1130` bit 12, the
+scissor, the surface pitch, the class-0 VRAM vertex path, the vendor's own
+constants, and the vendor's own replayed stream.
+
+**Next test, in order:** `gq2tri.hex` through `--prim tri` (§3.1az), then
+`--warp-selftest` (§3.1aw) if that does not fill.
+
+---
+
+## 9. The block-file readback as an instrument — and what it measures
+
+Everything in §3.1d-§3.1az was judged by counting pixels in a render target,
+which §3.1l measured to be uninformative in the 50-120 px range. §4 said to
+build the `0x910`/`0x914`/`0x938` readback first and never was. This section
+builds it, calibrates it against known values, and uses it to replace four
+inferences with measurements.
+
+### 9.1 Two defects in our own instrumentation, found before any of it worked
+
+**1. The pre-flight guard was refusing `mtx676`'s bind packet.**
+`preflight_range()` classified a dword whose top byte is one of the opcode
+bytes as a packet header, and refused the range when it failed the structural
+check. The bind packet's tag is `0x41403c3c` - LSB-first register indices
+`0x3c, 0x3c, 0x40, 0x41`, i.e. `0x10f0, 0x10f0, 0x1100, 0x1104` - whose top
+byte `0x41` is the *register index of `0x1104`*, not an opcode:
+
+```
+  PREFLIGHT grp3 bind: dw 0 = 41403c3c has a 0x41 opcode byte but is not a
+  block-load header (n=32, len=15420) - DATA in the command range - refusing
+```
+
+So `--selftest676`'s bind was never submitted, and the "no evidence of
+execution" result on record is our own guard, not the hardware. Fixed: a dword
+that fails the opcode structural check now falls through to the bare-tag parse.
+The guardrail is kept - a tag that pads with `0x21` must pad to the end, so
+stray data in the command range is still caught.
+
+**This is why `0x1104` had never been exercised**: every packet that writes it
+lands a `0x41` byte in its tag, and the guard refused every one.
+
+**2. `--selftest676` never wrote `0x10b8`.** `mtx676` writes
+`0x10b8 = 0x83c00000` - the one-attribute descriptor - between `0x10b4 = 0`
+and the arm group. Read directly from the binary rather than from the §3.3
+prose, which describes the packet but not the value:
+
+```
+  a0355:  mov DWORD PTR [rsp+0x84], 0x83c00000   ; the input array
+  a0360:  mov DWORD PTR [rsp+0x80], 0x1          ; count 1
+  a042e:  mov DWORD PTR [rcx-0x14], 0x2e2e2e2e   ; idx 0x2e x4 -> 0x10b8
+```
+
+Without it the block file has no attribute to arrive on - the same defect
+§3.1z found on the transform path, in a second code path.
+
+**3. `parhelia-warpasm.py` silently truncated constant destinations.** Both
+destination index fields are four bits (`set_dstB` at `w0[17:14]`, `set_dstA`
+at `w0[7:4]`), but the range check only guarded the seven-bit *source* range.
+`mov c16, v0` assembled as `mov c0, v0` - a write into the live MVP. Now an
+error.
+
+### 9.2 The readback port works — with both controls
+
+`--blockdump FIRST [COUNT]` (new) reads a run of block-file slots through
+`mtx514`'s window. `--blockpoke` confirms the port is read-only: a write
+pattern does not stick.
+
+The port is not blind, and the first dump settled a question we had been
+guessing at:
+
+```
+  0x000  3bcccccd 00000000 00000000 bf800000   0.00625 0 0 -1
+  0x001  00000000 3c088885 00000000 bf800000   0 0.00833333 0 -1
+  0x004  43200000 c2f00000 3f000000 3f800000   160 -120 0.5 1
+  0x005  43200000 42f00000 3f000000 43700000   160 120 0.5 240
+```
+
+Those are **the vendor's own constants** - the 320x240 ortho and the viewport
+pair §3.1af recovered from the gltri capture. Two things follow: the readback
+observes the real block file, and **a board is only cold until the first
+`modprobe mtx` in that power-on session, warm reboots included** - §1.2m's rule
+confirmed from the other side, by reading the residue directly.
+
+### 9.3 Our constant loads land — measured, not inferred
+
+Running our own generated transform stream and re-reading the same slots:
+
+```
+  0x000  1 0 0 0        0x004  512 -384 0.5 1
+  0x001  0 1 0 0        0x005  512  384 0.5 768
+  0x002  0 0 1 0
+  0x003  0 0 0 1
+```
+
+Exactly what `gen-minimal-draw.py` emits for a 1024x768 viewport, replacing the
+vendor residue. The constant path works end to end from our own stream. §3.1z
+inferred this from a 0 -> 411 px change; it is now read out of the hardware.
+
+### 9.4 The WARP executes our bound program — positive and negative control
+
+The block load is **not** fixed-function. With the loader slot bound to our
+*transform* program instead of `vsetup-a`, and a stream carrying the vendor's
+constants, nothing lands - the file still holds the previous run's values:
+
+| loader slot holds | constants in the block file afterwards |
+|---|---|
+| `vsetup-a` (the real loader) | **our stream's**, overwritten |
+| our transform program | unchanged - the load is discarded |
+
+So an `0x41` packet is consumed by *the program bound at `0x1100`*, and that
+program is ours, from our on-chip store, on a board with no vendor code. The
+question §3.1k raised and could not answer with pixel counts is settled:
+**the WARP runs.** `vsetup-a` at entry 0 is confirmed as the constant loader.
+
+### 9.5 The WARP computes the correct position — `o0` is not the defect
+
+A per-vertex program that mirrors its intermediates into free constant slots
+turns the WARP into an observable unit:
+
+```
+  add T0, v0, v0.0000 | mov c8, v0        ; the fetched vertex
+  ... dp4 / smul / mad, the ordinary transform ...
+  add o0, T1, r1.0000 | mov c9, T1        ; what o0 receives
+```
+
+NDC vertices `(-0.8,-0.8) (0.8,-0.8) (0.0,0.8)`, viewport `(512,-384)`/`(512,384)`:
+
+```
+  c8 = -0.8 -0.8 0 1          our vertex, z and w from 0x1128/0x112c
+  c9 = 102.4 691.2 0.5 768    512*-0.8+512 = 102.4 ; -384*-0.8+384 = 691.2
+```
+
+Reversing the vertex buffer moves both, to the values predicted before the run
+(`c8 = 0, 0.8`; `c9 = 512, 76.8`). So the vertex fetch, the attribute
+descriptors, the constants, the transform arithmetic and the `o0` write are all
+correct. **§3.1ad's "the break is `o0` -> setup" is withdrawn**: `o0` receives
+the right number.
+
+Two instrument caveats found the hard way:
+
+* A secondary `mov cN, ...` paired with **`smul`** does not write; paired with
+  `add` it does. Both null results in this section's first attempts were that,
+  not the hardware.
+* A *primary* write to the constant file (`add c11, c11, c3`) does not land at
+  all. Only the secondary `mov` reaches the block file.
+
+### 9.6 MEASURED: the WARP runs exactly once per draw
+
+`max r3, c12, v0` followed by `... | mov c12, r3` accumulates a componentwise
+maximum across every invocation, from a slot verified to start at zero. With
+`c8` as a built-in control that the program ran at all, and the 2D health line
+printed on every run:
+
+| stream | `c8` (vertex seen) | `c12` (max over invocations) | all three vertices? |
+|---|---|---|---|
+| tri, `v0..v2` = `(-.8,-.8) (.8,-.8) (0,.8)` | `-0.8 -0.8` = **v0** | `0 0 0 1` = `max(0, v0)` | no |
+| quad, `v0..v3` = `(-.8,-.8) (.8,-.8) (.8,.8) (-.8,.8)` | `0.8 -0.8` = **v1** | `0.8 0 0 1` = `max(0, v1)` | no |
+
+If the other vertices had run, the triangle's `c12.x` would be `+0.8` (from
+`v1`) and the quad's `c12.y` would be `+0.8` (from `v2`). Neither appears.
+
+**The accumulator is calibrated against invocations that are certainly
+serial.** Two separate draws, no reset between them:
+
+```
+  c12 before                          0.8 0   0 1
+  draw whose v0 = (+0.8, +0.8)   ->   0.8 0.8 0 1     y picked up, x kept
+```
+
+So the read-modify-write against the block file does accumulate across WARP
+invocations. Only *within one draw* does it stop at a single vertex, which is
+what makes the table above a measurement rather than a null result.
+
+**The one reading this does not formally exclude** is a lockstep vertex array
+in which all three lanes read `c12` in the same cycle and one write wins the
+race. Two things argue against it: the surviving index is the *first* (tri) and
+*second* (quad) vertex rather than the highest lane, and §3.1u found the
+identical index surviving in the rasterised output by a completely independent
+route. Whichever it is, exactly one vertex's worth of geometry leaves the WARP.
+
+**Exactly one vertex is transformed per draw packet, and its index is selected
+by the topology word** - `v0` for a triangle list, `v1` for
+the quad word. That is the same index §3.1u found surviving in the *rasterised*
+output, now measured inside the WARP, which means the "surviving vertex" is not
+a setup-unit or rasteriser effect at all: only one vertex is ever transformed.
+
+This is the whole defect. The setup unit then receives one real vertex and
+zeros for the rest, which is exactly the degenerate wedge from `(0,0)` in the
+direction of that vertex that §3.1r through §3.1u kept measuring.
+
+**§3.1f's "only vertex 0 is fetched" is reinstated in corrected form**, and
+§3.1s's "exactly one vertex is consumed, whatever the range" is confirmed on a
+sound instrument: a one-vertex draw range gives a byte-identical `c8`/`c9` to a
+three-vertex range.
+
+### 9.7 What the count is not
+
+Excluded on hardware with the block-file instrument in place, each with the
+health line passing and every packet idle:
+
+* **`0x10b0` bit 18**, annotated in the capture as the "legacy
+  per-vertex-register path" select and set unconditionally by our generator.
+  Clearing it (`--primword 0x0002305c`, the kernel `mtx3319` value against the
+  ICD's `0x0006305c`) changes neither the pixels nor `c8`/`c9`. §3.1w had only
+  excluded *writing* the legacy plane registers, which is a different test.
+* The draw range length, again: one vertex or three, identical.
+
+Still carried from §3.1v: `0x1040`, `0x1060`, the descriptor terminator and
+component count, the packet length field, the WARP program's length, output set
+and ordering, `mtx398`'s context defaults, the scissor and the surface pitch.
+
+### 9.7b Operational: `--unstick` recovers the engine without a power cycle
+
+Twice in this session the 2D health gate read `0/120000` and stayed there
+across a warm reboot - the condition `parhelia-no-lockup-guardrails` records as
+needing a hand power cycle. `parhelia-3dtri --unstick` cleared it both times:
+
+```
+  unstick: before  bmstat=00020000 0x1300=002004c2 0x300=00000000
+  unstick: after   bmstat=00020000 0x1300=000000c0 0x300=00000140 -- IDLE, recovered
+  health: 2D fill drew 120000/120000 px -- engine OK
+```
+
+Run `--unstick` before concluding the board needs physical intervention. Note
+the health gate did its job on every refused run: three batches in this session
+reported `0/120000` and their block-file dumps were stale values from the
+previous run, which would have read as real measurements without that line.
+
+### 9.8 Where to look next
+
+The count of one is not in any register we have tested, so it is carried by
+something structural. Two candidates, in order:
+
+1. **The program-selection table.** Between bind #1 and bind #3 the capture
+   block-loads a body that is not constants (annotated listing, "constant /
+   block load" after the `0x10f0 = 20000028` bind):
+
+   ```
+     +0   000000e0 00000160 00000080 00000800
+     +4   00000000 00000001 00000002 00000003
+     +8   02003004 0200300c 00000000 00000000
+     +12  07955583 ffffffff ffffffff ffffffff
+   ```
+
+   `0, 1, 2, 3` is a four-entry index list, `0x160` is the viewport constant
+   slot, and `02003004`/`0200300c` are two `0x1130` PIPECTL words. Our streams
+   never emit this table, and §3.1d's four binds are the structure it belongs
+   to. It is the one per-draw object we have never replicated.
+
+2. **`mtx1017`'s per-GL-mode emitter** (§3.1ax-§3.1az): the vendor decomposes
+   the primitive in software, copies the expanded vertices inline into the ring
+   and points a single draw at them. If the hardware transforms one vertex per
+   draw packet by design, that decomposition is not an optimisation but the
+   mechanism, and the emitter's 13 jump-table cases say how many draws a
+   primitive becomes.
+
+The cheapest discriminator between the two is to submit **three draw packets**
+for one triangle, each pointing at a different vertex, and check whether `c12`
+accumulates all three maxima. That needs no new RE and no new registers.
