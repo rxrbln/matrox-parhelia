@@ -2444,3 +2444,43 @@ they are set when the 3D context is created, before any trace we hold:
 `mtx398` writes `0xffff` (bit 8 set), we write `0xff` (clear). That whole set
 is the next thing to implement, from `mtx398` `0x32a91-0x32c62`, rather than
 guessed one register at a time.
+
+### 3.1p `mtx398`'s context-create defaults implemented — and excluded
+
+The default set is now decoded from the packet `mtx398` builds at
+`0x32a91-0x32c62` (tags are LSB-first register indices, `reg = 0x1000 + idx*4`)
+and emitted by `gen-minimal-draw.py --ctx-defaults`:
+
+| reg | value | reg | value |
+|---|---|---|---|
+| `0x11e8` | `0x00100000` | `0x1324` | `0xffffffff` |
+| `0x12c0` / `0x12c4` | `0xffffffff` / `0x7fffffff` | `0x1314` / `0x1318` | `0` |
+| `0x12c8` / `0x12cc` | `0` / `0x0000ffff` | `0x12fc` | `0` |
+| `0x12d0` / `0x12d4` | `0x000001ff` / `0` | `0x1328` / `0x132c` | `0` / `0x10001000` |
+| `0x12e4` / `0x12e8` | `0` | `0x1304` / `0x1308` | `0` |
+| `0x12f4` | `0x41f80000` (31.0f) | | |
+
+(`mtx398` also writes `0x1300 = 0x002010cc` and the four combiner slots, which
+the recipe already sets per-draw.) Note `0x12cc = 0xffff` and `0x12d0 = 0x1ff`,
+not the other way round as §3.1o first listed them.
+
+**Measured cold: no effect.** The gouraud quad draws a byte-identical result
+with and without the whole set:
+
+```
+without --ctx-defaults   24 packets idle   344 px   ff00ff00 x276, ff00ffff x68
+with    --ctx-defaults   30 packets idle   344 px   ff00ff00 x276, ff00ffff x68
+```
+
+Same count, same two colours, same bounding box. So the register set the
+submission audit flagged as "not implemented" is **not** what is missing for
+geometry, and that avenue is closed. The implementation is kept because a
+from-scratch driver has to establish these defaults regardless.
+
+**Where that leaves the geometry.** Everything downstream of vertex fetch now
+demonstrably works cold - multiple vertices are fetched, their colours reach
+the WARP, and the rasteriser interpolates between them (§3.1o) - while the
+covered area stays a few hundred pixels. Excluded so far, each measured:
+the capture's inherited state (§3.1n), `0x12fc` RASTERMODE, the `mtx398`
+context defaults, the draw's vertex-size field (§3.1n), `0x1040`, the output
+set and output order, the clip copy, the entry index, and both program sources.
