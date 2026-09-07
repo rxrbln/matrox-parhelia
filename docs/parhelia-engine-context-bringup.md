@@ -2758,3 +2758,36 @@ question. That is the single blocker for the vendor's own configuration.
 0/120000 on a freshly booted box, twice, which a warm reboot did not clear -
 the documented hand-power-cycle condition. A batch of results was taken in that
 state and is void; they are not recorded here. Always print the health line.
+
+### 3.1z The transform path was missing the one-attribute pipe — FIXED
+
+`gen-minimal-draw.py`'s transform path emitted its block load with **no vertex
+pipe configured at all**. Our own notes state that block loads are consumed
+through the vertex-fetch frontend - the `[count][first][1][0]` sub-header is
+the `v0` the loader microprogram reads - so a one-attribute pipe has to be
+programmed immediately before them, and the vendor capture has exactly that:
+
+```
+  0x1000 = 0, 0x1040 = 4, 0x10b0 = 0x0002305c, 0x10b4 = 0, 0x10b8 = 0x83c00000
+```
+
+Adding it changes the result on hardware, health-gated at 120000/120000:
+
+```
+  transform + loader, no pipe    NO pixels drawn
+  transform + loader + pipe      411 pixels drawn
+```
+
+So the constant load now lands and the transform program produces output where
+it previously collapsed every vertex. That was the §3.1y blocker.
+
+Emitting the pipe *before* the loader bind rather than after, matching the
+capture's order (pipe, bind, loads), gives an identical 411 px - the order does
+not matter, but the generator now follows the capture.
+
+**What remains is the same defect the passthrough path has.** With constants
+loaded, the 0.15..0.85 quad should cover x 1104..1776, y 67..382 - about
+210000 px. It draws 411 px in a sliver from (0,0), all `ff00ff00`, `v1`'s
+colour, exactly the one-vertex pathology of §3.1r/§3.1u. So the constant loader
+is no longer the blocker; the vertex fetch delivering a single vertex is, and
+it is common to both paths.
