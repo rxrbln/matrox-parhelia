@@ -2265,3 +2265,54 @@ value matches except the boot-specific fence pair and `0x1130` bit 12.
 **Method note:** always check for `STALL at packet` and `N packets kicked,
 stalled` before comparing pixel counts. A stalled run is not a measurement,
 and it poisons every later run in that boot.
+
+### 3.1l Pixel counts cannot discriminate variants — measured protocol
+
+Two further claims are **withdrawn**, both artefacts of comparing draws at
+different positions in a boot:
+
+- **"Writing `o0` last matters."** A program with the position written last
+  measured 118 px against 52 px for position-first. Re-run with a warm-up draw
+  and alternation, the two are identical: `A1 B1 A2 B2 = 118 118 118 118`.
+  Retracted.
+- **The `--posdesc` component-count sweep of §3.1h.** Field 3 read 52 px and
+  fields 0/1/2 read 120 px, but field 3 was the *first* draw of that batch.
+  The sweep is uninterpretable and proves nothing about the count field. (The
+  static decode of bits 28:24 from the four descriptor values still stands; it
+  is the hardware A/B that is void.)
+
+**The measured behaviour of the counter:**
+
+```
+boot, engineinit before each draw, RT cleared before each draw
+  warmup  g1-big   52 px      <- the first draw of a boot always reads ~52
+  big1    g1-big  118 px
+  small1  g2-small 66 px
+  big2    g1-big   52 px      <- same input as big1, different answer
+  small2  g2-small 66 px
+```
+
+The first draw after a boot always reads ~52. After that, `g2-small` is stable
+at 66 but `g1-big` alternates 118/52 depending on which draw preceded it, even
+though `--engineinit --initaperture` and a full `--vramzero` run before every
+one. So engine state carries across draws in a way neither the init nor the
+clear resets.
+
+**Consequence: a pixel count in the 50-120 range is not a measurement.** No
+same-boot A/B, warm-up or alternation makes it one. The only sound protocol is
+one draw per boot after an identical prologue, and even that only separates
+"zero" from "nonzero", not 52 from 118. Every variant comparison in §3.1f-h
+that rests on such counts should be treated as unproven.
+
+**What does survive** is the packet-count signal, which is discrete and
+reproducible across boots:
+
+```
+our-passnc (o0=v0, o1=v5)  43 packets kicked, all idle
+our-null   (end only)      40 packets kicked, STALLED at packet 39
+```
+
+That difference reproduces on a fresh boot and is not a pixel count, so it
+stands: **program content changes engine behaviour, therefore the WARP does
+execute cold.** Use stall/packet counts, not pixel counts, to discriminate
+WARP variants until the pipeline produces an output of unambiguous magnitude.
