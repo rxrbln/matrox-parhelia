@@ -1760,3 +1760,36 @@ the entry itself.
 3D context create (`ICD_CREATE`), which does work we have not replicated, and
 replaying a captured bind sequence is not equivalent. That is the thread to
 pull, not more permutations of the entry value.
+
+
+## 1.2k Two more excluded: vendor programs, and the passthrough path
+
+**A vendor WARP program image does not change the output either.** Uploading
+`mtx2068.bin` (10 instructions) or `mtx3213.bin` (16) in place of ours gives
+byte-identical results - 8824 px, same palette. So the WARP being bypassed is
+not a property of our program.
+
+**The `--passthrough` route draws nothing at all.** The documented
+WARP-bypass path (address-mode draw `0x17`, screen-space vertices, from
+[[parhelia-warp-output-b0]]) submits cleanly - `0x404 == end`, engine idle -
+and the tool's own check reports *"VRAM diff: 0 of 8192 pages changed - the
+engine wrote nothing anywhere"*. The replay stream at least rasterises; this
+one does not.
+
+**Register readback of the `0x1000+` file is useless.** Every register there
+reads 0 before and after a replay, matching the M9 finding that the indexed
+file reads all-zero. The bind cannot be verified by reading it back, which is
+why `0x918` reading 0 proves nothing - it is almost certainly write-only.
+
+**Where this leaves the triangle.** The rasteriser consumes vertex POSITIONS
+(geometry varies with the vertex file and lands inside the ideal triangle) but
+not vertex COLOURS (all-red and all-blue vertex sets give identical output).
+Coverage is 2.5-28%. That is consistent with the setup unit running without a
+vertex shader and with the DDA colour planes left at zero.
+
+The two candidate routes forward, neither yet done:
+1. Replicate the kernel's 3D context create (`ICD_CREATE`) so the WARP is bound
+   the way the vendor binds it, rather than replaying a captured sequence.
+2. Drive the legacy DDA path deliberately - load the vertex slots
+   (`0x1160`+) and the colour planes rather than leaving them zero - which
+   would give correct colours and coverage without the WARP.
