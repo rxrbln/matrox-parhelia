@@ -2944,3 +2944,39 @@ here, so it is a lead rather than a finding.
 
 Both forms leave the defect exactly where §3.1ad puts it: `v0` arrives intact,
 `o1` reaches setup, `o0` does not.
+
+### 3.1af The vendor's own constants, and a contradiction with §3.1x
+
+The annotated capture carries the **full payload** of every block load, so the
+vendor's real constants are recoverable, not guessable:
+
+```
+  block load hdr=41100023, n=8, first slot 0x000:
+    c0  3bcccccd 00000000 00000000 bf800000   0.00625, 0, 0, -1
+    c1  00000000 3c088889 00000000 bf800000   0, 0.00833333, 0, -1
+    c2  00000000 00000000 bf800000 00000000   0, 0, -1, 0
+    c3  00000000 00000000 00000000 3f800000   0, 0, 0, 1
+  viewport pair at slots 0x160 / 0x161:
+    (160, -120, 0.5, 1)  and  (160, 120, 0.5, 240)
+```
+
+`0.00625 = 2/320` and `0.00833333 = 2/240`: the matrix is an **ortho projection
+for a 320x240 window**, and the viewport scale/offset are 320/2 and 240/2. So
+in the vendor's configuration vertices are in **0..320 pixel space**.
+
+`gen-minimal-draw.py --vendor-constants` now loads exactly those values instead
+of the identity-plus-computed-viewport it used before. Measured with a quad at
+(40,40)-(280,200) in that space, which should cover ~38400 px: **2 pixels**.
+
+**This contradicts §3.1x.** That section read the 60-byte per-draw buffer in
+`mtxtrace-5draws.txt` as the vertex array and concluded the vendor feeds 0..1
+normalised coordinates. Those two cannot both be right: 0.1..0.9 through an
+ortho for 320x240 collapses to the corner. Either the buffer is not the vertex
+array - it is 60 bytes changing once per draw, which is suggestive but not
+proof - or the matrix is not applied to it. **§3.1x's "0..1 normalised" claim
+is therefore downgraded to unconfirmed**; the 5-dword `(x, y, r, g, b)` layout
+it also reported is independently supported by the `0x10b8` descriptors and by
+the colour measurements, and stands.
+
+The constants themselves are first-hand from the capture and are the right
+thing for a from-scratch driver to load, so `--vendor-constants` is kept.
