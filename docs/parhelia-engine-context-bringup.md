@@ -1898,3 +1898,74 @@ The unit is not inert — `0x8f0` and `0x924` both move — but it ends outside
 the §1.9 idle signature, which requires `(0x924 & 0xfff) == 0x100`, while
 `bmstat` reports idle. Whatever the WARP does with our stream, it does not
 finish in the state the vendor's own idle test expects.
+
+### 3.1d The draw binds FOUR programs, not one — PROVEN from the capture
+
+Decoding the capture's `0x1100` writes in stream order, with the block loads
+interleaved, shows the vendor binds **four different programs** in sequence:
+
+```
+  0x10b0 = 0002305c ; 0x10b8 = 83c00000     one-attribute pipe
+  0x1100 = 07557183     bind #0   MODE 0x20000028
+  0x1100 = 07557383     bind #1   MODE 0x20000028
+  BLK 32 slots first=0 ... first=352        12 zeroing loads
+  BLK 8/5/5/5/2/4/1/2 slots                 the real constants
+  0x1100 = 07557583     bind #2   MODE 0x20000028
+  0x1110 = 00000003
+  0x1100 = 07557783     bind #3   MODE 0x20000002   <- the draw
+  0x10c8/0x10d0 = 075579bf   0x10cc/0x10d4 = 075579cf   0x10d8 = 07556b83
+```
+
+The four `0x1100` values differ by exactly `0x200`, and `0x200` entry units is
+`0x600` bytes — the heap slot size of §3.1b. So they are four consecutive heap
+slots: four distinct programs, uploaded at context create.
+
+**`gen-stream.py --warp-placeholder` patched all four to our single vertex
+program.** Bind #1 is live across every block load, so cold, our transform
+program consumed the constant loads and the constant file was never written;
+our program then evaluates `dp4 r2, T0, c3/c2/c1/c0` against an empty file.
+
+The stage registers are five more entries, and `0x10c8`/`0x10d0` share one
+value while `0x10cc`/`0x10d4` share another that is exactly `0x10` higher —
+two entry points four instructions apart in the same program, in the slot four
+above the vertex programs; `0x10d8` is three slots below.
+
+**Three setup microprograms recovered** from `mtx_parhelia.o` at raw file
+offsets (not vaddrs — those addresses are past `.data`'s vaddr range), decoded
+with `tools/parhelia-warpdis2.py` and saved under `captures/warp-programs/`:
+
+| offset | file | length | entries | what it does |
+|---|---|---|---|---|
+| `0x1641e0` | `vsetup-a` | 40 instr | 0, 16, 28 | constant-upload **loop**: `getc c2, v0.x` (count), `mova T1.x, v0.yyyy` (first), `subi c2,c2,1`, `br cc6`, `mov c0, v0`, `getidx T1.xy, a0+1`, `br` — plus an unrolled `mov c0..c6, v1..v7` variant at 16 |
+| `0x1643c0` | `vsetup-b` | 17 instr | 0 | `getc c29, v0.x`, `mov T0..T5` from `v0`/`v1`, `getc c17..c21` |
+| `0x1646a0` | `vsetup-c` | 29 instr | 0 | `mov`/`mova T0..T7` from `v0..v3`, `getc c24..c29`, then `streg [0x0e8..0x0fc], c24..c29` |
+
+**Tooling added:** `gen-stream.py --warpmulti` numbers the four binds
+`0xdeade000..3`; `--stagesunbound` writes the vendor's own unbound marker `2`
+to the stage registers instead of our entry; `parhelia-3dtri --warpbind N FILE
+OFF` uploads an extra program at store index `64*N` with entry offset `OFF`
+and patches placeholder `N`.
+
+**Measured cold, all still `NO pixels drawn`:**
+
+| variant | result |
+|---|---|
+| `--warpinval` (cache invalidate on the bind) | 0 px |
+| `--warpidx 32` (non-zero entry) | 0 px |
+| `--stagesunbound` (stages = 2) | 0 px |
+| binds 0-3 = `vsetup-a`, `vsetup-b`, `vsetup-c`, ours | 0 px |
+| binds 0-3 = `vsetup-b`, `vsetup-a`, `vsetup-c`, ours | 0 px |
+
+So the four-bind structure is real and now reproducible, but which program
+belongs on which bind is still unknown, and guessing permutations is not
+converging. `mtx3810` (kernel start-table step 19) was checked as a possible
+missing init and is not one: its only hardware writes are `0x920` and the
+`0x384` DMAPAD, both of which we already do.
+
+**What is needed next is a positive control.** No cold configuration has yet
+produced a single pixel, so a null result cannot distinguish a wrong bind from
+a missing pipeline enable. The cheapest control is to let the vendor
+initialise the WARP once (`modprobe mtx`, one GL client, stop it), then replay
+our stream in the same power-on session: if it draws, the gap is exactly the
+context create, and the four binds can be bisected against a working baseline.
+That deliberately ends the cold window and needs a power cycle to restore.
