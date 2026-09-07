@@ -2874,3 +2874,48 @@ So the width mismatch was real but is not the blocker. Note the pitch field
 does not map to the tile-row width the obvious way: `0x780` = 1920 yields 16
 tiles per row = 1024 px, and the relationship is not yet decoded - worth
 settling, because a from-scratch driver has to compute it.
+
+### 3.1ad LOCALISED: `v0` reaches the WARP intact, `o0` does not reach setup
+
+Three measurements with all of §3.1q (the fence), §3.1z (the one-attribute
+pipe) and §3.1ab (the corrected de-tiler) in place, each health-gated:
+
+**1. A zero-area primitive still rasterises.** Four *identical* vertices at
+(0.5, 0.5) - a quad that must draw nothing - draw **165 px**, coloured
+`ffff0000`, that vertex's own red. So the positions reaching the setup unit are
+not our vertices, while the colour is.
+
+**2. `v0` arrives at the WARP intact.** Running the transform program with its
+colour output rewritten to the raw position (`add o1, v0, r1.0000`) paints the
+vertex's own coordinates as colour:
+
+```
+  vertices 0.15 / 0.85    ->  ffd92600 (117 px) and ffd82700 (38 px)
+                              R = 0xd9 = 0.85, G = 0x26 = 0.15   EXACT
+```
+
+Those are our numbers, so the vertex fetch, the attribute descriptors and the
+`v0` register are all correct. The barely-varying second colour (`0xd9`->`0xd8`)
+also shows the rasteriser interpolating, over a very small attribute range.
+
+**3. The break is `o0` -> setup, not the constants.** A passthrough program -
+`o0 = v0`, no constants involved at all - with a window-space quad
+(200,150)-(800,600) placed well inside a correctly sized 1024x768 target draws
+**111 px** at x 0..167, y 0..129 instead of ~270000 px at x 200..800,
+y 150..600.
+
+So the defect is **between the WARP's `o0` output and the setup unit**:
+
+| stage | status |
+|---|---|
+| vertex fetch, descriptors, `v0` | **correct**, proven by position-as-colour |
+| colour `v5` -> `o1` -> setup | **correct**, colours match and interpolate |
+| position `v0` -> `o0` -> setup | **broken**, output unrelated to the input |
+
+That is a much narrower target than "the vertex fetch delivers one vertex",
+which §3.1r/§3.1u proposed and which measurement 2 above refutes. The relevant
+open question is the one `parhelia-warp-output-b0` raises: the setup unit reads
+position from **port B 0**, and whether `parhelia-warpasm.py`'s `o0` encoding
+actually targets that port is unverified - the assembler is validated against
+the vendor's 13 words bit-for-bit, so if it is wrong, it is wrong in a way the
+vendor program does not exercise.
