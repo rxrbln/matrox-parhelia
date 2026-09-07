@@ -3016,3 +3016,40 @@ block-load bodies still carry the capture boot's heap entries verbatim**
 memory holding no program on this boot. Placeholdering the entries inside block
 bodies, the way the register writes already are, is the next step for this
 path.
+
+### 3.1ah The replay's limit: we do not have the vendor's program set
+
+With block-body entries placeholdered as well as the register writes, the
+capture's stream replays completely and cleanly:
+
+```
+  9 WARP entry placeholders (registers) + 11 inside block bodies
+  60 packets kicked, all idle
+  draw re-pointed at our vertex dwords, surface patched   ->  NO pixels drawn
+```
+
+Every substitution verifiably lands. What does not is the thing the stream is
+really made of: **the vendor binds at least nine distinct WARP programs** -
+four successive `0x1100` binds one heap slot apart, five stage entries, plus
+the entries embedded in block bodies - and we substitute *one* program for all
+of them.
+
+What we actually hold:
+
+| program | source | have it? |
+|---|---|---|
+| per-vertex transform | `parhelia-warpasm.py` regenerates the vendor's 13 words bit-for-bit | yes |
+| three setup microprograms | `mtx_parhelia.o` `.data` at file offsets `0x1641e0` / `0x1643c0` / `0x1646a0` | yes |
+| the remaining pipeline programs | the kernel's class-3 heap, written at context create | **no** |
+
+The heap programs are uploaded by `mtx1391` through `0x918`/`0x91c` when the 3D
+context is created, which is before any trace we hold begins, and they appear
+in no capture. So a byte-faithful replay of the *stream* cannot be a faithful
+replay of the *draw* - the stream is mostly pointers into a program set we do
+not have.
+
+That is a structural limit of this approach, not another missing register.
+Closing it means either recovering the remaining programs from
+`mtx_parhelia.o` `.data` (three are already there, so more may be), or
+capturing the `0x918`/`0x91c` upload stream at context create, which needs the
+vendor module loaded.
