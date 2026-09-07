@@ -3195,3 +3195,24 @@ but **not the outcome: still 111 px**, where a filled quad is ~270000.
 So the pitch inconsistency was real and is now fixed, and it was not the
 blocker either. Any geometry figure in §3.1f through §3.1al should be read with
 `TPR = pitch / 64` for whatever pitch that run actually used.
+
+### 3.1an `0x1130` bit 12 = flat shading, confirmed on hardware
+
+The register census (§3.1j) found exactly one register whose value differed
+between our stream and the capture: `0x1130`, `0200200c` ours against
+`0200300c` the vendor's - bit 12. It had never been tested on hardware.
+
+Setting it (`gen-minimal-draw.py --flat`) on the window-space quad:
+
+```
+  bit 12 clear   111 px, all ff00ff00   (green)
+  bit 12 set     111 px, all ff0000ff   (blue)
+```
+
+Same pixel count and extent, **different colour** - the provoking vertex
+changes. So bit 12 is the flat-shading select, confirmed from hardware rather
+than inferred from the GL state matrix, and gltri sets it because it draws one
+flat colour.
+
+It does not affect geometry, so the last remaining value difference between our
+stream and the vendor's capture is now both explained and excluded.
