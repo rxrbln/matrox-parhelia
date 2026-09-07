@@ -2852,3 +2852,25 @@ numeric claim about which vertex it points at must be re-derived.
 **Method note:** the 2D fill was available as a known-geometry control from the
 first day and would have caught this immediately. Validate the instrument
 against a draw of known shape before trusting any geometry it reports.
+
+### 3.1ac The surface is 1024 px wide, and that is not the blocker either
+
+16 tiles per row (§3.1ab) means a tile row spans 16 * 64 = **1024 px**, so the
+render target bound with `cfg = 0x32020780` is 1024 wide - not the 1920 that
+the `0x780` pitch field reads as. Every draw so far used a viewport built for
+1920x900, which maps the 0..1 quad to x 1104..1776, i.e. **entirely outside a
+1024-px surface**. That was a real defect and would clip everything but a
+sliver.
+
+Rebuilding the stream for the true width (`--pitch 1024 --screen 1024x768`, so
+the viewport maps the 0.15..0.85 quad to x 588..947, y 57..326, ~96000 px)
+still does not fill:
+
+```
+  155 pixels drawn, x 0..1021, y 0..379, all ff00ff00
+```
+
+So the width mismatch was real but is not the blocker. Note the pitch field
+does not map to the tile-row width the obvious way: `0x780` = 1920 yields 16
+tiles per row = 1024 px, and the relationship is not yet decoded - worth
+settling, because a from-scratch driver has to compute it.
