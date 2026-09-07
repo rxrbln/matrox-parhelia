@@ -4257,6 +4257,19 @@ our program bound at its `0x1100`). Both cannot be true, so:
   unproven, since the vendor's per-draw program uses a plain `add o0` and
   renders correctly.
 
+### 11.3b The block file survives a reboot, and the last writer wins
+
+After the board went half-dead and came back with `uptime 0`, the block file
+still held **our** constants - the identity MVP and the `(512,-384)/(512,384)`
+viewport our generator loads - not the vendor client's, which had overwritten
+them in between. The last stream submitted before the board died was ours.
+
+So the constant file is a persistent store across a warm reboot, holding
+whatever was written last, which is a second independent confirmation of
+section 1.2m's rule and of section 9.2's reading of the vendor residue. It also
+means `--blockdump` on a freshly booted board tells you what the *previous*
+session left, not a hardware default: only a true power cycle clears it.
+
 ### 11.4 The clean A/B
 
 Same boot, same render target, same vertex buffer, same vertices, X frozen:
