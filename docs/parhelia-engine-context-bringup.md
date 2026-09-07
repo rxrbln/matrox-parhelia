@@ -4702,4 +4702,17 @@ What remains unreplicated is the vendor's **program-selection table**, the
 `0x4106000f` block load between bind #1 and bind #3 whose body is `0,1,2,3`
 plus two `0x1130` words and a WARP entry - the annotated capture's own
 "mechanism by which the vendor binds a *set* of programs rather than one".
-`--progtable` now emits it.
+`--progtable` now emits it - and **it does not help**: the same 16420 px.
+Nor does the capture's packet *order*. The vendor writes the primitive word
+`0x10b0` at call 105, before the stream bases, `VTXCOUNT`, `0x10b4` and the
+descriptors, where our generator left `0x10b0` at the block-load pipe value
+`0x0002305c` across the whole vertex-fetch setup and wrote the real primitive
+word last. Matching the capture's order changed nothing for one triangle and
+made another draw *nothing* at all, so it was reverted.
+
+So the vertex count is not in the register set, not in the register values, not
+in their order, not in the program-selection table, and not in the WARP program
+(the vendor's own stream draws all three vertices from the same vertex buffer
+through the same tool, and our program in the vendor's stream draws none).
+That leaves the framing of the stream itself - our 44 one-packet calls against
+the capture's 122 - as the only structural difference not yet tested.
