@@ -2352,3 +2352,48 @@ evenly spaced pairs, `(4k, 3k)` and `(4k+1, 3k+1)` for the 4/3 case.
 That is the signature of a primitive assembled from `v0` and the origin, not
 of a triangle. Whatever consumes the WARP's position output is receiving one
 real vertex and zeros for the other two.
+
+### 3.1n From-scratch minimal streams behave the same as the replay
+
+`tools/gen-minimal-draw.py` builds a 24-packet stream in which every register
+is justified and **nothing is spliced from the gltri capture** - none of its
+scissor, guard band, texture state or four-program bind sequence is inherited.
+Run cold with the passthrough program it produces the *same* sparse output as
+the 43-packet capture replay:
+
+```
+min  (tri,  from scratch)   24 packets idle   52 px
+minq (quad, from scratch)   24 packets idle  344 px   (reproduced twice)
+```
+
+So the inherited capture state is **not** the cause. Whatever is wrong is
+common to both paths.
+
+**Corrections from `min-justify.txt`, which documents every register:**
+
+- `0x10b8`: the pair `0x20c00000` + `0xa1c50020` declares **`[x,y]` + `[r,g,b]`
+  at dword 2, HW-proven with our own vertex bytes**. Position is *two*
+  components. That contradicts the "bits 28:24 = count - 1" reading of §3.1h
+  (the file records the field boundaries as an open conflict between the
+  kernel's draw-builders and the wire). Since position is 2 components, vertex
+  dwords 2,3,4 are free for `r,g,b` - a 5-dword gouraud vertex is correct.
+- `0x1120`/`0x1124` are **the guard band** (packed halves of +/-8160.0f), *not*
+  the float default vector. The §3.1f suggestion that `y` comes from `0x1124`
+  is therefore wrong.
+- `0x1040` is only a placeholder; **the real vertex size rides draw header bits
+  [22:17]**, which we emit as `dwords - 1`. Confirmed on hardware: emitting `5`
+  there for a 5-dword vertex **stalls** the engine (the fetch overruns the
+  60-byte range), while `4` completes. Our encoding was already right.
+
+**Also retracted: "only vertex 0 is fetched" (§3.1f).** It rested on
+`h1-same` (three identical vertices) and `g1-big` (three distinct) both reading
+52 px - but both were the *first* draw of their batch, and the first draw of
+any boot reads 0 or 52 whatever it contains. The claim is unproven.
+
+**Invocation hazard:** do **not** pass `--prim` to `parhelia-3dtri` with a
+minimal stream. It patches `0x10b0` from the tool's own table, and for quads
+that is `0x0006505c` against the generator's computed `0x0006605c` - a
+different topology. The first gouraud-quad attempt drew nothing because of it.
+
+**Draw budget:** with these minimal streams a boot yields about two usable
+draws; the third consistently leaves the 2D health fill at 0/120000.
