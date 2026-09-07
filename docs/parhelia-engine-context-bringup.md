@@ -4943,6 +4943,14 @@ all measured on hardware and none of them the cause:
   arm/disarm pairs in the capture are preceded *in the same tag word* by a
   `0x1300` sync (`0x707`/`0x307`/`0x207`). §12.4b already covers why that
   opcode cannot be used cold.
+* **The capture's other block load.** `c87`, header `0x41020007`, whose
+  nine-dword body is not constants but three WARP heap entries interleaved with
+  floats - the second half of the "binds a set of programs" mechanism, and the
+  last per-draw object we had never emitted. `--entrytable` emits it with our
+  entries substituted, and it **stalls the ring** at the packet that carries it
+  (measured), so the entries in that body are evidently required to be real
+  heap addresses rather than on-chip store indices. Left in, off by default,
+  as the shape to revisit once we can allocate a program heap.
 * **Inline ring register writes.** The capture's primary ring carries 139
   dwords of register writes between calls - including `0x1090`/`0x1094`, the
   write-back address and serial, which our stream never writes at all and which
