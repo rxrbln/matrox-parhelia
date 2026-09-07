@@ -2484,3 +2484,44 @@ covered area stays a few hundred pixels. Excluded so far, each measured:
 the capture's inherited state (§3.1n), `0x12fc` RASTERMODE, the `mtx398`
 context defaults, the draw's vertex-size field (§3.1n), `0x1040`, the output
 set and output order, the clip copy, the entry index, and both program sources.
+
+### 3.1q The command image was never fenced before the doorbell — FIXED
+
+`tri_ringreplay` patched the command image and copied the vertex bytes into the
+DMA buffer, then rang the doorbell with **no `write_barrier()` in between**.
+The only barrier sat between the `0x404` and `0x408` writes. On a
+write-combining mapping the engine therefore read whatever had already drained
+- in practice the *previous* draw's bytes.
+
+Proven by colouring the warm-up draw magenta, a colour no other vertex file
+uses, and then drawing a red/green/blue/yellow quad:
+
+```
+  warm-up  = magenta triangle
+  quad     -> 344 px:  ff00ff00 x276  (this draw)
+                       ffff00ff x68   (MAGENTA - the warm-up's colour)
+```
+
+The 68-pixel component followed the warm-up's colour, so it was the previous
+draw's vertex data being rasterised by the current draw.
+
+**Fix:** one `write_barrier()` after the image is fully patched, before
+`0x404`. Measured immediately after:
+
+```
+  quad as the FIRST draw of a boot   276 px, ff00ff00 only, no residue
+```
+
+The first draw of a boot now renders at all - it previously read 0 or 52 px -
+and no foreign colour appears.
+
+**This retracts §3.1o.** The cyan pixels that were read as "green blended with
+blue, therefore gouraud interpolation works" were exactly the 68-pixel residue
+component, not interpolation. With the fence the quad draws **276 pixels of a
+single flat colour** (`ff00ff00`, `v1`'s green). Interpolation is *not*
+demonstrated, and it also explains the recurring 52 / 68 / 120 / 344 counts:
+they were sums of a real component and a stale one.
+
+**Every pixel count measured before this fix is suspect**, including the
+history dependence of §3.1l and the "first draw reads 52" rule - those were
+symptoms of the missing fence, not of the hardware.
