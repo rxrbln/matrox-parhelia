@@ -4377,10 +4377,19 @@ a line that was in every log and read straight past.
 
 That is a sufficient explanation for the standing symptom - every packet
 retires, `bmstat` idle, no pixels - and for the cold "sliver", which would be
-whatever stale address slot 3 happened to hold. It is also why the *vendor*
-replay always worked: the tool patches slot 3 there, and moving `--rtbase`
-demonstrably moves where the triangle lands, which is independent hardware
-proof that slot 3 is the destination.
+whatever stale address slot 3 happened to hold. **The "moving `--rtbase` moves the triangle" claim first written here was
+wrong and is withdrawn** - it was asserted from memory, not measured. Measured
+afterwards, `--rtbase 0x400000`, `0x800000` and `0x3800000` each produce *no*
+pixels at the address given, while the unpatched replay draws at its own target.
+So patching slot 3 does **not** redirect the draw, and slot 3 is very likely
+**not** the destination despite DWGCTL `[11:10] = 3`.
+
+The register-level fact stands (the last DWGCTL before the draw is
+`0x00a60ec4`), and binding the target to a slot the stream never writes is
+still wrong. What is *not* established is that slot 3 is the right one. The way
+to settle it is to patch each of the four slots in turn in the vendor stream and
+see which one moves the output - four replays, and the only one that needs the
+board.
 
 The generator now derives the slot from the DWGCTL it emits, so the two cannot
 disagree, and refuses a DWGCTL selecting slot 1 while `--depth-base` binds the
