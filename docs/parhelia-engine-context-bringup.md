@@ -1969,3 +1969,39 @@ initialise the WARP once (`modprobe mtx`, one GL client, stop it), then replay
 our stream in the same power-on session: if it draws, the gap is exactly the
 context create, and the four binds can be bisected against a working baseline.
 That deliberately ends the cold window and needs a power cycle to restore.
+
+### 3.1e FIRST COLD RASTERISATION — a constant-free program draws
+
+A 4-instruction WARP program that reads **no constants** rasterises on a
+power-cycled board with no vendor code:
+
+```
+  0: add o0, v0, v0.0000       window-space position
+  1: add o1, v5, r1.0000       colour
+  2: end
+```
+
+```
+px-screen.hex (window-space verts)  ->  8 px, all ffff0000  (v0 is red)
+px-white.hex  (NDC verts)           -> 52 px, all ffffffff  (verts are white)
+```
+
+The pixel colour follows the vertex colour and the count follows the vertex
+data, so these are genuinely our draw - not residue, and not the leftovers
+that produced §1.2m's withdrawn result. **The 3D pipeline, the WARP, the
+setup unit and the rasteriser all work cold.**
+
+**This confirms the §3.1d diagnosis.** The same stream with our
+constant-using transform program draws nothing, and the only difference is
+that it evaluates `dp4 r2, T0, c3/c2/c1/c0` and `mad T1.xyz, c8.xyz1, r2,
+T1.xyz0` against a constant file the block loads never wrote - because bind #1,
+the constant loader, had been patched to our vertex program.
+
+`--no-clipcopy` (dropping the `o11` clip-position write) changes nothing: 8 px
+either way, so the clip position is not what limits the coverage.
+
+**Still open:** the coverage is sparse - a few dozen pixels, not a filled
+triangle - so the window-space convention `o0` expects is not yet calibrated,
+and the constant path still has to be made to work so the real transform
+program can run. But there is now a **cold positive control** to bisect
+against, which is what every earlier null result lacked.
