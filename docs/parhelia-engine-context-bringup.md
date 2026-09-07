@@ -3124,3 +3124,20 @@ no better here than the `vsetup-a` carving of the same region.
 
 Anyone binding these must find each program's true first instruction rather
 than trusting the file's offset 0.
+
+### 3.1ak `o11` is not where the setup unit reads position
+
+All earlier `o11` comparisons predate the fence (§3.1q) and the de-tiler
+correction (§3.1ab) and were void, so this was re-measured with everything in
+place. Writing the position **only** to `o11` (`add o11, v0`, plus the usual
+colour to `o1`), window-space quad (200,150)-(800,600) in a 1024x768 target:
+
+```
+  position -> o0    111 px
+  position -> o11     2 px
+```
+
+`o0` is the better of the two, so `o0` is the right destination and the
+port-B-0 alternative reading is excluded. The defect stays where §3.1ad puts
+it: `v0` arrives intact, `o1` reaches setup, `o0` does not carry geometry that
+the rasteriser honours.
