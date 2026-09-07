@@ -2556,3 +2556,32 @@ whole vertex - the **second** one - and zeros for the rest.
 
 Still to explain: why exactly one vertex is delivered, and why it is index 1
 rather than index 0.
+
+### 3.1s Exactly one vertex is consumed, whatever the range
+
+With the fence in place and one draw per boot, doubling the vertex buffer from
+four vertices to eight changes **nothing**:
+
+```
+4 vertices (quad)          276 px, ff00ff00, (0,0)..(893,191)
+8 vertices (two quads)     276 px, ff00ff00, (0,0)..(893,191)   identical
+```
+
+The second quad's vertices - including a magenta `v5` at (600,800) chosen to be
+unmistakable - produce no pixels at all. So the draw consumes exactly one
+vertex regardless of how long the `(start, end)` range is, and the vertex count
+the hardware uses is **not** derived from `(end - start) / stride`.
+
+**The draw header's low 16 bits are the packet length, not a vertex count.**
+Patching them from 1 to 2 on an otherwise identical stream stalls the ring at
+packet 23 - the parser mis-frames - rather than changing the geometry. Our
+`totalDwords - 2` encoding is correct. (For the vendor's 3-dword draw packet
+the two readings are degenerate, both giving 1, which is why this needed
+testing.)
+
+**Points still do not rasterise** (task #22): four vertices as `--prim points`
+through the same clean path draw nothing at all.
+
+So the count of one comes from neither the range, the packet length, nor the
+stride field (§3.1n), and the fetch delivers vertex **index 1** whole - both its
+position and its colour (§3.1r).
