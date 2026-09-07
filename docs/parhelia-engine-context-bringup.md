@@ -2176,3 +2176,61 @@ output whose magnitude is unambiguous - a filled triangle of the right order
 (hundreds of thousands of pixels) versus nothing. Until the pipeline produces
 that, comparisons need at minimum a repeat of the same variant in the same
 boot to establish the spread, and preferably a reboot between variants.
+
+### 3.1j Cross-reference against the vendor capture: the registers are not the gap
+
+**Full ordered register diff**, our generated stream against the decoded
+vendor capture (`docs/parhelia-draw-sequence-annotated.md`, 648 writes):
+
+- **Our stream writes a strict subset.** There is no register we write that the
+  vendor does not.
+- Registers the vendor writes and we never do: `0x11c8`, `0x11cc`, `0x11d0`,
+  `0x11d4`, `0x11d8` (texture border/filler, all `0` or the border colour),
+  `0x12b8` (EOBTAG `0x00070601`), `0x12bc` (the sync tag, dropped on purpose by
+  `--nosync`), `0x131c`/`0x1320` (PAT0/PAT1, the **2D** pattern). None is 3D
+  setup state.
+- **Final values agree on every shared register** except three, all explained:
+  `0x1090`/`0x1094` are the fence address and submission serial (boot-specific),
+  and `0x1130` is `0200300c` vendor vs `0200200c` ours - **bit 12, flat
+  shading**, which gltri sets because it draws one flat colour. (The
+  annotation's "bit9 set/CLEAR" labels on `0x1130` are wrong: bit 9 is set in
+  both, the difference is bit 12.)
+
+So the setup gap is **not** in the register stream.
+
+### 3.1k The WARP output never reaches the setup unit
+
+A WARP program consisting of nothing but `end` still draws:
+
+```
+our-null.warp.hex   (end; wra)      66 px, all ff00ffff
+our-passnc.warp.hex (o0=v0, o1=v5)  52-120 px, all ff00ffff
+```
+
+`ff00ffff` is exactly the colour carried in our vertex dwords 2,3,4. **A
+program that writes no outputs at all still produces coloured pixels derived
+from our vertex data.** The setup unit is therefore not consuming the WARP's
+`o0`/`o1`; something downstream of the vertex fetch is rasterising directly.
+
+That single fact subsumes most of this session's puzzles - why our program, a
+position-as-colour program, two vendor program images and a null program all
+produced the same shape, and why neither `o11`, the output set (§3.1i), the
+component count (§3.1h) nor the entry index changed anything.
+
+Combined with §3.1j - our register state matches the vendor's - the conclusion
+is that **cold, the WARP does not execute**, and the sparse pixels come from
+the legacy path. With the vendor's residual context it did execute, which is
+exactly what §1.2m retracted.
+
+**`0x920` is not the missing enable.** Three writes exist in the binary
+(`mtx676` `0xa0343`, `mtx656` `0xa0ee4`, `mtx3810` `0xa3d31`) and all write a
+value that is only ever `read & ~bit31 & ~bit0` plus `mtx3810`'s bit 0. Cold
+that is `0`, which is what we already write. Nearby at `0xa0355` `mtx676`
+builds the one-attribute pipe with the literal `0x83c00000` and count `1`,
+confirming the block-load descriptor decode of §3.1h.
+
+**Determinism, correcting §3.1i:** within one boot and a fixed prologue the
+result repeats exactly - 120/120/120 without re-init, 118/118/118 with
+`--engineinit` before each draw. The 52-vs-120 spread is *between* boots with
+different prologues, not run-to-run noise. A/B comparison is valid provided
+both arms run in the same boot after the same prologue.
