@@ -4574,3 +4574,49 @@ The pool base is per boot: `0x2f00000` in three boots, elsewhere in others, and
 the client double-buffers so the bound target alternates between frames. Locate
 it in-band when it is needed - replay the capture with a uniquely coloured
 triangle and search for that colour - rather than assuming a cached value.
+
+### 12.6 The Gouraud glitch IS the last tile row — cut at y = 224 = 7 x 32
+
+With pure red/green/blue corners every interpolated pixel carries its own
+barycentric weights, so the blue channel *is* the weight toward the apex and
+maps straight to a scanline - a measurement no de-tiling can corrupt. For the
+vendor-viewport triangle (apex y = 12, base y = 228, height 216):
+
+```
+  blue   scanline y     pixels
+   0     228.0             9
+   1     227.2             8
+   2     226.3             9
+   3     225.5             4
+   4     224.6             8
+   5     223.8           246     <- 30x jump
+   6     222.9           122
+   7     222.1           238
+```
+
+The coverage collapses by a factor of thirty between `y = 224.6` and
+`y = 223.8`. **224 = 7 x 32 is exactly a tile-row boundary.** The viewport is
+320x240 and 240 is 7.5 tile rows, so the last *partial* tile row (224..255) is
+not written and the triangle loses its base rows - about 1400 px, the same
+order as the 975-pixel discrepancy between two runs of this shape (31104 vs
+30129).
+
+Everything else about the triangle is right: binned into eight bands, the
+measured barycentric distribution matches the ideal `(1-w)` density to within
+one percent on all three corners.
+
+```
+  corner      measured / ideal share per band
+  red   (v0)  .22/.24 .21/.20 .18/.17 .15/.14 .11/.11 .08/.08 .04/.05 .01/.01
+  green (v1)  .24/.24 .21/.20 .18/.17 .14/.14 .11/.11 .08/.08 .03/.05 .00/.01
+  blue  (v2)  .19/.24 .21/.20 .19/.17 .15/.14 .12/.11 .08/.08 .05/.05 .02/.01
+                ^ the deficit, and it is the band along the base
+```
+
+**Rule for the driver: a tiled colour target only receives complete 32-row tile
+rows.** Round the render target's height up to a multiple of 32 - and keep the
+viewport inside it - or the last partial tile row is silently dropped. This is
+the same granularity `docs/parhelia-surface-address-translation.md` §1.1
+derives for the allocator from `1920 * roundup(1200,32) * 4`; what is new is
+that it applies to what the engine will *write*, not only to how much memory is
+reserved.
