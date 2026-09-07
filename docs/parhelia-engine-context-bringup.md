@@ -2680,3 +2680,45 @@ the same conclusion §3.1p reached from the other direction.
 
 `--vtxvram` is kept: a from-scratch driver will want a VRAM vertex path, and
 the option now exists to develop it against.
+
+### 3.1x The vendor's live vertex buffer, recovered from the userspace trace
+
+`captures/mtxtrace-5draws.txt` records per-submit buffer diffs. Most regions are
+ICD structures - `SUBMIT 5`/`17` at `0x131b000` are a key/value state array
+(`0x26 -> 1.0f`, `0xa6 -> 2048.0f`, `0x40..0x49 -> 0xffffffff`) and the small
+region at `+0xa000` is the submission tail, whose tag `0x21212425` decodes to
+`0x1090` (fence address `0x188a4000`) and `0x1094` (serial 7).
+
+But `SUBMIT 17` through `SUBMIT 22` each change **exactly 60 bytes** at
+`0xaf70000`, span `0x40-0x78`, stepping `0x2000` per draw - a per-draw vertex
+buffer ring. 60 bytes = 15 dwords = **3 vertices x 5 dwords**, and the contents
+decode cleanly:
+
+```
+  +40  0.5   +44  0.9   +48 1.0  +4c 1.0  +50 1.0     v0 = (0.5, 0.9) white
+  +54  0.1   +58  0.1   +5c 1.0  +60 1.0  +64 1.0     v1 = (0.1, 0.1) white
+  +68  0.9   +6c  0.1   +70 1.0  +74 1.0  +78 1.0     v2 = (0.9, 0.1) white
+```
+
+Two things follow, both first-hand from the vendor's own buffer:
+
+1. **The vertex is 5 dwords `(x, y, r, g, b)`** - confirming the layout the
+   `0x10b8` descriptor pair declares, now from the producer side as well as
+   from our own measured colour test.
+2. **The coordinates are 0..1 normalised**, not window space and not NDC
+   `-1..1`. gltri's triangle is `(0.5,0.9) (0.1,0.1) (0.9,0.1)` - a centred
+   triangle in a unit square - and all three vertices are white, which is why
+   its state does not interpolate.
+
+Every experiment so far fed **window-space** coordinates (400..1400). For the
+passthrough program, which writes `o0 = v0` unmodified, that is the right space
+only if the setup unit consumes window space; the vendor never exercises that
+path, because its program always applies the viewport transform from the
+constants. So the vendor's working configuration is transform-program +
+constant-loader + 0..1 vertices, and that combination has never been tested
+together on a healthy engine.
+
+**Next test when the board is back:** `minx` (transform program) with the
+kind-0 constant loader bound at store index 64 (`--warpbind 1
+vsetup-a.warp.hex 0`, entry `0x100`) and a vertex file in 0..1 - the vendor's
+own geometry, in the vendor's own coordinate space.
