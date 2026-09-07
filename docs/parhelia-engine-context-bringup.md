@@ -1831,3 +1831,70 @@ The one path that rasterises at all is the replay, and there the WARP is
 bypassed. Everything points at the bind being part of the kernel's
 `ICD_CREATE` context create, which is not reproducible by replaying captured
 register writes.
+
+### 1.2m The "cold triangle" was residual vendor state — RETRACTED
+
+`parhelia-cold-3d-works` and commits `11d65cc` / `b61672d` recorded a triangle
+rasterising from our own stream on a cold engine (8051 px for `px-red.hex`,
+8824 px for `px-white.hex`). **That does not reproduce after a true power
+cycle. The cold result is withdrawn.**
+
+The retraction is not a measurement artefact. Three independent runs on a
+freshly power-cycled board, with the tool rebuilt at `afd21e4` (the commit
+that produced the original log) and byte-identical `ns-*.hex`,
+`our-gouraud.warp.hex` and `px-white.hex`, all report `NO pixels drawn`:
+
+| run | binary | clear/scan | result |
+|---|---|---|---|
+| `ramtest.sh`, verbatim | HEAD | 0x180000 | drawn 0 px (was 8051) |
+| single control draw | `afd21e4` | 0x180000 | 0 new px |
+| single control draw | HEAD | **0x700000, full RT** | `NO pixels drawn` |
+
+2D is unaffected: the DMA fill draws 120000/120000 px on every one of those
+boots, and all 43 packets retire with the engine idle. Only the 3D draw
+produces nothing.
+
+**What actually differed.** Every earlier "cold" sample was taken after a
+`reboot -f`, which is a *warm* reboot. §1.2 already records that the VBIOS
+restores 2D but never clears the WARP instruction store or the constant file.
+Earlier in that same power-on session `prep-draw.sh` had loaded `mtx` and run
+a GL client, so the WARP unit still held the vendor's programs and constants.
+Our stream was drawing with the vendor's residual context, not ours.
+
+That single fact explains the whole set of anomalies previously filed as
+separate mysteries:
+
+- geometry came out correct while colours did not — the residual vendor
+  transform program ran, ours did not;
+- output was byte-identical for our program, a position-as-colour program and
+  two vendor program images — the store contents were residual in every case,
+  so the program we uploaded was never what executed;
+- the heap path (`0x920` bit 0 = 1) drew nothing — there is no residue there.
+
+**Consequences for method.** A warm reboot is *not* a cold sample. A board is
+cold-equivalent only from a power cycle up to the first `modprobe mtx`; after
+that every warm-rebooted measurement in that power-on session is contaminated.
+
+**Two further measurement constraints found while establishing this:**
+
+1. **One 3D draw per boot.** `parhelia-3dtri`'s health gate refuses to run when
+   its 2D fill does not draw 120000 px, and one 3D draw leaves 2D unable to
+   draw. Re-running `--engineinit --initaperture` does *not* restore it. Every
+   "0 px" that follows a draw in the same boot is a refused run, not a
+   measurement — check for `health: 2D fill drew 0/120000 px` in the log.
+2. **Clear and scan the whole render target.** `--vramzero 0x2f00000 0x180000`
+   covers 1.5 MB, which at a 8192-byte tile stride is 6 tile rows — y 0..191.
+   A 1920x900 target is `ceil(900/32) * 30 * 8192` = `0x6CC000`. Use
+   `0x700000` for both the clear and the scan.
+
+**Cold WARP state across a draw** (read-only, `--readreg`), for reference:
+
+```
+after engine init   0x8f0=00020000  0x908=63af8001  0x924=00200100
+after the draw      0x8f0=02020000  0x908=63af8001  0x924=00200002
+```
+
+The unit is not inert — `0x8f0` and `0x924` both move — but it ends outside
+the §1.9 idle signature, which requires `(0x924 & 0xfff) == 0x100`, while
+`bmstat` reports idle. Whatever the WARP does with our stream, it does not
+finish in the state the vendor's own idle test expects.
