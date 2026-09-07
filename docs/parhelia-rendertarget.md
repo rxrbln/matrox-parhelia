@@ -204,7 +204,15 @@ masked `& 0x3fff` in `mtx641` @0xc6d0) is used for bounds/size maths.
 
 **base** (`0x1220 + 8*slot`) = plain **VRAM byte offset**.  Bits[1:0] are a
 memory-space selector (`0x3` = non-local/AGP), per `mtx_drv.so`
-`Surface2d::Enable`.
+`Surface2d::Enable`.  [Re-confirmed from four witnesses in
+`parhelia-surface-address-translation.md` §1.]
+
+> **CORRECTION.** The `pitch` field below is the surface **width**, not a row
+> stride: the 3D render target is **tiled**, 64x32 pixels per 8192-byte tile,
+> tiles row-major.  See `parhelia-surface-address-translation.md` §5, which
+> derives it exactly from a measured 16128-pixel footprint.  §3 there also shows
+> the 3D colour/depth binding (slots 0 and 2) is emitted **by the kernel into the
+> primary stream**, which is why it never appears in a client capture.
 
 **cfg** (`0x1224 + 8*slot`):
 

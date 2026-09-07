@@ -90,7 +90,7 @@ about the 0x0528, not about "Parhelia".
 Any future capture or hardware claim in this repository should name the device
 id it was taken on.
 
-## 3. GART / AGP aperture **[HW]**
+## 4. GART / AGP aperture **[HW]**
 
 The test board carries **two** host bridges: an nVidia nForce3 250Gb (AGP) and
 an ALi M1695 with three PCI Express root ports.  The P690 sits at `03:00.0`
@@ -176,3 +176,106 @@ conclusion would have sent the capture work to the 0x0528 for no reason.
 The consequence is the opposite of what was recorded: a known-good draw **can**
 be captured on this card, from ioquake3 under `mtxtrace`, and diffed against
 what our own tool emits.
+
+
+## 5. The per-device branch census **[RE]**
+
+Counted mechanically over both binaries (`objdump -d`, no vendor source read).
+
+| binary | device-id compare sites | functions |
+|---|---|---|
+| `kernel/mtx_parhelia.o` | 21 | 1 (`mtx3376`, the bus-interface init) |
+| `xserver/7_4_0/mtx_drv.so` | 69 | 29 |
+
+The ids that appear: `0x520`, `0x521`, `0x525`, `0x527`, `0x528`, `0x2527`,
+`0x2537`, `0x2538`, `0x2539`. Every branch splits them into
+
+* **original Parhelia-512** — `0x527`, `0x528` (our PCI-X card)
+* **LX / P-series** — `0x2537`, `0x2538`, `0x2539` (our PCIe P690)
+* older parts — `0x520`, `0x521`, `0x525`, `0x2527`
+
+so a unified driver needs exactly one family predicate plus a handful of
+per-id exceptions, not a per-id table.
+
+## 6. `0x308` carries a different VALUE per device — NEW **[RE]**
+
+This is the one engine-register difference found so far, and it is in the
+bus-master configuration group that §2 already flagged as the risk area.
+
+`[KERN] mtx3376`, the tail of the function:
+
+```
+cbc:  cmp $0x527102b  -> dc5
+cc9:  cmp $0x528102b  -> e35
+cd6:  cmp $0x2537102b -> dba
+      otherwise       -> ce6
+
+e35 (0x0528):   if [r15+0xc] <= 5 -> dc5 else -> ce6
+dba (0x2537):   if [r15+0xc] >  1 -> cf4 (ebx = 1) else -> dc5
+dc5:            if bus flag bit 1 clear -> ce6; else set a flag bit and -> ce6
+
+ce6:  mov $0x83,%ebx            /* 0x0528 */
+cf2:  je  cf9
+cf4:  mov $0x1,%ebx             /* everything else, P690 included */
+d28:  mov %ebx,%edx
+d2a:  mov $0x308,%esi
+d32:  call memWriteDword        /* write(0x308, ebx) */
+```
+
+Whatever path is taken, the **value** is decided at `ce6` by device id alone:
+
+| device | `0x308` |
+|---|---|
+| `0x0528` Parhelia-512 | **`0x00000083`** |
+| `0x2539` P690, and every other id | **`0x00000001`** |
+
+`0x300` is read-modify-written just before it with the AGP-mode fields and the
+host-bridge fixups of `parhelia-engine-context-bringup.md` §1.4; those fields
+are zero for a PCIe part, so on the P690 the pair reduces to
+`0x300 = (read & 0xe0e0ff3f) | 0x100` and `0x308 = 1`.
+
+`0x384` writes of 0 around this block are DMAPAD inserts, not configuration.
+
+## 7. Config-space save differs in SIZE — NEW **[RE]**
+
+Both branches guard on the same `dev[+0x8] & 0xc0000000 == 0x40000000` test
+(a power/state gate) and then diverge:
+
+* `[XDRV] mtx2096` (`0xc5580`), reached for **`0x528`**: calls
+  `HSLPARSaveCriticalData`, reads struct field `0x3a8` and config dword 4.
+* `[XDRV] mtx1900` (`0xc53e0`), reached for **`0x2538`**: loops
+  `ClientReadConfigSpaceDword` for `ebx = 0..0x3f` — **64 config dwords, the
+  PCIe extended header** — before reading MMIO `0x300`.
+
+So suspend/restore on the PCIe parts must save 256 bytes of config space where
+the PCI-X part saves the legacy header. A driver that saves only 64 bytes will
+restore a P690 incorrectly.
+
+## 8. Where the two cards stand for an open driver
+
+| area | 0x0528 PCI-X | 0x2539 P690 PCIe | shared? |
+|---|---|---|---|
+| BAR layout | fb=0 (256 MB, 32-bit), mmio=1 | fb=0 (128 MB, **64-bit**), mmio=**2** | must probe, never assume |
+| VRAM vs the flat `0x08000000` offset split | 256 MB — **overflows it, open question** | 128 MB — fits exactly | P690 is the unambiguous case |
+| `0x308` | `0x83` | `0x01` | **§6, differs** |
+| `0x300` | AGP fields + host-bridge fixups | fields zero | same code, different inputs |
+| errata set | PowerM EOBTag Cap66Mhz CompBypass | PowerM Cap66Mhz CompBypass | §2 |
+| config-space save | legacy header | 64 dwords | **§7, differs** |
+| interrupts `0x8fc` | common path | `[XDRV] mtx1681` has a `0x2537` branch | mostly shared, one exception |
+| DVO / output regs | `0x1c20` | `0x1c54` / `0x1c58` | already handled in the open driver |
+| HAL init `0x1c58 = 0x40` | applied | **skipped** (`0x527`/`0x528` only) | bringup §1.2 step 9 |
+| `0x3a8 \|= 0x20` | not applied | applied when `dev[0x2a0] == 0` | bringup §1.2 correction |
+| engine register file, ring, fence | identical | identical | §3 |
+| depth surface S8Z24 | format `0x36`, slot 1 | ioquake3 reports `Z(24-bit) stencil(8-bits)` | confirmed both |
+
+### Still open, and where to look
+
+1. **What `EOBTag` does to the hardware.** Still inference (§2). It sets bit 6
+   of the assembled configuration byte; the 0x0528 gets it, the P690 cannot.
+2. **How a 256 MB `0x0528` addresses VRAM above `0x08000000`.** Concrete new
+   pointer: `[XDRV] mtx1158` (`0xe7e6e`) gates a `SFATOOL_StoreFeatureID`
+   registration on `r12d > 0x8000000`, i.e. on VRAM larger than 128 MB. That
+   feature id is the thread to pull. The P690 never takes this path, so the
+   open driver can support the P690 fully without settling it.
+3. **`0x404 == end` block-load framing on the P690.** Measured only on the
+   0x0528 (which runs with EOBTag); §3 still says re-measure. Unchanged.

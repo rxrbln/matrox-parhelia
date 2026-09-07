@@ -105,8 +105,8 @@ Known register offsets (from docs/parhelia-gl-driver.md + this push):
   DST_COLOR=9 1-DST_COLOR=0xa SRC_ALPHA_SAT=0xb CONST_COLOR=0xe 1-CONST_COLOR=0xf
   CONST_ALPHA=0x10 1-CONST_ALPHA=0x11. Factor bank = WriteBuffer key 0x5, whose
   absolute base is resolved at libGL runtime dispatch — [CAP] the base.
-- S8Z24 depth surface base/format = slot2 0x1230/0x1234; the exact S8Z24 format
-  enum in 0x1234 = [CAP].
+- S8Z24 depth surface base/format = **slot 1, `0x1228`/`0x122c`** (not slot 2),
+  format enum **0x36** = 32 bpp. See `parhelia-engine-context-bringup.md` §7.
 
 RESIDUAL (the RE agents for this section died on API errors before deepening):
 the concrete texture FORMAT enums (RGBA8/RGB565/… → hw code), texture dim/log2

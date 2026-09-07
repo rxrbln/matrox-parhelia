@@ -428,6 +428,14 @@ ZBIAS/DEPTHBIAS/SLOPESCALEDEPTHBIAS→`0x2104/0x2100` raw floats) [BIN PARD
 
 ### 3.2 `0x12e8` — blend control
 
+> **Confirmed and extended from the Linux kernel binary — see
+> `docs/parhelia-blend-alpha-encoding.md`.** Every field and factor code
+> below is reproduced byte for byte by `mtx2480`/`mtx642` in
+> `mtx_parhelia.o`. Two corrections: the no-dither format set is
+> `{0x0f, 0x10, 0x1e}` (the Linux gate does not test `0x2f`), and the
+> blend-constant component order R,G,B,A is no longer [INF] — it is
+> anchored on `glBlendColor`'s argument order in the ICD.
+
 Packer [BIN PARD 0x9c5d3–0x9c795], factor translator `0x9a5f0` (jump table
 0x9a7d4, `D3DBLEND-1`) returning `(rgbCode, alphaCode)`, equation translator
 `0x9a8f0` (table 0x9a928):

@@ -364,6 +364,12 @@ record (§4.2).
 
 ## 6. Alpha test
 
+> **Register-level encoding: `docs/parhelia-blend-alpha-encoding.md` §2.**
+> There is no `0x1060`/`0x1064` register: `0x18` and `0x19` are ICD state
+> slots, and the kernel folds enable (slot `0x0f`), function and reference
+> into the single register `0x12e4` — bit 0, bits [3:1], bits [15:8].
+> The 8-bit `(int)(ref*255 + 0.5)` conversion below is unchanged.
+
 * `0x103c` = enable, 0/1.
 * `0x1064` = func, the same 1..8 NEVER..ALWAYS enum (jump table rodata
   `0x36bca4`, bodies `0x1152f9`…`0x114b8f`).

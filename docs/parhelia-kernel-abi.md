@@ -312,6 +312,39 @@ argument 3 — see the note in §2.2): **[CONF]**
 
 ---
 
+
+### 3.4 Where the ICD's device handle comes from **[BIN]** (2026-09-07)
+
+`ICD_CREATE` (`0xc038461f`) takes the device/PDEV handle at `+0x00`, and a
+client cannot synthesise it. Traced through `libGL.so.1.3.0`:
+
+```
+init(obj, const char *devpath, u64 handle)   @0x3590d0
+    rbp = rdx                         ; 3rd argument = the handle
+    obj[0] = open(devpath, O_RDWR)
+    ioctl(fd, GET_MEMORY_INFO, &st)   ; obj[0x90]=fb base, obj[0x94]=fb size
+    rsi = rbp
+    call @0x358c30                    ; the ICD_CREATE wrapper
+@0x358c30:
+    struct[0x00] = rsi                ; the handle, passed straight through
+    ioctl(fd, 0xc038461f, struct)
+    cb = mmap(fd, struct[0x08], 0x238)   ; NOTE 0x238 bytes, not a page
+    memset(cb, 0, 0x238)
+    obj[0x08] = cb
+```
+
+So the handle enters libGL as its **third argument** - it comes from the
+GLX/DRI layer, which got it from the X server. The X server created the PDEV
+with the **root** ioctl `ParhlEnableDevice` (`0xc0804614`, RW 128).
+
+**Consequence for a from-scratch driver:** running as root we can create our own
+render context with `0xc0804614` rather than borrowing X's, then feed that
+handle to `ICD_CREATE`. That is the concrete route to submitting without X -
+and it is the same gap as "engine/context init" (task #18).
+
+Corrections to §3.3 and §5.2: the control block is mapped **0x238 bytes**, and
+libGL memsets it to zero immediately after mapping.
+
 ## 4. Register access
 
 ### 4.1 There is no inline MMIO **[CONF]**
