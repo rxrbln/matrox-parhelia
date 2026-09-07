@@ -3216,3 +3216,18 @@ flat colour.
 
 It does not affect geometry, so the last remaining value difference between our
 stream and the vendor's capture is now both explained and excluded.
+
+### 3.1ao The position is float, not integer or fixed-point
+
+A sparse sliver is what an enormous clipped triangle looks like, and float
+200.0 read as an integer is `0x43480000` = 1.1e9 - so the setup unit reading
+`o0` as integer or fixed-point would produce exactly this symptom. Tested by
+putting raw integers in the position dwords instead of floats, same quad,
+everything else unchanged:
+
+```
+  float positions     111 px
+  integer positions   NO pixels drawn
+```
+
+So `o0` is consumed as float and that reading is excluded.
