@@ -3091,3 +3091,36 @@ vendor's own attribute assignment, and picking one means matching its input
 registers to the `0x10b8` descriptors, not just binding it. That mapping is the
 next piece of work, and it is now a finite search over a known set rather than
 an unknown.
+
+### 3.1aj What the 25 programs actually are, and their entry offsets
+
+Mapping each recovered program's input and output registers gives a clean
+pattern for the sixteen "plain" ones:
+
+```
+  162f70  13 instr  reads v0..v1    writes o0
+  163014   9        reads v0..v3    writes o0
+  163094   9        reads v0..v5    writes o0
+  163114   9        reads v0..v7    writes o0
+  163194  11        reads v0..v9    writes o0
+  ...                                        up to v0..v15
+```
+
+They read `v0..v(2k-1)` for k = 1..8 and **write only `o0`**. Those are the
+**vertex-copy path** programs - one per attribute count - not per-vertex
+transforms; a transform would write `o0` plus `o1`/`o11`. The per-vertex
+transform we already have, regenerated bit-for-bit by
+`parhelia-warpasm.py --gen transform`.
+
+So the library's real value is the three constant loaders and the three
+`streg` register-writer programs, not sixteen new vertex programs.
+
+**Entry offsets matter.** Carving between terminators leaves leading padding:
+`vprog-16427c` opens with a `nop` and two zero instructions, and its actual
+code starts at **instruction 3** (`getidx r3, a0+0`). Binding it at offset 0
+runs padding. Measured both ways on the transform quad with the vendor
+constants - offset 0 and offset 3 - both give **2 px**, so the real loader is
+no better here than the `vsetup-a` carving of the same region.
+
+Anyone binding these must find each program's true first instruction rather
+than trusting the file's offset 0.
