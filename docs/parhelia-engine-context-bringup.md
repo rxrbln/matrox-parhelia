@@ -112,6 +112,33 @@ Order as emitted. `r12` = device, register/value pairs verbatim:
 | 20 | `0xde39e` | `0x008` | `0x10000020` |
 | 21 | `0xde3b0` | `0x00c` | `0x00010001` |
 
+**REPLICATED AND VERIFIED ON HARDWARE (2026-09-07).** `engine_init()` in
+`tools/parhelia-3dtri.c` now emits steps 1-6, 8-11, 13-16 in this exact order,
+plus 17-21 behind `--initaperture`, plus the §1.4 bus pair. Step 1 is a full
+`apply_vid_reset()` for both heads (timing-block reset, `0x1c00`/`0x1c04`
+bit 4 route, `0x1c00` bit 24 strobe), ported from the open driver's
+`parhelia_apply_vid_reset`.
+
+Measured from a cold boot with **`mtx` never loaded and X down**: the 2D
+instrument draws 120000/120000 px before the init, 120000 after it, and
+120000 again from a fresh process. So the sequence is faithful and
+non-destructive with no vendor code anywhere in the path.
+
+**Two steps are NOT replicated**, and neither is a literal register write:
+* step 7, `0x1c50` = from PInS — needs the VBIOS PInS block, which this tool
+  does not parse.
+* step 12, `HSLS90InitMemClk()` — contents never reverse engineered.
+
+Observation worth chasing: `0x10b0` reads back `0` after step 11 writes `0x40`.
+
+**A trap this exposed:** `./3dtri --engineinit` alone does *not* stop after the
+init - main falls through to the built-in WARP triangle draw, which renders
+nothing and then hangs, killing the engine until reboot. An earlier reading of
+that as "engine_init breaks the engine" was wrong. Always pair `--engineinit`
+with the action you actually want (e.g. `--dmafill`), and never diagnose from
+a `timeout`-killed run: stdout is block-buffered into a pipe and the whole
+transcript is lost on SIGKILL, which is why the run looked silent.
+
 Corrections to `docs/parhelia-engine-init.md`:
 
 * **`0x8fc = 0` is not "hardware DMA, not emulated".** `0x8fc` is the
