@@ -2005,3 +2005,54 @@ triangle - so the window-space convention `o0` expects is not yet calibrated,
 and the constant path still has to be made to work so the real transform
 program can run. But there is now a **cold positive control** to bisect
 against, which is what every earlier null result lacked.
+
+### 3.1f Only the first vertex is fetched — and "one draw per boot" RETRACTED
+
+**Multiple 3D draws per boot work.** §1.2m's "one 3D draw per boot" is
+withdrawn: it was an artefact of an engine left locked by the heap-path test,
+not a property of the hardware. Measured in a single boot, no reboots:
+
+```
+1. 2D before anything          : 120000 px
+2. 2D after engineinit         : 120000 px
+3. 3D draw A                   : health 120000/120000,  52 pixels
+4. 2D AFTER the 3D draw        : 120000 px      <- 2D survives a 3D draw
+5. 3D draw B (different verts) : health 120000/120000, 144 pixels
+```
+
+`--vramzero` and `--nzdump` over `0x700000` between draws are harmless. This
+makes iteration roughly ten times cheaper and every earlier "one variant per
+reboot" schedule unnecessary.
+
+An attempt to "fix" the health gate by resetting the raster state it inherits
+(`0x12cc`/`0x12d0` write masks, `0x11f4`, `0x12c8`, `0x12e4`, `0x12e8`, and
+`0x1324`/`0x1328`/`0x132c`) made the fill draw **nothing at all** and was
+reverted. `0x1324` is left at `0xffffffff` by our own stream, so that trio is
+not the scissor min/max pair it was assumed to be.
+
+**The blocker for a triangle: only vertex 0 is fetched.** A vertex file with
+three *identical* vertices - a true degenerate that must draw nothing -
+produces the byte-identical 52 pixels as the same file with three *distinct*
+vertices:
+
+| vertex file | v0 | v1, v2 | pixels |
+|---|---|---|---|
+| `g1-big` | (400,300) | (1400,300), (900,900) | 51 |
+| `h1-same` | (400,300) | (400,300), (400,300) | 52 |
+| `g2-small` | (100,100) | (300,100), (100,300) | 69 |
+
+Pixel count does not track area either - a 200x200 triangle draws *more* than
+a 1000x600 one - and that count is independent of any de-tiling, so no
+scan-window or stride error can explain it. De-tiled, the pixels form a clean
+line from (0,0) to `v0/3`.
+
+**Confirmed along the way:**
+
+- The colour attribute reads vertex dwords **2, 3, 4**. A vertex of
+  `(x, y, 0.0, 1.0, 1.0)` renders `ff00ffff` - exactly R=0, G=1, B=1 from
+  those dwords. The `0x10b8` descriptor's `offset << 4` encoding is correct.
+- Position fetches four components and **`w` must be non-zero**. Vertex sets
+  whose dword 3 came out 0 (colour green=0) draw nothing at all.
+
+**Hazards found:** a `--vramzero`/`--nzdump` over `0x4000000` (64 MB) crashes
+the box, and a 4-dword vertex (a 12-dword draw range) locked the engine.
