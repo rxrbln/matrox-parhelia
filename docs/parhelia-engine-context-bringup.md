@@ -4354,6 +4354,44 @@ the capture binds `0x1220 = 0x02000000` while the pixels land near
 (`parhelia-render-target-location`). Until that offset is decoded, the render
 target has to be found by measurement every boot.
 
+### 11.4d THE RENDER TARGET WAS BOUND TO THE WRONG SLOT
+
+`DWGCTL` bits `[11:10]` select the destination surface slot. Extracting every
+`0x1300` write from the capture in stream order, the **last one before the
+draw** is the 3D form `0x00a60ec4`, and `(0x00a60ec4 >> 10) & 3 = 3` — **slot
+3**, `0x1238`/`0x123c`:
+
+```
+  call 113  00000707   slot 1
+  call 114  00a60ec4   slot 3   <- the draw
+```
+
+`gen-minimal-draw.py` bound the colour target to **slot 0** (`0x1220`/`0x1224`)
+while emitting that same DWGCTL. The engine therefore drew into a slot our
+stream never wrote.
+
+**Nothing on the replay path masked it.** `parhelia-3dtri` patches only
+registers the stream already contains, so `--rtbase` found no `0x1238` write in
+our stream and printed `(0 writes patched)` while appearing to set the target -
+a line that was in every log and read straight past.
+
+That is a sufficient explanation for the standing symptom - every packet
+retires, `bmstat` idle, no pixels - and for the cold "sliver", which would be
+whatever stale address slot 3 happened to hold. It is also why the *vendor*
+replay always worked: the tool patches slot 3 there, and moving `--rtbase`
+demonstrably moves where the triangle lands, which is independent hardware
+proof that slot 3 is the destination.
+
+The generator now derives the slot from the DWGCTL it emits, so the two cannot
+disagree, and refuses a DWGCTL selecting slot 1 while `--depth-base` binds the
+Z buffer there.
+
+**Method note.** Three of this session's wrong turns - the residue artefact,
+the hard-coded render target, and this - were all the same failure: a number
+that was *reported* was never checked against a number that was *expected*.
+`(0 writes patched)`, `RT 975 dwords`, and `rt.txt = 0x2f00000` were each
+printed plainly and each read as agreement.
+
 ### 11.5 Operational
 
 * **Never run two `hw-run.sh` invocations against the board concurrently.** One
