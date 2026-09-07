@@ -2791,3 +2791,30 @@ loaded, the 0.15..0.85 quad should cover x 1104..1776, y 67..382 - about
 colour, exactly the one-vertex pathology of §3.1r/§3.1u. So the constant loader
 is no longer the blocker; the vertex fetch delivering a single vertex is, and
 it is common to both paths.
+
+### 3.1aa Vertex stride probed directly, and a note on the origin endpoint
+
+Spacing the same three vertices at a wider byte stride, with the draw range
+widened to match, is worse, not better (health-gated):
+
+| stride | result |
+|---|---|
+| 20 bytes (5 dwords, as configured) | 411 px |
+| 40 bytes | NO pixels |
+| 80 bytes | not measured, the preceding draw poisoned the engine |
+
+So the fetch stride really is the configured 20 bytes and the draw header's
+`dwords - 1` field is right; the missing vertices are not a stride overrun.
+
+**An inconsistency worth recording for whoever picks this up.** On the
+transform path a vertex that read as all-zero would *not* land at the origin:
+`r2 = 0` gives `T1 = c4.xyz1 * 0 + c5.xyz0 = c5`, i.e. the viewport centre
+(960, 450) with the generator's constants. Yet the sliver still starts at
+(0, 0). And if every constant were zero the whole primitive would collapse to a
+point and draw nothing, but it draws 411 px. So on the transform path the
+constants are at least partly live, and the (0,0) endpoint is **not** explained
+by "the other vertices read as zero" - the explanation that fitted the
+passthrough path does not carry over.
+
+That is the sharpest open contradiction in the current picture and probably the
+right thread to pull next.
