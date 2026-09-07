@@ -3166,3 +3166,32 @@ output order and termination order, `o11` as the position destination, the
 stage entries, `mtx398`'s context defaults, `0x12fc`, the scissor, the surface
 width, the class-0 VRAM vertex path, the vendor's own constants, the vendor's
 own replayed stream, and the recovered constant loaders.
+
+### 3.1am CORRECTION to §3.1ab/§3.1ac: tiles per row = pitch / 64
+
+§3.1ab concluded the de-tiler should use 16 tiles per row and that 30 was
+wrong. **That correction was itself wrong**, and §3.1ac's "the render target is
+1024 px wide, not 1920" follows from it and is withdrawn too.
+
+The calibration used `--dmafill`, and `parhelia-3dtri`'s `width` defaults to
+**1024**, so that fill lands on a *pitch-1024* surface. The solved answer,
+16 tiles per row, is exactly `1024 / 64`. The relationship is simply
+
+```
+  tiles per row = pitch / 64
+```
+
+so 30 was correct for the pitch-1920 draws all along, and 16 is correct only
+for pitch 1024. The de-tiling *formula* validated in §3.1ab stands - the
+in-tile swizzle reproduces a 400x300 fill exactly - only the fixed 16 was wrong.
+
+**This also means several recent runs were internally inconsistent**: the
+stream was generated for `--screen 1024x768`, the tool was passed
+`--rtcfg 0x32020780` (pitch 1920) which overrides the surface descriptor, the
+tool's own `--pitch` was 1920, and the result was de-tiled as 1024. Making all
+four agree at 1024 changes the reported extent (x 0..347 rather than x 0..893)
+but **not the outcome: still 111 px**, where a filled quad is ~270000.
+
+So the pitch inconsistency was real and is now fixed, and it was not the
+blocker either. Any geometry figure in §3.1f through §3.1al should be read with
+`TPR = pitch / 64` for whatever pitch that run actually used.
