@@ -4292,6 +4292,41 @@ the vendor's 122 calls can be truncated toward our 27 packets until the
 triangle disappears. `tools/` now has what that needs - `--rrentry` to redirect
 a replayed stream's WARP binds, and the suffix builder that drops leading calls.
 
+### 11.4b The register diff that names what our stream lacks
+
+Decoding the capture call by call (`0x00` register lists, tags LSB-first) and
+diffing the register/value set of its **last 23 calls** - the per-draw sequence
+proper - against `gen-minimal-draw.py --ctx-defaults`:
+
+**The vendor writes and we never do:**
+
+| register | value | what it is |
+|---|---|---|
+| `0x1228` / `0x122c` | `0x01000000` / `0x36020780` | **the depth surface** - bound on every draw |
+| `0x10c8`-`0x10d8`, `0x10c0` | heap entries | the five stage entries |
+| `0x1004`-`0x101c`, `0x1044`-`0x104c` | `0` | the other seven stream bases and three stride pairs |
+| `0x12bc` | `0x000001a8` | the sync tag |
+
+**Shared registers whose last value differs:** `0x10b8` (vendor `0`, the
+descriptor-list terminator; ours ends on the colour descriptor), `0x1100` (the
+entry, expected), `0x1220` (the render target, expected).
+
+The depth surface is the strongest candidate for "27 packets retire, zero
+pixels": `0x11f4`, the depth/stencil state, appears **nowhere** in the capture,
+so it is context-create state - and it measures `0x8a` on a live vendor
+context. A stream that binds no Z buffer inherits an armed test with nothing to
+test against. `--depth-base` and `--reg11f4` now emit both.
+
+`0x11f4` also confirmed §0's register-file rule from the other side: written
+directly through MMIO it reads back unchanged at `0x8a`. These registers reach
+the chip only as DMA packet payload.
+
+**Not measured.** The run that would have tested it took the board to the
+half-dead state (pings, sshd unresponsive) before printing anything, so it is
+not known whether the depth binding helps, nor which of the two variants - the
+bound surface at an arbitrary VRAM address, or the in-stream `0x11f4` write -
+was responsible. Treat both as suspect until one is run alone.
+
 ### 11.5 Operational
 
 * **Never run two `hw-run.sh` invocations against the board concurrently.** One
