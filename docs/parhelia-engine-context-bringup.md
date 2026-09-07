@@ -4716,3 +4716,51 @@ in their order, not in the program-selection table, and not in the WARP program
 through the same tool, and our program in the vendor's stream draws none).
 That leaves the framing of the stream itself - our 44 one-packet calls against
 the capture's 122 - as the only structural difference not yet tested.
+
+### 12.8 The second vertex comes from outside our buffer, and the shape is a wedge
+
+Feeding a vertex buffer whose every dword is a distinct recognisable value
+(`dword i = 0.01*(i+1)`, so `v0 = (0.01,0.02)`, `v1 = (0.06,0.07)`,
+`v2 = (0.11,0.12)`) and reading the interpolated position back as colour:
+
+```
+  covered NDC   x 0.012..0.400   y 0.024..0.800
+```
+
+The **start** is `v0`, to interpolation rounding. The **end** is `(0.400,
+0.800)` - a value that appears nowhere in the buffer, whose dwords only reach
+`0.15`. Doubling the buffer to six vertices (dwords out to `0.30`) gives a
+byte-identical result: 21806 px, the same coverage. So the far end of the
+primitive is not read from our vertex buffer at all, and is the same fixed
+direction in every run and across boots.
+
+Binned by x, the covered region is a **wedge**: a band that starts a few
+pixels wide at `v0` and widens along a straight line to the fixed endpoint.
+
+```
+  NDC x : covered y range   (px)
+   0.05 : 0.055..0.067        7
+   0.20 : 0.357..0.384      464
+   0.35 : 0.678..0.710      911
+```
+
+That is §3.1t's degenerate wedge, now measured directly: the setup unit
+receives `v0` and two vertices from a fixed internal source.
+
+**Also excluded, retested with the working target and sync:** the
+`mtx398` context defaults (`--ctx-defaults`) make no difference either way -
+they are 28 of the registers the vendor's own draw tail never writes, and
+removing them changes nothing except that a second test triangle becomes
+reproducible; and `0x1104`, which the capture's GL draw path never writes in
+*either* bind (it was added here from `mtx676`, the kernel's WARP self-test,
+not the draw path).
+
+**Where this leaves it.** Every candidate in the register file is excluded, in
+its values, its order, and its presence or absence. The vertex fetch delivers
+`v0` correctly - the constant-file probe reads it and its exact window
+transform back - and the vendor's own stream draws all three vertices from the
+*same* buffer through the *same* tool. So the trigger for fetching more than
+one vertex is not a register we have identified, and the next thing to try is
+the one structural difference left: replaying the capture with our packets
+spliced in (`tools/ring-crossover.py`, already written) to find which of the
+vendor's 122 calls the count depends on.
