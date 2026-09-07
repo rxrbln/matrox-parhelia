@@ -3231,3 +3231,39 @@ everything else unchanged:
 ```
 
 So `o0` is consumed as float and that reading is excluded.
+
+### 3.1ap An explicit `w` in the vertex changes nothing
+
+The position descriptor declares two components, so `z` and `w` come from
+`0x1128`/`0x112c`, whose role the recipe records as "verbatim, undecoded". If
+`w` were not 1.0 the perspective divide would blow up and produce exactly a
+clipped sliver, so this dependency had to be removed rather than assumed.
+
+`gen-minimal-draw.py --pos4` declares a four-component position
+(`0x23c00000`) with the colour moved to dword 4 (`0xa1c50040`), and the vertex
+becomes seven dwords `x, y, z, w, r, g, b` with `w = 1.0` supplied explicitly:
+
+```
+  2-component position, w from 0x112c   111 px
+  4-component position, w in the vertex 111 px
+```
+
+Byte-identical. So `w` is not the problem and the undecoded `0x1128`/`0x112c`
+defaults are not load-bearing here.
+
+**Closing state of this line of work.** Everything measurable from the captures
+and the binaries has been tried against the `o0` -> setup defect. The exclusion
+list now covers the vertex range, the packet length field, `0x1040`, `0x1060`,
+the descriptor terminator and component count, an explicit `w`, integer and
+fixed-point position encodings, WARP program contents, length, output set,
+output order and termination order, `o11` as the destination, the stage
+entries, the vertex-copy programs, the recovered constant loaders, `mtx398`'s
+context defaults, `0x12fc`, `0x1130` bit 12, the scissor, the surface pitch,
+the class-0 VRAM vertex path, the vendor's own constants and the vendor's own
+replayed stream.
+
+What has not been tried is the one thing that would make "fill" versus "sliver"
+an unambiguous diff rather than another single-variable guess: a known-good
+baseline - the vendor module loaded once, a GL client run, then our stream
+submitted in the same session - and then removing one vendor-supplied piece at
+a time.
