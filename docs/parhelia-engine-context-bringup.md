@@ -4801,12 +4801,17 @@ not the whole story either.
 field and ours was linear (`0`), which the recipe marks `[INF]`, never
 exercised; `--textiling 2`, matching every capture, behaves identically.
 
-**Not yet tried**, in order: `0x11e8`, the texture-cache partition - the recipe
-records that the Linux GL path never emits it for one or two stages while
-MTXPARD's table gives `0x00500000`, so a cold context may need it where a
-vendor-initialised one does not; and `0x12f4 = 0x42000000`, the guard band the
-recipe ties to "<= 2 stages", which our stream writes only under
-`--ctx-defaults`.
+**Also excluded:** `0x11e8 = 0x00500000`, the texture-cache partition MTXPARD's
+table gives for one or two stages and which the Linux GL path never emits, put
+in alongside `0x12f4 = 0x42000000`, the guard band the recipe ties to "<= 2
+stages" (`--texcache`). Still no pixels.
+
+So enabling a texture unit kills the draw on a cold context, and none of the
+sampler window, the tiling code, the combiner, the pipe union, the cache
+partition or the guard band accounts for it. The most likely remaining reading
+is that a texture unit needs state established at *context create*, which is
+where §12.7's vertex-count trigger also has to live - the two may be the same
+missing piece.
 
 This is an honest partial result: texturing is implemented, on hardware, and
 the failure is localised to one register of one group rather than to the
