@@ -127,7 +127,9 @@ non-destructive with no vendor code anywhere in the path.
 **Two steps are NOT replicated**, and neither is a literal register write:
 * step 7, `0x1c50` = from PInS — needs the VBIOS PInS block, which this tool
   does not parse.
-* step 12, `HSLS90InitMemClk()` — contents never reverse engineered.
+* step 12, `HSLS90InitMemClk()` — **now decoded and partially implemented**
+  (`--initmemclk`), see §1.2b. Incomplete, and the partial form breaks the
+  engine, so it is off by default.
 
 Observation worth chasing: `0x10b0` reads back `0` after step 11 writes `0x40`.
 
@@ -1351,3 +1353,76 @@ clear primitive's `0x1300 = 0x000000c4` / `0x002000c4` returns zero packets.
 `GLTEST_CLEARDEPTH` and `GLTEST_DEPTHVAL` have been added to `tools/gltest.c`;
 one capture with two different clear values will locate the register by
 diffing, exactly as `0x11f4` was found above.
+
+
+## 1.2b HAL step 12, `HSLS90InitMemClk` — DECODED, partially implemented
+
+`[XDRV] mtx1945` (`0xdcef0`). Every value is **board specific and comes from
+the VBIOS PInS block**, so nothing here can be hardcoded; `tools/parhelia-3dtri.c`
+reads the option ROM through sysfs (`--initmemclk`, with `--pinsfile` as a
+fallback when the ROM window is closed).
+
+```
+read 0x1c00,0x1c04,0x1800,0x1a00
+0x1c00 |= 0x20 ; 0x1c04 |= 0x20        hold both DC clocks
+0x1800 &= ~1  ; 0x1a00 &= ~1           both display heads OFF
+HWDelay(1000)
+HWS90ResetMemoryController()           = mc_write(0xff4, ctrl 3, 0)
+HWS90InitializeSystemClock()
+HWS90InitializeMemoryController()
+```
+
+**`SelectS90MemoryController`** reduces to `write(0xffc, ctrl)` for ctrl 1/2/3.
+**`WriteS90MemoryControllerDword(reg, ctrl, val)`** = save `0xffc`, select,
+write `reg`, restore `0xffc` if it changed.
+**`WaitForS90MemoryIdle`** spins on `ReadS90MemoryControllerDword(0xff8, ctrl 1)`
+until `(v >> 8) & 6 == 6`.
+
+**`HWS90InitializeSystemClock`** — PLL words come from `PInS+0x200/0x204/0x208`:
+
+```
+read 0xe00,0xe04,0xe08
+write each |= 1 ; then write each = 1 ; then write each = 0
+HWDelay(1000)
+if (IsScUseFS_SUN90(...,0)) { v = PInS+0x28; 0xe30 = v|0x80000000; delay(100); 0xe30 = v; }
+if (IsScUseFS_SUN90(...,1)) { ... 0xe34 ... }        <- predicate NOT decoded
+```
+
+**`HWS90InitializeMemoryController`** — 44 entries of `pinsDatasConvertor`
+(`[XDRV] .data 0x34b580`, `{pinsOff, reg, ctrl}`), value = `PInS[0x210 + off]`:
+
+| ctrl | registers |
+|---|---|
+| 3 | `0xf00 0xf04 0xf08 0xf10 0xf1c 0xf20 0xf24 0xf28 0xf2c 0xf44 0xf94 0xf98 0xf9c 0xfa0 0xfc0 0xfc4 0xfc8 0xfcc 0xff0 0xff8` (pins `0x00`..`0x4c`) |
+| 1 | `0xf14 0xf18 0xf48 0xf4c 0xf58 0xf5c 0xf68 0xf6c 0xf70 0xf74 0xf8c 0xf90` (pins `0x50`..`0x7c`) |
+| 2 | the same twelve registers (pins `0x80`..`0xac`) |
+
+Measured on the test board: PInS at ROM offset `0x7800`, version `0200`, clocks
+`01610097 000c028b 00000328`, first controller words `2000f400 5053ffff
+2608c383 2403438a`.
+
+**NOT yet implemented, and this is why the partial form is harmful:**
+1. `WaitForS90MemoryIdle()` after the 44 writes.
+2. The tail: `0xf00 |= 0x40000000` (ctrl 1 read, ctrl 3 write), wait idle,
+   `HWS90ResetMemoryController()` **again**, then further writes sourced from
+   `PInS+0x268`, `+0x26c`, …
+3. The FS-PLL branches (`0xe30`/`0xe34`) — `IsScUseFS_SUN90` not decoded.
+4. Restoring the display heads and the DC clock hold afterwards.
+
+**Measured:** with only parts 1-3 of the sequence above, the 2D instrument goes
+from 120000 px to 0. Do not enable `--initmemclk` until the tail is finished.
+
+## 1.2c Status of from-scratch bring-up (2026-09-07)
+
+| | result |
+|---|---|
+| 2D from cold, `mtx` never loaded, X down | **120000/120000 px, reproducible** |
+| engine init steps 1-6, 8-11, 13-16 + §1.4 bus pair | verified harmless, engine still draws |
+| step 12 | decoded, partial, **harmful** - off by default |
+| 3D replay from cold | wedges the engine at a **varying** packet (14, 20, 21 across runs) |
+
+The 3D stall point moving between identical runs is the open lead. The
+per-packet stall detector is a fixed poll budget (`--polls`, default 200000),
+so a spurious timeout has not been excluded - but the first 3D attempt wedges
+the engine, so a second measurement in the same boot is worthless. Any test of
+this needs one reboot per data point.
