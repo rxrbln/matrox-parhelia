@@ -2919,3 +2919,28 @@ position from **port B 0**, and whether `parhelia-warpasm.py`'s `o0` encoding
 actually targets that port is unverified - the assembler is validated against
 the vendor's 13 words bit-for-bit, so if it is wrong, it is wrong in a way the
 vendor program does not exercise.
+
+### 3.1ae `o0` written through a temp: same result; and the `o0`/`o1` encoding
+
+Writing the position the vendor's way - through a temp,
+`add T1, v0` then `add o0, T1, r1.0000`, rather than `add o0, v0` directly -
+gives 114 px against 111. No change.
+
+The word encodings are worth recording for whoever picks up the port-B
+question:
+
+```
+  add o0, v0, v0.0000   00083e00 00440000 b89a2249   (warpasm --gen passthrough)
+  add o0, T1, r1.0000   08083e00 00440105 b89a2249   (the vendor's form)
+  add o1, v5, r1.0000   08087e00 00440015 b89a2249
+```
+
+`o0` and `o1` in the vendor's form differ **only in bit 14** of word 0, a clean
+destination-index bit. But the generated passthrough's `o0` has **bit 27
+clear** where both the vendor-form `o0` and every `o1` have it set. Bit 27 is
+therefore a per-instruction flag that `--gen passthrough` emits differently -
+a plausible port/write-enable - though setting it changes nothing measurable
+here, so it is a lead rather than a finding.
+
+Both forms leave the defect exactly where §3.1ad puts it: `v0` arrives intact,
+`o1` reaches setup, `o0` does not.
