@@ -2722,3 +2722,39 @@ together on a healthy engine.
 kind-0 constant loader bound at store index 64 (`--warpbind 1
 vsetup-a.warp.hex 0`, entry `0x100`) and a vertex file in 0..1 - the vendor's
 own geometry, in the vendor's own coordinate space.
+
+### 3.1y The transform path draws nothing with any loader candidate
+
+With the board healthy (2D gate 120000/120000 on every run below), the
+vendor's own configuration - transform program, constant loader bound at
+`0x1100` with mode `0x20000028`, and the 0..1 vertices recovered in §3.1x -
+draws nothing:
+
+| loader bound at bind #1 | health | result |
+|---|---|---|
+| `vsetup-a` entry 0 (the loop) | 120000/120000 | NO pixels |
+| `vsetup-a` entry 16 (unrolled, 7 slots) | 120000/120000 | NO pixels |
+| `vsetup-b` entry 0 | 120000/120000 | NO pixels |
+| `vsetup-c` entry 0 | - | not measured, the preceding draw poisoned the engine |
+
+Entry 16 was the strongest candidate: it is the unrolled `mov c0,v1 ...
+mov c6,v7` form and the generator's block load is exactly six slots.
+
+The arithmetic says the constants are the difference. `gen-minimal-draw`'s
+transform loads an identity MVP into `c0..c3` and viewport scale/offset into
+`c4`/`c5`, so a 0.15..0.85 quad should land at x 1104..1776, y 67..382 -
+roughly 210000 pixels. Zero pixels means the constant file is still empty and
+the transform collapses every vertex, exactly as §3.1d predicted.
+
+**So the two paths fail differently and neither works:**
+
+- passthrough, no constants -> draws a 276 px sliver (one vertex survives)
+- transform, needs constants -> draws nothing (constants never arrive)
+
+The constant loader binding is unresolved, and with it §3.1d's four-bind
+question. That is the single blocker for the vendor's own configuration.
+
+**Board note:** the engine entered a state where the 2D instrument gate read
+0/120000 on a freshly booted box, twice, which a warm reboot did not clear -
+the documented hand-power-cycle condition. A batch of results was taken in that
+state and is void; they are not recorded here. Always print the health line.
