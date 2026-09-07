@@ -2634,3 +2634,30 @@ not the rule, until a prediction has held on a case chosen to break it. The one
 model that did survive such a test is §3.1r's - the rotated-quad direction and
 colour, predicted before the run - and even that turned out to be the
 topology-specific special case recorded here.
+
+### 3.1v Two more exclusions on the clean signal
+
+Both measured one-draw-per-boot with the §3.1q fence in place, quad stream,
+four-colour gouraud quad. Both give a byte-identical **276 px, `ff00ff00`,
+(0,0)..(893,191)**:
+
+- **WARP pipeline depth.** Padding the passthrough program from 4 to 12
+  instructions with NOPs before `end`, so it matches the vendor program's
+  length, changes nothing. A short program is not why only one vertex survives.
+- **`0x1060` (`--vtxcap`), the documented "vertices addressable in the bound
+  buffer ... the fetch limit".** Setting it to the true vertex count 4 instead
+  of the default `0x280cc` changes nothing. (This test was attempted before and
+  never completed - the engine had died mid-batch - so it is only now actually
+  measured.)
+
+**Running list of what has been excluded for the one-vertex fetch**, each on
+hardware: the address range length (4/5/8 vertices identical), the draw packet
+length field (patching it stalls), `0x1040` stride, `0x1060` fetch limit, the
+`0x10b8` descriptor terminator, the component-count field, the WARP program
+length, the WARP output set and ordering, the clip-position write, `mtx398`'s
+context-create defaults, `0x12fc` RASTERMODE, the scissor, and the entire
+inherited capture state (a from-scratch 24-packet stream behaves identically).
+
+What is *not* excluded and remains untested: that the vertex count is carried
+in state established at 3D-context create which appears in no capture we hold -
+the same conclusion §3.1p reached from the other direction.
