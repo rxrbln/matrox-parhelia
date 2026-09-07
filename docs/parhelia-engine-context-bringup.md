@@ -1664,3 +1664,44 @@ touched, so consecutive runs are **not** independent cold samples. A result
 that reached packet 41 was later shown to be residual state - on a genuine
 power cycle the same stream stalled at packet 0. Any cold-3D claim needs a real
 power cycle, or at least must be reproduced after one.
+
+
+## 1.2i Step 12 is NOT needed to reach all of VRAM - two retractions
+
+`--initmemclk` now implements the whole of HAL step 12, including the tail:
+`0xff4 = 1`, wait idle, `0xf00 |= 0x40000000` (read ctrl 1, write ctrl 3), wait
+idle, reset again, the eight `PInS+0x268..0x2a4` writes to `0xf48/0xf4c/0xf58/
+0xf5c` on controllers 1 and 2, `0xff4 = 1`, wait idle, then restore the display
+heads and the DC clock hold. `mc_read` and `mc_wait_idle` are implemented from
+`[XDRV] 0xe58b0` and `0xe5950`.
+
+**It does not work and it is not needed.** Measured cold:
+
+* `mc_wait_idle` always times out with `0xff8` reading **0** - the memory
+  controller status never appears, so either the `0xff8`/`0xffc` window needs
+  something we have not found or the selector encoding is wrong.
+* After running it, CPU writes to VRAM stop persisting **everywhere**, and the
+  2D instrument's count goes wrong (131072 px instead of 120000).
+
+It stays behind `--initmemclk`, off by default.
+
+### RETRACTED: the "16 MB CPU write limit"
+
+Probing the whole aperture on a freshly cold-booted box, with no step 12 and no
+vendor code:
+
+| offset | 4 MB | 8 MB | 16 MB | 24 MB | 32 MB | 47 MB | 64 MB | 128 MB | 192 MB | 240 MB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| write persists | ok | ok | ok | ok | ok | ok | ok | **lost** | ok | **lost** |
+
+So writes are **not** limited to the first 16 MB. The earlier finding in
+[[parhelia-bar0-16mb-write-limit]] was measured on a box that had already run
+other tests, not on a cold one. Two isolated offsets still fail (`0x8000000`
+and `0xf000000`) and are unexplained.
+
+### RETRACTED: "the render target must be below 16 MB"
+
+A 3D draw with the target at `0x2f00000` (47 MB) renders: cleared to 0 px, then
+8051 px after the draw, 43 packets all idle. §1.2h's placement constraint was
+an artefact of the same bad measurement - the earlier attempt cleared with
+`--vramzero` and never verified the clear took.
