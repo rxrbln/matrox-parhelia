@@ -2525,3 +2525,34 @@ they were sums of a real component and a stale one.
 **Every pixel count measured before this fix is suspect**, including the
 history dependence of §3.1l and the "first draw reads 52" rule - those were
 symptoms of the missing fence, not of the hardware.
+
+### 3.1r With clean measurement: the primitive is `origin -> v1`
+
+With the §3.1q fence in place, one draw per boot, the output is a thin ~3-pixel
+band and its shape is **predictable**:
+
+```
+quad v0..v3 = (400,300)red (1400,300)green (1400,900)blue (400,900)yellow
+   276 px, ff00ff00 (green), (0,0)..(893,191), slope 4.675
+   v1 = (1400,300) -> slope 1400/300 = 4.667, colour green    MATCH
+
+rotate so v1 = (1400,900) blue
+   296 px, ff0000ff (blue), (0,0)..(893,574), slope 1.556
+   v1 = (1400,900) -> slope 1400/900 = 1.556, colour blue     MATCH (predicted
+                                                              before the run)
+```
+
+**The rasterised primitive runs from (0,0) to `v1` and carries `v1`'s colour.**
+The prediction was made before the second run and held exactly, so this is a
+model, not a curve fit. Every other vertex reads as `(0,0)`.
+
+That `v1` supplies *both* the position and the colour is the useful detail: the
+fetch is not mixing attributes from different vertices, it is delivering one
+whole vertex - the **second** one - and zeros for the rest.
+
+**Excluded here:** the `0x10b8 = 0` descriptor-list terminator
+(`--zero-descs`), which our texturing notes list as required, changes nothing:
+276 px, same colour, same geometry.
+
+Still to explain: why exactly one vertex is delivered, and why it is index 1
+rather than index 0.
