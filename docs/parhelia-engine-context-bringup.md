@@ -2151,3 +2151,28 @@ writes only `o0` and `o1`. A setup unit expecting outputs the program never
 writes would read stale registers for position, which fits every symptom. Note
 that adding or removing the `o11` clip write changes nothing, so the setup is
 not consuming `o11` either.
+
+### 3.1i The sparse output is not deterministic
+
+Writing the vendor's full output set (`o0`, `o1`, `o11`, `o3..o6` -
+`parhelia-warpasm.py --gen passthrough --tex 4`) instead of just `o0`/`o1`
+changes nothing: 120 px for `g1-big`, the same as every other variant. So the
+`0x1114`/`0x1118` VTXFMT hypothesis of §3.1h is excluded too.
+
+**More importantly, the same configuration does not give the same answer
+twice.** `ns` + `our-passnc` + `g1-big` + full scissor measured **120 px** in
+one boot and **52 px** in the next, differing only in what had been drawn
+before it in that boot. Both runs passed the 2D health gate at 120000/120000.
+
+That undermines every single-variant comparison made against these counts,
+including the ones in §3.1f-h: differences of 52 vs 68 vs 120 px are within
+the run-to-run spread and cannot be attributed to the variable under test. The
+sparse pixels are substantially a function of residual engine state, not of
+our stream.
+
+**What this means for the method.** Counting pixels from a near-degenerate
+draw is not a usable signal. A variant is only interpretable once there is an
+output whose magnitude is unambiguous - a filled triangle of the right order
+(hundreds of thousands of pixels) versus nothing. Until the pipeline produces
+that, comparisons need at minimum a repeat of the same variant in the same
+boot to establish the spread, and preferably a reboot between variants.
