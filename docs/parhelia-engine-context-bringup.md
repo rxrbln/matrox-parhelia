@@ -2056,3 +2056,45 @@ line from (0,0) to `v0/3`.
 
 **Hazards found:** a `--vramzero`/`--nzdump` over `0x4000000` (64 MB) crashes
 the box, and a 4-dword vertex (a 12-dword draw range) locked the engine.
+
+### 3.1g The scissor was gltri's 320x240; primitive comparison
+
+**The replayed raster state carries the capture client's scissor.** `0x132c =
+0x00f00140` is 320x240 - gltri's window - while our vertices are in a 1920x900
+space, so almost every vertex is outside it. That is why a *small* triangle
+near the origin drew **more** pixels (69) than a large one (51). The tool's
+`--scissor` option patches `0x132c` (and clears `0x1328`) and had never been
+passed; the log line `scissor 00000000` means *unpatched*, not "no scissor".
+
+Opening it to the full target (`--scissor 0x03840780`, h=900 w=1920) changes
+the result but does not produce a fill: `g1-big` 53 -> 119 px, `g2-small`
+68 -> 0 px.
+
+**Same vertices, three primitives** (`g2-small` = (100,100),(300,100),(100,300),
+full scissor):
+
+| primitive | result |
+|---|---|
+| points | NO pixels drawn |
+| lines | **3 pixels**, bbox x 0..1315, **y 0..0** |
+| triangles | 98 pixels, bbox x 0..1919, y 0..97 |
+
+Points still do not rasterise at all (task #22). Lines produce exactly three
+pixels for three vertices, but all at **y = 0**, with x spread far outside the
+input range.
+
+**The drawn pattern is not our geometry.** De-tiled, the triangle case is a
+perfectly regular line from (0,0): 80 evenly spaced pixel *pairs* stepping
+(4,3), ending near (317,238) - the diagonal of the old 320x240 scissor box.
+The endpoint barely moves when `v0` changes from (800,600) to (1200,900), so
+it is clamped, not geometric. Earlier probes that all lay on the same ray
+through the origin made this look like a `v0/3` scaling; it is not.
+
+Still unexplained: `y` collapses toward 0 while `x` spreads across the full
+target width. The VTXDEFAULT pair `0x1120 = 45ffc5ff` (~8184.5) and
+`0x1124 = c5ff45ff` (~-8168.7) are the guard-band defaults for components the
+vertex fetch does *not* supply, so a position descriptor declaring too few
+components would take `y` from `0x1124` and push it off-screen. The component
+count field in the `0x10b8` descriptor (`0x20c00000` position, `0xa1c50020`
+colour, `0xa0c70050` texcoord) is not yet decoded - only the `offset << 4`
+low half and the `0xc0 | reg` destination are confirmed.
