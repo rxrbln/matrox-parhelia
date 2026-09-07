@@ -2585,3 +2585,26 @@ through the same clean path draw nothing at all.
 So the count of one comes from neither the range, the packet length, nor the
 stride field (§3.1n), and the fetch delivers vertex **index 1** whole - both its
 position and its colour (§3.1r).
+
+### 3.1t Refinement: the surviving vertex is the third from last, not `v1`
+
+§3.1r said the primitive runs from the origin to `v1`. That was measured only
+on quads. A triangle through the identical clean path uses `v0`:
+
+| prim | verts | measured slope | v used | that v's slope | colour |
+|---|---|---|---|---|---|
+| tri | 3 | 1.330 | `v0` = (400,300) | 1.333 | red = `v0` |
+| quad | 4 | 4.675 | `v1` = (1400,300) | 4.667 | green = `v1` |
+
+Both are the **third-from-last** vertex of the buffer (tri: `v0` = last-2;
+quad: `v1` = last-2). The claim "the primitive runs to `v1`" is therefore
+withdrawn and replaced by: one whole vertex survives - position and colour
+together - and it is the one at index `n - 3`.
+
+The sliver's length also differs sharply between the two (tri reaches
+x = 125, quad x = 893) while both start at (0,0), so the second endpoint is not
+simply the surviving vertex either; only its *direction* is reproduced.
+
+This is consistent with the rasteriser receiving a primitive whose other
+vertices are all `(0,0)`, i.e. a degenerate wedge, rather than with a line
+primitive between two real vertices.
