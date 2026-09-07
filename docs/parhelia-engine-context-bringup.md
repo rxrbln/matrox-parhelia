@@ -3965,6 +3965,12 @@ printed on every run:
 If the other vertices had run, the triangle's `c12.x` would be `+0.8` (from
 `v1`) and the quad's `c12.y` would be `+0.8` (from `v2`). Neither appears.
 
+> **§9.6 IS RETRACTED — see §11.3.** The vendor's own captured stream renders
+> a correct three-vertex Gouraud triangle and *also* reads back as a single
+> vertex through this probe. A constant-file write therefore commits once per
+> draw and cannot count invocations. The measurements below are real; the
+> conclusion drawn from them is not.
+
 **The accumulator is calibrated against invocations that are certainly
 serial.** Two separate draws, no reset between them:
 
@@ -4177,3 +4183,108 @@ not a copy and whose purpose is undecoded.
 draw's own pixel count as a secondary check. The 3-px floor is constant across
 completely different programs, so it is an artefact and not a signal - exactly
 the trap §3.1l describes, and the reason no conclusion here rests on it.
+
+---
+
+## 11. A correct Gouraud triangle, and the A/B that finally isolates our stream
+
+### 11.1 The measurement everything before it got wrong: draw residue
+
+Every `--noclear` VRAM diff answers "what changed since the snapshot", and
+**redrawing the same triangle over itself changes nothing**. Measured, in one
+session with the vendor context live:
+
+```
+  vendor buffer, set A (big)     ->      975 dwords    <- set A was already there
+  vendor buffer, set B (small)   ->    31104 dwords
+  --ringvtx    , set A           ->    30129 dwords
+  --ringvtx    , set B           ->    31104 dwords
+```
+
+`31104` is exactly `0.5 * 288 * 216`, the area set A's NDC coordinates ask for
+under the live `(160,-120)/(160,120)` viewport. The `975` reading is the
+residue artefact, not a failure.
+
+**This invalidates a chain of conclusions drawn earlier in this same session**,
+each of which compared a run against a predecessor that had already drawn the
+same shape: that a `--ringvtx` vertex buffer draws a "sliver" where the
+vendor's own buffer draws a triangle, and therefore that *vertex buffer
+placement* was the defect. It is not. `--ringvtx` is correct, and so is the
+address the tool computes for it.
+
+**The protocol that works: alternate two visibly different vertex sets.** Never
+judge a draw against a diff whose predecessor drew the same geometry.
+
+### 11.2 A CORRECT GOURAUD TRIANGLE
+
+With the vendor's captured stream replayed in the same boot and **our own
+vertices in our own vertex buffer**, the render target holds a correct
+per-pixel-interpolated triangle:
+
+```
+  53744 px scanned, 50148 distinct colours
+  29876 px have R+G+B = 255 +/- 5
+  pure red 58 px, pure green 8 px, pure blue 109 px   (the three corners)
+```
+
+`R+G+B = 255` is the barycentric invariant for corners of pure red, green and
+blue: it holds for every interpolated pixel and for no other content in the
+buffer. 29876 matches the 30120-dword VRAM diff of that draw, and 50148
+distinct colours in 53744 pixels is per-pixel interpolation, not a flat fill.
+The area tracks the vertices exactly (§11.1).
+
+So the pipeline **does** produce correct Gouraud output on this hardware from
+our data, and the remaining gap is entirely in the command stream we generate.
+
+### 11.3 The probe cannot count invocations — §9.6 and §10 retracted
+
+The same vendor stream that renders that three-vertex triangle reads back as
+**one vertex** through the §9.5 constant-file probe (`c11` = `max(0, v0)` with
+our program bound at its `0x1100`). Both cannot be true, so:
+
+* **A constant-file write from a WARP program commits once per draw.** It
+  cannot distinguish one invocation from many. §9.6's "exactly one vertex is
+  transformed per draw packet" is **withdrawn**, and with it §10's reading that
+  the WARP runs once per primitive.
+* What §9.5 established stands: the fetch, the constants, the transform and the
+  `o0` value are all correct, read out of the hardware.
+* §10.1 stands as measured - a descriptor's dword offset is not clamped to the
+  current vertex, and offsets 5 and 10 do return vertices 1 and 2. What does
+  not follow is that this is *how* the hardware is meant to see a primitive.
+* §10.2's decode of opcode `0x83` as `emit` stands on the binary alone: dst
+  `o0` with an empty write mask, three sources, one per vertex, one vendor
+  program per vertex count, round-tripping bit-for-bit. Its *role* is now
+  unproven, since the vendor's per-draw program uses a plain `add o0` and
+  renders correctly.
+
+### 11.4 The clean A/B
+
+Same boot, same render target, same vertex buffer, same vertices, X frozen:
+
+| stream | packets | result |
+|---|---|---|
+| the vendor's captured stream | 154, all idle | **31104 dwords** - a correct triangle |
+| `gen-minimal-draw.py` transform | 27, all idle | **0 dwords** |
+| ditto with `--ctx-defaults` (all four `mtx398` groups) | 44, all idle | **0 dwords** |
+
+Neither our WARP program nor the `mtx398` context defaults account for it: the
+vendor's stream with **our** passthrough program bound at every `0x1100`
+(`--rrentry`, new) also draws nothing, so the program matters too - but our
+program is regenerated from the binary and its first bundle is byte-identical
+to the one the capture binds (`00003e00 00440000 b89a2249`).
+
+This is the first time the two paths have been compared under identical
+conditions with a sound instrument, and it is a bisection rather than a search:
+the vendor's 122 calls can be truncated toward our 27 packets until the
+triangle disappears. `tools/` now has what that needs - `--rrentry` to redirect
+a replayed stream's WARP binds, and the suffix builder that drops leading calls.
+
+### 11.5 Operational
+
+* **Never run two `hw-run.sh` invocations against the board concurrently.** One
+  freezes X while the other resumes it; the board ends up pinging but with
+  sshd unresponsive - the documented half-dead state.
+* `--unstick` clears a `0/120000` health gate without a power cycle.
+* The CPU can only *write* the first 16 MB of the framebuffer BAR, so
+  `--replayrt`'s clear silently does nothing above it and its "N px before"
+  becomes meaningless. Use `--vramdiffbase`/`--vramdiff` there instead.
