@@ -4562,6 +4562,41 @@ can write, so no MMIO recovery can work by construction. What is not yet known
 is which of them it is. Practically: one 3D draw per boot, and
 `~/tmp/nanokvm.sh reset` makes a boot cost about 45 seconds.
 
+### 12.4b SOLVED: the stall is a missing batch sync
+
+§12.4 established the engine is idle and still drawing, so it is not a hang.
+The capture's call 113, immediately **before** its draw, is the sync that
+retires the previous batch:
+
+```
+  0x1300 = 0x00000707     DWGSYNC
+  0x12bc = 0x000001a9     the tag ARMED (bit 0 set)
+  0x12bc = 0x000001a8     and immediately disarmed
+  0x12b0 = 0x3fff8842
+```
+
+Our streams emitted neither part. Writing only the disarmed tag is not the
+protocol, and `parhelia-dwgsync-family` had written the armed form off because
+bit 0 "hangs on this card" - it does *on its own*; the vendor writes both, in
+that order, in one packet.
+
+**Emitting the tag pair makes 2D survive a 3D draw**: the fill returns to
+`120000/120000` where it had read `0/120000` through every recovery §12.4
+lists. That ends "one 3D draw per boot" and the reboot it required.
+
+The `0x707` opcode is separable and must stay **off** on a cold board: its
+`0x400` bit is the *drain*, which needs the surface write-back path X arms, and
+cold it stalls the ring outright (measured: packet 33, `dwgctl=00000707`). The
+fence-only form `0x307` (`0x100|0x200` = fence surfaces A/B, no drain) is safe
+cold and is in the tool's known-good DWGCTL table - but it changes neither the
+coverage nor anything else measurable, so the tile cache is not what limits
+§12.1's 49%.
+
+`--sync` carries the tag pair (default on), `--sync-dwgctl` the opcode.
+
+**Still crashing:** four consecutive 3D draws in one boot take the board down,
+so the sync fixes 2D-after-3D, not 3D-after-3D.
+
 ### 12.5 The surface base register, and the per-boot target
 
 Under a live vendor context the base register is a **pool offset**: the capture
