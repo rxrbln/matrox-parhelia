@@ -1529,17 +1529,59 @@ anywhere in the option ROM, and `mtx1324` reads only min/max limits from PInS.
 They must be solved the way `parhelia_program_dc_clock` already does
 (`Fout = 27MHz*N*P/X/B3`) and written with the `word | bit31` load strobe.
 
-**Two hardware results that settle the point:**
+**RETRACTED (2026-09-07).** This section originally claimed that forcing the
+seven remaining registers to the vendor's values, and `0x0304 = 0x00001010`
+alone, each took the 2D instrument from 120000 px to 0. **Both results were a
+harness artefact, not hardware.** Those scripts ran
+`./3dtri --engineinit ... >/dev/null` with **no terminating action**, so main
+fell through to the built-in WARP triangle draw, which hangs and kills the
+engine until reboot - the trap already recorded in §1.2. Re-measured with
+`--dumpregs` terminating every init command:
 
-* Forcing all seven remaining registers to the vendor's measured values after
-  our init takes the 2D instrument from 120000 px to **0**.
-* `0x0304 = 0x00001010` alone does the same. Cold `0x0304` reads 0, so that
-  write is exactly "set bits 4 and 12" - the same thing the accessors do - and
-  it still breaks the engine, because those bits enable display hardware whose
-  timing has not been programmed.
+```
+cold 2D                       120000 px
+after engine + aperture       120000 px
+after 0x0304 = 0x1010         120000 px
+after all six display regs    120000 px
+```
+
+**None of them harms the engine.** The same mistake also produced a transient
+claim that the ported PLL programming and `dc_route()` broke 2D; that was the
+same fall-through. Any hardware measurement here must give every `3dtri`
+invocation an explicit terminating action.
 
 **Conclusion: the register-level ENGINE init is complete.** Everything the
 vendor does that we do not is display bring-up, which an offscreen cold 3D draw
 does not need. So the cold 3D stall at recipe packet 20 is **not** an
 engine-init gap - it has to be in the command stream or the 3D context state,
 and that is where to look next. Chasing more init registers is the wrong tree.
+
+
+## 1.2g Full vendor register parity reached - and 3D still stalls
+
+With `--engineinit --initaperture` plus the seven registers set to the values
+the vendor X driver leaves on this board, our register state matches the
+vendor's across the whole curated set, and the 2D instrument stays at
+120000/120000 px. The cold 3D replay stalls at exactly the same recipe packet
+as before.
+
+That is the clean version of the §1.2f conclusion, on valid data: **the
+register-level GPU init is complete and is not what is stopping 3D.** The
+remaining defect is in the command stream or the 3D context state.
+
+What is implemented and verified cold, `mtx` never loaded, X down:
+
+| | |
+|---|---|
+| `mtx1373` steps 1-6, 8-11, 13-16, **17-21** | ✓ |
+| §1.4 bus pair, `0x300` RMW and `0x308 = 0x83` | ✓ |
+| WARP program in the on-chip store via `0x918`/`0x91c` | ✓ |
+| constant file zeroed, 384 slots | ✓ |
+| the seven remaining vendor registers | ✓ (values measured, not derived) |
+| 2D engine after all of it | **120000/120000 px** |
+
+Still not implemented: HAL step 7 (`0x1c50` from PInS), step 12's tail
+(§1.2b), and the FS PLL *encoding* - the vendor's words for `0x0e10/0x0e14/
+0x0e1c` do not decode under the DC-clock field layout (they give VCO1 =
+1350 MHz, outside the documented window), so those values are currently copied
+rather than solved.
