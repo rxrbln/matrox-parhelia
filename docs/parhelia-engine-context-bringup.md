@@ -2661,3 +2661,22 @@ inherited capture state (a from-scratch 24-packet stream behaves identically).
 What is *not* excluded and remains untested: that the vertex count is carried
 in state established at 3D-context create which appears in no capture we hold -
 the same conclusion §3.1p reached from the other direction.
+
+### 3.1w Program termination order and the VRAM/class-0 vertex path
+
+- **`wra` before `end` vs after** - the two orderings give a byte-identical
+  276 px. Program termination order is not the cause.
+- **Vertices in VRAM addressed as class 0.** Implemented as
+  `parhelia-3dtri --vtxvram ADDR`: the vertex dwords are poked into VRAM, the
+  draw operands are set to that GPU offset, and the stream's `0x1000` is
+  patched to `0` - the arrangement `tri_secondary` uses, against the class-3
+  system-memory buffer we had always used. Result: **NO pixels drawn** at all.
+  Either the class-0 offset encoding needs something more than the raw VRAM
+  offset, or that path needs state we do not set; it is worse than class 3, not
+  better.
+- **The legacy DDA planes are not involved.** The replay stream writes 92 of
+  the `0x1160-0x1198` registers and the from-scratch minimal stream writes
+  **none**, and both produce the same sliver.
+
+`--vtxvram` is kept: a from-scratch driver will want a VRAM vertex path, and
+the option now exists to develop it against.
