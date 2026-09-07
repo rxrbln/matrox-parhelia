@@ -1426,3 +1426,41 @@ per-packet stall detector is a fixed poll budget (`--polls`, default 200000),
 so a spurious timeout has not been excluded - but the first 3D attempt wedges
 the engine, so a second measurement in the same boot is worthless. Any test of
 this needs one reboot per data point.
+
+
+## 1.2d Cold 3D bring-up: two missing context steps found and implemented
+
+Both are things the vendor's context create does that a captured stream silently
+assumes, and neither was in our path.
+
+**1. The WARP instruction store was empty.** §3.1b already said it -
+"replaying a captured stream on a cold card can never work: the instruction
+store is empty" - but our `--warpprog` used the *heap* path (entry =
+`4*(bus/12) | 3`), which `0x920` bit 0 = 1 selects. Cold, `0x920` reads 0, so
+the hardware was looking at the on-chip store. `--warpstore` now uploads
+through the documented window (`0x918` = instruction index, `0x91c` = data
+port, 3 dwords per instruction) and yields the boot-independent entry
+`4*instrIndex + 4*entryOff`.
+
+**2. The constant file was never zeroed.** `mtx3107` zeroes all **384 slots**
+at context create; our recipe loads 34, leaving 350 holding undefined cold
+state. `gen-stream.py --zeroblocks` prepends twelve 32-slot zero loads.
+
+**Measured effect, cold, `mtx` never loaded:**
+
+| configuration | cold 3D replay |
+|---|---|
+| neither | stalls at a **varying** packet - 14, 20, 21 across identical runs |
+| `--zeroblocks` only | stalls at packet 2, i.e. on a zeroing load itself |
+| `--warpstore` + `--zeroblocks` | **deterministic**, stalls at recipe packet 20; all 12 zeroing loads pass, `0x41c = 0x1a0` (syncs retiring) |
+
+The remaining stall is **positional, not slot specific**: removing the block
+load at slot `0x149` with `--skipblocks 0x149` moved nothing - the next load
+takes its place at the same recipe packet. So it is not a bad constant address;
+something becomes true after a fixed amount of the recipe.
+
+Still unimplemented and still candidates: HAL step 12's tail (§1.2b), the
+per-chipset `mtx3376` fixups, HAL step 7, and the aperture block. Also unproven:
+whether the per-packet doorbell stepping (`--polls`, default 200000) is itself
+declaring a false stall - the first cold 3D attempt wedges the engine, so each
+data point costs a reboot.
