@@ -1510,3 +1510,36 @@ writer has not been located yet.
 **Remaining gap for cold 3D, precisely:** `0x0304`, the FS PLL trio, `0x1a00`,
 `0x1c04` bit 8, and `0x1c00` bits 0 and 4 - each to be implemented with its own
 sequence, plus HAL step 12's tail (§1.2b).
+
+
+## 1.2f The remaining init diff is ALL display — the engine init is complete
+
+Following each of the six registers into the vendor binaries rather than
+copying its value:
+
+| reg | what it is | evidence |
+|---|---|---|
+| `0x0e10`, `0x0e14`, `0x0e1c` | **PLL0, PLL1, PLL3** - `PARHELIA_PLL(n) = 0x0e10 + n*4`, i.e. pixel clocks | `src/parhelia_reg.h`; `[XDRV] mtx1324` builds the FS descriptor `0xe10 + fs*4` with frequency limits from PInS |
+| `0x1a00` | display head 1 enable (bit 18 = PLL locked) | our own modeset code |
+| `0x1c00` bits 0/4, `0x1c04` bit 8 | DC clock controllers | §1.2 steps 2/3 and `parhelia_program_dc_clock` |
+| `0x0304` | a **bit-flag** register with paired accessors in the display code: `[XDRV] mtx1250` clears bit 0, `mtx2734` sets bit 0, `mtx2140` clears bit 4 | `0xf5c70`-`0xf5d30`, adjacent to the clock-division helpers |
+
+The PLL words are **computed, not stored** - none of the vendor's three appears
+anywhere in the option ROM, and `mtx1324` reads only min/max limits from PInS.
+They must be solved the way `parhelia_program_dc_clock` already does
+(`Fout = 27MHz*N*P/X/B3`) and written with the `word | bit31` load strobe.
+
+**Two hardware results that settle the point:**
+
+* Forcing all seven remaining registers to the vendor's measured values after
+  our init takes the 2D instrument from 120000 px to **0**.
+* `0x0304 = 0x00001010` alone does the same. Cold `0x0304` reads 0, so that
+  write is exactly "set bits 4 and 12" - the same thing the accessors do - and
+  it still breaks the engine, because those bits enable display hardware whose
+  timing has not been programmed.
+
+**Conclusion: the register-level ENGINE init is complete.** Everything the
+vendor does that we do not is display bring-up, which an offscreen cold 3D draw
+does not need. So the cold 3D stall at recipe packet 20 is **not** an
+engine-init gap - it has to be in the command stream or the 3D context state,
+and that is where to look next. Chasing more init registers is the wrong tree.
