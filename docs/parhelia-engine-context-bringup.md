@@ -4063,3 +4063,117 @@ something structural. Two candidates, in order:
 The cheapest discriminator between the two is to submit **three draw packets**
 for one triangle, each pointing at a different vertex, and check whether `c12`
 accumulates all three maxima. That needs no new RE and no new registers.
+
+## 10. One invocation per primitive — the fetch proves it, `emit` is its output op
+
+§9.6 measured that exactly one vertex is transformed per draw. The obvious
+reading was that the vertex fetch is broken. It is not: the fetch is
+**per-primitive**, and it was our attribute declaration that only ever asked
+for one vertex.
+
+### 10.1 A descriptor addresses the whole vertex buffer
+
+`gen-minimal-draw.py --descs` (new) sets the `0x10b8` list explicitly. The
+descriptor's low half is a **dword offset << 4**, and it is not clamped to one
+vertex - with a 5-dword vertex, offset 5 is the *next* vertex and offset 10 the
+one after. Measured through the §9 block-file probe, one draw per row, health
+passing on every one:
+
+| descriptor | reads back as | that is |
+|---|---|---|
+| `0xa0c200a0` v2 <- dword 10 | `(0, 0.8, 0, 1)` | **vertex 2**'s position |
+| `0xa0c20050` v2 <- dword 5 | `(0.8, -0.8, 0, 1)` | **vertex 1**'s position |
+| `0x20c10050` v1 <- dword 5 | `(1, 0, 0, 1)` unchanged | **v1 refuses a descriptor** |
+
+`v1` does not accept one whether it is marked last or not, while `v0`, `v2`,
+`v3`, `v4` and `v5` all do - an unexplained register-specific quirk, recorded
+because it cost a run.
+
+With six descriptors declaring three positions and three colours, a single WARP
+invocation transforms **all three vertices correctly**:
+
+```
+  c8  = 102.4 691.2 0.5 768     vertex 0
+  c9  = 921.6 691.2 0.5 768     vertex 1
+  c10 = 512   76.8  0.5 768     vertex 2
+```
+
+all three exactly as predicted from the NDC inputs and the viewport constants.
+So the hardware is **one WARP invocation per primitive**, with every vertex of
+that primitive declared as its own attribute pair - which is precisely what
+§3.1aj's "sixteen vertex-copy programs reading `v0..v(2k-1)`" are: *k vertices
+x two registers*, not k attributes.
+
+**The draw header's `bits[22:17]` is a vertex-size field, not a count.**
+Setting it to 2 instead of 4 with everything else identical makes the fetch
+return zero (`c8 = (0,0,0,1)`, `c9` the bare viewport offset), rather than
+adding vertices. §3.1n's reading stands and the count is not there.
+
+### 10.2 Opcode 0x83 is `emit` — the vertex output instruction
+
+Disassembling the copy programs shows what a per-primitive program does with
+its vertices. `vprog-163114`, the four-vertex one:
+
+```
+  add T0, v0.www0, v0.xyz0
+  add T1, v2.www0, v2.xyz0
+  add r2, v4.www0, v4.xyz0
+  add r3, v6.www0, v6.xyz0
+  emit o0., T0, v1, v0        <- opcode 0x83, dst o0 with an EMPTY write mask
+  emit o0., T1, v3, v0
+  emit o0., r2, v5, v0
+  emit o0., r3, v7, v0
+  end
+```
+
+Three facts follow, and the register pairing is the giveaway: `(v0,v1)`,
+`(v2,v3)`, `(v4,v5)`, `(v6,v7)` - **position in the even register, colour in the
+odd one, one pair per vertex**, exactly the layout §10.1 measured the fetch can
+deliver.
+
+* Opcode `0x83` takes three sources - transformed position, that vertex's
+  colour, and `v0` - and its destination is `o0` with **mask 0**. A masked-off
+  destination is not a register write; it is a **port push**. One `emit` per
+  vertex is how a primitive leaves the WARP.
+* `vprog-163014` emits **2** vertices, `vprog-163094` **3**, `vprog-163114`
+  **4** - one program per primitive size. That is the whole "sixteen
+  vertex-copy programs" library explained.
+* Our programs wrote `add o0, T1, r1.0000`, an ordinary register write, so
+  three of them simply overwrote one register - which is exactly the
+  one-vertex-reaches-setup symptom.
+
+Added to the tools: `emit` in `parhelia-warpdis2.py`'s `PRIMARY` table, and
+`maskA`/`maskB` raw field overrides in `parhelia-warpasm.py` so the empty mask
+is expressible. It round-trips bit-for-bit against the vendor image:
+
+```
+  emit o0, T0, v1, v0 {maskB=0,f2b=0}  ->  08080200 00440100 419a21a2
+  vendor vprog-163094 instruction 4    ->  08080200 00440100 419a21a2
+```
+
+### 10.3 `emit` alone does not yet rasterise
+
+Three configurations, each health-gated at 120000/120000 with all 27 packets
+idle, all give the same **3 px at x 166..176, y 38..38** that a null draw gives:
+
+| program | descriptors | result |
+|---|---|---|
+| transform x3 then 3 `emit`s, colour at v5/v6/v7 | pos 0/5/10, col 2/7/12 | 3 px |
+| transform x3 then 3 `emit`s, vendor pairing | `(v0,v1)(v2,v3)(v4,v5)` | 3 px |
+| three bare `emit`s, window-space verts, no transform | vendor pairing | 3 px |
+
+In all of them the block-file probe confirms the three positions were computed
+correctly, so the program runs and the fetch is right; the vertices are not
+reaching the setup unit. What is still missing is whatever arms the port -
+candidates in order: the `0x1110`/`0x1114`/`0x1118` VTXFMT triple, which
+describes the WARP *output* set and is the only per-draw state that could tell
+setup how many vertices to expect (the capture writes `0x1110 = 0x00000f27`
+in the context phase and `0x00000003` per draw, and we emit only the latter);
+the `emit` operand roles, of which only the position is understood; and the
+`add T0, v0.www0, v0.xyz0` preamble the vendor runs before every emit, which is
+not a copy and whose purpose is undecoded.
+
+**Method note.** Every result in §10 was read out of the block file with the
+draw's own pixel count as a secondary check. The 3-px floor is constant across
+completely different programs, so it is an artefact and not a signal - exactly
+the trap §3.1l describes, and the reason no conclusion here rests on it.
