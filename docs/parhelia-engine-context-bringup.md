@@ -1631,11 +1631,32 @@ odd `0x12bc` write arms block-until-retire; `0x41c` sat at `0x1a0` waiting for
 `0x1a8`, forever. The sync is ordering only and not needed to draw, so
 `--nosync` drops the whole group (31 register writes).
 
-**What still does not work: the draw rasterises nothing.** All packets retire,
-the engine is idle, and no pixels appear at the bound colour surface
-(`0x1220 = 0x02000000`) or anywhere else scanned. Proven not to be ours by
-colour rotation: two different vertex files give byte-identical VRAM content,
-so the 8051 non-zero dwords at `0x2000000` are static, not rendered.
+**AND IT RASTERISES.** On a genuine cold boot, with the render target placed
+**below 16 MB**:
+
+```
+after --vramzero        0 px
+draw with px-red     8051 px
+draw with px-white   8824 px, different colours
+```
+
+Different vertex data gives a different pixel count and different colours, so
+these are ours. De-tiled it is a clean triangle, bbox x 1..271, y 0..191.
+
+**A triangle now renders from our own command stream on a cold engine with no
+vendor code in the path at all** - no `mtx`, no X, no ICD.
+
+**The render target must be below 16 MB.** That is the same boundary as the CPU
+write limit ([[parhelia-bar0-16mb-write-limit]]): HAL step 12's 44-entry PInS
+table programs memory controllers 1, 2 and 3, and without it only the low bank
+appears usable. With the RT at `0x02000000` the draw retires but nothing
+appears.
+
+**A trap that cost a wrong conclusion:** an earlier run concluded "the draw
+rasterises nothing, proven by colour rotation". That test scanned
+`0x02000000`, where `--vramzero` silently does nothing because CPU writes above
+16 MB are dropped - so it compared two uncleared leftovers and found them
+identical. Always clear and scan below 16 MB, or verify the clear took.
 
 **Method note.** `reboot -f` is a WARM reboot: the VBIOS re-POSTs enough to
 restore 2D, but the WARP instruction store and the constant file are not
