@@ -4655,3 +4655,51 @@ the same granularity `docs/parhelia-surface-address-translation.md` §1.1
 derives for the allocator from `1920 * roundup(1200,32) * 4`; what is new is
 that it applies to what the engine will *write*, not only to how much memory is
 reserved.
+
+### 12.7 PROVEN with a sound instrument: only vertex 0 is fetched
+
+Position-as-colour makes the rasterised geometry readable without any
+de-tiling: the pixel's red and green channels *are* the interpolated NDC
+position. Four triangles through the same stream, cold, health-gated, all
+packets idle:
+
+| fed vertices | pixels |
+|---|---|
+| `(0.05,0.05) (0.95,0.05) (0.50,0.95)` | 16420 |
+| `(0.05,0.05) (0.95,0.05) (0.05,0.95)` | 16420 |
+| `(0.05,0.05) (0.35,0.05) (0.05,0.75)` | 16420 |
+| `(0.02,0.02) (0.98,0.02) (0.02,0.98)` | 20853 |
+
+The first three differ in `v1` and `v2` and are **byte-identical**; the fourth
+differs in `v0` and changes. In every case the covered region runs from `v0` to
+a *fixed* endpoint at NDC `(0.400, 0.800)` - window `(716.8, 76.8)` - and the
+third case covers NDC out to `0.400/0.800` although it was fed a triangle that
+stops at `0.35/0.75`, so the shape is not the fed triangle at all.
+
+**Only `v0` reaches the setup unit.** §3.1f's original "only vertex 0 is
+fetched", withdrawn in §3.1n for resting on contaminated pixel counts, is
+reinstated - this time on an instrument that cannot be fooled by residue,
+de-tiling or a wrong render target.
+
+The front of the pipeline is not at fault: §12.1's probe reads `v0` and its
+window position back exactly, and the vendor's own stream draws all three
+vertices from the *same* `--ringvtx` file through the *same* tool.
+
+**Excluded for the vertex count, all retested with the working render target
+and the §12.4b sync in place** - every earlier test of these was void because
+it ran during the broken-target era:
+
+* the eight stream bases and four stride pairs (`--zero-streams`)
+* the descriptor-list terminator (`--zero-descs`)
+* the five stage entries (`--stages`)
+* the depth surface (`--depth-base`)
+* all four of those together
+* `0x1040` as a real byte stride - `20` draws **nothing**, `5` is refused;
+  the capture's `4` is not a byte stride and changing it does not help
+* the grid snap of §12.2
+
+What remains unreplicated is the vendor's **program-selection table**, the
+`0x4106000f` block load between bind #1 and bind #3 whose body is `0,1,2,3`
+plus two `0x1130` words and a WARP entry - the annotated capture's own
+"mechanism by which the vendor binds a *set* of programs rather than one".
+`--progtable` now emits it.
