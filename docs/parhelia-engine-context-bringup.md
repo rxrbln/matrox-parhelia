@@ -4764,3 +4764,50 @@ one vertex is not a register we have identified, and the next thing to try is
 the one structural difference left: replaying the capture with our packets
 spliced in (`tools/ring-crossover.py`, already written) to find which of the
 vendor's 122 calls the count depends on.
+
+## 13. Texturing: first hardware test, and where it fails
+
+`gen-minimal-draw.py --texture BASE,W,H` (§10 of this file's companion recipe,
+`docs/parhelia-textured-draw.md`) went on hardware for the first time. It draws
+**nothing**, and the failure bisects to a single register.
+
+**The vertex side is fine.** The seven-dword `x,y,r,g,b,s,t` vertex and the
+third descriptor `0xa0c70050` (texcoord to `v7` at dword 5) work: the same
+stream with those and the *plain* combiner, no texture unit, draws **62581 px**.
+
+**The combiner is not the cause.** `--tex-combiner 0` keeps the plain
+interpolated-colour program while still binding the sampler: **no pixels**. So
+the two-slot `GL_MODULATE` program of `parhelia-textured-draw.md` §3.1 is not
+what breaks it.
+
+**It is the sampler window, and specifically enabling the unit.**
+`--texgroups N` emits only the first N groups of the eleven-register window:
+
+| emitted | result |
+|---|---|
+| 1 - `0x1200 = 0x00040103` only | **no pixels** |
+| 2 - plus `0x11dc`/`0x11e0`/`0x11e4` | no pixels |
+| 3 - plus the filter/wrap/border group | no pixels |
+| 4 - plus `0x1204 = 0x0001000c`, `0x1208`, `0x120c` | no pixels |
+
+Group 1 alone is enough to kill it. Note the base stream leaves
+`0x1200 = 0x0001000f` (unit 0 *disabled*, claiming all four pipes) and
+`0x1204..0x120c = 0`, so with group 1 alone the one-hot pipe union is `0x3`
+rather than the `0xf` §2.2 of the textured-draw recipe requires - but restoring
+the union at group 4 does **not** bring the pixels back, so the union rule is
+not the whole story either.
+
+**Excluded:** the tiling code. Every vendor texture carries a non-zero tiling
+field and ours was linear (`0`), which the recipe marks `[INF]`, never
+exercised; `--textiling 2`, matching every capture, behaves identically.
+
+**Not yet tried**, in order: `0x11e8`, the texture-cache partition - the recipe
+records that the Linux GL path never emits it for one or two stages while
+MTXPARD's table gives `0x00500000`, so a cold context may need it where a
+vendor-initialised one does not; and `0x12f4 = 0x42000000`, the guard band the
+recipe ties to "<= 2 stages", which our stream writes only under
+`--ctx-defaults`.
+
+This is an honest partial result: texturing is implemented, on hardware, and
+the failure is localised to one register of one group rather than to the
+feature as a whole.
