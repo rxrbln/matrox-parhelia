@@ -2098,3 +2098,56 @@ components would take `y` from `0x1124` and push it off-screen. The component
 count field in the `0x10b8` descriptor (`0x20c00000` position, `0xa1c50020`
 colour, `0xa0c70050` texcoord) is not yet decoded - only the `offset << 4`
 low half and the `0xc0 | reg` destination are confirmed.
+
+### 3.1h The `0x10b8` component-count field, and the output is not hiding
+
+**Descriptor layout, from the four values the recipe uses:**
+
+| descriptor | bit31 last | bit29 | bits 28:24 | reg (`0xc0\|n`) | offset `<<4` |
+|---|---|---|---|---|---|
+| `0x20c00000` position | 0 | 1 | **0** | v0 | 0 |
+| `0xa1c50020` colour | 1 | 1 | **1** | v5 | 2 |
+| `0xa0c70050` texcoord | 1 | 1 | **0** | v7 | 5 |
+| `0x83c00000` block load | 1 | 0 | **3** | v0 | 0 |
+
+Bits 28:24 read as **component count minus one**: the block-load descriptor is
+field 3 and its sub-header is exactly the four dwords `[count][first][1][0]`,
+and the colour is field 1 and measurably reads three dwords (a vertex
+`(x,y,0.0,1.0,1.0)` renders `ff00ffff`). That makes the recipe's **position
+descriptor field 0, i.e. one component**, which would take `y` from the
+VTXDEFAULT guard band `0x1124 = c5ff45ff` (~-8168) and push it off-screen -
+matching the observed `y` collapse.
+
+`gen-stream.py --posdesc N` rewrites that field. **Measured, it is not the
+fix** (`g1-big`, full scissor, passthrough program):
+
+| position field | components | result |
+|---|---|---|
+| 0 (recipe) | 1 | 120 px, bbox x 0..1913 y 0..228 |
+| 1 | 2 | 120 px, identical bbox |
+| 2 | 3 | 120 px, identical bbox |
+| 3 | 4 | 52 px, bbox x 0..1848 y 0..98 |
+
+So the count field is decoded but changing it does not restore geometry.
+
+**The output is not landing outside the scanned window.** Clearing and
+scanning 56 MB in nine safe `0x700000` chunks (a single 64 MB operation
+crashes the box) after one draw finds only:
+
+```
+base 0x0        106400 px 0000ff00   the 2D health fill
+base 0x700000    13600 px 0000ff00   remainder of it (sums to 120000)
+base 0x2a00000      120 px ff00ffff   our draw, inside the bound RT
+```
+
+Nothing anywhere else. The draw really does emit ~120 pixels, so every "sparse
+output" result is real and not a de-tiling or scan-window artefact.
+
+**Remaining suspicion, untested:** `0x1110`/`0x1114`/`0x1118` (VTXFMT0/1/2)
+describe the WARP *output* set handed to the setup unit. The recipe leaves
+`0x1114 = 00287210` and `0x1118 = 00006543` from the capture, which belong to
+the vendor's program writing `o0`, `o1`, `o11` and `o3..o6`; our passthrough
+writes only `o0` and `o1`. A setup unit expecting outputs the program never
+writes would read stale registers for position, which fits every symptom. Note
+that adding or removing the `o11` clip write changes nothing, so the setup is
+not consuming `o11` either.
