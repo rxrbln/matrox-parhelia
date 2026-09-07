@@ -2397,3 +2397,50 @@ different topology. The first gouraud-quad attempt drew nothing because of it.
 
 **Draw budget:** with these minimal streams a boot yields about two usable
 draws; the third consistently leaves the 2D health fill at 0/120000.
+
+### 3.1o Gouraud interpolation works cold; the geometry does not
+
+Giving each vertex a distinct colour turns the drawn pixels into a probe of
+which vertices reach the rasteriser. Position is two components, so vertex
+dwords 2,3,4 carry `r,g,b` (§3.1n).
+
+```
+quad  v0 red, v1 green, v2 blue, v3 yellow
+  -> 344 px:  ff00ff00 x276  (green = v1)
+              ff00ffff x68   (cyan - NOT a vertex colour: green blended with blue)
+
+tri   v0 red, v1 green, v2 blue
+  -> 120 px:  ffff0000 x52   (red = v0)
+              ff00ffff x68   (cyan = green blended with blue)
+```
+
+**Cyan is not any vertex's colour.** It is `(0,1,1)`, exactly `v1` green
+blended with `v2` blue. So on a cold engine with no vendor code the hardware is
+fetching multiple vertices, handing their colours to the WARP, and the
+rasteriser is **interpolating between them** - the colour half of the gouraud
+path works end to end.
+
+What is wrong is only the geometry: the interpolated region is a few dozen to a
+few hundred pixels instead of the hundreds of thousands the vertices describe.
+
+**`0x12fc` RASTERMODE is not the cause.** `mtx398`'s context default of `0`
+(against the capture's per-draw `0x0bb80024`) gives a byte-identical 344 px.
+
+**The identified, still-unimplemented gap is `mtx398`'s context-create default
+register set** (`parhelia-3d-submission-audit` line 483 already records it as
+"not implemented"). Neither our streams nor the vendor *capture* write these -
+they are set when the 3D context is created, before any trace we hold:
+
+| register | `mtx398` | our streams |
+|---|---|---|
+| `0x11e8` | `0x100000` | **never written** |
+| `0x12c0` / `0x12c4` | `0xffffffff` / `0x7fffffff` | as captured |
+| `0x12c8` / `0x12cc` / `0x12d0` / `0x12d4` | `0` / `0` / `0xffff` / `0x1ff` | `001000e4` / `ff` / `ff` / `0` |
+| `0x12fc` | `0` | `0bb80024` (tested, no effect) |
+| `0x1324` | `0xffffffff` | as captured |
+| `0x132c` | `0x10001000` | `03840780` |
+
+`0x12d0` is the stencil write mask plus **bit 8 = depth-write enable**:
+`mtx398` writes `0xffff` (bit 8 set), we write `0xff` (clear). That whole set
+is the next thing to implement, from `mtx398` `0x32a91-0x32c62`, rather than
+guessed one register at a time.
