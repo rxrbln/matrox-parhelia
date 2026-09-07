@@ -2316,3 +2316,39 @@ That difference reproduces on a fresh boot and is not a pixel count, so it
 stands: **program content changes engine behaviour, therefore the WARP does
 execute cold.** Use stall/packet counts, not pixel counts, to discriminate
 WARP variants until the pipeline produces an output of unambiguous magnitude.
+
+### 3.1m Coordinate scale sweep, and what the drawn primitive actually is
+
+**Scale sweep** (same triangle `(400,300),(1400,300),(900,900)` multiplied by
+`s`, passthrough program, full scissor, all 43 packets idle):
+
+| s | 0.001 | 0.01 | 0.0625 | 0.25 | 1 | 4 | 16 | 64 |
+|---|---|---|---|---|---|---|---|---|
+| px | 68 | 0 | 2 | 8 | 52-121 | **390** | **563** | 66 |
+
+`s = 4` and `s = 16` are clearly above the 52-121 noise band, so the primitive
+does grow with coordinate magnitude, but the response is not monotonic and
+peaks near `s = 16`. `s >= 256` could not be measured: the `s = 64` draw left
+the 2D fill drawing 0/120000 and every later run was refused.
+
+**The "line to `v0/3`" model is refuted.** Scaling `v0` by 3 does not move the
+endpoint to `v0`:
+
+| `v0` | endpoint | ratio | slope of `v0` | slope of line |
+|---|---|---|---|---|
+| (400,300) | (132,99) | 3.03 | 4/3 | 4/3 |
+| (1200,900) | (700,525) | 1.71 | 4/3 | 4/3 |
+
+So the divisor is not constant and the earlier `/3` reading was a coincidence
+of one data point.
+
+**What is reproducible** is that the drawn primitive is a straight line from
+the origin whose **direction matches `v0` exactly** - the slope is `v0.y/v0.x`
+in every measurement - with a length that is some saturating function of
+`|v0|`, and with `v1`/`v2` having no effect at all (three identical vertices
+give the same output as three distinct ones). The pixels are laid down as
+evenly spaced pairs, `(4k, 3k)` and `(4k+1, 3k+1)` for the 4/3 case.
+
+That is the signature of a primitive assembled from `v0` and the origin, not
+of a triangle. Whatever consumes the WARP's position output is receiving one
+real vertex and zeros for the other two.
