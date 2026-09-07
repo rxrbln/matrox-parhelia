@@ -2608,3 +2608,29 @@ simply the surviving vertex either; only its *direction* is reproduced.
 This is consistent with the rasteriser receiving a primitive whose other
 vertices are all `(0,0)`, i.e. a degenerate wedge, rather than with a line
 primitive between two real vertices.
+
+### 3.1u Correction: the surviving index tracks the topology, not the count
+
+§3.1t's "third from last" rule is **withdrawn**. It was fitted to two points
+(quad 4-3=1, tri 3-3=0) and fails on the third: a five-vertex buffer through
+the quad stream still draws `v1`, not index 2.
+
+| stream | `0x10b0` topology | vertices supplied | index drawn |
+|---|---|---|---|
+| `min` tri | 3 | 3 | `v0` |
+| `minq` quad | 6 | 4 | `v1` |
+| `minq` quad | 5 | 5 | `v1` |
+| `minq` quad | 8 | 8 | `v1` |
+
+So the surviving vertex is a function of the **stream's declared topology**,
+not of how many vertices the buffer holds - consistent with §3.1s, where
+doubling the buffer changed nothing.
+
+**A note on method, because this is the third rule in a row fitted to two
+points that then failed** (`v0/3`, "writing `o0` last matters", "third from
+last"): with one draw per boot, two samples are cheap and three are not, and
+every one of these rules survived two and died on three. State the measurement,
+not the rule, until a prediction has held on a case chosen to break it. The one
+model that did survive such a test is §3.1r's - the rotated-quad direction and
+colour, predicted before the run - and even that turned out to be the
+topology-specific special case recorded here.
