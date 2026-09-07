@@ -4327,6 +4327,33 @@ not known whether the depth binding helps, nor which of the two variants - the
 bound surface at an arbitrary VRAM address, or the in-stream `0x11f4` write -
 was responsible. Treat both as suspect until one is run alone.
 
+### 11.4c The positive control was reading the wrong VRAM
+
+The §11.4 A/B - vendor stream 31104 dwords, our stream 0 - does not reproduce
+across boots, and the reason is not the streams. `tools/prep-draw.sh` step 2
+wrote `0x2f00000` into `rt.txt` **as a literal**, directly underneath its own
+comment saying "the render target is allocated per boot, so a cached address
+from an earlier boot points at unrelated VRAM and every diff there reads zero".
+It never scanned.
+
+On the next boot the vendor stream - the positive control - therefore also read
+**0**, which is the only reason the mistake surfaced at all. Any diff taken at
+`0x2f00000` in a boot that allocated the surface elsewhere is void, and that
+includes our stream's 0 in §11.4: it is not evidence that our stream draws
+nothing, only that nothing was drawn *there*.
+
+`prep-draw.sh` now replays the capture with a known vertex set and finds the
+VRAM it actually changes, in `0x700000` chunks. **Chunk size matters:** a
+single `--vramdiff` of `0x3000000` took the board to the half-dead state, as
+the notes already record for `0x4000000`. Never diff or zero tens of megabytes
+in one call.
+
+Note the surface registers make this unavoidable rather than merely awkward:
+the capture binds `0x1220 = 0x02000000` while the pixels land near
+`0x2f65000`, so the value in the register is not the address the engine writes
+(`parhelia-render-target-location`). Until that offset is decoded, the render
+target has to be found by measurement every boot.
+
 ### 11.5 Operational
 
 * **Never run two `hw-run.sh` invocations against the board concurrently.** One
