@@ -3141,3 +3141,28 @@ colour to `o1`), window-space quad (200,150)-(800,600) in a 1024x768 target:
 port-B-0 alternative reading is excluded. The defect stays where §3.1ad puts
 it: `v0` arrives intact, `o1` reaches setup, `o0` does not carry geometry that
 the rasteriser honours.
+
+### 3.1al Stage entries bound to the matching vertex-copy program: no change
+
+Our attributes span `v0..v5` (position at `v0`, colour at `v5`), which matches
+`vprog-163094` exactly - the recovered copy program that reads `v0..v5`. Bound
+to all five stage entries (`0x10c8`-`0x10d8`, uploaded at store index 128 so
+the entry is `0x200`), with the passthrough as the per-vertex program and the
+window-space quad in a 1024x768 target:
+
+```
+  no stages bound                 111 px
+  stages -> vprog-163094 @0x200   111 px
+```
+
+Identical. The stage entries are not what limits the draw either, and the
+vertex-copy programs are not a missing link in the render path.
+
+**Running exclusion list for the `o0` -> setup defect**, all measured with the
+fence, the one-attribute pipe and the corrected de-tiler in place: the vertex
+range length, the draw packet length field, `0x1040`, `0x1060`, the descriptor
+terminator and component count, WARP program contents, length, output set,
+output order and termination order, `o11` as the position destination, the
+stage entries, `mtx398`'s context defaults, `0x12fc`, the scissor, the surface
+width, the class-0 VRAM vertex path, the vendor's own constants, the vendor's
+own replayed stream, and the recovered constant loaders.
