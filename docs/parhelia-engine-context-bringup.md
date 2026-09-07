@@ -2818,3 +2818,37 @@ passthrough path does not carry over.
 
 That is the sharpest open contradiction in the current picture and probably the
 right thread to pull next.
+
+### 3.1ab The de-tiler was wrong: 16 tiles per row, not 30 — SOLVED
+
+The 2D fill is a known-geometry control: it draws exactly 400x300 = 120000 px
+and the engine reports that count itself. De-tiled with the 30-tiles-per-row
+rule this project has used throughout, it comes out as **192 rows of 344..800
+px** instead of 300 rows of 400 - so the de-tiler was wrong.
+
+Solving the layout against those 120000 known-good addresses (searching tile
+geometry, tiles-per-row and in-tile model for the assignment that makes the
+fill exactly 400 wide and 300 tall) gives a single exact answer:
+
+```
+  tile 64x32, 8192 bytes, in-tile swizzle as documented, TILES PER ROW = 16
+      -> spans exactly (400, 300)          [next best: 432x304, wrong]
+```
+
+The in-tile bit assignment was right all along - the 8-pixel contiguous runs
+with 32/64-byte gaps in the raw addresses confirm it - only the tile-row width
+was wrong. A tile row therefore covers 16 * 64 = 1024 px, not the 1920 or the
+next-pow2 2048 that `parhelia-rendertarget-tiling` assumes.
+
+**What this invalidates.** Every de-tiled coordinate reported in §3.1f, §3.1r,
+§3.1t, §3.1u and §3.1aa was computed with TPR = 30. Specifically the
+"primitive runs from the origin to `v1`, direction matching exactly" model and
+its rotated-quad prediction are **void**: both the measured slope and the
+predicted one came out of the wrong transform. The *conclusion* that the
+primitive is a thin sliver survives - re-de-tiled correctly the 411-px
+transform quad is still 196 rows of 1..3 px, x 0..317, y 0..581 - but every
+numeric claim about which vertex it points at must be re-derived.
+
+**Method note:** the 2D fill was available as a known-geometry control from the
+first day and would have caught this immediately. Validate the instrument
+against a draw of known shape before trusting any geometry it reports.
