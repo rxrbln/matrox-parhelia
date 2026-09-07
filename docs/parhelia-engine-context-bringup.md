@@ -4816,3 +4816,135 @@ missing piece.
 This is an honest partial result: texturing is implemented, on hardware, and
 the failure is localised to one register of one group rather than to the
 feature as a whole.
+
+## 14. What the binaries settle, and the one thing they do not
+
+Three focused reverse-engineering passes over `mtx_parhelia.o`, `mtx_drv.so`
+and `MTXPARD.dll`, cross-checked against the capture.
+
+### 14.1 The vertex count mechanism is exactly what we already do
+
+For an address-mode (`0x17`/`0x97`) draw the hardware fetches
+
+```
+nVertices = (end - start) / (dwordsPerVertex * 4)
+```
+
+with `dwordsPerVertex-1` in header bits[22:17]. **There is no vertex-count
+register.** Three independent builders agree: `mtx1017` @`0x60e0` (the GL path
+in our capture; header built at `0x6746`-`0x678e`), `mtx1385` @`0x4a441`, and
+`mtx2393` @`0x3c6bc`, which reserves `0x20` bytes and emits `0x17000001` -
+1 dword per vertex, 8 elements - an independent confirmation that the range
+alone is the count. Our packet is byte-identical to the vendor's, so **the
+count mechanism is not where our defect lives.**
+
+**This retracts §3.1az.** `mtx1017`'s second jump table (`.rodata+0x200`,
+indexed by the *internal* primitive id in `ctx[0x41c]`, not the GL enum) sends
+`GL_TRIANGLES` to `0x6b0c`, the plain sequential walker - the same one points,
+lines and quads use. The vendor does **not** decompose a triangle list in
+software; it copies the vertices through and issues one `[hdr][start][end]`.
+Only strips, fans, loops and quad strips get a re-emitting walker
+(`0x6920`/`0x6b70`/`0x6b3a`). So per-mode decomposition cannot explain our
+one-vertex triangle either.
+
+### 14.2 `0x1110` is a presence bitmask over attribute KINDS — and ours was wrong
+
+`mtx2714` @`0xb7b1` puts the attribute **kind** in `0x10b8` bits **[19:16]**
+(the existing `[16:12]=A / [19:17]=B` split in
+`docs/parhelia-draw-builders-kernel.md` mis-reads the nibble position).
+`mtx2433` @`0x2b5b0` maps kind to a bit through the jump table at
+`.rodata+0x16c8`, and `mtx3400` @`0x43c54` emits the accumulated mask:
+
+| kind | 0 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|
+| bit | `0x0001` | `0x0002` | `0x0004` | `0x0100` | `0x0200` | `0x0400` | `0x0800` |
+
+The capture's two descriptors are kinds 0 and 5 and it writes `0x1110 = 3` -
+an exact cross-check. The context-phase `0x00000f27` is every kind but 4.
+
+Our generator hard-coded `3`, which is right for the two-descriptor vertex and
+**wrong for every textured path**, whose third descriptor `0xa0c70050` is kind
+7 and needs `|0x0100`. Now computed from the descriptors: `0x0003` untextured,
+`0x0103` textured. It does not fix texturing, but it was a real defect.
+
+### 14.3 `0x1120`-`0x112c` are the CLIP VOLUME, not vertex defaults
+
+`mtx1658` @`0x87bb0`, `mtx2747` @`0x87c20` and `mtx2898` @`0x88e60` write
+`ctx+0x5f8..0x604`, which `mtx3400` emits under tag `0x4b4a4948`:
+
+```
+0x1120 = (bf16(x_max) << 16) | bf16(x_min)
+0x1124 = (bf16(y_min) << 16) | bf16(y_max)     <- halves REVERSED vs 0x1120
+0x1128 = float z_min        0x112c = float z_max
+```
+
+x and y are bf16 (the top 16 bits of the float); z is two full floats.
+`mtx2301` @`0x87ce6` passes `.LC14/.LC13 = +/-8160.0f`, reproducing the captured
+`0x45ffc5ff` / `0xc5ff45ff` bit-exactly **including the asymmetry**, which is
+now explained rather than mysterious. A second path @`0x87e26` programs a real
+rectangle from the drawable extent, so the units are **window pixels**.
+
+So they are not "VTXDEFAULT" and not per-component defaults: the old note that
+"the missing `y` comes from `0x1124`" is wrong, and the `0,0,0,1.0f` seen in a
+priming capture is just the shadow's constructor default (`0x42080`). Rename
+them `CLIP_X`, `CLIP_Y`, `CLIP_ZMIN`, `CLIP_ZMAX`. Anything that *computes*
+these rather than replaying the vendor dwords must reverse the y halves or it
+programs an inverted, empty y clip.
+
+### 14.4 Three more registers pinned
+
+* **`0x12b0`** is a memory-level / FIFO watermark, `0x3ff00000 | (level << 15)`
+  (`mtx398` @`0x32d1b`); the per-draw `0x3fff8842` is the default of the
+  `3D/MemLevels` registry option registered at `0x7653f`. Not a clip window.
+* **`0x12f4`** is a scalar saturation limit whose legal values are 31.0 and
+  15.0: `mtx2572` @`0x3c270` **rewrites** the shadow `32.0 -> 31.0` and
+  `16.0 -> 15.0`, so the 32.0 our generator emitted is a value the vendor never
+  lets reach the chip. Corrected to `0x41f80000`; measured, it changes nothing,
+  but it was wrong.
+* **`0x1328`/`0x132c`** are the scissor MIN and MAX corners, 12-bit fields,
+  y in the high half, with DWGCTL bit 23 as the clip enable -
+  `ParhlXAASetClippingRectangle` @`0x535e0`, and `ParhlXAADisableClipping`
+  @`0x53660` writing `(0, 0, 0xfff, 0xfff)`. That closes the open question in
+  `docs/parhelia-raster-clip.md` about which is the min corner.
+
+**None of them can produce the observed endpoint**, and the next section says
+why that no longer matters.
+
+### 14.5 The "fixed endpoint" is not fixed — it is stale pipeline state
+
+§12.8 recorded the wedge's far end as a constant at NDC `(0.400, 0.800)`,
+identical for `v0 = (0.01,0.02)`, `(0.02,0.02)` and `(0.05,0.05)`. Running two
+draws in one boot breaks that:
+
+```
+  draw A, v0 = (0.90, 0.70)          79480 px
+  draw B, v0 = (0.01, 0.02)          11591 px
+    B covered NDC x 0.008..0.102  y 0.020..0.294
+```
+
+Alone, B ends at `(0.400, 0.800)`; after A it ends at `(0.102, 0.294)`. **The
+endpoint is history-dependent**, so the substituted vertices come from state
+the previous draw left, and `(0.400, 0.800)` was only the stable value after a
+reset. That rules out a constant in any register - consistent with §14.3 and
+§14.4 finding none - and points at the vertex/WARP output path holding the
+previous invocation's values for the vertices this draw never produced.
+
+### 14.6 Structural differences found and excluded
+
+A packet-level comparison (not register values) found three real differences,
+all measured on hardware and none of them the cause:
+
+* **Tag-word boundaries in the binds.** The capture puts `0x1374` in its own
+  one-register tag word on a per-vertex bind (`212121dd`) and rides `0x10f8`
+  with the mode latch (`3e403c3c`); a four-at-a-time packer merges them. The
+  generator can now emit either (`reglist`'s `BREAK`, `--strobe-alone`), and
+  the capture-exact form draws the same 11591 px.
+* **`0x1300` sync opcode at the head of the `0x12bc` pair.** All 33 `0x12bc`
+  arm/disarm pairs in the capture are preceded *in the same tag word* by a
+  `0x1300` sync (`0x707`/`0x307`/`0x207`). §12.4b already covers why that
+  opcode cannot be used cold.
+* **Inline ring register writes.** The capture's primary ring carries 139
+  dwords of register writes between calls - including `0x1090`/`0x1094`, the
+  write-back address and serial, which our stream never writes at all and which
+  appear *only* inline, never in a section. That is very likely the "write-back
+  path armed" that the `0x707` drain needs.
