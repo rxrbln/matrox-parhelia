@@ -4463,3 +4463,114 @@ from wherever we looked.
 * The CPU can only *write* the first 16 MB of the framebuffer BAR, so
   `--replayrt`'s clear silently does nothing above it and its "N px before"
   becomes meaningless. Use `--vramdiffbase`/`--vramdiff` there instead.
+
+---
+
+## 12. Our own stream draws — and the instrument traps that hid it
+
+### 12.1 OUR OWN COLD STREAM RENDERS A TRIANGLE
+
+`gen-minimal-draw.py`'s 45-packet stream, on a power-cycled board with no
+vendor module, no X and no vendor context, into a target it binds itself and
+that the tool clears first:
+
+```
+  health: 2D fill drew 120000/120000 px -- engine OK
+  ringreplay: 45 packets kicked, all idle
+  ringreplay: RT 0 px before -> 156383 pixels drawn
+```
+
+De-tiled at `TPR = 30` the extent is **x 51..748, y 193..729** filling 0.42 of
+its bounding box - a triangle, not a sliver. The predicted extent for those
+NDC vertices under the `(512,-384)/(512,384)` viewport is x 51..972, y 38..729,
+so **`xmin = 51` and `ymax = 729` are exact**; the far corner falls short by a
+factor of about 0.77 and the area is 49% of the 318205 px the vertices ask for.
+
+This is the first time our own stream has drawn anything of that magnitude.
+
+**The cold WARP probe confirms the front of the pipeline is correct**, from our
+own stream, with the constant file read back after the draw:
+
+```
+  c8 = -0.9 -0.9 0 1          the fetched vertex, exact
+  c9 = 51.2 729.6 0.5 768     the window position, exact
+  c0..c5                       identity MVP and our viewport, exact
+```
+
+So vertex fetch, attribute descriptors, the constant load, the transform and
+the `o0` write are all right on a cold board from our own stream. What is left
+is between `o0` and full coverage.
+
+### 12.2 The vendor's program is 13 instructions to our 12: a grid snap
+
+Diffing our generated program against `parhelia-warpasm.py --gen transform`
+word for word, instructions 0-7 are byte-identical and the vendor has **two
+extra**, bracketing the viewport transform:
+
+```
+  add T1.xy, T1, c[b1+8].ww00 {f1g=1,u2120=1}
+  mad T1.xyz, c[b1+0].xyz1, r5, T1.xyz0
+  sub o0, T1, c[b1+8].ww00 | sop2 r5.w, r5 {f1g=1,u2120=1}
+```
+
+Add a magic constant to x and y, transform, subtract it again - the classic
+float trick that forces a position onto a fixed-point grid. `--snap VALUE` now
+emits it against an absolute `c6.w` (the vendor's slot `0x168` is not in any
+capture we hold). `--snap 12582912` (3 * 2^22, integer grid) draws **nothing**,
+so either that is the wrong magic or the snap is not the missing piece; the
+value is still unknown.
+
+### 12.3 Five instrument traps, every one of which produced a false zero
+
+Each of these was mistaken for a hardware result during this session:
+
+1. **A reset during `scp` or `gcc` leaves a zero-byte file.** A 0-byte `3dtri`
+   exits 0 and prints nothing; a 0-byte `.warp.hex` gives
+   `warpprog: 0 dwords, not a multiple of 3` and the draw silently does not
+   happen. `prep-draw.sh` checks `[ -s ]` for exactly this reason and direct
+   `ssh` builds skip it. **`sync` after every `scp`, and check sizes.**
+2. **`--findcolor` scans only the first 32 MB.** A render target at
+   `0x3800000` is outside it, and the tool reports "none" - which reads exactly
+   like a failed draw.
+3. **Searching for a colour the draw never produced.** `0.05 -> 13` not `12`:
+   a rounded vertex colour makes an exact-match search return nothing. Use
+   components that are exact in 8 bits (0.2, 0.4, 0.6, 0.8).
+4. **`hw-run.sh` resumes X after every invocation**, and the GL client
+   immediately redraws over the render target. A draw in one invocation and a
+   dump in the next measures what X left behind, not the draw.
+5. **`--noclear` against uncleared VRAM.** With the target cleared first
+   (`--replayrt` below 16 MB, where the CPU can actually write) the same
+   configuration that "drew 1 pixel" drew 156383.
+
+### 12.4 The stall after one draw is not a stall
+
+Measured: after one 3D draw the 2D health fill reports 0/120000, but the engine
+is **idle and still drawing** - a colour search finds 14460 green pixels of the
+fill scattered over `0x1ca820..0x75a19c` instead of 120000 contiguous. So the
+engine has not hung; the 3D draw leaves raster state that the 2D fill does not
+reset, and it lands its pixels somewhere else.
+
+None of these restores it: `engine_init`, `--unstick`, `0x300 = 0x140` (the
+arm value the submission audit flags), `0x308` restored to its power-on
+`0x001f1f00`, the vendor's own 2D reset block from capture calls 6/12/34/40
+(`0x1328`, `0x132c`, `0x12c8`, `0x12e4`, `0x12fc`), its wider raster block from
+calls 19-22, or emitting `0x12b8`/`0x12bc` (EOBTAG and the sync tag) at the end
+of our draw - all tried, all still 0/120000.
+
+The registers that would carry it live in `0x1000-0x13ff`, which only the ring
+can write, so no MMIO recovery can work by construction. What is not yet known
+is which of them it is. Practically: one 3D draw per boot, and
+`~/tmp/nanokvm.sh reset` makes a boot cost about 45 seconds.
+
+### 12.5 The surface base register, and the per-boot target
+
+Under a live vendor context the base register is a **pool offset**: the capture
+binds `0x02000000` and the pixels land at `0x2f00000`, and patching it to
+`0x2900000` moves them to `0x3800000` - a constant `+0xf00000` in that boot.
+**Cold there is no pool and the register is a raw address**, which is what our
+own driver needs and what §12.1 uses.
+
+The pool base is per boot: `0x2f00000` in three boots, elsewhere in others, and
+the client double-buffers so the bound target alternates between frames. Locate
+it in-band when it is needed - replay the capture with a uniquely coloured
+triangle and search for that colour - rather than assuming a cached value.
