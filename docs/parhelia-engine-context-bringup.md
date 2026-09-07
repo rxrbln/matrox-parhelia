@@ -3345,3 +3345,30 @@ the engine reads that buffer correctly.
 
 Nothing else is ORed into the header, so the draw packet is now fully accounted
 for and excluded as a source of the defect.
+
+### 3.1as How the WARP program blob is referenced — and how it is not
+
+Trying to find which of the 25 programs the vendor binds, by locating a
+descriptor table that points at them:
+
+- **`.rela.data` does not reach them.** All 177 relocations in that section are
+  function pointers with addend 0 (`mtx1285`, `mtx1580`, `mtx1017` ...) - vtable
+  entries. No relocation carries an addend into the program region.
+- **No symbol covers them.** The program blob spans `.data` vaddrs
+  `0x9ad3c..0x9c5c4` (file `0x162f5c..0x1647e4`) and the symbol table has no
+  entry in that range; the programs are anonymous data.
+- **No code takes their address directly.** The only `lea`/`mov` displacements
+  in that numeric range are `0x9c100(%r13,%rbx,8)` and `0x9c108(%r12)`, which
+  are device-object offsets with a register base, not `.data` addresses.
+
+So the program set is reachable only by the byte-pattern search that found it
+(§3.1ai) - scanning for the `end` instruction - and the code path that selects
+among the programs does not resolve them through a static table this object
+exposes. The descriptors `mtx1391` consumes (`[0x18]` size, `[0x20]` code
+pointer, `[0x2c + i*4]` entry offsets) are therefore built at run time from
+somewhere that is not visible statically.
+
+That closes the static route to "which program goes on which bind". The
+remaining ways to answer it are to capture the `0x918`/`0x91c` upload at
+context create, or to bisect the 25 recovered programs against a working
+baseline - both of which need the vendor module loaded once.
