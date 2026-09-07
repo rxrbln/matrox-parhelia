@@ -2980,3 +2980,39 @@ the colour measurements, and stands.
 
 The constants themselves are first-hand from the capture and are the right
 thing for a from-scratch driver to load, so `--vendor-constants` is kept.
+
+### 3.1ag `gen-vendor-replay.py`: the capture's own stream, replayed
+
+`docs/parhelia-draw-sequence-annotated.md` decodes one complete draw period
+including every tag dword and every block-load payload, so the vendor's stream
+can be rebuilt byte-for-byte rather than reconstructed.
+`tools/gen-vendor-replay.py` does that and emits ring/sec/reloc for
+`--ringreplay`. It differs from the vendor's submission only where a value
+cannot survive a reboot.
+
+Two reconstruction faults had to be fixed, each visible as a ring stall at a
+specific packet:
+
+1. **X's interleaved 2D blits** (`0x1300 = 0x000005c0`, plus `0x138c`/`0x1310`)
+   draw from surface slot 1, which nothing in our stream binds - stall at
+   packet 13. Dropped, as `gen-stream.py` already does for the same reason.
+2. **Block loads without a descriptor quad.** Only the mtx1342 constant-block
+   form carries `[n][first][1][0]`; the capture marks the others "preformatted
+   body". Synthesising a descriptor for those makes the packet longer than its
+   header declares and desyncs the ring - stall at packet 26. The generator now
+   emits the descriptor only when the capture shows one, and asserts every
+   packet's length against `(hdr & 0xffff) + 2`.
+
+With both fixed, **all 60 packets execute and the engine stays idle**:
+
+```
+  60 packets (49 register lists, 10 block loads, 1 draw)   60 packets kicked, all idle
+```
+
+No pixels yet, and the reason is known rather than mysterious: the nine WARP
+entry registers are placeholdered onto our single uploaded program, and **the
+block-load bodies still carry the capture boot's heap entries verbatim**
+(`07956183`, `07955583`, `07956b83` in the `hdr=41020007` body). Those point at
+memory holding no program on this boot. Placeholdering the entries inside block
+bodies, the way the register writes already are, is the next step for this
+path.
