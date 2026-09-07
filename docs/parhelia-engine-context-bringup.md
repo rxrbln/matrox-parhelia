@@ -3305,3 +3305,43 @@ for `mov $imm,%esi` produces false positives - `0xae0` looked like an unwritten
 register but is `mtx728` allocating 0xae0 *bytes*, with `%edx`/`%ecx` as
 allocator arguments, not a register write. Confirm each hit's call target
 before treating it as a register.
+
+### 3.1ar The draw-packet builder, decoded exactly
+
+`mtx1017` at `0x6746-0x678e` builds the draw packet:
+
+```
+  6746  mov 0x98(%rsp),%eax     ; dwPerVertex
+  675c  dec %eax                ; - 1
+  675e  shl $0x11,%eax          ; << 17
+  6761  and $0x7e0000,%eax      ; mask to bits [22:17], six bits
+  6766  or  0x42c(%r15),%eax    ; context word supplies bit 31 (the GL path)
+  676d  or  $0x17000001,%eax    ; opcode 0x17, low16 = 1
+  6772  mov %eax,(%r9)          ; header
+  6775  mov %eax,0x4(%r9)       ; start operand
+  678e  mov %eax,0x8(%r9)       ; end operand
+```
+
+So the header is exactly
+
+```
+  hdr = 0x17000001 | (((dwPerVertex - 1) << 17) & 0x7e0000) | ctx[0x42c]
+```
+
+which confirms from the binary what §3.1s established by measurement: the
+low 16 bits are the literal `1` (a 3-dword packet), the vertex size rides
+bits [22:17] as **`dwPerVertex - 1`**, and bit 31 is a context flag rather than
+anything computed per draw. Our generator's
+`(1<<31) | (5<<26) | (3<<24) | ((dw-1)<<17) | 1` produces the identical word.
+
+**The operands are ring-relative.** At `0x6716` the second operand is computed
+as `[rdx+0x58] + %r9d`, and `%r9` is the pointer the packet itself is being
+written through - so the vendor's vertex bytes sit in the pushbuffer a fixed
+offset from the draw packet, which is why the annotated capture notes they
+"live in the ring gap between two calls" and were never dumped. Our tool
+instead points the operands at a separate DMA buffer, which is legitimate given
+`0x1000` carries the matching memory class, and the colour measurements prove
+the engine reads that buffer correctly.
+
+Nothing else is ORed into the header, so the draw packet is now fully accounted
+for and excluded as a source of the defect.
