@@ -3267,3 +3267,41 @@ an unambiguous diff rather than another single-variable guess: a known-good
 baseline - the vendor module loaded once, a GL client run, then our stream
 submitted in the same session - and then removing one vendor-supplied piece at
 a time.
+
+### 3.1aq VTXFMT derived from the binary, independent of the capture
+
+`0x1110`/`0x1114`/`0x1118` are recorded in the recipe as "verbatim, undecoded"
+- values copied from the capture with no idea what they mean. They are
+written by register index (0x44/0x45/0x46), not by address, so they cannot be
+found by searching the disassembly for the register offset; they come from the
+shadow bytes at `S[0x608]`, `S[0x60c]`, `S[0x610]`.
+
+The initialiser at `0x42150-0x42220` builds those bytes a nibble at a time:
+
+```
+  0x608 |= 7  ... 0x609 |= 0xf          -> 0x27, 0x0f
+  0x60c  = 0x10                          -> 0x10
+  0x60d &= 0xf, |= 0x70                  -> 0x72
+  0x60e &= 0xf0, |= 0x08                 -> 0x28
+  0x610 &= 0xf,  |= 0x40                 -> 0x43
+  0x611 &= 0xf,  |= 0x60                 -> 0x65
+```
+
+Read as little-endian dwords:
+
+| register | from the binary | in the capture |
+|---|---|---|
+| `0x1110` VTXFMT0 | `S[0x608]` = `0x00000f27` | `0x00000f27` at bind |
+| `0x1114` VTXFMT1 | `S[0x60c]` = `0x00287210` | `0x00287210` |
+| `0x1118` VTXFMT2 | `S[0x610]` = `0x00006543` | `0x00006543` |
+
+**Exact match on all three**, derived from the driver's own initialiser rather
+than copied. So these are per-attribute nibble fields holding the driver's
+defaults, our replayed values are correct, and they are excluded as a cause.
+`0x1110` is the only one that changes per draw (`0x00000003` at draw time).
+
+**Method note:** enumerating candidate registers by grepping the disassembly
+for `mov $imm,%esi` produces false positives - `0xae0` looked like an unwritten
+register but is `mtx728` allocating 0xae0 *bytes*, with `%edx`/`%ecx` as
+allocator arguments, not a register write. Confirm each hit's call target
+before treating it as a register.
