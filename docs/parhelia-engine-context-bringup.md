@@ -5699,3 +5699,47 @@ constant reachable - it lives at `c6.w` in the transform path, so either load it
 or fold the snap into the vertex data. Fixing the coverage should fix points as
 a side effect, and should also raise the large-primitive counts to their true
 areas, which is independently worth having.
+
+### 20.4 Two measurement confounds that invalidated several counts
+
+Two properties of this harness broke a number of the absolute pixel counts in
+§20.3 and before, and both must be checked before any `--findcolor` result is
+believed:
+
+1. **The vendor client renders in the same colours we test with.** On a freshly
+   prepared board, before any draw of ours:
+
+   ```
+     333333 baseline: 134094 px      <- the vendor's own triangle
+     666666 baseline: 136017 px
+     999999 baseline:      9 px
+     cccccc / 336699 / 3399cc: none
+   ```
+
+   `#333333` was the control colour for most of this session. The *differential*
+   measurements (count before, draw, count after) stay valid because they
+   measure the change - but every absolute count against `#333333` or `#666666`
+   was reading the vendor's pixels.
+
+2. **VRAM survives a board reset.** A colour drawn before a `nanokvm reset`
+   is still there afterwards, so "fresh boot" does not mean "clean target".
+
+With clean colours and a checked baseline, the honest numbers are:
+
+```
+  triangle, area 135000  ->  134110 px   99.3%   EXACT
+  quad,     area  60000  ->   28968 px   48%
+```
+
+The triangle result is solid and repeatable. The quad result is **not**: a
+repeat with a different clean colour, and a two-triangle decomposition of the
+same quad, gave 73% and other values that do not reconcile, because successive
+draws over the same area in the same colour cannot be told apart by a colour
+count. Judging quads needs either a per-draw target clear (impossible above the
+16 MB CPU write limit, §12) or a distinct colour per draw with the baseline
+checked each time.
+
+So of §20.3's two claimed defects, only one is established: **small primitives,
+including a one-pixel point, write nothing**. Whether quads lose a triangle is
+open, and the earlier "6 of 7 primitives work" was never measured against true
+areas at all.
