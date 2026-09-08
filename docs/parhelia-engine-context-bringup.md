@@ -5032,3 +5032,69 @@ been open a long time (recorded as "task #22" in earlier notes). Note
 line/point width* taken from `[[state+0x3c68]+0x14]`, so the hardware does
 carry a point-size state; nothing in our stream sets it, and a zero width would
 rasterise nothing - which is the obvious first thing to test.
+
+
+## 17. The sampler registers are a PER-UNIT bank, and our priming primed one unit
+
+`0x11c0`-`0x11e8` are not global: they are a **per-unit bank selected by the
+preceding `0x1200 + u*4` write**. Proven three ways - `CDPSTextureEngine::
+UpdateHardware` (`mtx_drv.so` @`0x6ffb0`) emits `0x1200+u*4` and then that
+unit's filter/surface registers; `mtx2501` @`0x40116` gives each unit its own
+one-register `0x11e8` packet; and `mtx1783` (`.data` @`0x15860`) holds
+*different* `0x11e8` values per unit for the same stage count.
+
+`mtx398` @`0x329d9`-`0x32a9f` therefore primes each bank **while that unit is
+enabled**, and only then disables all four:
+
+```
+  for u in 0..3:
+      0x1200+u*4 = 0x00040100 | (1 << u)
+      0x11c0 = 0 ; 0x11c4 = 0x00000249 ; 0x11c8 = 0
+      0x11cc = 0xffffffff ; 0x11d0 = 0x11d4 = 0x11d8 = 0
+  0x1374 = 0
+  0x1200 = 0x0001000f ; 0x1204 = 0x1208 = 0x120c = 0
+```
+
+Our `--ctx-defaults` wrote the four enables in a loop and the bank **once**, so
+only unit 3's bank was ever primed. A draw where unit 0 claims pipes 0+1
+(`0x00040103`) has pipes 2+3 served by unit 1's cold-reset bank - which is a
+plausible mechanism for §13's "enabling the unit kills the draw". Fixed to the
+vendor's per-unit form.
+
+**`0x12b8` is not only an end-of-batch tag.** `mtx398` @`0x32cb7` writes it
+unconditionally - `0x00070601` on this chip - immediately before
+`0x12b0 = 0x3ff00000 | (level << 15)`, the memory-level watermark of §14.4,
+using the same `& 0xc00fffff` levels idiom. It appears **inline in the primary
+ring and never inside a DMA section**, which is why no section diff could ever
+have found it. Now emitted with `--ctx-defaults`.
+
+### 17.1 Two texture readings closed
+
+* **There is no TA descriptor array to program.** `mtx958` @`0x69650` writes
+  `HWREG+0x800 + i*0x38` with a count at `HWREG+0x7ec`, which looked like a
+  texture-address stage array. Mapping the shadow pointers (`mtx958`'s `rbp` =
+  `mtx1381`/`mtx2501`'s `r13 - 0x7e0`) shows `HWREG+0x7ec` is just the
+  texture-unit *count* bounding `mtx1381`'s emission loop, and
+  `HWREG+0x800 + i*0x38` is literally the shadow of unit *i*'s eleven sampler
+  registers. `docs/parhelia-textured-draw.md` §3.1's "competing static reading"
+  is **refuted**, and `docs/parhelia-texture-path.md`'s "9-dword array is the TA
+  stage array" applies only to the ICD-side shader blob, not to the wire.
+* **`0x11e8` is correctly excluded, and now with a reason.** `mtx1381`
+  @`0x3f739` selects `0x11e8` or a DMAPAD for the fourth slot of sampler packet
+  C depending on `[dev+0x2440] & 0x7fc00`; our capture's tag is `0x20727473`,
+  whose fourth byte is the pad - so that feature bit is clear on the 0528 and
+  **the vendor never programs `0x11e8` at all** on this chip.
+
+### 17.2 Corrections to the `0x1200` field notes
+
+`mtx2501` @`0x3fdf3` requires `0x1200[11:8] != 0` for a unit to count as a pipe
+owner, and @`0x3fef1` defines *disabled* as `value & 0x00ff0f00 == 0x00010000`.
+So `[11:8]` is a mask that must be non-zero when enabled and zero when
+disabled, not the "constant 1" the recipe records. Our `0x00040103` /
+`0x0001000c` satisfy both.
+
+Also worth knowing: every vendor path except the Linux ICD uses **one pipe per
+unit** (`1 << u`), and a working four-unit draw captured on this board is
+`0x1200..0x120c = 0x00040101, 0x00040102, 0x00040104, 0x00040108`, each with
+its own surface and filter registers - an alternative to the `0x3`/`0xc` split
+if the per-unit priming is not enough.
