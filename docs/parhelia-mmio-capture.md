@@ -196,9 +196,22 @@ register window -
   #S 000015baec4c Ao      <- the re-executed access, address truncated to 32 bits
 ```
 
-so the trap side is proven. The **completion** side is not: no `SIGTRAP` reaches
-the handler and the instruction restarts with a 32-bit-truncated address, which
-means the single-step handshake is wrong - most likely Xorg also owns `SIGTRAP`,
-or the trap flag must be set on the resuming context differently. Fixing that
-handshake is a bounded piece of work and it yields the textured-vs-untextured
-register diff that every other instrument here cannot produce.
+so the trap side is proven. The **completion** side is not, and one plausible
+cause has already been eliminated: unblocking `SIGTRAP` and `SIGSEGV` in the
+resuming `uc_sigmask` (Xorg blocks signals around critical sections, and a
+*synchronous* trap delivered while blocked is fatal rather than deferred)
+changes nothing - the same two-fault pattern repeats, with the second address
+being the first truncated to 32 bits and no `SIGTRAP` in between.
+
+That truncation is the thread to pull. It is reproducible across boots with
+different mapping bases, so it is not noise: the re-executed access computes a
+32-bit address. Either the trap flag is not taking effect and X then faults
+genuinely for an unrelated reason, or the store is being restarted with a
+clobbered pointer. The next step is to log `REG_RIP` in both handlers and
+disassemble the faulting instruction in `mtx_drv.so` - that says immediately
+which of the two it is, and it needs no hardware run beyond one capture.
+
+Also closed off on the way: **the 3D register file is not readable**, so a
+before/after register snapshot cannot substitute for a trace. `--readreg 0x1300
+0x1310` returns `000020c0` for every register in the range - a single latched
+value, not per-register state.
