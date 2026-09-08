@@ -5907,11 +5907,20 @@ vertices (x, y, r, g, b, s, t), a per-face tint modulated by a 64x64 texture:
   face 4 tint ff99ff    5316 px   expected  5331   99.7%
 ```
 
-**glxgears-style** - three meshing gears, 68 triangles, flat shaded in the
-familiar red/green/blue. Submitted as two 34-triangle chunks because a single
-submission stalls past ~224 ring packets (40 triangles = 222 packets is the
-largest that fits); `--rrfence auto` makes the second chunk land on the same
-target as the first.
+**glxgears** - three meshing gears, 160 triangles, flat shaded in the familiar
+red/green/blue, in the original's layout and proportions (20-tooth red,
+10-tooth green and blue).
+
+The first attempt drew loose petals rather than gears. That was geometry, not
+the driver: `gears.c` draws the front face as one `GL_QUAD_STRIP` right around
+the circle - a **continuous annulus** - and adds the teeth as separate quads
+outside it, whereas the hub segments here spanned only three quarters of each
+tooth pitch and so never closed into a ring. Spanning the full pitch fixes it.
+
+Submitted as **eight 20-triangle chunks**. A single submission stalls past ~224
+ring packets, and although 40 triangles (222 packets) does complete, it leaves
+the engine non-idle so the next submission is refused; 20 triangles (122
+packets) chains cleanly eight times with `--rrfence auto`.
 
 Both are read back with `--nzdump` and de-tiled by `tools/detile-nzdump.py`.
 
