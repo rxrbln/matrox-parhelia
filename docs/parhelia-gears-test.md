@@ -92,12 +92,16 @@ parhelia-3dtri --warpstore --warpidx 32 --warpbind 2 loader.warp.hex 0 \
 ```
 then the same for `g1` and `g2`; add `--rrrepeat 101` for the timing.
 
-## Batching a draw packet breaks the depth interlock
+## Batching: safe only for triangles that do not overlap each other
 
-Every one of the 1235 draw packets in `captures/gl-matrix/depth-secs.txt` covers
-exactly **three vertices**.  That is not the vendor being naive: the hardware
-does accept a larger vertex range - two disjoint triangles in one packet both
-draw - but the depth test between triangles inside one packet is not honoured.
+Across all 45 capture files the vendor emits 31329 draw packets: 22330 of three
+vertices, but also 1643 of four, 1224 of six, 631 of sixteen and 815 of
+twenty-four - and the 24-vertex ones carry the ordinary TRIANGLES primword
+`0x0006305c`, so they are eight independent triangles in one packet.  Batching
+is supported.
+
+What is NOT supported is batching triangles that **overlap each other in screen
+space**: the depth test between triangles inside one packet is not honoured.
 
 The measurement that isolates it, on gear 0 alone:
 
@@ -115,10 +119,34 @@ or precision problem: the reference's depth quantised to 24 bits moves the
 count by one pixel, and the hardware's own Z buffer agrees with the reference
 to within 64/2^24 on 96% of covered pixels.
 
+### Measured, gear 0 against the CPU reference
+
+| triangles per draw packet | pixels wrong |
+|---|---|
+| 1 | **45** |
+| 2 | 1150 |
+| 4 | 10701 |
+| 10 | 8171 |
+| 20 | 10571 |
+| all 400 | 18516 |
+
+But with triangles that never overlap - the gear's front face group, 60
+triangles tiling a plane - **all 60 in ONE packet is pixel-identical to 60
+separate packets** (both 100.00% within 2/255, the same 20 pixels, the same
+coverage).  So the limit is overlap, not count.
+
+Applying that: batch each face group into one packet, except the two groups
+whose triangles occlude one another - the four outward faces of a tooth, and
+the inner cylinder, a tube whose near and far walls overlap.  Gear 0 then draws
+in 204 packets instead of 400 with **exactly the same 45 wrong pixels**, and a
+frame costs 11.6 ms instead of 14.6 - **86 fps** for 800 triangles at 1024x768.
+
 ### What the driver has to do
 
-* **One draw packet per primitive**, as the vendor does.  `p3d_emit_draws()`
-  emits `nprim` packets of three vertices each.
+* **Never put two triangles that overlap in screen space in one draw packet.**
+  `p3d_emit_draws()` emits `nprim` packets; a driver that cannot prove
+  non-overlap should emit one primitive per packet, as the vendor does for
+  22330 of its 31329 packets.
 * **Cap the packets per submission.**  434 ring calls stalls the engine after
   257; `P3D_MAX_DRAWS` keeps a chunk to 180 draws (~214 calls).
 * **Do not put two surfaces that overlap in screen space in the same
