@@ -5184,6 +5184,24 @@ The size is still one pixel, because passthrough mode loads no constants and
 capture carries. Loading it needs the kind-0 constant loader, which is
 transform-mode machinery today; that is the remaining gap for `glPointSize`.
 
+### 14.1a CORRECTION: the point result does not reproduce across boots
+
+The measurements above are real - two runs, fresh colours, a `none` baseline
+before each and the identical byte range after both - but they are all from
+**one boot**. On five later boots the same streams draw nothing, including the
+byte-identical stream file that produced the six pixels, while an untextured
+triangle control in the same run draws 134-269 kpx at the same surface base.
+The pre-fence-change stream and the current one fail alike, so the generator
+changes are not the cause.
+
+So the honest state of GL_POINTS is: **`o10.z` is necessary** (nothing draws
+without it, at any size, on any boot) but **not demonstrably sufficient** - a
+six-pixel signal that appeared once and has not been reproduced. It sits close
+enough to the three-pixel null-draw floor that it deserves a stronger
+instrument than `--findcolor` before being called solved: a points draw big
+enough to be unmistakable, which needs `glPointSize > 1` working first. The
+two are one problem, not two.
+
 ### 14.2 The attribution tool was mis-locating every textured span
 
 `diff-gl-variants.py` selected draw spans by matching the header `0x97080001`.
