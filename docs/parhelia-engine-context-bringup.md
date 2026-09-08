@@ -5563,3 +5563,44 @@ tighter box than at the start of the session, and it points at the remaining
 untested content: the `0x41` block loads. The vendor's point span carries
 block loads our stream substitutes, and unlike the texture case the difference
 cannot be a register - so it has to be the payload of one of those.
+
+### 20.1 Points: the reverse diff, and what it eliminated
+
+The texture fix came from an asymmetry (`unset -> set`), so the reverse
+direction was checked too - registers **we** write that the vendor's point span
+does not, and registers where the values differ:
+
+```
+  we write, vendor does not:   0x1104 = 0, 0x12b8 = 00070601
+  values differ:               0x10f0  vendor 00000000  ours 00000003
+                               0x1130  vendor 0000200c  ours 0300200c
+                               0x1300  vendor 00a60ecd  ours 00a60ecc
+                               0x1314  vendor ff000000  ours 00000000
+                               0x12fc  vendor 04000024  ours 0bb80024
+```
+
+The `0x10f0`/`0x1130`/`0x1300` triple is a real correction: the vendor's point
+draw is **class 0**, and our `--pointsize 8` stream was using class 3 on the
+strength of the one-boot result §14.1a already withdrew. Emitting class 0 with
+the vendor's `0x1314` and `0x12fc` still writes **zero pixels**.
+
+Also checked and eliminated: the vendor's point span loads ten `0x41` blocks
+(including `c[0x172]` = the point size and clamps, `c[0x178]`, `c[0x17d]`) that
+our passthrough stream never emits - but under a live vendor context those
+constants are already present with the right values, confirmed by reading them
+back through the block-file window. And an explicit `o0.w = 1` makes no
+difference either, though `v0`'s descriptor declares only x,y so `o0.w` really
+was undefined.
+
+Finally, the vendor's **own** captured stream, patched to `--prim points` and
+fed our vertices, also writes zero pixels. That is the strongest statement
+available: it is not our stream's construction.
+
+So for GL_POINTS everything measurable has been eliminated - register state in
+both directions, the WARP program, the vertex count, the primitive class, the
+constants, and hidden MMIO. The remaining possibility is that the client-side
+conditions for a visible point differ from what this harness reproduces; the
+untried check is whether the **vendor's own** GL_POINTS client puts pixels on
+screen at all, which two runs timed out before answering and which should be
+done first next session, because if it does not, the target has been wrong all
+along.
