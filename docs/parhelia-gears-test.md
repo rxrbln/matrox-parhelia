@@ -91,3 +91,50 @@ parhelia-3dtri --warpstore --warpidx 32 --warpbind 2 loader.warp.hex 0 \
     --ringreplay F0-g0-{ring,sec}.hex F0-g0-reloc.txt --ringvtx F0-g0.vtx.hex
 ```
 then the same for `g1` and `g2`; add `--rrrepeat 101` for the timing.
+
+## Batching a draw packet breaks the depth interlock
+
+Every one of the 1235 draw packets in `captures/gl-matrix/depth-secs.txt` covers
+exactly **three vertices**.  That is not the vendor being naive: the hardware
+does accept a larger vertex range - two disjoint triangles in one packet both
+draw - but the depth test between triangles inside one packet is not honoured.
+
+The measurement that isolates it, on gear 0 alone:
+
+| geometry | silhouette | pixels wrong vs the CPU reference |
+|---|---|---|
+| front faces only | 95385 | 29 |
+| front + back faces, ONE draw packet | 95385 | **11759** |
+| front + back faces, TWO submissions | 95385 | **29** |
+
+The back faces are entirely hidden - they add **no** pixels to the silhouette -
+yet sharing a draw packet with the front faces corrupts 11759 of them.  Split
+across submissions the same triangles are exact.  Hidden geometry cannot
+legitimately change anything, so this is a pipeline hazard, not a depth-value
+or precision problem: the reference's depth quantised to 24 bits moves the
+count by one pixel, and the hardware's own Z buffer agrees with the reference
+to within 64/2^24 on 96% of covered pixels.
+
+### What the driver has to do
+
+* **One draw packet per primitive**, as the vendor does.  `p3d_emit_draws()`
+  emits `nprim` packets of three vertices each.
+* **Cap the packets per submission.**  434 ring calls stalls the engine after
+  257; `P3D_MAX_DRAWS` keeps a chunk to 180 draws (~214 calls).
+* **Do not put two surfaces that overlap in screen space in the same
+  submission.**  p3d_gears builds the mesh one face group at a time and gives
+  each group its own submission, which is what makes the silhouette exact.
+
+With all three, the three-gear scene agrees with the CPU reference on
+**167163 of 167431 covered pixels** and 97.4% of the frame matches within
+2/255, against 86% and a 16% facet-disagreement rate when batched.
+
+### Still open
+
+About 12% of gear pixels still pick a different facet than the reference,
+concentrated on the tooth flanks.  Their depth agrees to within 64/2^24, so the
+two implementations are disagreeing about coverage on nearly-tangent surfaces
+rather than about depth.  It is not culling (proven honoured: culling the
+opposite face changes the image completely), not winding, not depth precision,
+and not the normal's sign (a normal of (0,0,-1) against a light of (0,0,-1)
+gives full brightness, so negative components survive).
