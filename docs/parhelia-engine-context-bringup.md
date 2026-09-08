@@ -5482,3 +5482,49 @@ draws in 181 sections) are the right reference for finding it: they need
 diffing against an all-untextured capture taken the same way on the same boot,
 which is a far cleaner comparison than the mixed gl-matrix files that produced
 this false lead.
+
+## 19. TEXTURING WORKS — three registers the mixed captures could never show
+
+§18.1 left one instrument: a **same-boot, same-client, one-GL-state-apart** ring
+capture (`tools/tex-vs-plain.sh`). Diffing each draw's own span - not values
+swept across forty ring pages - gives twenty-one differences, and three of them
+are registers our streams had never emitted and that no previous analysis had
+ever named:
+
+```
+  0x10fc   plain unset -> tex 3e4ccccd     (0.2f)
+  0x1330   plain unset -> tex 3e4ccccd     (0.2f)
+  0x1334   plain unset -> tex 3f800000     (1.0f)
+```
+
+They are invisible to a last-value diff across a mixed capture precisely
+because they are **unset** in the untextured span - there is no "before" value
+to differ from - which is why §15's exhaustive bisection could exclude every
+sampler register and still miss them.
+
+The same diff also corrected the combiner: the wire carries
+`0x1260 = 0x08000000, 0x1268 = 0x01400000`, our original form, not the
+`texrepl` values §15 adopted.
+
+**With those three registers present, the vendor's own sampler configuration
+stops killing the draw.** `0x1200 = 0x00040103` (bit 8 set) and
+`0x1204 = 0x0001000c` - the two writes §15 measured as fatal, in isolation and
+in every combination tried - now work. Bit 8 is pipe-pair cache participation,
+and it evidently needs the state these three registers carry.
+
+Measured on 0528, one boot, against a same-run control:
+
+```
+  texture source at 0xa000000        ff336699
+  control triangle                   ff333333
+  after the textured draw            ff336699 ff336699 ff336699 ...
+  coverage                           100668 px over the triangle's bbox
+```
+
+The texel colour propagates exactly. **A textured triangle renders from our own
+generated command stream.**
+
+Recipe: `gen-minimal-draw.py --texture BASE,W,H` with the defaults - full
+sampler window (`--texgroups 4`, so `0x1204` is emitted), `0x1200 = 0x00040103`,
+the MODULATE combiner, and `0x10fc`/`0x1330`/`0x1334`. Note `--texfill BASE`
+writes `BASE - 0x240000` (§15), so upload accordingly.
