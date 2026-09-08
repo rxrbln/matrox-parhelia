@@ -173,3 +173,80 @@ Re-run the same PRE/POST command-buffer diff around each op in the `gltest.c`
 sweep (clear, flat tri, gouraud, quad, lines, depth, blend, texture) and diff the
 resulting buffers against each other; the delta is that feature's state. This
 turns the [C]/[P] encodings above into confirmed values.
+
+## Depth buffer: working, measured 2026-09-08
+
+The Z buffer draws correctly from our own C-generated stream.  Configuration,
+all confirmed against the vendor's own 3D draw span (`captures/gl-matrix/
+depth-secs.txt`, section `195204ea`, which binds both surfaces):
+
+| register | value | meaning |
+|---|---|---|
+| `0x1220`/`0x1224` | base, `32020780` | colour target, format 0x32, type 2, pitch in **pixels** |
+| `0x1228`/`0x122c` | base, `36020780` | depth surface, format **0x36** (S8Z24), type 2, same pitch |
+| `0x12c8` | `0x001000e0 \| func<<1 \| enable` | depth test; LESS = func 2 -> `...e5` |
+| `0x12d0` | `0x000000ff \| 0x100` | bit 8 = depth write enable |
+
+Slot 1 is the depth slot; slots 2 and 3 are not.  Binding the Z surface into
+slot 2 or 3 leaves the depth unit reading whatever slot 1 last held, which
+rejects roughly half the fragments and writes no Z at all - a failure that
+looks like a broken compare op rather than a mis-bound surface.
+
+### Measured behaviour
+
+Triangle of ~86500 pixels, depth surface 1024x768 at a base well clear of the
+colour target:
+
+| case | result |
+|---|---|
+| Z cleared far (`0x00ffffff`), LESS, z=0.8 triangle | 86593 px drawn - full coverage |
+| Z cleared near (`0x00000000`), LESS, same triangle | 0 px - every fragment rejected |
+| Z cleared far, func 5, same triangle | 0 px - func 5 is a GREATER-family op |
+| far triangle then near triangle | near fully drawn, far reduced to its unoccluded part |
+| near triangle then far triangle | identical near coverage, far rejected in the overlap |
+
+The written Z is the expected `0.8 * 2^24 = 0x00cccccd`, so Z24 is plain
+unsigned normalised: far is `0x00ffffff`, near is `0x00000000`.
+
+### Depth writes cover ~850 more pixels than colour writes
+
+Every measurement shows the depth footprint slightly larger than the colour
+footprint of the same triangle - 87426 Z pixels against 86577 colour pixels in
+the clear+draw test, and the same ~849 px gap appears as an order-dependent
+difference in the two-triangle occlusion test (40212 vs 41054 surviving far
+pixels).  The magnitude matches the triangle's perimeter, so this is an edge
+rule: boundary fragments update Z but not colour.  Not yet explained; it does
+not affect occlusion correctness in the interior.
+
+### Surface aliasing corrupts both buffers
+
+The depth surface base is honoured - moving it by 0x400000 moves the written Z
+by exactly 0x400000.  But a depth base placed near the colour target through
+the same pool aliases onto it, and then each buffer ends up holding a mixture
+of colour and Z:
+
+| depth base | colour buffer | depth buffer |
+|---|---|---|
+| `0x02400000` (near the colour target at `0x02000000`) | 14442 red + 57894 Z | 23475 Z + 2842 red |
+| `0x03400000` (well clear) | 86529 red, 45 Z | 86593 Z, 0 red |
+
+Colour pixels appearing inside the depth surface is the diagnostic: it can only
+happen if the two overlap.  A driver must allocate the two surfaces from
+disjoint ranges; the symptom otherwise reads as a broken depth test.
+
+### Clear
+
+`p3d_emit_clear()` emits the 2D solid fill into the same command stream: bind
+the surface into both slot 0 and slot 1, `0x12c0 = 0xffffffff`, `DWGCTL = 0xc0`,
+the value in `0x1314`, `0x1304 = 0`, `0x1308` = destination x/y and `0x138c` =
+height/width last, which is what fires the blit.  Because the fill overwrites
+slots 0 and 1, the clear must be emitted **before** `p3d_emit_state()`.
+
+A depth surface clears exactly like a colour one - the fill is byte-level over
+the same tiling.  Round the height up to a multiple of 32: a tiled target only
+takes complete 32-row tile rows.
+
+Verified by poisoning the colour buffer green and the Z buffer to near, then
+submitting one stream that clears and draws: the green is gone, Z reads back
+`0x00ffffff` outside the triangle, and the triangle draws - which it could not
+do at all had the depth clear not landed.
