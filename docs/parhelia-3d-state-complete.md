@@ -658,3 +658,30 @@ zero, not a dead opcode field.
 renders the pure texel for a texture alpha of 0x00, 0x80 **and** 0xff, so the
 result is `A*1 + B*0` - the C operand reads as 1.0 and the alpha replicate is
 not selecting alpha.  The `Crep` encoding is the open piece.
+
+## Mipmapping: the registers are right, the chain layout is not
+
+`p3d_tex_filter()` sets MIP in `0x11c0[7:6]` and `0x11e4[31:28]` carries the
+maximum level, and both are emitted correctly (`0x01c01040`, `0x10010040`).
+A two-level chain was laid out as level 0 = red 64x64 at the texture base and
+level 1 = green 32x32 at base + 64*64*4 = +0x4000, and the draw minified by
+giving the triangle texcoords spanning 0..16 over 512 px - two texels per
+pixel, so LOD 1.
+
+| state | result |
+|---|---|
+| `max_level = 1`, MIP filter NONE | draws, red (level 0) |
+| MIP filter NEAREST, `max_level = 0` | draws, red (level 0) |
+| **both** | **nothing draws at all** |
+
+Each half is harmless on its own; only asking the hardware to actually select
+level 1 kills the draw.  So the registers are accepted and the fault is where
+level 1 sits.  `docs/parhelia-texture-sampling.md` says every level is padded
+"to a 32-texel pitch and to `Ha` rows and `A` bytes", and those two alignment
+constants are what the naive `+ width*height*4` offset ignores.  Recovering
+them is the remaining work; nothing else about mipmapping is in doubt.
+
+A note on method: the first attempt used a 32-pixel triangle to force
+minification and measured nothing, which looked like a mipmap failure.  It was
+not - that triangle does not render at all, with or without mipmapping.
+Scaling the texcoords on a triangle known to draw is the sound way to minify.
