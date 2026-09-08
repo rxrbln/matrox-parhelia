@@ -230,3 +230,44 @@ Also closed off on the way: **the 3D register file is not readable**, so a
 before/after register snapshot cannot substitute for a trace. `--readreg 0x1300
 0x1310` returns `000020c0` for every register in the range - a single latched
 value, not per-register state.
+
+## The tracer WORKS — and a GL draw makes no register writes at all
+
+Three bugs stood between the design and a working tracer, and only the last one
+mattered:
+
+1. Xorg was assumed to replace our handlers. It does **not** - the refusal
+   wrapper never fires. (Harmless, and kept: it also stops X's crash reporter
+   swallowing a trap.)
+2. `mmap64` was not intercepted, so a second mapping of the same BAR could have
+   been invisible. It turns out X makes only one, but the hole was real.
+3. **The actual bug:** `on_trap` read the value back with `g_addr & ~3u`.
+   `~3u` is a 32-bit `0xfffffffc` that **zero-extends** to 64 bits, truncating
+   the address - `0x2ad45eb93000 & 0xfffffffc = 0x5eb93000`, exactly the
+   "second, out-of-region fault" in every log. The handler was faulting on its
+   own bogus pointer, and that fault is what killed X. `~(uintptr_t)3` fixes it.
+
+With that fixed the tracer runs: **2,957,173 accesses logged in one window, X
+survives**, and the entries are real - `R 0000 10000000` (the engine ID),
+`R 08f4 0000004f` (status polling). A standalone control on this same
+`resource1` mapping gives `segv=1, trap=1` for a load, so the mechanism is
+sound end to end.
+
+**And the result is a surprise worth acting on.** With the client verified to
+render inside the armed window (`gltest ... rc=0`, triangle drawn):
+
+```
+  total=6  W=0  R=1        <- the single read is our own self-test
+```
+
+**A GL draw produces no BAR1 register writes from the X process whatsoever.**
+Not few - none. The client maps no device at all (pure indirect GLX), so there
+is nowhere else for per-draw register traffic to come from.
+
+That closes the theory this whole instrument was built to test. There is **no
+hidden inline MMIO**: the DMA ring capture already holds the complete per-draw
+state, and the exhaustive ring diffs in this file were not missing anything.
+The texture unit returning zero and points covering no pixels therefore cannot
+be explained by a register we failed to observe - which points instead at the
+*content* our streams substitute for the vendor's, above all the `0x41` block
+loads (constants and programs) rather than the register writes around them.
