@@ -5931,10 +5931,30 @@ was not enough because sync packets shift the phase, so scenes currently use
 `--nopreflight` - the streams are machine generated and `--selfcheck` validates
 their framing.
 
-**The coverage defect is visible.** Both scenes render with 32x32 holes in a
-regular pattern, and the dump proves those pixels hold the *background*, so the
-rasteriser genuinely leaves them - it is not a de-tiling error (the swizzle was
-searched: every variant scores within 0.4%, and drawn-pixel connectivity is
-0.9926). Half a tile is 32x32. This is the same defect that makes a 32x32 quad
-draw 5% and a one-pixel point draw nothing, now visible directly on a real
-scene, which makes it far easier to work on than the point case.
+**RETRACTED: the 32x32 holes were my de-tiler, not the hardware.** The first
+scene dumps showed a regular checkerboard of missing 32x32 blocks, and this
+section originally claimed that as a rasterisation coverage defect on the
+strength of a swizzle search "scoring within 0.4%". That search was worthless -
+it varied one bit against a metric dominated by flat background - and the
+conclusion was wrong.
+
+`tools/detile-nzdump.py`, which I wrote fresh for these scenes, dropped the
+**tile-row parity** term from the in-tile x5 bit that `dump-pnm.py` has always
+had:
+
+```
+  x = b0 | b1<<1 | b2<<2 | b4<<3 | b5<<4 | ((b7 ^ (tile_row & 1)) << 5)
+  y = b6 | b3<<1 | b8<<2 | b9<<3 | b10<<4          TPR = pitch / 64
+```
+
+Without that XOR every second band of tiles lands 32 px off, which is exactly a
+32x32 checkerboard. Restored, both scenes de-tile cleanly and the holes are
+gone.
+
+**Validated properly this time**, the way §3.1ab's method note says to: a
+known-geometry 3D draw. A 500x300 axis-aligned rectangle rendered as two
+triangles de-tiles to exactly **500x300 at its true (200,200), fill 0.993** -
+and that same control also recovers the surface base (0x25a0000 on that boot).
+Note the 2D fill is NOT usable as this control: it writes **linearly** at pitch
+1024 (a plain linear read gives a perfect solid 400x300), so it exercises no
+tiling at all.
