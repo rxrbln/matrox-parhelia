@@ -5846,3 +5846,45 @@ seven separate primitive bugs, and not a points bug: it is one defect in how
 many primitives a draw walks, plus GL_POINTS which stays at zero even as a
 single primitive. Fixing the walk would give tristrip, trifan, quads and
 quadstrip at once, since their first triangle already rasterises correctly.
+
+## 21. SOLVED: many 3D submissions per boot, no reboot
+
+§12.4c fixed the fence *within* one stream, and §20.5 found that a series of
+**separate** submissions still latched the engine after two or three draws -
+which is what made every per-primitive measurement in §20 unreliable and cost a
+board reset per experiment.
+
+The cause is the same counter one level up. Each submission carries the fence
+tags its stream was generated with, so a fresh submission **re-arms a tag the
+engine has already retired**. `0x41c` holds the last retired tag; arming a value
+at or below it means the batch can never complete, and the engine stops.
+
+`parhelia-3dtri --rrfence auto` reads `0x41c` and rewrites every `0x12bc` in the
+submitted image to continue from there:
+
+```
+  uint32_t last = rd32(c, 0x41c);
+  g_rrfence = (last & ~7u) + 8;
+```
+
+**Measured on 0528, one boot, no reset:**
+
+```
+  submission  1 ... 0x41c 000001b8 -> 000001d0   idle 1
+  submission  2 ... 0x41c 000001d0 -> 000001e8   idle 1
+  ...                                            (monotonic, +0x18 each)
+  submission 10 ... 0x41c 00000290 -> 000002a8   idle 1
+  then 30 more                                   idle 1, fence 0x578
+  then 15 more                                   idle 1
+  2D instrument after all of it                  120000 / 120000
+  a fresh triangle after all of it               134128 of 135000 (99.4%)
+```
+
+**55+ consecutive submissions in one boot**, the engine idle throughout, 2D
+still drawing, and 3D still rendering at full coverage. Previously two or three
+submissions latched it.
+
+Use `--rrfence auto` on every replay. It also removes the reason §20's
+per-primitive numbers were untrustworthy: a whole primitive matrix can now be
+measured in one boot, each primitive in its own colour with its baseline
+checked, instead of one primitive per reset.
