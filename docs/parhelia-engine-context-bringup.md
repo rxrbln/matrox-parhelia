@@ -5650,9 +5650,31 @@ against a filled control:
 
 Lines behave the same way: two 400-pixel lines give 145 px.
 
-So **GL_POINTS is not a special case at all.** Our stream rasterises every
-primitive at a fraction of its true coverage, and a point is simply the size at
-which a fraction of one pixel is nothing. That also retires the framing this
+**CORRECTION, measured cleanly straight afterwards.** The claim that follows in
+this section - that every primitive rasterises at a fraction - is **wrong**, and
+the number that suggested it came from a control triangle whose pixels are
+written twice (the target is mirrored 16 MB up, so every count here is doubled).
+Measured against true areas on a clean board:
+
+```
+  triangle, area 135000    ->  134118 px    99.3%  EXACT
+  quad,     area  60000    ->   28969 px    48%    about HALF
+  16 x 16 quad, area 256   ->       0 px
+  1 px point               ->       0 px
+```
+
+So **triangles are correct**, and two separate defects remain:
+
+1. **A quad draws about half its area** - consistent with only one of its two
+   triangles being emitted, which makes the earlier "quads work, 336436 px"
+   claim an overstatement too.
+2. **Small primitives vanish entirely** - a 16x16 quad should still cover 128 px
+   even at half, and covers none.
+
+GL_POINTS belongs to the second class, so the framing below is right in spirit -
+there is no points-specific defect, and that is why every points-vs-triangle
+register diff came back empty - but the mechanism is a size threshold, not a
+uniform coverage loss. That also retires the framing this
 file has carried since §14 - there was never a points-specific defect to find,
 which is why the exhaustive points-vs-triangle register diffs (§20, §20.1) kept
 coming back empty. They were correct: there is no difference, because the fault
