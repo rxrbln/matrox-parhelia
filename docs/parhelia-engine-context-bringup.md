@@ -5135,3 +5135,106 @@ unit** (`1 << u`), and a working four-unit draw captured on this board is
 `0x1200..0x120c = 0x00040101, 0x00040102, 0x00040104, 0x00040108`, each with
 its own surface and filter registers - an alternative to the `0x3`/`0xc` split
 if the per-unit priming is not enough.
+
+## 14. GL_POINTS, and what the attribution tool was hiding
+
+### 14.1 A point's extent comes from WARP output port o10.z
+
+Every other primitive worked from our own stream; points drew nothing, and the
+five registers the capture changes for a point were all already correct in our
+output. A full ordered diff of the vendor's `base`, `points` and `psize` draw
+spans - the complete write *sequence* per register, not just the last value -
+settles that there is nothing else to copy:
+
+> **92 registers have byte-identical write sequences between the vendor's
+> triangle draw and its point draw**, including `0x1000`, `0x1040`, `0x1060`,
+> `0x10b4`, the whole `0x10b8` descriptor list, `0x1100`, `0x1110`, the stage
+> entries and the entire combiner. Apart from `0x10b0`, `0x10f0`, `0x1130`,
+> `0x1300` and the scissor, the two draws are the same bytes.
+
+So the difference is in the one object the capture does not contain: the WARP
+program. A triangle has area of its own; **a point does not, and the setup unit
+takes its extent from WARP output port `o10.z`.** Both vendor point-size
+fragments (`mtx727` @`.data+0xcbe0`, `mtx793` @`.data+0xcb40`) end with
+`mov o10.z, T1.zzzz`, and the vendor binds ONE program for triangles and points
+alike - `0x1100 = 0x08557783` in the `base`, `points` and `psize` captures - so
+it writes `o10` unconditionally and a triangle simply ignores it. Ours wrote
+`o0`, `o1` and `o11` only, which left the extent whatever the port held.
+
+Measured on 0528 in one boot, every run in a colour no earlier draw had used
+and against a `none` baseline, because with `--noclear` a pixel count is
+accumulated residue and cannot tell a blank draw from a repeat:
+
+```
+  class 3 (wide, DWGCTL nibble 0xc) + o10.z    6 points -> 6 px, reproduced
+                                               twice at the identical range
+  class 0 (thin, DWGCTL nibble 0xd) + o10.z    nothing
+  o10.z from a vertex register (v0.x, v5.x)    nothing
+  no o10.z write at all                        nothing
+```
+
+Two things follow. The extent must come from the **constant file** - a vertex
+register in the same instruction slot draws nothing at any value - and the
+**wide-point class is the path that reads it**, which is also the class the
+vendor's own `psize` capture selects. A GL driver should therefore always take
+the class-3 path and vary the constant.
+
+The size is still one pixel, because passthrough mode loads no constants and
+`c[0x172].w` keeps the vendor context's `0.5` - exactly the value the `base`
+capture carries. Loading it needs the kind-0 constant loader, which is
+transform-mode machinery today; that is the remaining gap for `glPointSize`.
+
+### 14.2 The attribution tool was mis-locating every textured span
+
+`diff-gl-variants.py` selected draw spans by matching the header `0x97080001`.
+The header carries the vertex width in bits [22:17], so a **textured** draw is
+`0x970c0001` (7 dwords: x, y, r, g, b, s, t). Matching only the 5-dword form
+made every textured variant lock onto a fragment of an unrelated frame, and
+`attribution.txt` reported the wreckage as findings: `0x1000: 3 -> 2`, a
+missing draw header, `reglist 110 -> 43` and eighteen registers "no longer
+written". **None of those were real.** The selector now matches any width and
+the regenerated attribution shows `97080001 -> 970c0001` and nothing else
+spurious.
+
+The same off-by-a-format bug was live in `gen-minimal-draw.py`: `--texture`
+emitted `0x97080001` unless the caller separately passed `--dw-per-vertex 7`,
+and the replay derives the vertex count as `(end - start) / (dwpv * 4)`, so a
+21-dword textured buffer was read as four mis-strided vertices. The width is
+now derived from the attribute layout and the guard band, `0x1060` and the
+descriptor terminator with it:
+
+| what | was | now | evidence |
+|---|---|---|---|
+| draw header | always 5 dw | 7 dw with a texture or `--pos4` | `970c0001` in every textured capture |
+| `0x1060` | fixed `0x280cc` | `0x321000 / stride` | reproduces `0x280cc`, `0x1c9b6`, `0x19080` for widths 5, 7, 8 |
+| `0x12f4` | `0x41f80000` (31.0) | `0x42000000` (32.0) | 32.0 in all 1507 writes across 37 captures |
+| `0x10b8` terminator | `--zero-descs` only | always | every capture ends the burst with `0x10b8 = 0` |
+| `progtable` body | `0x02003004/0x0200300c` | the live `0x1130` and `0x1130 & ~8` | body[9] == `0x1130` in all 27 variants |
+
+`0x1060` is a vertex **count**, `floor((bufSize - streamOffset) / stride)`
+(`mtx1035` @`0xb9ee`), over one buffer of `0x321000` free bytes - not the
+`0x31c2f0` recorded in `parhelia-draw-builders-kernel.md`.
+
+### 14.3 Texture state: what is right, and the two candidates left
+
+Against the real `texlin` span, **every texture register our generator emits
+already matches the vendor byte for byte** - `0x1200`, `0x1204`, `0x11c0`
+through `0x11e4`, `0x1110`, the combiner slots and the pads. `0x11e0[18:16]`
+is a **texel-size code**, not a tiling flag: 2 for both 32-bpt formats and 4
+for the 8-bpt one. `0x1204 = 0x0001000c` is required and is a driver
+invariant, not silicon - `mtx2501` @`0x3ff28` dereferences all four pipe-owner
+entries unconditionally, so an unclaimed pipe is a null dereference.
+
+`c[0x139]..c[0x13d]` is texture unit *i*'s 4-row texture matrix, read by the
+`dp4 o3.x, v7, c[b0+89]` form that `mtx2177` selects when `hasTg == 1`. Our
+program is the non-matrix `mov o3, v7` path, so **an uninitialised texture
+matrix cannot be our blank triangle**, and `0x13d` is unit 1's row 0, not a
+fifth row.
+
+That leaves two candidates the earlier bisection never covered: the draw
+header above, and the **per-unit surface prime**. The vendor primes each
+unit's private bank with the surface triple as well as the filter registers -
+`0x1200+4u = 0x000401(1<<u)`, `0x11dc = 0`, `0x11e0 = 0x32020001`,
+`0x11e4 = 0x00010001` - and `--ctx-defaults` wrote the filter half only, so on
+a cold context units 1..3 held a zero-width, zero-format surface descriptor
+while unit 0's draw had pipes 2+3 served by them. Both are now emitted.
