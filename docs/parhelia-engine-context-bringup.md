@@ -4999,3 +4999,36 @@ a textured draw under the vendor context still puts down no texels at all
 (searched for all four checkerboard colours). So §13's localisation stands on
 its own - enabling texture unit 0 kills the draw for a reason unrelated to
 context-create state.
+
+## 16. All GL primitives except points
+
+With §15's context in place, every primitive our generator can emit was put on
+hardware with a distinct flat colour per topology and counted by colour search.
+Six of seven work, and each draws a *different* coverage, so the topology word
+is genuinely honoured rather than everything falling back to one shape:
+
+| `--prim` | vertices | primitives | pixels |
+|---|---|---|---|
+| `tri` | 6 | 2 triangles | 294974 |
+| `tristrip` | 6 | 4 triangles | 314892 |
+| `trifan` | 6 | 4 triangles | 351605 |
+| `quads` | 8 | 2 quads | 336436 |
+| `lines` | 6 | 3 segments | 1326 |
+| `linestrip` | 6 | 5 segments | 2546 |
+| `points` | 6 | 6 points | **none** |
+
+The line counts are right for one-pixel-wide segments: the three `lines`
+segments measure 820 + 317 + 492 = 1629 px of ideal length against 1326 drawn,
+and the five `linestrip` segments 2974 against 2546 - both a little under, as
+an edge rule gives.
+
+The triangle-family counts differ from each other in the right direction: a
+strip and a fan over the same six vertices cover more than two independent
+triangles, and the fan covers most because every triangle shares `v0`.
+
+**Points do not rasterise.** That is the one primitive still open, and it has
+been open a long time (recorded as "task #22" in earlier notes). Note
+`mtx2301` @`0x87e26`, decoded in §14.3, grows the clip rectangle by *half a
+line/point width* taken from `[[state+0x3c68]+0x14]`, so the hardware does
+carry a point-size state; nothing in our stream sets it, and a zero width would
+rasterise nothing - which is the obvious first thing to test.
