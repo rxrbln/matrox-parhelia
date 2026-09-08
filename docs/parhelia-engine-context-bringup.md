@@ -5888,3 +5888,53 @@ Use `--rrfence auto` on every replay. It also removes the reason §20's
 per-primitive numbers were untrustworthy: a whole primitive matrix can now be
 measured in one boot, each primitive in its own colour with its baseline
 checked, instead of one primitive per reset.
+
+## 22. Real scenes: a textured cube and a glxgears-style demo
+
+With triangles exact (§20.7), texturing working (§19) and many submissions per
+boot (§21), the pieces are enough for actual scenes. `tools/gen-scene.py` emits
+them: because a draw walks ONE primitive, a scene is a flat triangle list and
+the stream carries one draw per triangle, with the model-view-projection,
+back-face rejection and depth sort done on the CPU (there is no hardware depth
+buffer in use yet).
+
+**Textured cube** - 6 triangles after back-face culling, depth sorted, 7-dword
+vertices (x, y, r, g, b, s, t), a per-face tint modulated by a 64x64 texture:
+
+```
+  face 0 tint ff9999   96239 px   expected 97140   99.1%
+  face 3 tint ffff99   17408 px   expected 17419   99.9%
+  face 4 tint ff99ff    5316 px   expected  5331   99.7%
+```
+
+**glxgears-style** - three meshing gears, 68 triangles, flat shaded in the
+familiar red/green/blue. Submitted as two 34-triangle chunks because a single
+submission stalls past ~224 ring packets (40 triangles = 222 packets is the
+largest that fits); `--rrfence auto` makes the second chunk land on the same
+target as the first.
+
+Both are read back with `--nzdump` and de-tiled by `tools/detile-nzdump.py`.
+
+### 22.1 Three things this demo pinned down
+
+**The 2D fill's destination offset is per boot.** `--texfill BASE` lands at
+`BASE - 0x240000` on one boot and `BASE + 0x5a0000` on another. Measure it every
+boot - fill a unique colour and `--findcolor` it - before clearing a target or
+uploading a texture, or the clear silently does nothing and the sampler reads
+stale texels. Several confusing results here were exactly that.
+
+**The preflight cannot parse a call list.** `0x20292820` is not in its opcode
+set, so it walks the CALL operands as register tags and desynchronises; it
+refused a legitimate 362-call ring at dword 1025 while shorter rings of the
+identical shape resynchronised by luck. Teaching it the five-dword call packet
+was not enough because sync packets shift the phase, so scenes currently use
+`--nopreflight` - the streams are machine generated and `--selfcheck` validates
+their framing.
+
+**The coverage defect is visible.** Both scenes render with 32x32 holes in a
+regular pattern, and the dump proves those pixels hold the *background*, so the
+rasteriser genuinely leaves them - it is not a de-tiling error (the swizzle was
+searched: every variant scores within 0.4%, and drawn-pixel connectivity is
+0.9926). Half a tile is 32x32. This is the same defect that makes a 32x32 quad
+draw 5% and a one-pixel point draw nothing, now visible directly on a real
+scene, which makes it far easier to work on than the point case.
