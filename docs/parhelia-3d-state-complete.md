@@ -368,3 +368,49 @@ channels rather than independent per channel.
 
 Per-vertex alpha therefore interpolates and drives both the alpha test and the
 blender.
+
+## Clipping and lighting, 2026-09-08
+
+Both became possible once the constant file worked
+(`docs/parhelia-constant-file-blocker.md`).
+
+### Clipping
+
+An NDC triangle far outside the view volume - `(-2,-2) (2,-2) (0,2)`, whose
+unclipped screen vertices are `(-512,1152) (1536,1152) (512,-384)` - rasterises
+to **688096 px** against a hand-computed visible area of **687872**, a 0.03%
+difference.  Edges are straight to the screen boundary, the colour gradient
+continues from the unclipped vertices rather than restarting, and there is no
+wraparound.  Viewport clipping needs no extra state: the scissor and guard band
+the library already emits are enough.
+
+### Lighting
+
+`p3d_warp_lighting()` is a fixed-function directional light: `max(0, N.L)` per
+vertex times the material colour, interpolated by the setup unit.  The normal
+rides in the colour attribute `v5`, the light direction is `c4` and the
+material `c5`, both loaded in the same block as the MVP.
+
+Measured with `L = (0,0,1)`, white material, and three vertex normals:
+
+| vertex normal | predicted N.L | predicted grey | measured |
+|---|---|---|---|
+| `(0,0,1)` | 1.000 | 255 | **255** (`#ffffff`) |
+| `(0.707,0,0.707)` | 0.707 | 180 | **180** (`#b4b4b4`) |
+| `(1,0,0)` | 0.000 | 0 | 16 (`#101010`, one pixel inside the corner) |
+
+97371 pixels in 1667 distinct greys - a smooth interpolated ramp.
+
+### Two WARP encoding rules that cost a day
+
+Both assemble cleanly and both silently draw **nothing**:
+
+1. **Only one constant per instruction bundle.**  `dp3 r3, v5, c4 | mov T1, c9`
+   reads two constants in one bundle.  Keep `mov T1, c9` paired with a primary
+   that reads no constant, exactly as the vendor does.
+2. **A constant reads correctly only in the operand positions the vendor uses**
+   - `dp4`/`dp3` src1 and `mad` src0.  `add o1, c0, r1.0000` runs and draws,
+   but the colour that comes out is `#ffff80`, not c0's `(1,0,0,0)`.
+
+Neither is a program-length limit: the working program plus one extra
+instruction draws normally, which is the control that separated the two.
