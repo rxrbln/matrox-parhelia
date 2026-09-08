@@ -5743,3 +5743,41 @@ So of §20.3's two claimed defects, only one is established: **small primitives,
 including a one-pixel point, write nothing**. Whether quads lose a triangle is
 open, and the earlier "6 of 7 primitives work" was never measured against true
 areas at all.
+
+### 20.5 Seven primitives in one boot latches the engine
+
+Re-measuring all seven primitives properly - a distinct clean colour each,
+non-overlapping screen regions, known areas, baselines checked - does not
+produce usable numbers, because **the engine latches partway through the
+sequence**. Both attempts ended `idle 0`, and the draws after the latch write
+nothing, which is indistinguishable from a primitive that does not work.
+
+The first attempt gave, as deltas against each colour's own baseline:
+
+```
+  tri        16824 of 20000     drew
+  trifan     19070 of 40000     drew, about half
+  tristrip       0              after this point the engine had latched
+  quads          0
+  lines          0
+  linestrip      0
+  points         0
+```
+
+Giving each stream its own fence base (`--sync 0x200, 0x240, ...`, since seven
+independently generated streams otherwise all start at the default `0x1a8` and
+the fence cannot advance across submissions - the §12.4c bug one level up) did
+**not** fix it: the second attempt latched with nothing drawn at all.
+
+So the §12.4c fix is verified only *within* one stream - four draws in one
+42-packet submission, `0x41c` advancing 0x1b0/0x1b8/0x1c0/0x1c8 - and does not
+generalise to a series of separate submissions. Until that is understood, any
+per-primitive coverage number from a multi-draw run is worthless, and the
+per-primitive status of this driver is **unmeasured** rather than known. Only
+the single-draw results are trustworthy:
+
+```
+  triangle, area 135000 -> 134110 px   99.3%   (isolated draw, clean colour)
+  textured triangle                    exact texel colour (section 19)
+  one-pixel point                      0 px, in every configuration tried
+```
