@@ -621,11 +621,40 @@ all of which match `docs/parhelia-multitexture.md` exactly.  The vertex is
 cyan, the second unit combined with `GL_ADD` renders 98304 px of pure white -
 the saturated sum, which is only reachable if both textures are read.
 
-**The MODULATE chain is not right yet.**  `MUL r0, t1, r0` at slot 8 is emitted
-as the documented `0x1264 = 0x02000028`, `0x126c = 0x01400000` (Areg = t1,
-Creg = r0, dreg = r0, saturate, opcode base 0 = MUL), and every field checks
-out against the packing rules, but the result is `#fffefe`/`#feffff` - an
-additive result, not the `#00ff00` that yellow x cyan must give.  So the second
-ALU instruction runs and reads both units, but its opcode is not taking effect.
-ADD and MODULATE differ only in `0x126c`/`0x1268` bits `[11:10]`, and both
-behave as ADD.
+**The MODULATE chain is not right yet** - `MUL r0, t1, r0` at slot 8 renders an
+additive `#fffefe` rather than yellow x cyan = `#00ff00`.  See the opcode
+section below: this is NOT the opcode failing, which was the first reading.
+
+
+## The combiner opcode field works exactly as documented
+
+Two features - the multitexture MODULATE chain and GL_DECAL - failed the same
+way, which looked like the `0x126c` opcode base having no effect.  **That was
+wrong.**  Sweeping the field on the single-unit ALU with A = t0 (a `#336699`
+texel) and C = v0 (a grey `#808080` vertex colour) gives:
+
+| `0x126c` base | result | reading |
+|---|---|---|
+| `0x0000` | `#1a334c` | 0.5 x texel - **MUL** |
+| `0x0400` | `#336699` | texel - **MOV** |
+| `0x0800` | `#4c99e6` | 1.5 x texel - **MAD** |
+| `0x0a00` | `#336699` | texel - **LRP**, see below |
+| `0x0c00` | `#66ccff` | **2 x texel** - ADD |
+
+Every opcode behaves as its table entry.  The `0x0c00` row is the useful one:
+ADD produced *twice the texel*, not texel + vertex colour, because **register
+code 0 is `t0`** - so an operand field left at zero silently samples texture
+unit 0 rather than meaning "unused".  `LRP` reads the same way: with
+`B = 0 = t0` it computes `A*C + B*(1-C)` = `texel*0.5 + texel*0.5` = the texel,
+exactly what was measured.
+
+That is the real defect behind both failures - operand fields that were left
+zero, not a dead opcode field.
+
+### GL_DECAL: the LRP runs, its C operand does not
+
+`LRP r0, t0, v0, t0.a` is emitted as `0x1264 = 0x00040002`,
+`0x126c = 0x01400b00` (A = t0, B = v0, C = t0 with replicate 4 = alpha).  It
+renders the pure texel for a texture alpha of 0x00, 0x80 **and** 0xff, so the
+result is `A*1 + B*0` - the C operand reads as 1.0 and the alpha replicate is
+not selecting alpha.  The `Crep` encoding is the open piece.
