@@ -5305,3 +5305,56 @@ a draw on our context. That is the same 3D-context-create gap that blocks cold
 operation, now pinned to a single mechanism rather than a whole subsystem: the
 next step is the missing context state that lets a second texture unit be
 claimed, not any further sampler register.
+
+## 16. Two rigorous negatives, and the instruments that produced them
+
+§14 and §15 were argued from `--findcolor`, which searches 32 MB per call and
+cannot distinguish "drew nothing" from "drew somewhere I did not scan". Two
+better instruments settle both open items.
+
+**`--peek ADDR N` reads the actual pixels.** After an untextured control the
+render target reads `ff333333`; after the textured draw over it, the same
+addresses read **`ff000000`** while the texture source at `0xa000000` reads
+`ffffffff`. So the textured triangle is not missing - it is drawn, opaque, with
+**RGB exactly zero and alpha 1.0**. The rasteriser, the interpolators and the
+combiner's output path all work; only the value the texture unit hands the
+combiner is zero.
+
+**A differential count is sensitive to one pixel.** Draw a control triangle,
+count its colour, draw points *inside* it, count again. Any point that lands
+removes pixels from the count. Measured:
+
+```
+  control                     269109 px
+  after 6 points, size 8      269109 px      <- zero pixels written
+  after 6 points, size 1      269109 px      <- zero pixels written
+```
+
+**GL_POINTS writes no pixels at all.** That is a much stronger statement than
+§14.1a's "did not reproduce", and it retires the six-pixel result for good.
+
+### 16.1 What is excluded for texturing
+
+Every one of these was tested on hardware with a same-run control that drew
+134-269 kpx, and every one still produced `ff000000`:
+
+| candidate | result |
+|---|---|
+| `0x1200` = `0x0004000f`, `0x00040003`, `0x00050003` | draws, black |
+| `0x1200` bit 8 set (any pipe mask), `0x1204 = 0x0001000c` | no draw at all |
+| surface triple, filter, wrap, `0x11cc..0x11d8` | draws, black |
+| `0x11e8` cache partition `0x00500000` **and** `0x00100000`, without bit 8 | draws, black |
+| our combiner, and the vendor's GL_REPLACE combiner read verbatim out of the `texrepl` capture (`0x1264=2, 0x1260=0, 0x126c=0x01400400, 0x1268=0x01400400`) | draws, black |
+| `mov o3, v7` and `mov o3, v7.xy01` (explicit `w = 1`) | draws, black |
+| texture addressing: 2.5 M white pixels flooded over `0x9800000..0xb7f98a0` so no translation can miss | draws, black |
+
+Worth keeping: **`--texfill BASE` actually writes `BASE - 0x240000`** - the 2D
+destination base is pool-relative like the surface base - so every textured run
+before this section had been sampling unwritten VRAM. Fixing that did not fix
+the draw, but it invalidates the earlier evidence.
+
+So the texture unit is enabled, addressed and read by a correct combiner, and
+returns zero. The only registers that would give it a pipe pair are the two
+that stall the draw outright. Both remaining failures - texturing and points -
+now point at the same place: **the 3D-context-create state we have never
+emitted**, not at any register in the sampler or the primitive path.
