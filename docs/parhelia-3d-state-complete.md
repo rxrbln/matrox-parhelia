@@ -414,3 +414,44 @@ Both assemble cleanly and both silently draw **nothing**:
 
 Neither is a program-length limit: the working program plus one extra
 instruction draws normally, which is the control that separated the two.
+
+## Transform, clipping and lighting in ONE draw
+
+Each of the three was proven separately above.  This is the combined case - a
+single draw, single stream, single WARP program, with the depth buffer also
+bound and testing:
+
+* **Transform**: MVP with a translation of +0.25 in x, so the NDC triangle
+  `(-2,-2) (2,-2) (0,2)` lands at screen `(-384,1152) (1664,1152) (640,-384)`.
+* **Clipping**: those vertices are outside the viewport on all four sides.
+* **Lighting**: vertex normals `(0,0,1)`, `(1,0,0)`, `(0.707,0,0.707)` against
+  `L = (0,0,1)`, so the unclipped vertex greys would be 255, 0 and 180.
+
+| quantity | predicted | measured |
+|---|---|---|
+| visible area | 663552 px | 662528 px (0.15% low, one scanline) |
+| brightness at (10,700) | 221 | **221** |
+| brightness at (500,400) | 171 | **171** |
+| brightness at (1000,700) | 98 | **98** |
+
+The three sample points are chosen far apart inside the clipped region and are
+computed from the barycentric interpolation of `max(0, N.L)` at the transformed
+vertex positions.  Matching all three exactly to the LSB is only possible if
+the transform, the clip and the lighting are simultaneously correct - a wrong
+matrix moves the barycentric weights, a wrong clip changes which pixels exist,
+and wrong lighting changes the ramp.
+
+The visible grey range is 94..227 rather than 0..255 because the fully lit and
+fully unlit vertices are both off-screen and clipped away - itself a check that
+the clip is doing what is claimed.
+
+Reproduce with:
+
+```
+p3d_selftest --depth --zbase 0x3400000 --posdesc 0x21c00000 \
+             --coldesc 0xa1c50030 --warpentry --light --translate 0.25 0 \
+             --emit TCL
+parhelia-3dtri --warpstore --warpidx 32 --warpbind 2 loader.warp.hex 0 \
+               --warpprog light4-prog.hex --rrfence auto \
+               --ringreplay TCL-{ring,sec}.hex TCL-reloc.txt --ringvtx TCL-verts.hex
+```
