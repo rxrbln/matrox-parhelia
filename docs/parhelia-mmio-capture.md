@@ -203,6 +203,21 @@ resuming `uc_sigmask` (Xorg blocks signals around critical sections, and a
 changes nothing - the same two-fault pattern repeats, with the second address
 being the first truncated to 32 bits and no `SIGTRAP` in between.
 
+**The faulting instruction is now identified.** Logging `REG_RIP` gives
+`mtx_drv.so + 0x4a785` for the in-region fault, which disassembles to
+
+```
+  4a77b:  89 db              mov    %ebx,%ebx          ; zero-extend the offset
+  4a77d:  48 8b 40 20        mov    0x20(%rax),%rax
+  4a781:  48 8b 40 40        mov    0x40(%rax),%rax    ; -> the BAR1 pointer
+  4a785:  8b 04 18           mov    (%rax,%rbx,1),%eax ; the register READ
+```
+
+so the trap genuinely catches the driver's register access, and the access form
+is a plain 32-bit load with the offset in `%rbx` and the mapping pointer reached
+through two indirections. The second, out-of-region fault has a `REG_RIP` in a
+**different module** entirely, so it is not this instruction restarting.
+
 That truncation is the thread to pull. It is reproducible across boots with
 different mapping bases, so it is not noise: the re-executed access computes a
 32-bit address. Either the trap flag is not taking effect and X then faults
