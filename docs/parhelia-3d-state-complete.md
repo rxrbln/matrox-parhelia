@@ -342,3 +342,29 @@ so they prove the blender ran even though the alpha is a constant 1.0; the
 SRC_ALPHA row matching the unblended control is exactly what alpha = 1.0
 predicts.  Every result matches the factor table's prediction, confirming both
 the RGB and the alpha nibble of each factor.
+
+### Per-vertex alpha
+
+A three-component colour attribute makes the interpolator supply alpha = 1.0,
+which is why the alpha test above could only be probed at its extremes.  Widen
+the colour descriptor's component mask `[25:22]` from `0111` to `1111` and the
+vertex carries a real alpha: layout x,y,z,r,g,b,a, seven dwords per vertex, so
+the draw header becomes `0x970c0001`.
+
+With alpha = 0.5 at every vertex, over a green background:
+
+| state | result |
+|---|---|
+| blending off | 86568 red - the wider vertex still draws correctly |
+| `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` | 43311 px `0x7f8000` + 43265 px `0x807f00` = 86576, the whole triangle |
+| alpha test GREATER, ref `0x40` | 86576 red - passes |
+| alpha test GREATER, ref `0xc0` | 0 - all 524288 pixels stay green |
+
+`0x7f8000` and `0x807f00` are the two roundings of 127.5, which is exactly
+`0.5 * red + 0.5 * green`.  The split into two values in near-equal numbers is
+the dither unit (`0x12e8` bit 23) resolving the half-LSB; `0x808000` and
+`0x7f7f00` never appear, so the dither is anti-correlated between the two
+channels rather than independent per channel.
+
+Per-vertex alpha therefore interpolates and drives both the alpha test and the
+blender.
