@@ -303,3 +303,42 @@ ONE_MINUS_SRC_ALPHA 7/7, DST_COLOR 8/0xa, and so on.
 Verification: our encoder emits `0x00800202` with blending off and `0x0080eced`
 for `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)` - both exactly the
 values the vendor capture carries.
+
+### Hardware verification of the alpha test
+
+Flat red triangle, ~86585 px, black background, each run carrying an
+alpha-test-off positive control:
+
+| alpha test | red pixels |
+|---|---|
+| off | 86585 |
+| GREATER, ref `0x00` | 86593 |
+| GREATER, ref `0x80` | 86585 |
+| GREATER, ref `0xff` | **0** |
+| LESS, ref `0xff` | **0** |
+
+The test accepts and rejects on both compare directions and honours the
+reference, so the encoding is confirmed on hardware.  GREATER `0xff` and LESS
+`0xff` both rejecting everything pins the pipeline's constant fragment alpha at
+exactly 255 - our vertices carry no alpha component yet, so the interpolator
+supplies 1.0.
+
+### Hardware verification of blending
+
+Flat red triangle over a **green** background, so a blended result cannot be
+confused with an unblended one.  437703 green + 86585 triangle = 524288, the
+whole scanned region, in every row:
+
+| mode | `0x12e8` | result |
+|---|---|---|
+| off | `00800202` | 86585 red |
+| `ONE, ONE` (additive) | `00802223` | **86585 yellow**, 0 red - red + green |
+| `ZERO, ONE` | `00802021` | **524288 green** - destination preserved exactly |
+| `DST_COLOR, ZERO` (modulate) | `00801411` | **86585 black** - red x green |
+| `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` | `0080eced` | 86585 red, same as off |
+
+Additive, modulate and keep-destination are independent of the fragment alpha,
+so they prove the blender ran even though the alpha is a constant 1.0; the
+SRC_ALPHA row matching the unblended control is exactly what alpha = 1.0
+predicts.  Every result matches the factor table's prediction, confirming both
+the RGB and the alpha nibble of each factor.
