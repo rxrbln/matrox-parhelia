@@ -5358,3 +5358,39 @@ returns zero. The only registers that would give it a pipe pair are the two
 that stall the draw outright. Both remaining failures - texturing and points -
 now point at the same place: **the 3D-context-create state we have never
 emitted**, not at any register in the sampler or the primitive path.
+
+## 17. The setup program was uploaded but never referenced
+
+`--warpbind N file 0` has been on every command line in this file for weeks and
+the tool has always reported **`0 patched`**. That is not a cosmetic detail: it
+means the program was uploaded into the on-chip store and then **nothing in the
+stream ever referenced its entry**, so it never ran. `vsetup-c` is the program
+that ends with `streg [0x0e8..0x0fc], c24..c29` - the WARP internal registers
+that carry the primitive class - and it had never executed once.
+
+The blob it consumes is the one `progtable()` emits: a 16-dword `0x41` whose
+words [8] and [9] are the pipeline-control word, i.e. the class (§14.2 fixed
+those from a hard-coded flat-triangle pair to the live `0x1130`).
+
+`--setup-bind SLOT` now emits the loader bind with a `0xdeade000 + SLOT`
+placeholder followed by that blob, so `--warpbind` patches the uploaded entry
+in. The tool now reports **`2 patched`**, and a triangle drawn with the setup
+program actually running still draws 134110 px - so the mechanism is correct
+and harmless.
+
+It does not fix either open item. With `vsetup-c` running and the class blob
+carrying `0x0300200c` (wide point), points still write **zero** pixels by the
+differential count; with it running under a textured draw the target still
+reads `ff000000`. `vsetup-a` and `vsetup-b` in the same role change nothing.
+
+So the missing context state is not simply "the setup program never ran",
+though that was real and is now fixed. One observation is worth recording
+without being claimed: with the vendor's own `0x1200 = 0x00040103` /
+`0x1204 = 0x0001000c` pair **and** `--wbarm` (the write-back path armed from
+the ring - bit 8 is a *cache* participation bit, and a cache needs somewhere to
+write back), a run produced `ff343333 ff333434 ff343434 ff343435` instead of
+the invariable `ff000000` - values dithered around the control's own colour.
+**It did not reproduce**: a repeat with a `#666666` control left the target
+untouched at `ff666666`. The live GL client renders while X is frozen, so a
+changed pixel can be its work rather than ours; that reading is a lead for the
+next session, not a result.
