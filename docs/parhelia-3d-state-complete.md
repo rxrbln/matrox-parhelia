@@ -597,3 +597,35 @@ GL_ADD, GL_DECAL and GL_BLEND have their lowerings decoded in
 `LRP r0, TEX, PREV, TEX.a`, BLEND is `LRP r0, c0, PREV, TEX`) with opcodes in
 `[14:9]` - MOV 2, MUL 0, ADD 6, SUB 3, MAD 4, LRP 5 as encoded - but none is
 implemented or exercised.
+
+## Multitexture: two units bind and sample; the MODULATE chain does not
+
+`0x11c0`..`0x11e4` is one windowed register file shared by all four units, and
+`0x1200 + unit*4` with its low nibble forced to `1 << unit` selects which bank
+the following writes land in.  There is no `0x11c0 + unit*stride`.
+`p3d_state` now programs each unit in that order and emits, for two units:
+
+| register | value |
+|---|---|
+| `0x1200` | `0x00040101` (unit 0 bank) |
+| `0x1204` | `0x00040102` (unit 1 bank) |
+| `0x1110` | `0x00000303` (two texcoord sets, bit `8+set`) |
+| draw header | `0x97100001` - nine dwords per vertex |
+| descriptors | pos, colour, `0x20c70050` (set 0, last flag cleared), `0x a0c80070` (set 1, last) |
+
+all of which match `docs/parhelia-multitexture.md` exactly.  The vertex is
+`x,y, r,g,b, s0,t0, s1,t1` and the WARP program gains `mov o4, v8` alongside
+`mov o3, v7`, since texcoord set *i* drives output `o(3+i)`.
+
+**Both units are proven to sample.**  With unit 0 holding yellow and unit 1
+cyan, the second unit combined with `GL_ADD` renders 98304 px of pure white -
+the saturated sum, which is only reachable if both textures are read.
+
+**The MODULATE chain is not right yet.**  `MUL r0, t1, r0` at slot 8 is emitted
+as the documented `0x1264 = 0x02000028`, `0x126c = 0x01400000` (Areg = t1,
+Creg = r0, dreg = r0, saturate, opcode base 0 = MUL), and every field checks
+out against the packing rules, but the result is `#fffefe`/`#feffff` - an
+additive result, not the `#00ff00` that yellow x cyan must give.  So the second
+ALU instruction runs and reads both units, but its opcode is not taking effect.
+ADD and MODULATE differ only in `0x126c`/`0x1268` bits `[11:10]`, and both
+behave as ADD.
