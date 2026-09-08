@@ -129,33 +129,45 @@ With all three, the three-gear scene agrees with the CPU reference on
 **167163 of 167431 covered pixels** and 97.4% of the frame matches within
 2/255, against 86% and a 16% facet-disagreement rate when batched.
 
-### Still open: the shading degrades as submissions accumulate
+### SOLVED: the loader's descriptor list has to be terminated
 
-Each face group drawn on its own, or any PAIR of them, is essentially exact:
+Each face group drawn alone, or any PAIR of them, was essentially exact - front
+faces alone 29 pixels off, flanks alone 32, front+flanks 48, front+back 29 -
+and only the full six-group sequence was wrong, at 9594.  Nothing was wrong
+with any group's geometry or shading; state was leaking between submissions.
 
-| submitted | pixels wrong vs the reference |
+93.6% of the wrong pixels had a depth agreeing with the reference to within
+64/2^24, so the same surface won and only its colour differed.  Recovering N.L
+from the colour showed the reference always matching the geometric n.L while
+the hardware used a value belonging to a **different normal** - 0.663 is
+exactly (0,1,0).L, another tooth's flank normal.  The faces that went wrong
+were precisely those whose neighbouring vertices carry different normals: the
+front and back faces all share (0,0,+/-1), so picking up a neighbour's normal
+there is invisible, while every tooth flank has its own.
+
+The cause: the constant loader is fed through its own one-attribute descriptor
+(`0x10b4 = 0`, `0x10b8 = 0x83c00000`), and that list was never closed.  A draw
+descriptor list ends with a zero terminator; leaving the loader's open left
+descriptor state behind, and the next submission's attribute fetch picked up
+the wrong vertex's normal.  One more register write fixes it:
+
+```
+0x10b4 = 0
+0x10b8 = 0x83c00000     one xyzw attribute, offset 0, last
+0x10b8 = 0              terminator - without this the list stays open
+```
+
+| | pixels wrong |
 |---|---|
-| front faces alone | 29 |
-| tooth flanks alone | 32 |
-| front faces + flanks (2 submissions) | 48 |
-| front faces + back faces (2 submissions) | 29 |
-| **all six face groups (6 submissions)** | **9594** |
+| gear 0, list left open | 9594 |
+| gear 0, list terminated | **45** |
+| all three gears, terminated | **100 of 167431 covered (0.06%)** |
 
-So neither the geometry nor the shading of any group is wrong - they are right
-when drawn alone and right in pairs.  Something accumulates across submissions.
+The three-gear scene now covers **167423 of the reference's 167431 pixels** -
+eight apart - with **99.99% of the frame within 2/255**.
 
-What the wrong pixels are is pinned down: 93.6% of them have a depth that
-agrees with the reference to within 64/2^24, so the SAME surface won and only
-its colour differs.  Recovering N.L from the colour shows the reference always
-matches the geometric n.L (0.109 against 0.107, 0.447 against 0.449, ...) while
-the hardware uses a value belonging to a different normal - 0.663 is exactly
-(0,1,0).L, another tooth's flank normal.  The faces that go wrong are precisely
-those whose neighbouring vertices carry DIFFERENT normals: the front and back
-faces all share (0,0,+/-1), so fetching a neighbour's normal there is
-invisible, while every flank has its own.
+### A measurement trap worth recording
 
-Ruled out by direct measurement: culling (proven honoured - culling the
-opposite face changes the image completely), winding, depth precision (24-bit
-quantisation of the reference, per vertex or per pixel, moves the count by one
-pixel), the normal's sign (normal (0,0,-1) against light (0,0,-1) gives full
-brightness), and a one-pixel coverage shift (explains only 9%).
+Three "the render drew nothing" results in a row were the test box's disk being
+100% full: `nzdump` reported the correct pixel count and wrote an empty file.
+Check `df` before believing a sudden regression.
