@@ -5394,3 +5394,36 @@ the invariable `ff000000` - values dithered around the control's own colour.
 untouched at `ff666666`. The live GL client renders while X is frozen, so a
 changed pixel can be its work rather than ours; that reading is a lead for the
 next session, not a result.
+
+### 17.1 The setup-stage entries, and a dumper that had been writing empty files
+
+`dump-warp-programs.sh` dumped each 0x600-byte program slot with
+`dd if=/dev/mem bs=0x600 ...`. **`dd` does not parse `0x600`**, so every slot
+file it has ever produced was **zero bytes** - the entries map was right and
+the program bodies were empty, silently. With `bs=1536` the dump works, and
+this boot's five setup-stage entries resolve:
+
+```
+  0x10c8 = 071579bf -> slot 15406800 instruction 111   program A
+  0x10cc = 071579cf -> slot 15406800 instruction 115   A + 4 instructions
+  0x10d0 = 071579bf                                    A again
+  0x10d4 = 071579cf                                    B again
+  0x10d8 = 07156b83 -> slot 15403e00 instruction  96   program C
+  0x10c0 = 0
+```
+
+confirming the A, B, A, B, C pattern §1939 inferred from the entry arithmetic.
+The bodies are **setup-unit microcode, not WARP vertex microcode** - the third
+dword takes values (`20800000`, `1a000000`, `11c00000`, `06c0e000`) that the
+vertex ISA never produces - so `parhelia-warpdis2.py` cannot read them and they
+are saved verbatim as `captures/warp-programs/stage-{A,B,C}.warp.hex`
+(17, 13 and 32 instructions).
+
+`--stage-binds A,B,C` emits the five entries as `0xdeade000 + slot`
+placeholders so `--warpbind` patches in the uploaded programs. With all three
+bound and running, and the control triangle still drawing 268219 px, **points
+still write zero pixels and a textured draw still reads `ff000000`.**
+
+So the stage group is now emitted, correct and harmless - and it is not the
+missing state either. Together with §17 this rules out both halves of the
+"the setup programs never ran" theory, which was the leading hypothesis.
