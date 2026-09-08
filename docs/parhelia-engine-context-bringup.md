@@ -5528,3 +5528,38 @@ Recipe: `gen-minimal-draw.py --texture BASE,W,H` with the defaults - full
 sampler window (`--texgroups 4`, so `0x1204` is emitted), `0x1200 = 0x00040103`,
 the MODULATE combiner, and `0x10fc`/`0x1330`/`0x1334`. Note `--texfill BASE`
 writes `BASE - 0x240000` (§15), so upload accordingly.
+
+## 20. Points: what the same-boot diff says, and what it does not
+
+The instrument that solved texturing was pointed at points too
+(`tools/points-vs-tri.sh`, a same-boot points-vs-triangles capture). Diffing
+each draw's own span gives **only the five registers we already emit
+correctly**:
+
+```
+  0x10b0  0006305c -> 00060020      primitive word
+  0x10f0  00000002 -> 00000000      WARP mode
+  0x1130  0200200c -> 0000200c      pipeline control, class 0
+  0x1300  00a60ec4 -> 00a60ecd      DWGCTL nibble
+  (plus 0x1090 X's blit source and 0x12bc the fence counter)
+```
+
+So unlike texturing, there is **no hidden register difference between a
+triangle and a point** - the vendor configures a point exactly the way we do.
+
+Diffing the vendor's point span against *our* stream instead lists 45
+registers the vendor writes that we never do. Emitting all 45, and the
+plausible subset (`0x1154=1`, `0x1180=1`, `0x11f4=1`, `0x138c=0x00200020`,
+the depth surface), changes nothing: the differential count stays at
+269095 px, i.e. **zero pixels written**. Nor does it matter whether the WARP
+program writes `o10.z` at all, or whether the draw declares six vertices or
+the single vertex the vendor's own point draw uses.
+
+`--extra-regs reg=val,...` was added for that probe and is worth keeping.
+
+So for points the failure is *not* register state, *not* the vertex program,
+*not* the vertex count, and by §17 not hidden MMIO either. That is a much
+tighter box than at the start of the session, and it points at the remaining
+untested content: the `0x41` block loads. The vendor's point span carries
+block loads our stream substitutes, and unlike the texture case the difference
+cannot be a register - so it has to be the payload of one of those.
