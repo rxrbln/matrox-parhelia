@@ -128,10 +128,9 @@ viewport scale and offset correct.  Gouraud interpolation survives the
 transform: corners `#fe0000` / `#10ee00` / `#0001fe`, edge midpoints `#80007f`
 and `#008080`, and R+G+B = 255 +/-1 across all 97371 pixels.
 
-## Remaining artefact
+## Remaining artefact - SOLVED
 
-Both the Gouraud and the textured triangle lose a small sliver at the
-bottom-right corner - the right vertex rasterises to about x=735 instead of
-768, 933 pixels short of the predicted 98304.  It is identical in both, so it
-is a coverage effect of that geometry and not a texture or interpolation fault.
-Unexplained; roughly 1% of the area.
+The bottom-right sliver was a missing end-of-draw pipeline drain, not a
+coverage effect: DWGCTL 0x307 with the batch fence wrapped around it.  Every
+pixel count is now exact.  See "The missing sliver" in
+docs/parhelia-3d-state-complete.md.

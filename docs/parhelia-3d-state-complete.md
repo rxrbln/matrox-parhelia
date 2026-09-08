@@ -208,15 +208,14 @@ colour target:
 The written Z is the expected `0.8 * 2^24 = 0x00cccccd`, so Z24 is plain
 unsigned normalised: far is `0x00ffffff`, near is `0x00000000`.
 
-### Depth writes cover ~850 more pixels than colour writes
+### Depth writes cover ~850 more pixels than colour writes - SOLVED
 
-Every measurement shows the depth footprint slightly larger than the colour
-footprint of the same triangle - 87426 Z pixels against 86577 colour pixels in
-the clear+draw test, and the same ~849 px gap appears as an order-dependent
-difference in the two-triangle occlusion test (40212 vs 41054 surviving far
-pixels).  The magnitude matches the triangle's perimeter, so this is an edge
-rule: boundary fragments update Z but not colour.  Not yet explained; it does
-not affect occlusion correctness in the interior.
+Originally measured as 87426 Z pixels against 86577 colour pixels for the same
+triangle, and guessed at as an edge rule.  It was neither an edge rule nor a
+depth/colour difference: the draw was simply not draining, and the colour path
+lost more of the tail than the depth path did.  With the end-of-draw pipeline
+drain (see "The missing sliver" below) the two footprints are **identical** -
+87500 colour pixels and 87500 Z pixels.
 
 ### Surface aliasing corrupts both buffers
 
@@ -455,3 +454,54 @@ parhelia-3dtri --warpstore --warpidx 32 --warpbind 2 loader.warp.hex 0 \
                --warpprog light4-prog.hex --rrfence auto \
                --ringreplay TCL-{ring,sec}.hex TCL-reloc.txt --ringvtx TCL-verts.hex
 ```
+
+
+## The missing sliver: a missing end-of-draw pipeline drain - SOLVED
+
+Every draw was losing roughly 1024 pixels - about 1% - and it showed up three
+different ways: a bite out of the bottom-right corner of the Gouraud and
+textured triangles (933 px short of 98304), one scanline missing from the
+clipped TCL draw (1024 px short of 663552), and a depth footprint ~850 pixels
+larger than the colour footprint of the same triangle.
+
+### What the loss actually looked like
+
+Comparing the measured pixel set against a CPU rasterisation of the same
+triangle:
+
+* **zero extra pixels** in every case - the geometry is exact, nothing is drawn
+  outside the triangle, so this was never a rasterisation or clipping fault;
+* the missing pixels are confined to **whole 32x32 pixel sub-blocks** at the
+  end of raster order.  The clipped draw lost exactly one - block (31,23), the
+  last block of the last tile of the screen, 1024 of its 1024 covered pixels;
+* within a tile the loss is in-tile x 32..63 for all 32 rows, i.e. a 32x32
+  block, which is contiguous in *pixels* but scattered in memory - so it is a
+  rasterisation quantum, not a byte-range write buffer.
+
+A fixed ~1024-pixel quantum, always the last work in raster order, is a
+pipeline that is never drained.
+
+### The fix
+
+The vendor drains it immediately after its draw packet, in one register list:
+
+```
+0x1300 = 0x00000307     DWGSYNC opcode (DWGCTL nibble 6/7 is the sync family)
+0x12bc = tag | 1        arm the fence
+0x12bc = tag            disarm
+0x1300 = 0x00a60ec4     restore the 3D DWGCTL
+```
+
+Wrapping the batch fence **around** the sync opcode is the point: the fence
+then waits for the pixel pipeline to empty instead of merely ordering behind
+the draw.  Our streams emitted the EOBTAG and the fence pair but left DWGCTL at
+its 3D value, so nothing ever forced the drain.
+
+### Result - every count is now exact
+
+| case | predicted | before | after |
+|---|---|---|---|
+| Gouraud triangle | 98304 | 97371 (933 missing) | **98304, 0 missing** |
+| textured triangle | 98304 | 97371 | **98304** (73664 + 24640 dither) |
+| clipped TCL draw | 663552 | 662528 (1024 missing) | **663552, 0 missing** |
+| depth vs colour footprint | equal | 86577 vs 87426 | **87500 vs 87500** |
