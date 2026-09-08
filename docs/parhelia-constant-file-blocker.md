@@ -3,7 +3,7 @@
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
-Status 2026-09-08: **open**.  The depth, alpha and blend work of
+Status 2026-09-08: **SOLVED**.  See the resolution at the end.  The depth, alpha and blend work of
 `docs/parhelia-3d-state-complete.md` is all fixed-function state written through
 ordinary register lists.  Transform, clipping and lighting are different: all
 three read the WARP **constant file**, and every attempt to write it from our
@@ -84,3 +84,54 @@ entry we do not have and we passed 0 there, so `a0` may still not be latched.
    -space vertices and is fully working, so a driver can ship the fixed-function
    path with a CPU transform and no constant file at all.  Lighting and hardware
    clipping would stay unavailable.
+
+
+---
+
+# SOLVED
+
+The loader is fed **as a vertex program**: it consumes one vec4 per iteration
+through the attribute port.  So the vertex fetch has to be pointed at a single
+four-component attribute *before* the loads, and the vendor does exactly that
+in the two packets immediately preceding the binds:
+
+```
+1000=00000000 1040=00000004 10b0=0002305c    <- stream class, 4 dwords/vertex
+10b4=00000000 10b8=83c00000                  <- descriptor reset, ONE xyzw attribute
+```
+
+`0x10b8 = 0x83c00000` is one attribute, component mask `1111`, offset 0, last.
+`0x1040 = 4` is the matching four-dword stride.
+
+Our stream emitted its *draw* descriptors (position + colour) and only much
+later, so the loader waited for data shaped for a different vertex format and
+never finished its loop - the engine stopped retiring even with no draw packet
+in the stream at all.  With the descriptor in place the load completes and the
+idle bit stays set.
+
+That single group was the whole blocker.  Neither the trailing `0x1130` write,
+the kind-1 base-register program, nor single-call grouping was needed.
+
+## Transform, verified on hardware
+
+Same NDC triangle `(-0.5,-0.5) (0.5,-0.5) (0,0.5)` at z=0.8, viewport
+1024x768, through the MVP in c0..c3 and the viewport pair in c8/c9:
+
+| matrix | measured | predicted |
+|---|---|---|
+| identity | x 256..768, y 193..575 | x 256..768, y 192..576 |
+| translate x +0.5 | x 512..1023, centroid x +256.2 | +0.5 * 512 = +256 |
+| translate y -0.25 | y 289..671, i.e. +96 | -(-0.25) * 384 = +96 |
+
+Both matrix rows are read from the constant file and applied exactly, with the
+viewport scale and offset correct.  Gouraud interpolation survives the
+transform: corners `#fe0000` / `#10ee00` / `#0001fe`, edge midpoints `#80007f`
+and `#008080`, and R+G+B = 255 +/-1 across all 97371 pixels.
+
+## Remaining artefact
+
+Both the Gouraud and the textured triangle lose a small sliver at the
+bottom-right corner - the right vertex rasterises to about x=735 instead of
+768, 933 pixels short of the predicted 98304.  It is identical in both, so it
+is a coverage effect of that geometry and not a texture or interpolation fault.
+Unexplained; roughly 1% of the area.
