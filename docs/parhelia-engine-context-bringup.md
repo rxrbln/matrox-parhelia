@@ -5427,3 +5427,41 @@ still write zero pixels and a textured draw still reads `ff000000`.**
 So the stage group is now emitted, correct and harmless - and it is not the
 missing state either. Together with §17 this rules out both halves of the
 "the setup programs never ran" theory, which was the leading hypothesis.
+
+## 18. A textured draw binds a DIFFERENT setup-stage program
+
+§17 ruled out the loader and the stage group as the missing state, and the
+userspace tracer then showed there is no hidden inline MMIO at all - a GL draw
+makes **zero** BAR1 register writes, so the ring capture is the complete
+per-draw record. That forces the difference to be in the *content* our streams
+substitute, and it is:
+
+```
+  variant   0x1100 (vertex programs)              0x10c8 (setup stage)
+  base      08557183 08557383 08557583            085579bf
+  texrepl   08557183 08557383 08557583            085579bf
+  texlin    08557183 08557383 08557583            085579bf  08557bbf   <==
+  tex       08557183 08557383 08557583            085579bf  08557bbf   <==
+```
+
+The **vertex** programs are identical across all four - the same three entries -
+so the vertex side is not the difference and never was. But a textured draw
+binds an **extra setup-stage program** at `0x10c8`: `0x08557bbf` alongside the
+usual `0x085579bf`. In bus terms `(entry & ~3) * 3` those are exactly `0x600`
+apart - one heap slot - so it is a genuinely different program, not another
+entry point into the same one.
+
+That is the first content-level difference found for texturing, and it fits
+every symptom: the setup unit is what interpolates attributes for the
+rasteriser, our streams bind only the untextured stage program, and the
+consequence is a triangle that rasterises perfectly (position and colour are
+set up) while the texture unit is handed nothing and returns zero - which is
+precisely what §16 measured as `ff000000` with full coverage.
+
+**Next step, and it is now mechanical:** the stage programs are dumpable with
+the fixed `dump-warp-programs.sh` (§17.1), so hold a *textured* GL client,
+capture the ring, resolve the `0x08557bbf` entry to its heap slot, extract the
+program and bind it at `0x10c8` through `--stage-binds`. Note `texrepl` does
+not show the extra entry, so the second stage program is tied to the texture
+*environment* rather than merely to a texture being bound - worth confirming
+while dumping.
