@@ -5781,3 +5781,33 @@ the single-draw results are trustworthy:
   textured triangle                    exact texel colour (section 19)
   one-pixel point                      0 px, in every configuration tried
 ```
+
+### 20.6 Isolated per-primitive results: only triangles are confirmed
+
+Measured one primitive per boot to stay under the latch threshold, each against
+its own checked baseline in a colour nothing else uses:
+
+```
+  triangle    134110 of 135000    99.3%   CONFIRMED
+  tristrip         0 of  40000            engine idle, 27 packets kicked
+  lines            0 of    400
+  quads            0 of  40000
+  points           0 of      1
+```
+
+The tristrip run is the cleanest negative in this file: engine idle before and
+after, all 27 packets kicked, `0x41c` retiring normally, and not one pixel.
+
+This supersedes every earlier per-primitive claim, including the "tri 294974,
+tristrip 314892, trifan 351605, quads 336436, lines 1326, linestrip 2546" matrix
+that this work has cited since the beginning. Those numbers came from absolute
+colour counts taken before it was known that **the vendor client renders in the
+same colours** (§20.4) and that **VRAM survives a reset**, so they were reading
+the vendor's pixels and each other's leftovers. A single differential line
+measurement (269095 -> 268951, 144 px) is the only non-triangle positive that
+still stands, and it does not reproduce in an isolated run.
+
+**Honest state of the primitive support: GL_TRIANGLES works, textured and
+untextured. No other primitive is confirmed to render.** That is a smaller
+claim than this file has carried for most of its life, and it is the one the
+measurements actually support.
