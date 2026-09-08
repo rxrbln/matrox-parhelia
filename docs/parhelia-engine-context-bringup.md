@@ -5635,3 +5635,45 @@ directions, the block-load constants, the WARP program (with and without the
 primitive class, hidden MMIO, and the vendor's own stream patched to points.
 The primitive demonstrably works on the silicon and our stream demonstrably
 does not drive it, with no remaining difference this harness can see.
+
+### 20.3 It is not points — our rasterisation loses coverage, and a point is 1 px
+
+Testing quads of decreasing size, all through the same working quads path,
+against a filled control:
+
+```
+  300 x 200 quad   60000 px expected    28968 px drawn      ~48%
+   64 x  64 quad    4096 px expected     1144 px drawn      ~28%
+   16 x  16 quad     256 px expected        0 px drawn
+    1 px point         1 px expected        0 px drawn
+```
+
+Lines behave the same way: two 400-pixel lines give 145 px.
+
+So **GL_POINTS is not a special case at all.** Our stream rasterises every
+primitive at a fraction of its true coverage, and a point is simply the size at
+which a fraction of one pixel is nothing. That also retires the framing this
+file has carried since §14 - there was never a points-specific defect to find,
+which is why the exhaustive points-vs-triangle register diffs (§20, §20.1) kept
+coming back empty. They were correct: there is no difference, because the fault
+is not in the points path.
+
+The vendor draws its point at full coverage (§20.2: one vertex, one pixel), and
+draws a triangle at full coverage. We draw large primitives at roughly a quarter
+to a half, and small ones not at all.
+
+That is a much better-posed target than "points do not work", and it is
+consistent with a sub-pixel or grid-snap deficiency: the vendor's transform
+program brackets its viewport transform with a snap (add a magic constant to
+x and y, do the mad, subtract it again - the float trick that forces a position
+onto the setup unit's sub-pixel grid) and the note in `warp_words` already
+records that *without it the primitive comes out degenerate*. Our
+**passthrough** program has no snap at all - it was only ever written into the
+transform path. An explicit `o0.w = 1` does not substitute for it (tested at
+16x16 and on a point).
+
+Next: give the passthrough program the same grid snap, which needs the magic
+constant reachable - it lives at `c6.w` in the transform path, so either load it
+or fold the snap into the vertex data. Fixing the coverage should fix points as
+a side effect, and should also raise the large-primitive counts to their true
+areas, which is independently worth having.
