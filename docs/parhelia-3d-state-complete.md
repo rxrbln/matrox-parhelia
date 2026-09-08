@@ -675,11 +675,23 @@ pixel, so LOD 1.
 | **both** | **nothing draws at all** |
 
 Each half is harmless on its own; only asking the hardware to actually select
-level 1 kills the draw.  So the registers are accepted and the fault is where
-level 1 sits.  `docs/parhelia-texture-sampling.md` says every level is padded
-"to a 32-texel pitch and to `Ha` rows and `A` bytes", and those two alignment
-constants are what the naive `+ width*height*4` offset ignores.  Recovering
-them is the remaining work; nothing else about mipmapping is in doubt.
+level 1 kills the draw.
+
+That was with the **tiled** layout code 2, which is what our texture used.
+Switching to **layout 0 (linear)** - which the sampling doc calls "the right
+first choice" - the mipmapped draw stops dying and renders normally.  So the
+chain offset is accepted: for both layout 0 (`Ha = 1`, `A = 0x40`) and layout 2
+(`Ha = 32`, `A = 0x1000`) at 64x64x4, `align(align(64,32)*align(64,Ha)*4, A)`
+is `0x4000`, exactly where level 1 was placed.  A tiled mip chain evidently
+needs more than that; a linear one does not.
+
+**What remains is LOD selection, which never happens.**  With the chain linear
+and accepted, the draw samples level 0 at 2 texels per pixel *and* at 8 texels
+per pixel (texcoords spanning 0..16 and 0..64 across 512 px).  `0x11c4`'s LOD
+clamps are wide open (min 0 in `[23:16]`, max 15 in `[31:24]`), so nothing is
+pinning it there.  Either the LOD needs a derivative the setup unit is not
+being given - the way GL_POINTS needed the WARP to write `o10.z` - or there is
+an enable still missing.  That is the single open question.
 
 A note on method: the first attempt used a 32-pixel triangle to force
 minification and measured nothing, which looked like a mipmap failure.  It was
