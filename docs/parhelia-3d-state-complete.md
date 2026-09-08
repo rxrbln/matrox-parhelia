@@ -572,10 +572,9 @@ different combiner program: it works by **not supplying a vertex colour**, so
 PREV defaults to white and `MUL(TEX, white)` is a pass-through.  `0x1110` going
 from `0x103` to `0x101` is the whole mechanism.
 
-`p3d_state` now emits exactly those three values for
-`P3D_TEXENV_REPLACE` and drops the colour descriptor, and the emitted stream
-matches the capture register for register.  **It does not yet work on
-hardware**: with a grey (0.5) vertex colour, MODULATE and REPLACE both render
+`p3d_state` emits exactly those three values for `P3D_TEXENV_REPLACE` and drops
+the colour descriptor, and the emitted stream matches the capture register for
+register.  With the ordinary pass-through vertex program that is **not enough**: with a grey (0.5) vertex colour, MODULATE and REPLACE both render
 `0x1a334c` = 0.5 x the texel, i.e. PREV is still the vertex colour.
 
 The reason is our vertex program.  `p3d_warp_passthrough` always writes `o1`
@@ -585,10 +584,13 @@ attempts to change that both stop the draw completely:
 * omitting the `o1` write entirely - the setup unit appears to require it;
 * `add o1, r1.1111, r1.0000` to force white - assembles, draws nothing.
 
-So the remaining work is a vertex-program variant that writes a constant white
-to `o1` in a form the setup unit accepts, or the vendor's own no-colour vertex
-program.  MODULATE is unaffected and is the working path; ioquake3 uses it for
-the large majority of stages.
+**SOLVED** by `p3d_warp_replace()`, which forces `o1` white the long way -
+`mul T2, v5, r1.0000` to zero a temp, then `add o1, T2, r1.1111`.  Measured
+with a grey vertex colour and a `0x336699` texel, it renders the pure texel
+(73664 px exact plus the dither's other 24640, 98304 total) instead of
+`0x1a334c`.  PREV is simply `o1`, so REPLACE is a vertex-program property, not
+a combiner one - which also means a driver can implement it by supplying white
+vertex colours with no program change at all.
 
 GL_ADD, GL_DECAL and GL_BLEND have their lowerings decoded in
 `docs/parhelia-fragment-isa.md` §12.2.5 (ADD is `ADD r0, TEX, PREV`, DECAL is
