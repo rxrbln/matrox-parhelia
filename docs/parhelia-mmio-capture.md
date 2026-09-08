@@ -119,7 +119,41 @@ That was not enough. A control - arming `tracing_on` around `modprobe mtx`
 itself - also recorded **zero** writes, so the module does no MMIO at init; the
 `ioremap` evidently happens later, when the X server opens the device.
 
-This is where the attempt stands, and the honest reading is limited: with the
+### RESOLVED: mmiotrace cannot see this driver at all
+
+The follow-up experiment settles it. Arming `tracing_on` **across X startup**
+with the 16384 kB buffer recorded `0 writes, 0 maps` - not merely no writes, but
+**no ioremap was hooked at all** - while X came up normally. The reason is in
+the X server's own address space:
+
+```
+2ba1642c4000-2ba1642c6000 rw-s febfe000 .../0000:06:00.0/resource1   BAR1, 8 KB registers
+2ba1642c6000-2ba1742c6000 rw-s d0000000 .../0000:06:00.0/resource0   BAR0, 256 MB framebuffer
+```
+
+**The vendor X driver mmaps the PCI BARs directly through sysfs.** It never
+asks the kernel to `ioremap` them - consistent with `lsmod` showing `mtx` at
+refcount **0** while X is running. mmiotrace works by page-faulting
+kernel `ioremap`'d regions, so it can see **nothing** of this driver's register
+traffic, and every attempt to use it on a draw was structurally doomed. That
+also explains why the DMA ring capture has always been the only instrument that
+worked.
+
+The right instrument for this stack is therefore a **userspace** equivalent:
+`LD_PRELOAD` into the X server, intercept the `mmap` of `resource1`, hand back a
+`PROT_NONE` alias, and log each faulting store from a `SIGSEGV` handler before
+single-stepping it. That is a real piece of work - x86-64 store decoding for the
+forms `mtx_drv.so` emits - but it is the only way to get a
+textured-vs-untextured register diff, and it would supersede the ring capture
+for every future question.
+
+What `captures/mmio-draw-0528.txt` (105 writes) actually recorded is therefore
+**unexplained** and should not be relied on until reproduced; it cannot have
+been this driver's own BAR1 stores.
+
+---
+
+Superseded reasoning, kept for the record: with the
 tracer current across `modprobe`, X startup and the GL client, a GL draw
 produced no kernel MMIO at all, while `captures/mmio-draw-0528.txt` from the
 original session holds 105 writes including `0x10b0`, `0x12b8` and `0x0308`.
