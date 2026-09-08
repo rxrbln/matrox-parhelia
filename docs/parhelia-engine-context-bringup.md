@@ -5238,3 +5238,52 @@ unit's private bank with the surface triple as well as the filter registers -
 `0x11e4 = 0x00010001` - and `--ctx-defaults` wrote the filter half only, so on
 a cold context units 1..3 held a zero-width, zero-format surface descriptor
 while unit 0's draw had pipes 2+3 served by them. Both are now emitted.
+
+## 15. Texturing bisected: the geometry is right, the fetch never arrives
+
+§14.3 listed two untested candidates. With a **same-run positive control** (an
+untextured triangle in an exact byte colour, 134110-135000 px every time) the
+textured path bisects cleanly. Every line below is one hardware run on a
+freshly reset board, each variant in a colour no earlier draw used:
+
+```
+  untextured control                                    135000 px   <- instrument
+  7-dword layout + kind-7 texcoord descriptor, no
+    texture registers at all                            134114 px   DRAWS
+  + 0x1200 = 0x0004000f  (bit 8 clear, all pipes)       134131 px   DRAWS
+  + surface triple 0x11dc/0x11e0/0x11e4                 134131 px   DRAWS
+  + filter/wrap 0x11c0/0x11c4/0x11cc..0x11d8            134131 px   DRAWS
+  + 0x1204 = 0x0001000c                                 nothing     KILLS
+  0x1200 = 0x00010003   (pipe mask alone)               draws
+  0x1200 = 0x0004000f   ([18:16] = 4 alone)             draws
+  0x1200 = 0x0001010f   (bit 8 alone)                   nothing     KILLS
+```
+
+So the **draw header, the 7-dword vertex layout and the kind-7 texcoord
+descriptor are all correct** - that half of §14.2 is confirmed on hardware -
+and the sampler enable, surface and filter registers are all harmless. The two
+writes that kill the draw are exactly the two that hand a pipe pair to a
+*second* texture unit: `0x1200` bit 8 (pipe-pair cache participation) and
+`0x1204 = 0x0001000c` (unit 1 parked on pipes 2+3). Neither the `0x11e8` cache
+partition (`0x00500000`) nor `--texallunits` nor the per-unit surface prime
+rescues them.
+
+**With both killers removed the textured triangle rasterises perfectly and
+samples black.** It is not a blank draw: it overdraws a 134110 px control down
+to the same 890 px edge remnant that any triangle drawn over another leaves, so
+coverage is full and the geometry is exact. Only the colour is zero.
+
+It is **not an addressing problem**, which was the obvious suspicion after
+finding that `--texfill 0xa000000` actually writes to `0x9dc0000` (the 2D
+destination base is pool-relative too, by `-0x240000` in that boot - worth
+knowing on its own, and it invalidated every earlier textured run, which had
+been sampling unwritten VRAM). Flooding `0x9800000..0xb7f98a0` with 2.5 million
+white pixels, so that **no** translation the sampler could apply can miss,
+still yields a black triangle.
+
+The fetch therefore never reaches the combiner, and the two register writes
+that would give the texture unit its pipe pair are precisely the ones that stall
+a draw on our context. That is the same 3D-context-create gap that blocks cold
+operation, now pinned to a single mechanism rather than a whole subsystem: the
+next step is the missing context state that lets a second texture unit be
+claimed, not any further sampler register.
