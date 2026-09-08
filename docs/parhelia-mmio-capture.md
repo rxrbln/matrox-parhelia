@@ -164,3 +164,41 @@ this run did not reproduce. **Do not treat either explanation as established.**
 Resolving it is the prerequisite for using mmiotrace on the texture question at
 all, and it is cheap: arm `tracing_on` across X startup with the 16384 kB buffer
 and see whether the ioremap and its traffic appear.
+
+## The userspace tracer (tools/mtxtrace.c) — mechanism proven, not yet complete
+
+Since mmiotrace is structurally blind here, `tools/mtxtrace.c` does the same job
+from userspace: an `LD_PRELOAD` that intercepts `mmap`, recognises the
+`.../resource1` mapping, and on demand makes it `PROT_NONE` so every register
+access traps. It needs **no instruction decoding**: on `SIGSEGV` it records the
+address and the write bit from the page-fault error code, makes the region
+accessible and sets the x86 trap flag; on the following `SIGTRAP` the access has
+retired, so simply reading the location recovers the value.
+`tools/mtxtrace-capture.sh` drives it for a textured and an untextured draw.
+
+Two findings that were not obvious and are worth keeping:
+
+1. **The GL client maps nothing.** `/proc/<gltest>/maps` has no `resource0`,
+   `resource1` or `/dev/mem`, so every register write is the **X server's**.
+   The tracer belongs in X, not in the client.
+2. **Xorg installs its own `SIGSEGV` handler during init**, long after
+   `LD_PRELOAD` runs, silently replacing one installed at load time - the first
+   trap then looks to Xorg like a crash and it exits. Install the fault
+   handlers when **arming**, not at load.
+
+State: with that fixed the handler fires correctly and the fault is in the
+register window -
+
+```
+  # MAP resource1
+  # ARM
+  #S 2b6915baec4c AI      <- armed, In region: X really is writing BAR1
+  #S 000015baec4c Ao      <- the re-executed access, address truncated to 32 bits
+```
+
+so the trap side is proven. The **completion** side is not: no `SIGTRAP` reaches
+the handler and the instruction restarts with a 32-bit-truncated address, which
+means the single-step handshake is wrong - most likely Xorg also owns `SIGTRAP`,
+or the trap flag must be set on the resuming context differently. Fixing that
+handshake is a bounded piece of work and it yields the textured-vs-untextured
+register diff that every other instrument here cannot produce.
