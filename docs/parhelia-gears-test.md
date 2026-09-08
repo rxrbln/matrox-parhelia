@@ -129,12 +129,33 @@ With all three, the three-gear scene agrees with the CPU reference on
 **167163 of 167431 covered pixels** and 97.4% of the frame matches within
 2/255, against 86% and a 16% facet-disagreement rate when batched.
 
-### Still open
+### Still open: the shading degrades as submissions accumulate
 
-About 12% of gear pixels still pick a different facet than the reference,
-concentrated on the tooth flanks.  Their depth agrees to within 64/2^24, so the
-two implementations are disagreeing about coverage on nearly-tangent surfaces
-rather than about depth.  It is not culling (proven honoured: culling the
-opposite face changes the image completely), not winding, not depth precision,
-and not the normal's sign (a normal of (0,0,-1) against a light of (0,0,-1)
-gives full brightness, so negative components survive).
+Each face group drawn on its own, or any PAIR of them, is essentially exact:
+
+| submitted | pixels wrong vs the reference |
+|---|---|
+| front faces alone | 29 |
+| tooth flanks alone | 32 |
+| front faces + flanks (2 submissions) | 48 |
+| front faces + back faces (2 submissions) | 29 |
+| **all six face groups (6 submissions)** | **9594** |
+
+So neither the geometry nor the shading of any group is wrong - they are right
+when drawn alone and right in pairs.  Something accumulates across submissions.
+
+What the wrong pixels are is pinned down: 93.6% of them have a depth that
+agrees with the reference to within 64/2^24, so the SAME surface won and only
+its colour differs.  Recovering N.L from the colour shows the reference always
+matches the geometric n.L (0.109 against 0.107, 0.447 against 0.449, ...) while
+the hardware uses a value belonging to a different normal - 0.663 is exactly
+(0,1,0).L, another tooth's flank normal.  The faces that go wrong are precisely
+those whose neighbouring vertices carry DIFFERENT normals: the front and back
+faces all share (0,0,+/-1), so fetching a neighbour's normal there is
+invisible, while every flank has its own.
+
+Ruled out by direct measurement: culling (proven honoured - culling the
+opposite face changes the image completely), winding, depth precision (24-bit
+quantisation of the reference, per vertex or per pixel, moves the count by one
+pixel), the normal's sign (normal (0,0,-1) against light (0,0,-1) gives full
+brightness), and a one-pixel coverage shift (explains only 9%).
