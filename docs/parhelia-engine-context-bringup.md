@@ -5458,10 +5458,27 @@ consequence is a triangle that rasterises perfectly (position and colour are
 set up) while the texture unit is handed nothing and returns zero - which is
 precisely what §16 measured as `ff000000` with full coverage.
 
-**Next step, and it is now mechanical:** the stage programs are dumpable with
-the fixed `dump-warp-programs.sh` (§17.1), so hold a *textured* GL client,
-capture the ring, resolve the `0x08557bbf` entry to its heap slot, extract the
-program and bind it at `0x10c8` through `--stage-binds`. Note `texrepl` does
-not show the extra entry, so the second stage program is tied to the texture
-*environment* rather than merely to a texture being bound - worth confirming
-while dumping.
+### 18.1 CORRECTION: the extra entry is frame noise, not the textured bind
+
+Tested immediately, and it does not hold. `tools/dump-tex-stage.sh` holds a
+**textured** client and captures its ring: the result is a clean capture with
+**five `970c0001` draws and no untextured draw at all** - and across all 181
+sections `0x10c8` takes exactly one value, `076acf3f`. There is no second stage
+program.
+
+The `08557bbf` above came from collecting every `0x10c8` write across a whole
+gl-matrix capture, which spans about forty ring pages and therefore several
+frames including the X server's own. It was never shown to be inside the
+textured draw's span, and this boot's evidence says it is not: **a textured
+draw binds the same single setup-stage program as an untextured one.**
+
+So §18's conclusion is withdrawn. What survives it is the measurement that
+prompted it - the vertex programs at `0x1100` are identical across `base`,
+`tex`, `texlin` and `texrepl`, so the vertex side is genuinely not the
+difference - and the constraint from §17 that, with no hidden MMIO, whatever is
+missing has to be content the ring carries. `dump-tex-stage.sh` and its clean
+all-textured capture (`captures/live-ring-0528/secstex.txt`, five textured
+draws in 181 sections) are the right reference for finding it: they need
+diffing against an all-untextured capture taken the same way on the same boot,
+which is a far cleaner comparison than the mixed gl-matrix files that produced
+this false lead.
