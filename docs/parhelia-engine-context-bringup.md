@@ -5604,3 +5604,34 @@ untried check is whether the **vendor's own** GL_POINTS client puts pixels on
 screen at all, which two runs timed out before answering and which should be
 done first next session, because if it does not, the target has been wrong all
 along.
+
+### 20.2 The vendor's own point is ONE pixel — measured
+
+§20.1 ended on an untried question: does the vendor's own GL_POINTS client put
+pixels on screen at all? It does, and the answer sharpens the target
+considerably. Running the client directly (X up, **not** frozen - freezing X
+makes any GL client hang, which is what made two earlier attempts time out):
+
+```
+  gltest: triangles n=1 verts=3 ...      green 16128 px
+  gltest: points    n=1 verts=1 ...      green     1 px
+  gltest: triangles n=1 verts=3 ...      green 16128 px
+```
+
+So GL_POINTS works on this hardware and the vendor's own draw is **one vertex
+producing exactly one pixel**. That is the whole target - not the hundreds of
+pixels a wide point would give, and only just above the null-draw floor, which
+is why `--findcolor` was never a usable instrument for it and why the
+differential count against a filled control is the only sound measure.
+
+Our stream reproduced that configuration exactly - class 0
+(`0x10f0 = 0`, `0x1130 = 0x0000200c`, `0x1300 = 0x00a60ecd`), a single vertex,
+the vendor's `0x1314` and `0x12fc` - and still writes **zero** pixels
+(269095 -> 269095).
+
+Everything measurable is now eliminated for GL_POINTS: register state in both
+directions, the block-load constants, the WARP program (with and without the
+`o10.z` write, with and without an explicit `o0.w`), the vertex count, the
+primitive class, hidden MMIO, and the vendor's own stream patched to points.
+The primitive demonstrably works on the silicon and our stream demonstrably
+does not drive it, with no remaining difference this harness can see.
