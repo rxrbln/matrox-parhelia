@@ -250,3 +250,56 @@ Verified by poisoning the colour buffer green and the Z buffer to near, then
 submitting one stream that clears and draws: the green is gone, Z reads back
 `0x00ffffff` outside the triangle, and the triangle draws - which it could not
 do at all had the depth clear not landed.
+
+## Alpha test and blending, implemented 2026-09-08
+
+Both were decoded from the capture and cross-checked against
+`docs/parhelia-blend-alpha-encoding.md`, which derives the same layouts from the
+vendor's Linux kernel object and Windows driver.  `src/parhelia3d` now emits
+both, and reproduces the vendor's captured register values bit for bit.
+
+### Compare functions are a three-bit mask, shared by depth and alpha
+
+`0x12c8` (depth) and `0x12e4` (alpha) use the same field: bit 0 enables the
+test, bits `[3:1]` select it, and the selector is a **mask** - bit 0 EQUAL,
+bit 1 LESS, bit 2 GREATER:
+
+| function | code |
+|---|---|
+| NEVER | 0 |
+| EQUAL | 1 |
+| LESS | 2 |
+| LEQUAL | 3 |
+| GREATER | 4 |
+| GEQUAL | 5 |
+| NOTEQUAL | 6 |
+| ALWAYS | 7 |
+
+Three independent captures agree: `GL_LESS` gives `...e5`, `GL_GEQUAL` gives
+`...eb` (= GREATER|EQUAL), and `glAlphaFunc(GL_GREATER, 0.5)` gives `0x8009`
+(= GREATER, enabled).  A disabled test carries ALWAYS.  This **corrects** the
+earlier note that the numbering was D3D's CMPFUNC enum - under D3D numbering 5
+would be GREATER, and the mask reading is the one that fits all three captures
+and the alpha register at the same time.
+
+`0x12e4` bits `[15:8]` are the alpha reference scaled to 0..255: GL's 0.5 was
+captured as `0x80`.
+
+### `0x12e8` BLENDCTL
+
+`[0]` enable, `[4:1]` srcRGB, `[8:5]` dstRGB, `[12:9]` srcAlpha, `[16:13]`
+dstAlpha, `[19:17]` and `[22:20]` the blend equation - written twice from one
+value, so there is a single equation for both pipes and
+`GL_EXT_blend_equation_separate` cannot be exposed.  Bit 23 marks the dither
+unit engaged and bit 24 disables it.  Blending is only honoured when DWGCTL's
+ROP nibble `[7:4]` is `0xc` (GXcopy); the 3D baseline `0x1300 = 0x00a60ec4`
+already satisfies that.
+
+The factor nibbles differ per pipe: a colour factor on the RGB pipe becomes the
+matching alpha factor on the alpha pipe (`SRC_COLOR 0x4` -> `SRC_ALPHA 0x6`), so
+each GL factor carries both codes.  ZERO 0/0, ONE 1/1, SRC_ALPHA 6/6,
+ONE_MINUS_SRC_ALPHA 7/7, DST_COLOR 8/0xa, and so on.
+
+Verification: our encoder emits `0x00800202` with blending off and `0x0080eced`
+for `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)` - both exactly the
+values the vendor capture carries.
