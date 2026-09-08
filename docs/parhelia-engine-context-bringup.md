@@ -5811,3 +5811,38 @@ still stands, and it does not reproduce in an isolated run.
 untextured. No other primitive is confirmed to render.** That is a smaller
 claim than this file has carried for most of its life, and it is the one the
 measurements actually support.
+
+### 20.7 CORRECTION to 20.6, and the pattern that actually fits
+
+§20.6's "only triangles are confirmed" was measured against baselines that were
+**not clean** - `#336699` already held 108862 px and `#3399cc` 43968 px from
+this session's own earlier draws. Repeating with genuinely fresh colours
+changes the picture:
+
+```
+  triangle, large, top-left   135000 expected   134085 drawn   99.3%
+  triangle, small, centre      15000 expected    14082 drawn   94%
+  tristrip (4 verts)           40000 expected    19026 drawn   48%  = ONE triangle
+  quad     (4 verts)           40000 expected    ~half           = ONE triangle
+  2 triangles as 6 verts       40000 expected        0 drawn
+  point                            1 expected        0 drawn
+```
+
+So triangles are fine at any size or position tested - the §20.3 "size
+threshold" and the §20.6 "only triangles" were both artefacts of dirty
+baselines, and both are withdrawn.
+
+The pattern the clean numbers actually fit is: **our draw emits one primitive.**
+A 3-vertex draw gives its triangle. A 4-vertex strip or quad gives its *first*
+triangle and not its second - consistently 48%. That is the same shape as the
+long-standing `parhelia-warp-one-vertex-per-draw` finding one level up: the
+draw walks one primitive, not the whole buffer.
+
+The 6-vertex case drawing **nothing** does not fit that rule and is unexplained;
+it is the one measurement here that should be repeated before being trusted.
+
+This is the right frame for the remaining work on GL primitives. It is not
+seven separate primitive bugs, and not a points bug: it is one defect in how
+many primitives a draw walks, plus GL_POINTS which stays at zero even as a
+single primitive. Fixing the walk would give tristrip, trifan, quads and
+quadstrip at once, since their first triangle already rasterises correctly.
