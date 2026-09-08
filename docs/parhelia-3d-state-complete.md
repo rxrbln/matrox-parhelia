@@ -554,3 +554,44 @@ masked as 98304 px of `#0000ff`.
   REPEAT is 0 and GL_CLAMP is **6**, from the capture's `texclamp`
   (`0xf0000036`).
 * `0x11e4[31:28]` is the maximum mip level.
+
+## GL_TEXTURE_ENV_MODE: MODULATE works, REPLACE is diagnosed but not working
+
+The capture's `texrepl` (GL_REPLACE) differs from `tex` (GL_MODULATE) in only
+three places:
+
+| register | MODULATE | REPLACE |
+|---|---|---|
+| `0x1110` attribute presence | `0x00000103` | `0x00000101` |
+| `0x1260` alpha combiner | `0x08000000` | `0x00000000` |
+| `0x1268` | `0x01400000` | `0x01400400` |
+
+The RGB combiner slot is **unchanged** - it stays `MUL(TEX, PREV)` in both
+(opcode field `[14:9]` decodes our `0x08000002` as MUL).  So REPLACE is not a
+different combiner program: it works by **not supplying a vertex colour**, so
+PREV defaults to white and `MUL(TEX, white)` is a pass-through.  `0x1110` going
+from `0x103` to `0x101` is the whole mechanism.
+
+`p3d_state` now emits exactly those three values for
+`P3D_TEXENV_REPLACE` and drops the colour descriptor, and the emitted stream
+matches the capture register for register.  **It does not yet work on
+hardware**: with a grey (0.5) vertex colour, MODULATE and REPLACE both render
+`0x1a334c` = 0.5 x the texel, i.e. PREV is still the vertex colour.
+
+The reason is our vertex program.  `p3d_warp_passthrough` always writes `o1`
+from `v5`, so the setup unit interpolates a colour whatever `0x1110` says.  Two
+attempts to change that both stop the draw completely:
+
+* omitting the `o1` write entirely - the setup unit appears to require it;
+* `add o1, r1.1111, r1.0000` to force white - assembles, draws nothing.
+
+So the remaining work is a vertex-program variant that writes a constant white
+to `o1` in a form the setup unit accepts, or the vendor's own no-colour vertex
+program.  MODULATE is unaffected and is the working path; ioquake3 uses it for
+the large majority of stages.
+
+GL_ADD, GL_DECAL and GL_BLEND have their lowerings decoded in
+`docs/parhelia-fragment-isa.md` §12.2.5 (ADD is `ADD r0, TEX, PREV`, DECAL is
+`LRP r0, TEX, PREV, TEX.a`, BLEND is `LRP r0, c0, PREV, TEX`) with opcodes in
+`[14:9]` - MOV 2, MUL 0, ADD 6, SUB 3, MAD 4, LRP 5 as encoded - but none is
+implemented or exercised.
