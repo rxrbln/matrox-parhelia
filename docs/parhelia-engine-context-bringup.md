@@ -4956,3 +4956,46 @@ all measured on hardware and none of them the cause:
   write-back address and serial, which our stream never writes at all and which
   appear *only* inline, never in a section. That is very likely the "write-back
   path armed" that the `0x707` drain needs.
+
+## 15. OUR OWN STREAM RENDERS A CORRECT GOURAUD TRIANGLE
+
+`gen-minimal-draw.py`'s own 27-packet stream, replayed with our own WARP
+program and our own vertex buffer, on a board where the vendor module has
+established a 3D context:
+
+```
+  321034 px on the R+G+B = 255 locus     (ideal for those vertices: 318205)
+  90009 distinct colours
+  pure red 1047 px, pure green 3339, pure blue 1041
+
+  corner      measured / ideal share per band
+  red   (v0)  .24/.24 .20/.20 .17/.17 .14/.14 .11/.11 .08/.08 .05/.05 .02/.01
+  green (v1)  .23/.24 .20/.20 .17/.17 .14/.14 .11/.11 .08/.08 .05/.05 .02/.01
+  blue  (v2)  .24/.24 .20/.20 .17/.17 .14/.14 .11/.11 .08/.08 .05/.05 .02/.01
+```
+
+The barycentric distribution matches the ideal `(1-w)` density **to within
+0.01 on every band for all three corners**, and the area is within 1% of the
+exact figure. Flat-coloured controls confirm the geometry independently: a
+`+/-0.9` triangle measures 318897 px against 318205 ideal, and a `+/-0.5` one
+97371 against 98304 - both 99-100%.
+
+**So the command stream, the WARP program, the constants, the descriptors, the
+draw packet and the vertex buffer are all correct.** Everything §12-§14
+recorded as a degenerate wedge - one vertex fetched, the rest substituted from
+stale state - is the *absence of 3D-context-create state on a cold board*, not
+a defect in what we generate.
+
+That reframes the remaining work exactly: the open item is no longer "why does
+our draw only fetch one vertex" but "what does the vendor's context create do
+that `--ctx-defaults` does not". `mtx398`'s four register groups are all
+implemented and are demonstrably not it (§12.8), so the missing piece is
+elsewhere in the 22-step start table - most likely the WARP program heap, since
+`--entrytable` (§14.6) shows the capture's per-draw stream refers to heap
+program entries we cannot yet allocate.
+
+**Texturing is a separate defect.** The same live context does *not* rescue it:
+a textured draw under the vendor context still puts down no texels at all
+(searched for all four checkerboard colours). So §13's localisation stands on
+its own - enabling texture unit 0 kills the draw for a reason unrelated to
+context-create state.
