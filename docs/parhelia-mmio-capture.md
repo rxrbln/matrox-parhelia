@@ -99,3 +99,34 @@ W 0x0408 ... 0x146003c3    ; each write submits one command packet
 ## Correction: 0x384 (2026-09-05)
 
 `0x384` is **DMAPAD**, a write-combining erratum pad — NOT a soft-trap (corrected 2026-09-05 from the kernel disassembly). Rule: write `0x384 = 0` whenever the previous register write offset was within 128 bytes *below* the new one; a register *read* resets the tracker and suppresses the next pad.
+
+## Attempt 2026-09-08: empty traces, and the gotcha the method text is missing
+
+Ran the documented method to capture a **textured** vs an **untextured** draw on
+one boot, so the diff would show anything the kernel writes inline that the DMA
+ring capture cannot see. `tools/mmio-tex-capture.sh` follows every ceiling here:
+16384 kB buffer, `mtx` loaded after the tracer, X started with `tracing_on = 0`,
+trace copied before the tracer is reset.
+
+**Both traces came back with the two markers and nothing between them.**
+
+One real gotcha this file did not record, and it is now fixed in the script: the
+distro loads `mtx` at boot, so `modprobe mtx` after arming the tracer is a
+**no-op** and hooks nothing. `pkill -x X; rmmod mtx` first, and the reload is
+genuinely traced (the script fails loudly if the module stays resident).
+
+That was not enough. A control - arming `tracing_on` around `modprobe mtx`
+itself - also recorded **zero** writes, so the module does no MMIO at init; the
+`ioremap` evidently happens later, when the X server opens the device.
+
+This is where the attempt stands, and the honest reading is limited: with the
+tracer current across `modprobe`, X startup and the GL client, a GL draw
+produced no kernel MMIO at all, while `captures/mmio-draw-0528.txt` from the
+original session holds 105 writes including `0x10b0`, `0x12b8` and `0x0308`.
+Either the draw path is entirely userspace MMIO on this configuration (the
+vendor stack does map registers into the client - see
+`parhelia-mesa-re-targets`), or the earlier capture was taken under conditions
+this run did not reproduce. **Do not treat either explanation as established.**
+Resolving it is the prerequisite for using mmiotrace on the texture question at
+all, and it is cheap: arm `tracing_on` across X startup with the 16384 kB buffer
+and see whether the ioremap and its traffic appear.
