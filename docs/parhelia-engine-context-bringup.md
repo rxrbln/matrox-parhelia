@@ -4594,8 +4594,45 @@ coverage nor anything else measurable, so the tile cache is not what limits
 
 `--sync` carries the tag pair (default on), `--sync-dwgctl` the opcode.
 
-**Still crashing:** four consecutive 3D draws in one boot take the board down,
-so the sync fixes 2D-after-3D, not 3D-after-3D.
+### 12.4c SOLVED: the fence tag is a counter, and reusing it is the crash
+
+The tag pair of 12.4b fixed 2D-after-3D but four consecutive 3D draws still
+took the board down.  The reason is visible in the capture the moment the tags
+are listed in order rather than one at a time - every sync steps the tag by
+**8**:
+
+```
+  0x0f0  0x0f8  0x100  0x108  0x110  0x118  0x120  0x128  0x130  0x138 ...
+```
+
+`0x12bc` is a batch **fence counter**, not a constant, and `0x41c` reads back
+the last tag that retired.  Our streams wrote one fixed tag (`0x1a8`) on every
+sync, so from the second batch on the fence had nothing to advance to and the
+engine never retired it.  That, not a hang, is what the fourth draw hit.
+
+The capture's full block is also three writes, not two - `0x1374`, the strobe,
+sits between the opcode and the pair:
+
+```
+  0x1300 = 0x00000707      (only once the write-back path is armed)
+  0x1374 = 0x00000000      strobe
+  0x12bc = tag | 1         armed
+  0x12bc = tag             disarmed
+```
+
+and each draw is bracketed `sync(T)` -> draw -> `0x12b8 = 0x00070601` ->
+`sync(T+8)`, so the chain continues naturally across any number of draws.
+
+**Measured on hardware, 0528, one boot:** four draws as four separate
+submissions with tags `0x1a8/0x1b0/0x1b8/0x1c0` - all 25 packets idle each
+time, `0x41c` reading back `0x1b0, 0x1b8, 0x1c0, 0x1c8` in turn, the fence
+advancing exactly as programmed.  Then the same four draws inside **one**
+42-packet stream: all idle, `0x41c = 0x1c8`.  The 2D fill reads
+`120000/120000` after both.  No crash, no reboot.
+
+`gen-minimal-draw.py` now emits the chain itself: `--sync` is the first tag,
+`--sync-step` the increment (8, the measured value), and `--draws N` produces
+N fences.  `--eob` remains only for the `--sync 0` case.
 
 ### 12.5 The surface base register, and the per-boot target
 
