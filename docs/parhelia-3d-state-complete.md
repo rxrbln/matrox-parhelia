@@ -505,3 +505,52 @@ its 3D value, so nothing ever forced the drain.
 | textured triangle | 98304 | 97371 | **98304** (73664 + 24640 dither) |
 | clipped TCL draw | 663552 | 662528 (1024 missing) | **663552, 0 missing** |
 | depth vs colour footprint | equal | 86577 vs 87426 | **87500 vs 87500** |
+
+## Compare functions: the full table, measured
+
+The three-bit mask in `0x12c8[3:1]` (bit 0 enables the test) is now measured
+directly rather than inferred from two captures.  Method: sweep the low byte
+`0xe0..0xef` and test each against three conditions - incoming z below the
+stored value, exactly equal, and above.  The equal column needs care: draw once
+to write the depth, then **clear only the colour** and draw again, so any
+non-black pixel means the second draw passed.
+
+| `0x12c8` low byte | mask `[3:1]` | less | equal | greater | function |
+|---|---|---|---|---|---|
+| `0xe1` | 0 | | | | NEVER |
+| `0xe3` | 1 | | X | | EQUAL |
+| `0xe5` | 2 | X | | | LESS |
+| `0xe7` | 3 | X | X | | LEQUAL |
+| `0xe9` | 4 | | | X | GREATER |
+| `0xeb` | 5 | | X | X | GEQUAL |
+| `0xed` | 6 | X | | X | NOTEQUAL |
+| `0xef` | 7 | X | X | X | ALWAYS |
+
+So bit 0 = EQUAL, bit 1 = LESS, bit 2 = GREATER, and every even byte disables
+the test (all eight draw unconditionally).  `0xe5` and `0xeb` match the
+vendor's own GL_LESS and GL_GEQUAL captures, and the other six are new.
+
+ioquake3 needs LEQUAL (its default) and EQUAL (multi-pass shaders); both are
+confirmed working.
+
+## Colour mask, `0x1324`
+
+One byte per channel in the render target's own order - B `[7:0]`, G `[15:8]`,
+R `[23:16]`, A `[31:24]` - `0xff` to enable a channel and `0x00` to mask it.
+`glColorMask(1,0,1,1)` was captured as `0xffff00ff`, and on hardware a white
+triangle with green masked renders as 98304 px of `#ff00ff`, with red and green
+masked as 98304 px of `#0000ff`.
+
+## Texture filter and wrap, structured
+
+`p3d_tex_filter()` / `p3d_tex_wrap()` build the words from
+`docs/parhelia-texture-sampling.md`'s fields rather than a magic constant:
+
+* `0x11c0` MIN `[1:0]`, MAG `[4:3]`, MIP `[7:6]`, bit 12 always set; codes
+  0 nearest, 2 linear, 3 anisotropic, MIP 0 none / 1 nearest / 2 linear.
+  The capture's `texlin` (GL_LINEAR both) is `0x01c01012`, which the builder
+  reproduces from MIN=MAG=2.
+* `0x11c4` S `[2:0]`, T `[5:3]`, R `[8:6]`, LOD min `[23:16]`, max `[31:24]`.
+  REPEAT is 0 and GL_CLAMP is **6**, from the capture's `texclamp`
+  (`0xf0000036`).
+* `0x11e4[31:28]` is the maximum mip level.
