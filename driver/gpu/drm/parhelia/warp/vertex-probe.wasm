@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Diagnostic variant of the original passthrough program. Record fetched
+# position and colour in known constant slots, then emit the same outputs.
+wra | mov c15, v0
+wra | mov c14, v5
+add o0, v0, v0.0000
+add o1, v5, r1.0000 | mov o11, v0
+end
+wra

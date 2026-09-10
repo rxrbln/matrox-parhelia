@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config DRM_PARHELIA
+	tristate "Matrox Parhelia"
+	depends on DRM && PCI
+	select DRM_GEM_VRAM_HELPER
+	select I2C
+	select I2C_ALGOBIT
+	select FW_LOADER
+	select CRC32
+	help
+	  DRM driver for the Matrox Parhelia P-series (Parhelia-512, Parhelia8x,
+	  Parhelia-LX and P690) graphics adapters.  It provides native KMS for
+	  the primary display controller, VRAM GEM objects and a validated DMA
+	  submission interface for the WARP 3D engine.
+	  Requires the locally extracted parhelia/mtx*.bin resident firmware
+	  files in /lib/firmware (also in the initramfs for early loading).
+
+	  If compiled as a module, it will be called parhelia.

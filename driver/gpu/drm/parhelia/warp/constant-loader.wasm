@@ -1,0 +1,20 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; Constant-file upload protocol from parhelia-warp-control-ops.md section 5.2.
+; v0=(count, first, 1, 0); v1.. contain the vec4 payload. Preserve a0.
+; r6 and scalar s7 are scratch (not vec4 c7). No hardware-register stores.
+getidx r6, a0+0
+getc s7, v0.x
+mova T1.x, v0.yyyy
+mova T1.y, v0.zzzz
+copy:
+subi.s s7, s7, 1
+br cc6, done
+nop
+mov c[a0.x], v[a0.y]
+getidx T1.xy, a0+1
+br copy
+nop
+done:
+mova T1, r6
+end
+nop

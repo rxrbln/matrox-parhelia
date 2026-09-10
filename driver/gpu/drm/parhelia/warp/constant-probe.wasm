@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Original diagnostic program assembled with the project's recovered ISA.
+# Control-mode input: one vec4. Store it in c15 for kernel readback.
+wra | mov c15, v0
+end
+wra

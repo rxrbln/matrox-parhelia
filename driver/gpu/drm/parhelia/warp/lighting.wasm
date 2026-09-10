@@ -1,0 +1,21 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; Gears contract: xyz in v0, normal in v5, MVP c0..3, light c4,
+; diffuse c5, ambient c6, viewport c8/c9. One constant per bundle.
+; Preserve the reference's initial o1 write and its safe constant operand
+; positions (dp3/4 source 1, mad source 0); add the missing ambient term.
+add T0, v0, v0.0000
+dp4 r2.w, T0, c3
+dp4 r2.z, T0, c2
+dp4 r2.y, T0, c1
+dp4 r2.x, T0, c0
+add o1, v5, r1.0000 | mov T1, c9
+dp3 r3, v5, c4
+max r3, r3, r1.0000
+mad T2, c5, r3, r1.0000
+mad T2, c6, r1.1111, T2
+add o1, T2, r1.0000
+smul r5, r2, r2.xyz1 | mov o11, r2
+mad T1.xyz, c8.xyz1, r5, T1.xyz0
+add o0, T1, r1.0000
+end
+wra
