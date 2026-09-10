@@ -445,30 +445,15 @@ int parhelia_vram_gpu_addr(struct parhelia_device *pdev,
 			   struct drm_gem_vram_object *bo, u64 offset,
 			   u64 length, u32 *gpu_addr)
 {
-	struct parhelia_bo *pbo = container_of(bo, struct parhelia_bo, gbo);
 	u64 bank_size = pdev->vram_size >> 1;
 	u64 physical, physical_end, gpu;
 	u32 bar_addr;
 	int ret;
 
-	/* Class-0 engine addresses use the same predecessor descriptor lookup as
-	 * host accesses.  A dumb/DRI3 surface therefore has to be referenced by
-	 * its low logical dword-0 coordinate; dword 1 is only the translation
-	 * target programmed into the descriptor.  KMS scanout deliberately uses
-	 * parhelia_vram_bar_addr() and remains physical.
+	/* Host-aperture dword 0 is only a CPU/BAR alias.  Engine SURF and TEX
+	 * operands consume the bank-encoded physical allocation address stored in
+	 * descriptor dword 1, including for dumb/DRI3 objects.
 	 */
-	if (pbo->host_aperture && pbo->aperture.active) {
-		if (!length || offset > pbo->aperture.map_size ||
-		    length > pbo->aperture.map_size - offset ||
-		    pbo->aperture.node.start + offset >=
-			PARHELIA_HOST_APERTURE_LIMIT ||
-		    length > PARHELIA_HOST_APERTURE_LIMIT -
-			(pbo->aperture.node.start + offset))
-			return -ERANGE;
-		*gpu_addr = pbo->aperture.node.start + offset;
-		return 0;
-	}
-
 	if (!bank_size)
 		return -EINVAL;
 	ret = parhelia_vram_bar_addr(pdev, bo, offset, length, &bar_addr);
