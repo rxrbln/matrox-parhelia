@@ -22,6 +22,7 @@
 #define DRM_PARHELIA_CREATE_VERTEX	0x03
 #define DRM_PARHELIA_WAIT_FENCE		0x04
 #define DRM_PARHELIA_GET_BO_INFO	0x05
+#define DRM_PARHELIA_UPLOAD_RENDER	0x06
 
 #define DRM_IOCTL_PARHELIA_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_PARHELIA_GET_PARAM, \
@@ -41,6 +42,9 @@
 #define DRM_IOCTL_PARHELIA_GET_BO_INFO \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_PARHELIA_GET_BO_INFO, \
 		 struct drm_parhelia_get_bo_info)
+#define DRM_IOCTL_PARHELIA_UPLOAD_RENDER \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_PARHELIA_UPLOAD_RENDER, \
+		struct drm_parhelia_upload_render)
 
 /* Linear storage does not use the tiled render-target address decoder and
  * therefore needs only the native surface alignment, not a 32 MiB SUN90
@@ -99,6 +103,18 @@ struct drm_parhelia_get_bo_info {
 	__u64 size;
 };
 
+/* Copy an already hardware-laid-out byte span into native sampler storage.
+ * The kernel creates a short-lived type-0 host-aperture view for the copy;
+ * userspace never receives a raw BAR mapping of local memory. */
+struct drm_parhelia_upload_render {
+	__u64 data;
+	__u64 offset;
+	__u64 size;
+	__u32 handle;
+	__u32 flags;
+	__u64 pad;
+};
+
 /* Native sharing is intentionally same-device: FLINK/OPEN or a self-imported
  * PRIME fd preserves object identity for GET_BO_INFO.  The physical layout is
  * not DRM_FORMAT_MOD_LINEAR and is not portable to another DRM device.
@@ -133,6 +149,8 @@ struct drm_parhelia_get_bo_info {
 /* Kernel can insert owned EOB/DWGSYNC brackets at batch-boundary relocs. */
 #define PARHELIA_PARAM_STATEFUL_SUBMIT	20
 #define PARHELIA_PARAM_NATIVE_SHARE	21
+/* Guarded opaque type-0 host-aperture texture upload probe. */
+#define PARHELIA_PARAM_TEXTURE_UPLOAD	22
 
 #define PARHELIA_TEXTURE_PIPES_PAIRED	0
 #define PARHELIA_TEXTURE_PIPES_SINGLE	1

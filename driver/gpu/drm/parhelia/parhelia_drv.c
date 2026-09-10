@@ -42,6 +42,8 @@ static const struct drm_ioctl_desc parhelia_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(PARHELIA_GET_BO_INFO, parhelia_get_bo_info_ioctl,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(PARHELIA_UPLOAD_RENDER, parhelia_upload_render_ioctl,
+			  DRM_RENDER_ALLOW),
 };
 
 static const struct drm_driver parhelia_driver = {

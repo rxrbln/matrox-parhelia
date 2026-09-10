@@ -740,6 +740,32 @@ static void parhelia_retire_work(struct work_struct *work)
 	mutex_unlock(&pdev->submit_lock);
 }
 
+/* Drain every queued hardware user, then return with submit_lock held.  A
+ * caller which is about to expose local memory through a temporary host
+ * aperture must keep this lock until the descriptor has been revoked, so a
+ * racing submit cannot begin sampling or rendering the surface mid-copy. */
+int parhelia_submit_idle_lock(struct parhelia_device *pdev)
+{
+	int ret;
+
+	for (;;) {
+		mutex_lock(&pdev->submit_lock);
+		parhelia_retire_locked(pdev);
+		if (pdev->wedged) {
+			mutex_unlock(&pdev->submit_lock);
+			return -EIO;
+		}
+		if (!pdev->queued_slots)
+			return 0;
+		mutex_unlock(&pdev->submit_lock);
+		ret = wait_event_interruptible_timeout(pdev->submit_waitq,
+			READ_ONCE(pdev->wedged) || !READ_ONCE(pdev->queued_slots),
+			msecs_to_jiffies(10));
+		if (ret < 0)
+			return ret;
+	}
+}
+
 /* An async request owns its compact secondary heap until DWGSYNC retires its
  * slot.  This runs only while the selected slot is free and submit_lock is
  * held, so replacing its heap cannot invalidate an engine-visible address. */
@@ -1690,8 +1716,11 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 		layout = PARHELIA_BO_LAYOUT_NATIVE_64X32;
 	pitch = ALIGN(args->width, 64) * 4;
 	parhelia_bo_set_layout(bo, layout, args->width, args->height, pitch);
+	if (layout == PARHELIA_BO_LAYOUT_TEXTURE)
+		parhelia_bo_make_unmappable(bo);
 	ret = drm_gem_handle_create(file, &bo->bo.base, &handle);
-	if (!ret)
+	if (!ret && (layout != PARHELIA_BO_LAYOUT_TEXTURE ||
+		     !parhelia_texture_upload_enabled()))
 		args->mmap_offset = drm_vma_node_offset_addr(&bo->bo.base.vma_node);
 	drm_gem_object_put(&bo->bo.base);
 	if (ret)
@@ -1853,6 +1882,10 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		break;
 	case PARHELIA_PARAM_NATIVE_SHARE:
 		args->value = pdev->raw_aperture_owned;
+		break;
+	case PARHELIA_PARAM_TEXTURE_UPLOAD:
+		args->value = pdev->pdev->device == PARHELIA_P690 &&
+			pdev->raw_aperture_owned && parhelia_texture_upload_enabled();
 		break;
 	default:
 		return -EINVAL;

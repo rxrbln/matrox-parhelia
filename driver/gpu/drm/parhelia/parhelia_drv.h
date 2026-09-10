@@ -455,11 +455,16 @@ int parhelia_wait_fence_ioctl(struct drm_device *drm, void *data,
 				     struct drm_file *file);
 int parhelia_get_bo_info_ioctl(struct drm_device *drm, void *data,
 			       struct drm_file *file);
+int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
+				 struct drm_file *file);
+int parhelia_submit_idle_lock(struct parhelia_device *pdev);
 struct drm_gem_object *parhelia_gem_create_object(struct drm_device *drm, size_t size);
 int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 			 struct drm_mode_create_dumb *args);
 void parhelia_bo_set_layout(struct drm_gem_vram_object *gbo, u8 layout,
 			    u32 width, u32 height, u32 gpu_pitch);
+void parhelia_bo_make_unmappable(struct drm_gem_vram_object *gbo);
+bool parhelia_texture_upload_enabled(void);
 bool parhelia_bo_is_native(const struct parhelia_bo *bo);
 bool parhelia_gem_is_owned(const struct drm_gem_object *gem);
 void parhelia_host_aperture_fini(struct parhelia_device *pdev);

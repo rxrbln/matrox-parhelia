@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/io.h>
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/overflow.h>
+#include <linux/string.h>
+#include <linux/vmalloc.h>
 
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
@@ -14,6 +17,12 @@
 
 static const struct drm_gem_object_funcs parhelia_host_object_funcs;
 static const struct drm_gem_object_funcs parhelia_raw_object_funcs;
+static const struct drm_gem_object_funcs parhelia_unmappable_object_funcs;
+
+static bool texture_upload_probe;
+module_param(texture_upload_probe, bool, 0400);
+MODULE_PARM_DESC(texture_upload_probe,
+	"Enable guarded type-0 transient-aperture texture uploads");
 
 struct drm_gem_object *parhelia_gem_create_object(struct drm_device *drm, size_t size)
 {
@@ -38,6 +47,17 @@ void parhelia_bo_set_layout(struct drm_gem_vram_object *gbo, u8 layout,
 	bo->gpu_pitch = gpu_pitch;
 }
 
+void parhelia_bo_make_unmappable(struct drm_gem_vram_object *gbo)
+{
+	if (texture_upload_probe)
+		gbo->bo.base.funcs = &parhelia_unmappable_object_funcs;
+}
+
+bool parhelia_texture_upload_enabled(void)
+{
+	return texture_upload_probe;
+}
+
 bool parhelia_bo_is_native(const struct parhelia_bo *bo)
 {
 	return bo->layout == PARHELIA_BO_LAYOUT_NATIVE_64X32 ||
@@ -47,6 +67,7 @@ bool parhelia_bo_is_native(const struct parhelia_bo *bo)
 bool parhelia_gem_is_owned(const struct drm_gem_object *gem)
 {
 	return gem->funcs == &parhelia_raw_object_funcs ||
+	       gem->funcs == &parhelia_unmappable_object_funcs ||
 	       gem->funcs == &parhelia_host_object_funcs;
 }
 
@@ -178,6 +199,13 @@ static const struct drm_gem_object_funcs parhelia_raw_object_funcs = {
 	.vmap = drm_gem_ttm_vmap,
 	.vunmap = drm_gem_ttm_vunmap,
 	.mmap = drm_gem_ttm_mmap,
+	.print_info = drm_gem_ttm_print_info,
+};
+
+/* Native sampler storage has no meaningful raw CPU address on P690.  It is
+ * populated through UPLOAD_RENDER's transient translated aperture instead. */
+static const struct drm_gem_object_funcs parhelia_unmappable_object_funcs = {
+	.free = parhelia_raw_object_free,
 	.print_info = drm_gem_ttm_print_info,
 };
 
@@ -446,4 +474,136 @@ int parhelia_get_bo_info_ioctl(struct drm_device *drm, void *data,
 	args->size = gem->size;
 	drm_gem_object_put(gem);
 	return 0;
+}
+
+int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
+				 struct drm_file *file)
+{
+	struct drm_parhelia_upload_render *args = data;
+	struct parhelia_device *pdev = to_parhelia(drm);
+	struct drm_gem_vram_object *reservation = NULL;
+	struct drm_gem_object *gem;
+	struct parhelia_bo *bo;
+	unsigned long align_pages, slot = PARHELIA_HOST_APERTURE_SLOTS;
+	size_t reservation_size;
+	s64 aperture_offset;
+	u32 surface_address, reg, ctrl, dims;
+	u64 copied;
+	void *source;
+	int ret;
+
+	if (!texture_upload_probe)
+		return -EOPNOTSUPP;
+	if (!args->data || !args->handle || !args->size || args->flags ||
+	    args->pad || !IS_ALIGNED(args->offset, 4) ||
+	    !IS_ALIGNED(args->size, 4) || args->size > SIZE_MAX)
+		return -EINVAL;
+
+	source = vmemdup_user(u64_to_user_ptr(args->data), args->size);
+	if (IS_ERR(source))
+		return PTR_ERR(source);
+
+	gem = drm_gem_object_lookup(file, args->handle);
+	if (!gem) {
+		ret = -ENOENT;
+		goto out_source;
+	}
+	bo = to_parhelia_bo(gem);
+	if (gem->funcs != &parhelia_unmappable_object_funcs ||
+	    bo->layout != PARHELIA_BO_LAYOUT_TEXTURE ||
+	    args->offset >= gem->size || args->size > gem->size - args->offset) {
+		ret = -EINVAL;
+		goto out_gem;
+	}
+	reservation_size = 2 * PARHELIA_HOST_APERTURE_ALIGN;
+
+	/* This mirrors the vendor upload record: drain conflicting work, map the
+	 * destination through a short-lived aperture, LocMemCpy, then unmap. */
+	ret = parhelia_submit_idle_lock(pdev);
+	if (ret)
+		goto out_gem;
+	ret = parhelia_vram_pin(&bo->gbo);
+	if (ret)
+		goto out_submit_unlock;
+	mutex_lock(&pdev->aperture_lock);
+	if (!pdev->aperture_live) {
+		ret = -ENODEV;
+		goto out_aperture_unlock;
+	}
+	slot = find_next_zero_bit(pdev->aperture_slots,
+				  PARHELIA_HOST_APERTURE_SLOTS, 1);
+	if (slot == PARHELIA_HOST_APERTURE_SLOTS) {
+		ret = -ENOSPC;
+		goto out_aperture_unlock;
+	}
+	__set_bit(slot, pdev->aperture_slots);
+	align_pages = PARHELIA_HOST_APERTURE_ALIGN / PAGE_SIZE;
+	reservation = drm_gem_vram_create(drm, reservation_size, align_pages);
+	if (IS_ERR(reservation)) {
+		ret = PTR_ERR(reservation);
+		reservation = NULL;
+		goto out_slot;
+	}
+	ret = parhelia_vram_pin(reservation);
+	if (ret)
+		goto out_reservation;
+	aperture_offset = drm_gem_vram_offset(reservation);
+	if (aperture_offset < 0 ||
+	    aperture_offset >= PARHELIA_HOST_APERTURE_VALID ||
+	    !IS_ALIGNED(aperture_offset, PARHELIA_HOST_APERTURE_ALIGN)) {
+		ret = -ERANGE;
+		goto out_unpin_reservation;
+	}
+
+	reg = PARHELIA_HOST_APERTURE_SLOT(slot);
+	dims = BIT(16) | 1;
+	for (copied = 0; copied < args->size;) {
+		u32 bytes = min_t(u64, args->size - copied, SZ_8K);
+
+		ret = parhelia_vram_gpu_addr(pdev, &bo->gbo,
+				args->offset + copied, bytes, &surface_address);
+		if (ret)
+			goto out_disable;
+		/* 0x10/type 0 is the measured byte-linear bootstrap format.  Mesa
+		 * supplies the already-swizzled native bytes, so this is an opaque
+		 * view and cannot apply the 32x16 texture transform a second time. */
+		ctrl = (0x10u << 24) | bytes;
+		parhelia_write(pdev, reg, 0);
+		parhelia_write(pdev, reg + 4, surface_address);
+		parhelia_write(pdev, reg + 8, ctrl);
+		parhelia_write(pdev, reg + 12, dims);
+		wmb();
+		parhelia_write(pdev, reg,
+			       PARHELIA_HOST_APERTURE_VALID | (u32)aperture_offset);
+		parhelia_read(pdev, reg);
+		memcpy_toio((u8 __iomem *)pdev->vram + aperture_offset,
+			    (u8 *)source + copied, bytes);
+		wmb();
+		parhelia_read(pdev, reg);
+		copied += bytes;
+	}
+	/* Make every posted host write visible before the surface may be bound by
+	 * the next submit, then revoke the translation before recycling its BAR
+	 * coordinates. */
+	ret = 0;
+out_disable:
+	parhelia_write(pdev, reg, 0);
+	parhelia_read(pdev, reg);
+
+out_unpin_reservation:
+	parhelia_vram_unpin(reservation);
+out_reservation:
+	drm_gem_object_put(&reservation->bo.base);
+out_slot:
+	__clear_bit(slot, pdev->aperture_slots);
+out_aperture_unlock:
+	mutex_unlock(&pdev->aperture_lock);
+	parhelia_vram_unpin(&bo->gbo);
+out_submit_unlock:
+	mutex_unlock(&pdev->submit_lock);
+out_gem:
+	drm_gem_object_put(gem);
+out_source:
+	kvfree(source);
+	return ret;
 }
