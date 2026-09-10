@@ -272,6 +272,14 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	ret = parhelia_submit_init(pdev);
 	if (ret)
 		return ret;
+	/*
+	 * Establish the engine and its global host-aperture baseline before KMS
+	 * allocates the cursor surface and publishes its dedicated aperture.
+	 */
+	ret = parhelia_engine_init(pdev);
+	if (ret)
+		return dev_err_probe(&pci->dev, ret,
+				     "cannot initialize WARP engine\n");
 
 	ret = parhelia_modeset_init(pdev);
 	if (ret)
@@ -288,15 +296,6 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	if (ret)
 		return dev_err_probe(&pci->dev, ret, "cannot request IRQ %u\n", pci->irq);
 	pdev->irq_installed = true;
-
-	/* Initialize and populate the WARP store before exposing either DRM node.
-	 * Userspace only selects the fixed entry tokens advertised by GET_PARAM. */
-	ret = parhelia_engine_init(pdev);
-	if (ret) {
-		free_irq(pci->irq, pdev);
-		pdev->irq_installed = false;
-		return dev_err_probe(&pci->dev, ret, "cannot initialize WARP engine\n");
-	}
 
 	/* Engine initialization enabled mastering only after installing our span. */
 	ret = drm_dev_register(drm, 0);
@@ -316,6 +315,7 @@ static void parhelia_pci_remove(struct pci_dev *pci)
 
 	drm_dev_unregister(drm);
 	drm_atomic_helper_shutdown(drm);
+	parhelia_cursor_fini(to_parhelia(drm));
 	if (to_parhelia(drm)->irq_installed) {
 		parhelia_write(to_parhelia(drm), PARHELIA_MMIO_IRQ_MASK, 0);
 		free_irq(pci->irq, to_parhelia(drm));

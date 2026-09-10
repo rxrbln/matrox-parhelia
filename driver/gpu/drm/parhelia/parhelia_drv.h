@@ -441,6 +441,7 @@ int parhelia_vram_pin(struct drm_gem_vram_object *bo);
 void parhelia_vram_unpin(struct drm_gem_vram_object *bo);
 void parhelia_scanout_fini(struct parhelia_device *pdev);
 int parhelia_cursor_init(struct parhelia_device *pdev);
+void parhelia_cursor_fini(struct parhelia_device *pdev);
 void parhelia_state_shadow_invalidate(struct parhelia_device *pdev,
 				      const char *reason);
 void parhelia_submit_postclose(struct parhelia_device *pdev,

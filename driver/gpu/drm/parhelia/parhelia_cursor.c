@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Matrox Parhelia 64x64 palette/alpha hardware cursor. */
 #include <linux/iopoll.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 
 #include <drm/drm_atomic.h>
@@ -17,6 +18,18 @@
 #define PARHELIA_CURSOR_HEIGHT 64
 #define PARHELIA_CURSOR_STRIDE 128
 #define PARHELIA_CURSOR_SIZE (PARHELIA_CURSOR_STRIDE * PARHELIA_CURSOR_HEIGHT)
+/*
+ * A zero cursor base does not arm the P690 fetcher.  Keep the image at a
+ * nonzero, 1-KiB-aligned offset inside its private pinned BO.
+ */
+#define PARHELIA_CURSOR_IMAGE_OFFSET SZ_4K
+#define PARHELIA_CURSOR_BO_SIZE \
+	(PARHELIA_CURSOR_IMAGE_OFFSET + PARHELIA_CURSOR_SIZE)
+#define PARHELIA_CURSOR_APERTURE_SIZE SZ_16K
+#define PARHELIA_CURSOR_APERTURE_ALIGN (SZ_256K / PAGE_SIZE)
+#define PARHELIA_CURSOR_APERTURE_SLOT 2
+#define PARHELIA_CURSOR_APERTURE_CFG 0x05000020
+#define PARHELIA_CURSOR_APERTURE_DIMS 0x00010001
 
 #define PARHELIA_CURSOR_BASE(head) (PARHELIA_DC(head) + 0x00c0)
 #define PARHELIA_CURSOR_COLOR 0x0000
@@ -34,8 +47,10 @@ struct parhelia_cursor {
 	struct drm_plane plane;
 	struct parhelia_device *pdev;
 	struct drm_gem_vram_object *image;
+	struct drm_gem_vram_object *aperture;
 	struct iosys_map image_map;
 	u32 image_offset;
+	u32 aperture_offset;
 };
 
 static inline struct parhelia_cursor *
@@ -67,6 +82,23 @@ static void parhelia_cursor_wait_ready(struct parhelia_cursor *cursor)
 	readl_poll_timeout(cursor->pdev->mmio + PARHELIA_CURSOR_UPDATE_STATUS,
 			   status, status & PARHELIA_CURSOR_UPDATE_READY, 5,
 			   20000);
+}
+
+static void parhelia_cursor_program_aperture(struct parhelia_cursor *cursor)
+{
+	struct parhelia_device *pdev = cursor->pdev;
+	u32 reg = PARHELIA_HOST_APERTURE_SLOT(PARHELIA_CURSOR_APERTURE_SLOT);
+
+	/*
+	 * Engine initialization and recovery reset the global aperture table.
+	 * Republish the cursor alias before every CPU upload.
+	 */
+	parhelia_write(pdev, reg + 4, cursor->image_offset);
+	parhelia_write(pdev, reg + 8, PARHELIA_CURSOR_APERTURE_CFG);
+	parhelia_write(pdev, reg + 12, PARHELIA_CURSOR_APERTURE_DIMS);
+	wmb(); /* Publish descriptor fields before setting the valid bit. */
+	parhelia_write(pdev, reg,
+		       PARHELIA_HOST_APERTURE_VALID | cursor->aperture_offset);
 }
 
 static unsigned int parhelia_cursor_palette_index(u32 *palette,
@@ -115,6 +147,7 @@ static void parhelia_cursor_upload(struct parhelia_cursor *cursor,
 			 sizeof(*pixels), GFP_KERNEL);
 	if (!pixels)
 		return;
+	parhelia_cursor_program_aperture(cursor);
 
 	gem = drm_gem_fb_get_obj(fb, 0);
 	if (!gem)
@@ -276,12 +309,24 @@ static void parhelia_cursor_release(struct drm_device *drm, void *res)
 {
 	struct parhelia_cursor *cursor = res;
 
-	if (!ttm_bo_reserve(&cursor->image->bo, false, false, NULL)) {
-		drm_gem_vram_vunmap(cursor->image, &cursor->image_map);
-		ttm_bo_unreserve(&cursor->image->bo);
+	if (!ttm_bo_reserve(&cursor->aperture->bo, false, false, NULL)) {
+		drm_gem_vram_vunmap(cursor->aperture, &cursor->image_map);
+		ttm_bo_unreserve(&cursor->aperture->bo);
 	}
+	parhelia_vram_unpin(cursor->aperture);
+	drm_gem_vram_put(cursor->aperture);
 	parhelia_vram_unpin(cursor->image);
 	drm_gem_vram_put(cursor->image);
+}
+
+void parhelia_cursor_fini(struct parhelia_device *pdev)
+{
+	/*
+	 * PCI remove calls this while the MMIO BAR is still mapped.  Managed GEM
+	 * release happens later, after pcim resources may already be gone.
+	 */
+	parhelia_write(pdev,
+		       PARHELIA_HOST_APERTURE_SLOT(PARHELIA_CURSOR_APERTURE_SLOT), 0);
 }
 
 int parhelia_cursor_init(struct parhelia_device *pdev)
@@ -289,8 +334,9 @@ int parhelia_cursor_init(struct parhelia_device *pdev)
 	static const u32 formats[] = { DRM_FORMAT_ARGB8888 };
 	struct parhelia_cursor *cursor;
 	struct drm_gem_vram_object *image;
+	struct drm_gem_vram_object *aperture;
 	struct iosys_map image_map = {};
-	s64 offset;
+	s64 image_offset, aperture_offset;
 	int ret;
 
 	cursor = drmm_universal_plane_alloc(&pdev->drm, struct parhelia_cursor,
@@ -303,28 +349,70 @@ int parhelia_cursor_init(struct parhelia_device *pdev)
 		return PTR_ERR(cursor);
 	cursor->pdev = pdev;
 
-	image = drm_gem_vram_create(&pdev->drm, PARHELIA_CURSOR_SIZE, 1);
+	image = drm_gem_vram_create(&pdev->drm, PARHELIA_CURSOR_BO_SIZE, 1);
 	if (IS_ERR(image))
 		return PTR_ERR(image);
 	ret = parhelia_vram_pin(image);
 	if (ret)
 		goto err_put;
-	ret = ttm_bo_reserve(&image->bo, true, false, NULL);
-	if (ret)
-		goto err_unpin;
-	ret = drm_gem_vram_vmap(image, &image_map);
-	ttm_bo_unreserve(&image->bo);
-	if (ret)
-		goto err_unpin;
-	offset = drm_gem_vram_offset(image);
-	if (offset < 0 || offset > U32_MAX) {
+	image_offset = drm_gem_vram_offset(image);
+	if (image_offset < 0 || image_offset > U32_MAX - PARHELIA_CURSOR_IMAGE_OFFSET) {
 		ret = -ERANGE;
-		goto err_unmap;
+		goto err_unpin;
 	}
+
+	aperture = drm_gem_vram_create(&pdev->drm,
+				       PARHELIA_CURSOR_APERTURE_SIZE,
+				       PARHELIA_CURSOR_APERTURE_ALIGN);
+	if (IS_ERR(aperture)) {
+		ret = PTR_ERR(aperture);
+		goto err_unpin;
+	}
+	ret = parhelia_vram_pin(aperture);
+	if (ret)
+		goto err_aperture_put;
+	aperture_offset = drm_gem_vram_offset(aperture);
+	if (aperture_offset < 0 || aperture_offset > U32_MAX ||
+	    aperture_offset & (SZ_256K - 1)) {
+		ret = -ERANGE;
+		goto err_aperture_unpin;
+	}
+
+	/*
+	 * The cursor fetcher consumes a native surface, while CPU uploads use the
+	 * vendor's dedicated linear host alias.  Publish address/control/dimensions
+	 * first and the valid aperture word last.
+	 */
+	parhelia_write(pdev,
+		       PARHELIA_HOST_APERTURE_SLOT(PARHELIA_CURSOR_APERTURE_SLOT) + 4,
+		       image_offset + PARHELIA_CURSOR_IMAGE_OFFSET);
+	parhelia_write(pdev,
+		       PARHELIA_HOST_APERTURE_SLOT(PARHELIA_CURSOR_APERTURE_SLOT) + 8,
+		       PARHELIA_CURSOR_APERTURE_CFG);
+	parhelia_write(pdev,
+		       PARHELIA_HOST_APERTURE_SLOT(PARHELIA_CURSOR_APERTURE_SLOT) + 12,
+		       PARHELIA_CURSOR_APERTURE_DIMS);
+	wmb(); /* Publish descriptor fields before setting the valid bit. */
+	parhelia_write(pdev,
+		       PARHELIA_HOST_APERTURE_SLOT(PARHELIA_CURSOR_APERTURE_SLOT),
+		       PARHELIA_HOST_APERTURE_VALID | aperture_offset);
+
+	ret = ttm_bo_reserve(&aperture->bo, true, false, NULL);
+	if (ret)
+		goto err_descriptor;
+	ret = drm_gem_vram_vmap(aperture, &image_map);
+	ttm_bo_unreserve(&aperture->bo);
+	if (ret)
+		goto err_descriptor;
 	cursor->image = image;
+	cursor->aperture = aperture;
 	cursor->image_map = image_map;
-	cursor->image_offset = offset;
+	cursor->image_offset = image_offset + PARHELIA_CURSOR_IMAGE_OFFSET;
+	cursor->aperture_offset = aperture_offset;
 	iosys_map_memset(&cursor->image_map, 0, 0, PARHELIA_CURSOR_SIZE);
+	dev_info(&pdev->pdev->dev,
+		 "cursor surface %#x mapped through host aperture %#x\n",
+		 cursor->image_offset, cursor->aperture_offset);
 
 	ret = drmm_add_action_or_reset(&pdev->drm, parhelia_cursor_release,
 				       cursor);
@@ -336,11 +424,13 @@ int parhelia_cursor_init(struct parhelia_device *pdev)
 	pdev->drm.mode_config.cursor_height = PARHELIA_CURSOR_HEIGHT;
 	return 0;
 
-err_unmap:
-	if (!ttm_bo_reserve(&image->bo, false, false, NULL)) {
-		drm_gem_vram_vunmap(image, &image_map);
-		ttm_bo_unreserve(&image->bo);
-	}
+err_descriptor:
+	parhelia_write(pdev,
+		       PARHELIA_HOST_APERTURE_SLOT(PARHELIA_CURSOR_APERTURE_SLOT), 0);
+err_aperture_unpin:
+	parhelia_vram_unpin(aperture);
+err_aperture_put:
+	drm_gem_vram_put(aperture);
 err_unpin:
 	parhelia_vram_unpin(image);
 err_put:
