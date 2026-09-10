@@ -73,12 +73,11 @@ struct drm_parhelia_create_render {
 	__u64 mmap_offset; /* out: DRM file mmap offset, NOT a GPU address */
 };
 
-/* A linear local-VRAM vertex allocation.  This is deliberately distinct from
- * a render target: the driver pins it for the lifetime of the creating render
- * file and accepts it only for a bounded class-0 0x97 draw relocation.  It is
- * available on the P690, whose class-0 fetch was hardware-verified.  @size
- * is both the requested and returned allocation size; @mmap_offset is a DRM
- * file mapping offset and never a GPU address. */
+/* A linear, DMA32 vertex allocation.  This is deliberately distinct from a
+ * render target and is never mapped through BAR0.  The driver owns its class-3
+ * bus address and accepts it only for bounded draw relocations from the
+ * creating render file.  @size is both the requested and returned allocation
+ * size; @mmap_offset is a DRM file mapping offset and never a GPU address. */
 struct drm_parhelia_create_vertex {
 	__u64 size;
 	__u32 flags;
@@ -136,8 +135,10 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_TEXTURE_PIPE_MODE	13
 /* WARP pass-through for two texture-coordinate sets: o3 <- v7, o4 <- v8. */
 #define PARHELIA_PARAM_WARP_TEXTURED_MULTITEX	14
-/* Non-zero only when CREATE_VERTEX and class-0 draw relocations are usable. */
+/* Non-zero only when CREATE_VERTEX's dedicated class-3 DMA buffers are usable.
+ * The old name is retained for source and binary ABI compatibility. */
 #define PARHELIA_PARAM_VRAM_VERTEX	15
+#define PARHELIA_PARAM_VERTEX_BUFFER	PARHELIA_PARAM_VRAM_VERTEX
 /* P690-only guarded mode-7 index/stream relocation contract. */
 #define PARHELIA_PARAM_NATIVE_INDEXED	16
 /* Non-zero only when the fenced three-slot producer queue is available. */
@@ -186,11 +187,10 @@ struct drm_parhelia_packet {
  * For PARHELIA_RELOC_DRAW, @packet must identify a 0x97 packet; @dword and
  * @delta are respectively the byte offset and byte length in @vertices.
  *
- * PARHELIA_RELOC_DRAW_VRAM uses the same range fields, but names a linear
- * local-VRAM vertex allocation returned by CREATE_VERTEX.  The allocation is
- * pinned for the lifetime of its creating render file.  This relocation is
- * accepted only on P690, and the kernel validates both the allocation owner
- * and every byte of the 0x97 range before changing the stream to class 0.
+ * PARHELIA_RELOC_DRAW_VRAM uses the same range fields, but names a dedicated
+ * class-3 DMA allocation returned by CREATE_VERTEX.  The old suffix is kept
+ * for binary ABI compatibility.  The kernel validates allocation ownership
+ * and the complete byte range; the bus address never crosses the UAPI.
  *
  * PARHELIA_RELOC_STREAM_VRAM is reserved for a mode-7 direct-fetch stream.
  * @packet identifies the opcode-0 register-list packet, @dword is the

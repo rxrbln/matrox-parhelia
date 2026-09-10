@@ -13,6 +13,7 @@
 #include <linux/i2c.h>
 
 #include <drm/drm_device.h>
+#include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_mm.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_gem_vram_helper.h>
@@ -296,13 +297,14 @@ struct parhelia_submit_slot {
 	struct parhelia_root_probe_trace *root_probe;
 };
 
-/* CREATE_VERTEX retains one GEM reference and one VRAM pin for each entry.
- * Entries belong to the creating render file and are removed from postclose
- * only after no submitted engine work can still consume the range. */
+/* CREATE_VERTEX is a dedicated class-3 DMA object.  It must never be backed by
+ * the programmable BAR0 host aperture: a raw linear TTM mapping can alias an
+ * unrelated native surface on P690.  The list owns one GEM reference, and
+ * entries remain alive until no submitted engine work can consume them. */
 struct parhelia_vertex_bo {
+	struct drm_gem_dma_object dma;
 	struct list_head link;
 	struct drm_file *file;
-	struct drm_gem_vram_object *bo;
 };
 
 /*

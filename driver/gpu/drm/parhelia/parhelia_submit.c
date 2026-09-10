@@ -259,16 +259,14 @@ module_param(mode3_bound_range, bool, 0400);
 MODULE_PARM_DESC(mode3_bound_range,
 		 "Enable P690 one-triangle-per-packet mode-3 rendering (default false)");
 
-/* BAR0 is a programmable host-aperture window, not a linear CPU view of
- * local memory.  A raw TTM mmap can therefore alias a native framebuffer;
- * the observed 0x01364000 vertex placement wrote vertex bytes into root rows
- * 403/404.  Keep class-0 vertex fetch unavailable until CREATE_VERTEX owns a
- * dedicated host-aperture mapping.  The coherent DMA upload ABI remains the
- * normal, hardware-accelerated fallback. */
+/* BAR0 is a programmable host-aperture window, not a linear CPU view of local
+ * memory.  CREATE_VERTEX therefore uses a dedicated DMA32 GEM object and the
+ * proven class-3 fetch path.  Keep the historical parameter name because test
+ * scripts already use it. */
 static bool vram_vertex;
 module_param(vram_vertex, bool, 0400);
 MODULE_PARM_DESC(vram_vertex,
-		 "Enable unsafe raw-BAR P690 class-0 vertex buffers (default false)");
+		 "Enable dedicated DMA32 P690 vertex buffers (default false)");
 
 /* Permit one ioctl to carry two complete logical state batches.  The kernel
  * retains each batch's opening/EOB/DWGSYNC bracket and coalesces only the final
@@ -851,45 +849,6 @@ static bool parhelia_is_vram_operand(const u32 *cmd, u32 length, u32 dword)
 	return false;
 }
 
-/* The recovered Mesa builder leaves the stream in class 3 immediately before
- * all of its 0x97 draws. A local-VRAM vertex draw changes only that final
- * bind: touching an earlier class-0 loader bind would be unrelated to the
- * draw and could leave a later class-3 bind active. */
-static int parhelia_select_vram_vertex_stream(u32 *commands,
-		const struct drm_parhelia_packet *packets, u32 count)
-{
-	u32 *last_stream0 = NULL;
-	u32 i;
-
-	for (i = 0; i < count; i++) {
-		u32 *cmd = commands + packets[i].offset;
-		u32 pos = 1;
-
-		if (cmd[0] >> 24)
-			continue;
-		while (pos < packets[i].length) {
-			u32 tag = cmd[pos++];
-			unsigned int slot;
-
-			for (slot = 0; slot < 4; slot++) {
-				u32 index = (tag >> (slot * 8)) & 0xff;
-
-				if (index == 0x21)
-					break;
-				if (index == 0)
-					last_stream0 = &cmd[pos];
-				pos++;
-			}
-		}
-	}
-	/* 3 is the known-good PCI DMA stream class.  Requiring that exact state
-	 * keeps this private probe tied to the proven 0x97 path. */
-	if (!last_stream0 || *last_stream0 != 3)
-		return -EINVAL;
-	*last_stream0 = 0;
-	return 0;
-}
-
 /* The public helper only pins plane framebuffers. Render relocations need
  * the same TTM operation, held until the synchronous batch fence retires. */
 int parhelia_vram_pin(struct drm_gem_vram_object *bo)
@@ -1238,21 +1197,79 @@ parhelia_vertex_bo_lookup(struct parhelia_device *pdev,
 	struct parhelia_vertex_bo *entry;
 
 	list_for_each_entry(entry, &pdev->vertex_bos, link) {
-		if (entry->file == file && &entry->bo->bo.base == obj) {
+		if (entry->file == file && &entry->dma.base == obj) {
 			return entry;
 		}
 	}
 	return NULL;
 }
 
+static void parhelia_vertex_object_free(struct drm_gem_object *gem)
+{
+	struct parhelia_vertex_bo *entry =
+		container_of(to_drm_gem_dma_obj(gem), struct parhelia_vertex_bo, dma);
+
+	if (entry->dma.vaddr)
+		dma_free_wc(drm_dev_dma_dev(gem->dev), gem->size,
+			    entry->dma.vaddr, entry->dma.dma_addr);
+	drm_gem_object_release(gem);
+	kfree(entry);
+}
+
+static const struct drm_gem_object_funcs parhelia_vertex_object_funcs = {
+	.free = parhelia_vertex_object_free,
+	.print_info = drm_gem_dma_object_print_info,
+	.vmap = drm_gem_dma_object_vmap,
+	.mmap = drm_gem_dma_object_mmap,
+	.vm_ops = &drm_gem_dma_vm_ops,
+};
+
+static struct parhelia_vertex_bo *
+parhelia_vertex_bo_create(struct drm_device *drm, size_t size)
+{
+	struct parhelia_vertex_bo *entry;
+	int ret;
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return ERR_PTR(-ENOMEM);
+	ret = drm_gem_object_init(drm, &entry->dma.base, size);
+	if (ret)
+		goto out_free;
+	entry->dma.base.funcs = &parhelia_vertex_object_funcs;
+	ret = drm_gem_create_mmap_offset(&entry->dma.base);
+	if (ret)
+		goto out_put;
+	entry->dma.vaddr = dma_alloc_wc(drm_dev_dma_dev(drm), size,
+					&entry->dma.dma_addr,
+					GFP_KERNEL | __GFP_NOWARN);
+	if (!entry->dma.vaddr) {
+		ret = -ENOMEM;
+		goto out_put;
+	}
+	if (upper_32_bits(entry->dma.dma_addr) ||
+	    entry->dma.dma_addr > U32_MAX - size) {
+		ret = -ERANGE;
+		goto out_put;
+	}
+	return entry;
+
+out_put:
+	drm_gem_object_put(&entry->dma.base);
+	return ERR_PTR(ret);
+out_free:
+	kfree(entry);
+	return ERR_PTR(ret);
+}
+
 /*
  * Mode-7 direct fetch needs more than a range check: its index values select
  * byte addresses in the bound vertex stream.  This records the one-stream,
- * class-0 contract recovered for the P690.  The index slice is only a source
+ * class-3 contract recovered for the P690.  The index slice is only a source
  * snapshot: before a mode-7 packet reaches the engine, submit copies it into a
  * driver-private, pinned local-VRAM object which has no DRM handle or mmap
- * permission.  A TTM reservation does not stop writes through CREATE_VERTEX's
- * existing mmap, so validation is always performed on that private snapshot.
+ * permission.  A GEM reference does not stop writes through CREATE_VERTEX's
+ * mmap, so validation is always performed on that private snapshot.
  */
 enum parhelia_mode7_transport {
 	PARHELIA_MODE7_TRANSPORT_NONE,
@@ -1500,9 +1517,8 @@ static int parhelia_mode7_copy_indices(struct parhelia_device *pdev,
 				       struct parhelia_mode7_submit *mode7,
 				       const struct parhelia_mode7_state *state)
 {
-	struct drm_gem_vram_object *src;
 	struct drm_gem_vram_object *dst;
-	struct iosys_map src_map = { }, dst_map = { };
+	struct iosys_map dst_map = { };
 	void *snapshot;
 	u32 address;
 	int ret;
@@ -1511,25 +1527,14 @@ static int parhelia_mode7_copy_indices(struct parhelia_device *pdev,
 		return parhelia_mode7_validate_dma_indices(pdev->vertex_cpu,
 							   mode7->index_offset,
 							   mode7->index_length, state);
-	src = mode7->index_bo->bo;
-
-	/* The relocation check already bounds this to CREATE_VERTEX's 1 MiB ABI. */
+	/* The relocation check already bounds this to CREATE_VERTEX's 1 MiB ABI.
+	 * Copy first, then validate only the private immutable destination. */
 	snapshot = kvmalloc(mode7->index_length, GFP_KERNEL);
 	if (!snapshot)
 		return -ENOMEM;
-
-	ret = ttm_bo_reserve(&src->bo, true, false, NULL);
-	if (ret)
-		goto out_snapshot;
-	ret = drm_gem_vram_vmap(src, &src_map);
-	if (!ret)
-		iosys_map_memcpy_from(snapshot, &src_map, mode7->index_offset,
-				      mode7->index_length);
-	if (!ret)
-		drm_gem_vram_vunmap(src, &src_map);
-	ttm_bo_unreserve(&src->bo);
-	if (ret)
-		goto out_snapshot;
+	memcpy(snapshot,
+	       (u8 *)mode7->index_bo->dma.vaddr + mode7->index_offset,
+	       mode7->index_length);
 
 	/* No handle is created for @dst.  Consequently neither a userspace mmap nor
 	 * a userspace-visible GPU offset exists for this buffer. */
@@ -1585,7 +1590,6 @@ static int parhelia_validate_mode7_contract(const u32 *commands,
 					  const struct parhelia_mode7_submit *mode7,
 					  struct parhelia_mode7_state *state)
 {
-	const struct drm_gem_vram_object *stream_bo;
 	u64 stream_bytes;
 	u32 operand_index, i;
 	int ret;
@@ -1624,15 +1628,14 @@ static int parhelia_validate_mode7_contract(const u32 *commands,
 		if (!mode7->stream_size || mode7->stream_offset >= mode7->stream_size)
 			return -EINVAL;
 	} else {
-		stream_bo = mode7->stream_bo->bo;
-		if (mode7->stream_offset >= stream_bo->bo.base.size)
+		if (mode7->stream_offset >= mode7->stream_bo->dma.base.size)
 			return -EINVAL;
 	}
 	stream_bytes = (u64)(state->limit - state->floor) * state->stride[0] +
 		state->descriptor_extent;
 	if (stream_bytes > (mode7->transport == PARHELIA_MODE7_TRANSPORT_DMA ?
 			mode7->stream_size :
-			stream_bo->bo.base.size) - mode7->stream_offset)
+			mode7->stream_bo->dma.base.size) - mode7->stream_offset)
 		return -EINVAL;
 	return 0;
 }
@@ -1645,7 +1648,6 @@ static int parhelia_mode7_patch_addresses(
 		const struct parhelia_mode7_submit *mode7,
 		struct parhelia_device *pdev)
 {
-	const struct drm_gem_vram_object *stream_bo;
 	u32 stream_gpu, stream_end, index_end, stream_size;
 	u32 *index_cmd;
 
@@ -1664,23 +1666,18 @@ static int parhelia_mode7_patch_addresses(
 		index_cmd[2] = index_end | 3u;
 		return 0;
 	}
-	stream_bo = mode7->stream_bo->bo;
-	stream_size = stream_bo->bo.base.size;
+	stream_size = mode7->stream_bo->dma.base.size;
 	if (!mode7->index_copy || !stream_size || mode7->stream_offset >= stream_size)
 		return -EINVAL;
-	if (parhelia_vram_gpu_addr(pdev,
-				    (struct drm_gem_vram_object *)stream_bo,
-				    mode7->stream_offset,
-				    stream_size - mode7->stream_offset,
-				    &stream_gpu) ||
-	    (stream_gpu & 3) ||
+	if (check_add_overflow(lower_32_bits(mode7->stream_bo->dma.dma_addr),
+			       mode7->stream_offset, &stream_gpu) ||
 	    check_add_overflow(stream_gpu, stream_size - mode7->stream_offset, &stream_end) ||
-	    stream_end > PARHELIA_HOST_APERTURE_BASE ||
 	    check_add_overflow(mode7->index_copy_offset, mode7->index_length, &index_end) ||
 	    index_end > PARHELIA_HOST_APERTURE_BASE)
 		return -EINVAL;
 
-	commands[packets[mode7->stream_packet].offset + mode7->stream_dword] = stream_gpu;
+	commands[packets[mode7->stream_packet].offset + mode7->stream_dword] =
+		stream_gpu | 3u;
 	index_cmd = commands + packets[mode7->index_packet].offset;
 	index_cmd[1] = mode7->index_copy_offset;
 	index_cmd[2] = index_end;
@@ -1837,9 +1834,8 @@ static int parhelia_bound_range_validate_and_patch(
 		struct parhelia_device *pdev)
 {
 	struct parhelia_mode7_state state = { };
-	struct drm_gem_vram_object *bo;
 	const u32 *stream, *prim, *bounds, *reset;
-	u32 first_range, range_count, bytes, stream_gpu, stream_end, i;
+	u32 first_range, range_count, bytes, stream_bus, stream_end, i;
 
 	if (!bound->stream_seen || bound->stream_dword != 2 || packet_count < 6 ||
 	    bound->stream_packet > packet_count - 6)
@@ -1905,19 +1901,16 @@ static int parhelia_bound_range_validate_and_patch(
 		}
 	}
 
-	bo = bound->stream_bo->bo;
 	if (check_mul_overflow(range_count * 3, state.stride[0], &bytes) ||
-	    bound->stream_offset > bo->bo.base.size ||
-	    bytes > bo->bo.base.size - bound->stream_offset)
+	    bound->stream_offset > bound->stream_bo->dma.base.size ||
+	    bytes > bound->stream_bo->dma.base.size - bound->stream_offset)
 		return -EINVAL;
-	if (parhelia_vram_gpu_addr(pdev, bo, bound->stream_offset, bytes,
-				    &stream_gpu) ||
-	    (stream_gpu & 3) ||
-	    check_add_overflow(stream_gpu, bytes, &stream_end) ||
-	    stream_end > PARHELIA_HOST_APERTURE_BASE)
+	if (check_add_overflow(lower_32_bits(bound->stream_bo->dma.dma_addr),
+			       bound->stream_offset, &stream_bus) ||
+	    check_add_overflow(stream_bus, bytes, &stream_end))
 		return -EINVAL;
 	commands[packets[bound->stream_packet].offset + bound->stream_dword] =
-		stream_gpu;
+		stream_bus | 3u;
 	return 0;
 }
 
@@ -2105,53 +2098,41 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	return 0;
 }
 
-/* This allocation is intentionally narrow: it is a P690 class-0 source, not
- * a generic GEM pin ioctl.  Holding the pin for the creating file keeps the
- * local offset stable across the map/write/submit sequence and avoids ever
- * accepting an arbitrary linear render or imported BO as a vertex address. */
+/* This allocation is intentionally narrow: it is a P690 class-3 source, not
+ * a generic GEM pin ioctl.  DMA32 backing gives the engine a stable bus address
+ * while keeping every CPU mapping out of the programmable BAR0 aperture. */
 int parhelia_create_vertex_ioctl(struct drm_device *drm, void *data,
 				 struct drm_file *file)
 {
 	struct drm_parhelia_create_vertex *args = data;
 	struct parhelia_device *pdev = to_parhelia(drm);
-	struct drm_gem_vram_object *bo;
 	struct parhelia_vertex_bo *entry;
 	size_t size;
 	u32 handle;
 	int ret;
 
-	if (pdev->pdev->device != PARHELIA_P690 || !pdev->raw_aperture_owned ||
-	    !vram_vertex)
+	if (pdev->pdev->device != PARHELIA_P690 || !vram_vertex)
 		return -EOPNOTSUPP;
 	if (!args->size || args->size > PARHELIA_VERTEX_BO_MAX_SIZE ||
 	    args->flags || args->handle || args->mmap_offset)
 		return -EINVAL;
 	size = PAGE_ALIGN(args->size);
-	bo = drm_gem_vram_create(drm, size, 1);
-	if (IS_ERR(bo))
-		return PTR_ERR(bo);
-	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-	if (!entry) {
-		ret = -ENOMEM;
-		goto out_put;
-	}
-	ret = drm_gem_handle_create(file, &bo->bo.base, &handle);
+	entry = parhelia_vertex_bo_create(drm, size);
+	if (IS_ERR(entry))
+		return PTR_ERR(entry);
+	ret = drm_gem_handle_create(file, &entry->dma.base, &handle);
 	if (ret)
-		goto out_free;
+		goto out_put;
 
 	mutex_lock(&pdev->submit_lock);
 	if (pdev->wedged) {
 		ret = -EIO;
 	} else {
-		ret = parhelia_vram_pin(bo);
-		if (!ret) {
-			/* Retain the BO independently of its GEM handle. postclose drops
-			 * this after unpinning, which also handles an explicit GEM_CLOSE. */
-			drm_gem_object_get(&bo->bo.base);
-			entry->file = file;
-			entry->bo = bo;
-			list_add_tail(&entry->link, &pdev->vertex_bos);
-		}
+		/* Retain the BO independently of its GEM handle.  postclose drops
+		 * this reference after every queued use has retired. */
+		drm_gem_object_get(&entry->dma.base);
+		entry->file = file;
+		list_add_tail(&entry->link, &pdev->vertex_bos);
 	}
 	mutex_unlock(&pdev->submit_lock);
 	if (ret)
@@ -2159,16 +2140,14 @@ int parhelia_create_vertex_ioctl(struct drm_device *drm, void *data,
 
 	args->size = size;
 	args->handle = handle;
-	args->mmap_offset = drm_vma_node_offset_addr(&bo->bo.base.vma_node);
-	drm_gem_object_put(&bo->bo.base);
+	args->mmap_offset = drm_vma_node_offset_addr(&entry->dma.base.vma_node);
+	drm_gem_object_put(&entry->dma.base);
 	return 0;
 
 out_handle:
 	drm_gem_handle_delete(file, handle);
-out_free:
-	kfree(entry);
 out_put:
-	drm_gem_object_put(&bo->bo.base);
+	drm_gem_object_put(&entry->dma.base);
 	return ret;
 }
 
@@ -2226,9 +2205,7 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		args->value = pdev->chip->texture_pipe_mode;
 		break;
 	case PARHELIA_PARAM_VRAM_VERTEX:
-		/* Raw BAR mappings can alias native surfaces on the P690. */
-		args->value = pdev->pdev->device == PARHELIA_P690 &&
-			      pdev->raw_aperture_owned && vram_vertex;
+		args->value = pdev->pdev->device == PARHELIA_P690 && vram_vertex;
 		break;
 	case PARHELIA_PARAM_NATIVE_INDEXED:
 		/* This is never a normal rendering feature yet.  It is exposed solely
@@ -2292,7 +2269,7 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	dma_addr_t primary_bus = pdev->primary_bus;
 	bool *draw_relocated;
 	bool host_vertex_draw = false;
-	bool vram_vertex_draw = false;
+	bool vertex_object_draw = false;
 	bool async = args->flags & PARHELIA_SUBMIT_ASYNC;
 	u32 i, j, end = 0, fence, dma_tag, primary_words, waited, opening_slot;
 	u32 boundary_packet = 0, boundary_count = 0;
@@ -2549,7 +2526,7 @@ retry_slot:
 			    (reloc->dword & 3) || !reloc->delta || (reloc->delta & 3) ||
 			    reloc->handle || reloc->dword > args->vertex_dwords * sizeof(u32) ||
 			    reloc->delta > args->vertex_dwords * sizeof(u32) - reloc->dword ||
-			    vram_vertex_draw) {
+			    vertex_object_draw) {
 				ret = -EINVAL;
 				goto out_unpin;
 			}
@@ -2561,7 +2538,7 @@ retry_slot:
 		}
 		if (reloc->type == PARHELIA_RELOC_DRAW_VRAM) {
 			struct parhelia_vertex_bo *vertex_bo;
-			u32 range_end, gpu_start, gpu_end;
+			u32 range_end, bus_start, bus_end;
 
 			if (pdev->pdev->device != PARHELIA_P690) {
 				ret = -EOPNOTSUPP;
@@ -2584,26 +2561,20 @@ retry_slot:
 				ret = -EACCES;
 				goto out_unpin;
 			}
-			/* CREATE_VERTEX owns the persistent VRAM pin. Re-pinning here
-			 * would make the object lifetime depend on submit count; its stable
-			 * class-0 offset is exactly why this relocation is a separate ABI. */
-			if (range_end > vertex_bo->bo->bo.base.size) {
+			/* CREATE_VERTEX owns a stable DMA32 allocation.  The GEM lookup held
+			 * by this request prevents its bus address from being freed before
+			 * the terminal fence retires. */
+			if (range_end > vertex_bo->dma.base.size ||
+			    check_add_overflow(lower_32_bits(vertex_bo->dma.dma_addr),
+					       reloc->dword, &bus_start) ||
+			    check_add_overflow(bus_start, reloc->delta, &bus_end)) {
 				ret = -EINVAL;
 				goto out_unpin;
 			}
-			if (parhelia_vram_gpu_addr(pdev, vertex_bo->bo,
-						    reloc->dword, reloc->delta,
-						    &gpu_start) ||
-			    (gpu_start & 3) ||
-			    check_add_overflow(gpu_start, reloc->delta, &gpu_end) ||
-			    gpu_end > PARHELIA_HOST_APERTURE_BASE) {
-				ret = -EINVAL;
-				goto out_unpin;
-			}
-			packet_cmd[1] = gpu_start;
-			packet_cmd[2] = gpu_end;
+			packet_cmd[1] = bus_start;
+			packet_cmd[2] = bus_end;
 			draw_relocated[reloc->packet] = true;
-			vram_vertex_draw = true;
+			vertex_object_draw = true;
 			continue;
 		}
 		if (reloc->type == PARHELIA_RELOC_STREAM_VRAM) {
@@ -2627,7 +2598,7 @@ retry_slot:
 				goto out_unpin;
 			}
 			vertex_bo = parhelia_vertex_bo_lookup(pdev, file, objects[i]);
-			if (!vertex_bo || reloc->delta >= vertex_bo->bo->bo.base.size) {
+			if (!vertex_bo || reloc->delta >= vertex_bo->dma.base.size) {
 				ret = -EACCES;
 				goto out_unpin;
 			}
@@ -2659,7 +2630,7 @@ retry_slot:
 				goto out_unpin;
 			}
 			vertex_bo = parhelia_vertex_bo_lookup(pdev, file, objects[i]);
-			if (!vertex_bo || index_end > vertex_bo->bo->bo.base.size) {
+			if (!vertex_bo || index_end > vertex_bo->dma.base.size) {
 				ret = -EACCES;
 				goto out_unpin;
 			}
@@ -2721,7 +2692,7 @@ retry_slot:
 
 			if (pdev->pdev->device != PARHELIA_P690 || !mode3_screen_test ||
 			    mode3.stream_seen || mode7.stream_seen || mode7.index_seen ||
-			    host_vertex_draw || vram_vertex_draw ||
+			    host_vertex_draw || vertex_object_draw ||
 			    (args->vertex_dwords != 30 && args->vertex_dwords != 36) ||
 			    reloc->handle || reloc->delta ||
 			    (packet_cmd[0] >> 24) || reloc->dword >= packet->length ||
@@ -2757,7 +2728,7 @@ retry_slot:
 				goto out_unpin;
 			}
 			vertex_bo = parhelia_vertex_bo_lookup(pdev, file, objects[i]);
-			if (!vertex_bo || reloc->delta >= vertex_bo->bo->bo.base.size) {
+			if (!vertex_bo || reloc->delta >= vertex_bo->dma.base.size) {
 				ret = -EACCES;
 				goto out_unpin;
 			}
@@ -2841,12 +2812,9 @@ retry_slot:
 		if (ret)
 			goto out_unpin;
 	}
-	if (vram_vertex_draw) {
-		ret = parhelia_select_vram_vertex_stream(commands, packets,
-						  args->packet_count);
-		if (ret)
-			goto out_unpin;
-	}
+	/* CREATE_VERTEX uses the same class-3 stream state as copied @vertices.
+	 * Its range operands differ, but no client-controlled bus address survives
+	 * relocation and no BAR0 aperture descriptor is involved. */
 	for (i = 0; i < args->packet_count; i++) {
 		u32 opcode = commands[packets[i].offset] >> 24;
 
@@ -3446,9 +3414,7 @@ void parhelia_submit_fini(struct parhelia_device *pdev)
 	}
 	list_for_each_entry_safe(entry, tmp, &pdev->vertex_bos, link) {
 		list_del(&entry->link);
-		parhelia_vram_unpin(entry->bo);
-		drm_gem_object_put(&entry->bo->bo.base);
-		kfree(entry);
+		drm_gem_object_put(&entry->dma.base);
 	}
 	mutex_unlock(&pdev->submit_lock);
 }
@@ -3468,8 +3434,8 @@ retry:
 
 			if (slot->state == PARHELIA_SLOT_QUEUED && slot->file == file) {
 				mutex_unlock(&pdev->submit_lock);
-				/* postclose must not release a CREATE_VERTEX pin while an
-				 * in-flight class-0 batch still owns its GEM lookup. */
+				/* postclose must not release a CREATE_VERTEX allocation while an
+				 * in-flight class-3 batch still owns its GEM lookup. */
 				wait_event(pdev->submit_waitq,
 					READ_ONCE(pdev->wedged) ||
 					READ_ONCE(slot->state) != PARHELIA_SLOT_QUEUED);
@@ -3482,16 +3448,14 @@ retry:
 		if (entry->file != file)
 			continue;
 		/* A timeout quarantines every object which may still be read by the
-		 * onboard engine. Keep this persistent pin until module teardown too;
-		 * PCI mastering is already disabled, but unpinning could move VRAM. */
+		 * onboard engine. Keep the allocation until module teardown; PCI
+		 * mastering is already disabled, but freeing a live DMA target is unsafe. */
 		if (pdev->wedged) {
 			entry->file = NULL;
 			continue;
 		}
 		list_del(&entry->link);
-		parhelia_vram_unpin(entry->bo);
-		drm_gem_object_put(&entry->bo->bo.base);
-		kfree(entry);
+		drm_gem_object_put(&entry->dma.base);
 	}
 	mutex_unlock(&pdev->submit_lock);
 }
