@@ -80,6 +80,17 @@ module_param(mode3_bound_range, bool, 0400);
 MODULE_PARM_DESC(mode3_bound_range,
 		 "Enable P690 one-triangle-per-packet mode-3 rendering (default false)");
 
+/* BAR0 is a programmable host-aperture window, not a linear CPU view of
+ * local memory.  A raw TTM mmap can therefore alias a native framebuffer;
+ * the observed 0x01364000 vertex placement wrote vertex bytes into root rows
+ * 403/404.  Keep class-0 vertex fetch unavailable until CREATE_VERTEX owns a
+ * dedicated host-aperture mapping.  The coherent DMA upload ABI remains the
+ * normal, hardware-accelerated fallback. */
+static bool vram_vertex;
+module_param(vram_vertex, bool, 0400);
+MODULE_PARM_DESC(vram_vertex,
+		 "Enable unsafe raw-BAR P690 class-0 vertex buffers (default false)");
+
 /* Permit one ioctl to carry two complete logical state batches.  The kernel
  * retains each batch's opening/EOB/DWGSYNC bracket and coalesces only the final
  * primary producer update. */
@@ -1706,7 +1717,8 @@ int parhelia_create_vertex_ioctl(struct drm_device *drm, void *data,
 	u32 handle;
 	int ret;
 
-	if (pdev->pdev->device != PARHELIA_P690 || !pdev->raw_aperture_owned)
+	if (pdev->pdev->device != PARHELIA_P690 || !pdev->raw_aperture_owned ||
+	    !vram_vertex)
 		return -EOPNOTSUPP;
 	if (!args->size || args->size > PARHELIA_VERTEX_BO_MAX_SIZE ||
 	    args->flags || args->handle || args->mmap_offset)
@@ -1811,9 +1823,9 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		args->value = pdev->chip->texture_pipe_mode;
 		break;
 	case PARHELIA_PARAM_VRAM_VERTEX:
-		/* The class-0 frontend has been proven only on the PCIe P690. */
+		/* Raw BAR mappings can alias native surfaces on the P690. */
 		args->value = pdev->pdev->device == PARHELIA_P690 &&
-			      pdev->raw_aperture_owned;
+			      pdev->raw_aperture_owned && vram_vertex;
 		break;
 	case PARHELIA_PARAM_NATIVE_INDEXED:
 		/* This is never a normal rendering feature yet.  It is exposed solely
