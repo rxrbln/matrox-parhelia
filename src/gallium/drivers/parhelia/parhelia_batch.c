@@ -33,9 +33,16 @@ int
 parhelia_create_render(int fd, unsigned width, unsigned height,
                        struct drm_parhelia_create_render *allocation)
 {
+   uint32_t flags;
+
    if (!allocation || !width || width > 1024 || !height || height > 768)
       return -EINVAL;
-   *allocation = (struct drm_parhelia_create_render){.width = width, .height = height};
+   flags = allocation->flags;
+   *allocation = (struct drm_parhelia_create_render){
+      .width = width,
+      .height = height,
+      .flags = flags,
+   };
    return ioctl(fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, allocation) ? -errno : 0;
 }
 

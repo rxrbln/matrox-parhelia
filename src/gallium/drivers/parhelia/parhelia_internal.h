@@ -19,6 +19,7 @@ struct parhelia_screen {
    bool async_submit;
    bool stateful_submit;
    bool native_share;
+   bool texture_upload;
    uint64_t vram_size;
 };
 
@@ -36,6 +37,10 @@ struct parhelia_resource {
    void *map;
    void *malloc_data;
    bool native_shared;
+   /* Native sampler BOs cannot be raw-mapped on P690.  Their CPU image is a
+    * software-swizzled malloc shadow copied through UPLOAD_RENDER. */
+   bool upload_texture;
+   bool upload_dirty;
 
    uint32_t linear_handle;
    uint64_t linear_size;
@@ -79,6 +84,7 @@ ph_resource(struct pipe_resource *r)
 
 void ph_resource_resolve_linear(struct parhelia_resource *r);
 void ph_resource_upload_tiled(struct parhelia_resource *r);
+int ph_resource_upload_texture(struct parhelia_resource *r);
 struct pipe_context *ph_context_create(struct pipe_screen *screen, void *priv,
                                        unsigned flags);
 

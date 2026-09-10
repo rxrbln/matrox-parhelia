@@ -1740,6 +1740,13 @@ ph_submit_vertices(struct ph_context *ctx)
    color = ph_resource(ctx->fb.cbufs[0].texture);
    if (ctx->fb.zsbuf.texture)
       depth = ph_resource(ctx->fb.zsbuf.texture);
+   /* The upload class has CPU shadows but no reverse aperture/download path.
+    * Never let a framebuffer write make those shadows stale and later
+    * overwrite the rendered result on sampler bind. */
+   if (color->upload_texture || (depth && depth->upload_texture)) {
+      ctx->submit_error = -EOPNOTSUPP;
+      goto out;
+   }
    /* GL may keep a depth attachment bound while disabling depth test for a
     * HUD overlay.  The 8-dword alpha stream is the validated no-Z packet;
     * do not accidentally turn that into the depth/RGBA descriptor merely
@@ -1767,12 +1774,12 @@ ph_submit_vertices(struct ph_context *ctx)
     * recovered for layout 2; all small, mip-described and unusual textures
     * retain the conservative linear sampler backing. */
    if (texture)
-      texture_tiled = tiled_textures ?
+      texture_tiled = texture->upload_texture ? true : tiled_textures ?
          (!small_texture_linear ||
           (texture->base.width0 >= 32 && texture->base.height0 >= 32)) :
          ph_auto_tiled_texture(ctx, texture, sampler);
    if (texture1)
-      texture1_tiled = tiled_textures ?
+      texture1_tiled = texture1->upload_texture ? true : tiled_textures ?
          (!small_texture_linear ||
           (texture1->base.width0 >= 32 && texture1->base.height0 >= 32)) :
          ph_auto_tiled_texture(ctx, texture1, sampler1);
@@ -1828,6 +1835,21 @@ ph_submit_vertices(struct ph_context *ctx)
       goto out;
    if (texture && !rgb5a1_texture)
       ph_restore_rgba_tiled(texture);
+   if (texture1 && texture1 != texture && texture1->rgb5a1_packed) {
+      if (ctx->aggregate_batches && ph_drain_batch(ctx))
+         goto out;
+      ph_restore_rgba_tiled(texture1);
+   }
+   if (texture && texture->upload_texture &&
+       (ret = ph_resource_upload_texture(texture))) {
+      ctx->submit_error = ret;
+      goto out;
+   }
+   if (texture1 && texture1->upload_texture &&
+       (ret = ph_resource_upload_texture(texture1))) {
+      ctx->submit_error = ret;
+      goto out;
+   }
    if (texture && !texture1 && !depth && ph_copy_present_quad(ctx, color, texture))
       goto out;
    if (ctx->cpu_alpha_cutout) {
@@ -3073,6 +3095,10 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
    int ret;
    if (!r || !r->handle || ctx->submit_error)
       return;
+   if (r->upload_texture) {
+      ctx->submit_error = -EOPNOTSUPP;
+      return;
+   }
    if (getenv("PARHELIA_CPU_CLEAR")) {
       /* The normal path queues this packet behind previous 3D work.  A CPU
        * diagnostic must establish the same ordering before touching the
@@ -3083,6 +3109,7 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
             memcpy((uint8_t *)r->map +
                    p3d_tile_offset_layout(x, y, r->stride, r->tile_layout),
                    &value, sizeof(value));
+      r->upload_dirty |= r->upload_texture;
       r->tiled_dirty = true;
       r->linear_dirty = false;
       r->mip_defined |= BITFIELD_BIT(0);
@@ -3230,6 +3257,12 @@ ph_copy_texture_box(struct ph_context *ctx,
    if (!staging)
       return false;
 
+   /* A prior source-alpha draw may have repacked the native shadow as
+    * A1R5G5B5.  Restore the complete ordinary image before applying a
+    * potentially partial 32-bit copy. */
+   if (dr->rgb5a1_packed)
+      ph_restore_rgba_tiled(dr);
+
    for (int y = 0; y < height; y++) {
       const int sy = src_box->y + (src_box->height < 0 ? -1 - y : y);
       for (int x = 0; x < width; x++) {
@@ -3271,10 +3304,11 @@ ph_copy_texture_box(struct ph_context *ctx,
                       (size_t)dy * dr->linear_stride + dx * cpp, in, cpp);
          if (dr->map)
             memcpy((uint8_t *)dr->map +
-                      (((dr->base.bind & PIPE_BIND_SAMPLER_VIEW) &&
+                      ((dr->upload_texture ||
+                        ((dr->base.bind & PIPE_BIND_SAMPLER_VIEW) &&
                         !(dr->base.bind & (PIPE_BIND_RENDER_TARGET |
                                            PIPE_BIND_DISPLAY_TARGET |
-                                           PIPE_BIND_SCANOUT))) ?
+                                           PIPE_BIND_SCANOUT)))) ?
                        p3d_texture_tile_offset(dx, dy,
                                                ph_sampler_tiled_pitch(dr->base.width0)) :
                        p3d_tile_offset_layout(dx, dy, dr->stride,
@@ -3287,6 +3321,7 @@ ph_copy_texture_box(struct ph_context *ctx,
    }
    dr->tiled_dirty = !dr->linear_map;
    dr->linear_dirty = false;
+   dr->upload_dirty |= dr->upload_texture;
    dr->mip_defined |= BITFIELD_BIT(0);
    dr->content_generation++;
    FREE(staging);
@@ -3436,6 +3471,7 @@ ph_prepare_rgb5a1(struct parhelia_resource *texture)
    __sync_synchronize();
    texture->rgb5a1_packed = true;
    texture->rgb5a1_packed_generation = texture->content_generation;
+   texture->upload_dirty |= texture->upload_texture;
    return true;
 }
 
@@ -3461,6 +3497,7 @@ ph_restore_rgba_tiled(struct parhelia_resource *texture)
                    (size_t)y * texture->linear_stride + x * 4, 4);
    __sync_synchronize();
    texture->rgb5a1_packed = false;
+   texture->upload_dirty |= texture->upload_texture;
 }
 
 static void
@@ -3577,6 +3614,10 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
    (void)p;
    if (texture && t->base.level < ph_resource_mip_levels(r) && t->staging &&
        (transfer->usage & PIPE_MAP_WRITE)) {
+      /* Do not apply a partial RGBA update over the temporary 16-bit packed
+       * image.  Rebuild the complete ordinary native shadow first. */
+      if (r->rgb5a1_packed)
+         ph_restore_rgba_tiled(r);
       if (r->linear_map) {
          for (int y = 0; y < transfer->box.height; y++)
             for (int x = 0; x < transfer->box.width; x++)
@@ -3619,8 +3660,14 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
        * the resource's ordinary RGBA pixels.  A later binary-alpha draw may
        * reclassify/repack it under the new content generation. */
       r->rgb5a1_packed = false;
+      r->upload_dirty |= r->upload_texture;
       r->content_generation++;
       r->mip_defined |= BITFIELD_BIT(transfer->level);
+      /* Upload now to keep ordinary texture creation eager.  A temporary
+       * aperture allocation failure leaves upload_dirty set; sampler bind
+       * retries it before allowing a draw to reference this BO. */
+      if (r->upload_texture)
+         ph_resource_upload_texture(r);
    }
    FREE(t->staging);
    FREE(t);

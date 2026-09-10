@@ -262,10 +262,44 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
    for (unsigned y = 0; y < r->base.height0; y++)
       for (unsigned x = 0; x < r->base.width0; x++)
          memcpy((uint8_t *)r->map +
-                   p3d_tile_offset_layout(x, y, r->stride, r->tile_layout),
+                   (r->upload_texture ?
+                    p3d_texture_tile_offset(x, y, r->mip.level[0].pitch) :
+                    p3d_tile_offset_layout(x, y, r->stride, r->tile_layout)),
                 (uint8_t *)r->linear_map +
                    (size_t)y * r->linear_stride + x * 4, 4);
+   r->upload_dirty |= r->upload_texture;
    r->linear_dirty = false;
+   r->rgb5a1_packed = false;
+}
+
+int
+ph_resource_upload_texture(struct parhelia_resource *r)
+{
+   struct drm_parhelia_upload_render upload;
+
+   if (!r || !r->upload_texture || !r->upload_dirty)
+      return 0;
+   if (!r->handle || !r->map || !r->size)
+      return -EINVAL;
+   upload = (struct drm_parhelia_upload_render) {
+      .data = (uintptr_t)r->map,
+      .size = r->size,
+      .handle = r->handle,
+   };
+   if (ioctl(ph_screen(r->base.screen)->fd, DRM_IOCTL_PARHELIA_UPLOAD_RENDER,
+             &upload)) {
+      int ret = -errno;
+
+      fprintf(stderr,
+              "parhelia: texture upload handle=%u size=%llu failed: %s\n",
+              r->handle, (unsigned long long)r->size, strerror(errno));
+      return ret;
+   }
+   r->upload_dirty = false;
+   if (getenv("PARHELIA_TRACE"))
+      fprintf(stderr, "parhelia: texture upload handle=%u size=%llu\n",
+              r->handle, (unsigned long long)r->size);
+   return 0;
 }
 
 static struct pipe_resource *
@@ -276,6 +310,10 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    const bool share_native = screen->native_share &&
       (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
                       PIPE_BIND_SHARED));
+   const bool sampler_storage = !share_native &&
+      (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
+      templ->width0 <= 512 && templ->height0 <= 512 &&
+      !(templ->bind & PIPE_BIND_DEPTH_STENCIL);
    const unsigned max_width = share_native ? 4096 : 1024;
    const unsigned max_height = share_native ? 4096 : 768;
    unsigned mip_levels;
@@ -339,9 +377,13 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * well (bind=0xa), although it never binds its 16..512px atlases as a
     * target.  Treat this measured sampler extent as texture storage; the
     * actual 640x480 colour/depth images remain in the bank-separated class. */
-   if (!share_native && (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
-       templ->width0 <= 512 && templ->height0 <= 512 &&
-       !(templ->bind & PIPE_BIND_DEPTH_STENCIL))
+   if (sampler_storage && screen->chip_id == 0x2539 &&
+       !screen->texture_upload) {
+      fprintf(stderr,
+              "parhelia: safe P690 texture upload ABI is unavailable\n");
+      goto fail;
+   }
+   if (sampler_storage)
       create.flags = PARHELIA_CREATE_RENDER_TEXTURE;
    if (ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &create)) {
       fprintf(stderr, "parhelia: create render %ux%u failed: %s\n",
@@ -355,15 +397,31 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * descriptor and p3d_tile_offset_layout() both consume pitch in pixels. */
    if ((create.pitch & 3) || create.pitch < templ->width0 * 4)
       goto fail;
-   if (mip_levels > 1 && create.size < r->mip.size)
+   /* Layout 2 uses a power-of-two texel pitch, which can exceed the current
+    * allocation ABI's 64-pixel pitch for NPOT images.  Reject any object
+    * whose reported storage cannot contain the software-swizzled image. */
+   if ((create.flags & PARHELIA_CREATE_RENDER_TEXTURE) &&
+       create.size < r->mip.size)
       goto fail;
    r->stride = create.pitch / 4;
    r->mmap_offset = create.mmap_offset;
-   r->map = mmap(NULL, r->size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                 ph_screen(pscreen)->fd, r->mmap_offset);
-   if (r->map == MAP_FAILED) {
-      r->map = NULL;
-      goto fail;
+   r->upload_texture = screen->texture_upload &&
+                       create.flags == PARHELIA_CREATE_RENDER_TEXTURE;
+   if (r->upload_texture) {
+      if (create.mmap_offset)
+         goto fail;
+      r->map = align_malloc(r->size, 64);
+      if (!r->map)
+         goto fail;
+      memset(r->map, 0, r->size);
+      r->upload_dirty = true;
+   } else {
+      r->map = mmap(NULL, r->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                    ph_screen(pscreen)->fd, r->mmap_offset);
+      if (r->map == MAP_FAILED) {
+         r->map = NULL;
+         goto fail;
+      }
    }
    if (!share_native &&
        (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
@@ -384,27 +442,37 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
             templ->height0,
          .flags = PARHELIA_CREATE_RENDER_LINEAR,
       };
-      if (ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER,
-                &linear)) {
-         fprintf(stderr, "parhelia: create linear shadow %ux%u failed: %s\n",
-                 linear.width, linear.height, strerror(errno));
-         goto fail;
-      }
-      r->linear_handle = linear.handle;
-      r->linear_size = linear.size;
-      r->linear_stride = linear.pitch;
-      if (r->linear_stride < ALIGN_POT(templ->width0, 32) * 4 ||
-          (r->linear_stride & 3))
-         goto fail;
-      if (mip_levels > 1 && linear.size < r->linear_mip.size)
-         goto fail;
-      r->linear_handle_owned = true;
-      r->linear_map = mmap(NULL, r->linear_size, PROT_READ | PROT_WRITE,
-                           MAP_SHARED, ph_screen(pscreen)->fd,
-                           linear.mmap_offset);
-      if (r->linear_map == MAP_FAILED) {
-         r->linear_map = NULL;
-         goto fail;
+      if (r->upload_texture) {
+         r->linear_size = r->linear_mip.size;
+         r->linear_stride = r->linear_mip.level[0].pitch * 4;
+         r->linear_map = align_malloc(r->linear_size, 64);
+         if (!r->linear_map)
+            goto fail;
+         memset(r->linear_map, 0, r->linear_size);
+      } else {
+         if (ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER,
+                   &linear)) {
+            fprintf(stderr,
+                    "parhelia: create linear shadow %ux%u failed: %s\n",
+                    linear.width, linear.height, strerror(errno));
+            goto fail;
+         }
+         r->linear_handle = linear.handle;
+         r->linear_size = linear.size;
+         r->linear_stride = linear.pitch;
+         if (r->linear_stride < ALIGN_POT(templ->width0, 32) * 4 ||
+             (r->linear_stride & 3))
+            goto fail;
+         if (mip_levels > 1 && linear.size < r->linear_mip.size)
+            goto fail;
+         r->linear_handle_owned = true;
+         r->linear_map = mmap(NULL, r->linear_size, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, ph_screen(pscreen)->fd,
+                              linear.mmap_offset);
+         if (r->linear_map == MAP_FAILED) {
+            r->linear_map = NULL;
+            goto fail;
+         }
       }
    }
    if (getenv("PARHELIA_TRACE"))
@@ -417,7 +485,9 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
               r->linear_stride, r->tile_layout);
    return &r->base;
 fail:
-   if (r->linear_map)
+   if (r->upload_texture)
+      align_free(r->linear_map);
+   else if (r->linear_map)
       munmap(r->linear_map, r->linear_size);
    if (r->linear_handle_owned && r->linear_handle) {
       if (r->linear_is_dumb) {
@@ -432,6 +502,8 @@ fail:
       struct drm_gem_close close = {.handle = r->handle};
       ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &close);
    }
+   if (r->upload_texture)
+      align_free(r->map);
    align_free(r->malloc_data);
    FREE(r);
    return NULL;
@@ -511,8 +583,11 @@ ph_resource_from_handle(struct pipe_screen *pscreen,
    /* The imported image is linear presentation storage.  Allocate a native
     * tiled shadow for every renderable import and resolve explicitly.
     */
+   /* Imported images need a renderable native backing regardless of whether
+    * callers will later sample them.  They cannot use the sampler-only
+    * malloc/upload class because the imported mmap replaces linear_map. */
    render_templ.bind &= ~(PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
-                          PIPE_BIND_SHARED);
+                          PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW);
    pres = ph_resource_create(pscreen, &render_templ);
    if (!pres) {
       fprintf(stderr,
@@ -579,7 +654,9 @@ static void
 ph_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *pres)
 {
    struct parhelia_resource *r = ph_resource(pres);
-   if (r->linear_map)
+   if (r->upload_texture)
+      align_free(r->linear_map);
+   else if (r->linear_map)
       munmap(r->linear_map, r->linear_size);
    if (r->linear_fd >= 0)
       close(r->linear_fd);
@@ -592,7 +669,9 @@ ph_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *pres)
          ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &close);
       }
    }
-   if (r->map)
+   if (r->upload_texture)
+      align_free(r->map);
+   else if (r->map)
       munmap(r->map, r->size);
    if (r->handle_owned && r->handle) {
       struct drm_gem_close close = {.handle = r->handle};
@@ -716,6 +795,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param native_share = {
       .param = PARHELIA_PARAM_NATIVE_SHARE,
    };
+   struct drm_parhelia_get_param texture_upload = {
+      .param = PARHELIA_PARAM_TEXTURE_UPLOAD,
+   };
    (void)config;
    if (!s)
       return NULL;
@@ -766,6 +848,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->native_share =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &native_share) &&
       native_share.value == 1;
+   s->texture_upload =
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &texture_upload) &&
+      texture_upload.value == 1;
    /* u_init_pipe_screen_caps() queries DRM_CAP_PRIME through this callback.
     * Install it first so GBM uses the DRI image path for ARGB scanout rather
     * than its restricted dumb-buffer fallback. */
