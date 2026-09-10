@@ -2706,17 +2706,10 @@ retry_slot:
 			goto out_unpin;
 		async_failure_stage = "dma-resv fence attachment";
 		ret = parhelia_slot_attach_fence(async_slot, objects, args->reloc_count);
-		/* The slot itself retains every GEM reference and VRAM pin through
-		 * DWGSYNC.  On the 32-bit P690 test target dma-resv's optional fence
-		 * array can fail under pressure; keep the explicit waitable submission
-		 * usable rather than dropping a complete frame.  Mesa waits that fence
-		 * before CPU/scanout handoff, and a later retry can restore implicit
-		 * sharing without changing the hardware queue contract. */
-		if (ret == -ENOMEM) {
-			dev_warn_ratelimited(&pdev->pdev->dev,
-				"async dma-resv fence attachment exhausted memory; using slot lifetime fence only\n");
-			ret = 0;
-		}
+		/* Fence publication is part of accepting the submission.  If any
+		 * reservation cannot take the fence, abort before ringing the producer
+		 * doorbell.  Already attached references are completed with this error
+		 * by out_unpin, so no observer can wait forever. */
 		if (ret)
 			goto out_unpin;
 	}
