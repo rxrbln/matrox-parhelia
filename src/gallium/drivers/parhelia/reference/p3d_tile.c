@@ -150,8 +150,16 @@ p3d_texture_tile_offset_cpp(uint32_t x, uint32_t y, uint32_t pitch,
 
 	if (cpp == 4)
 		return p3d_texture_tile_offset(x, y, pitch);
-	/* Vendor mtx2146: 16-bpp codes 2/3 use 32x16 texel blocks, with
+	/* Vendor mtx2146: all three byte sizes use 32x16-texel blocks.
+	 * The 8-bpp path at 0x2145f uses 512-byte blocks and 4x4-byte
+	 * microtiles; the 16-bpp path at 0x21592 uses 1024-byte blocks and
 	 * 2x4-texel 16-byte microtiles. */
+	if (cpp == 1) {
+		block = ((y >> 4) * pitch + x) >> 5;
+		in_block = ((y & 0xcu) << 5) | ((y & 3u) << 2) |
+			   (x & 3u) | ((x & 0x1cu) << 2);
+		return block * 512u + in_block;
+	}
 	if (cpp != 2)
 		return UINT32_MAX;
 	block = ((y >> 4) * pitch + x) >> 5;
