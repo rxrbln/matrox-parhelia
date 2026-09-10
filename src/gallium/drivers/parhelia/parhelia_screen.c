@@ -798,10 +798,6 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param texture_upload = {
       .param = PARHELIA_PARAM_TEXTURE_UPLOAD,
    };
-   struct drm_parhelia_get_param max_vertex = {
-      .param = PARHELIA_PARAM_MAX_VERTEX_DWORDS,
-   };
-   bool max_vertex_supported;
    (void)config;
    if (!s)
       return NULL;
@@ -833,22 +829,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->single_texture_pipe =
       pipe_mode.value == PARHELIA_TEXTURE_PIPES_SINGLE;
    s->vram_size = vram.value;
-   /* The old coherent upload ABI has a fixed 4096-dword limit.  A successful
-    * query advertises the actual kernel allocation, but userspace never
-    * exceeds its own bounded aggregate staging array. */
-   s->max_vertex_dwords = PH_BATCH_DWORDS;
-   max_vertex_supported =
-      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &max_vertex) &&
-      max_vertex.value;
-   if (max_vertex_supported) {
-      s->max_vertex_dwords = max_vertex.value < PH_BATCH_VERTEX_DWORDS ?
-                                max_vertex.value : PH_BATCH_VERTEX_DWORDS;
-   }
-   /* The negotiated coherent class-3 path avoids mapping a programmable
-    * BAR0 aperture into userspace.  Retain CREATE_VERTEX only as an old-
-    * kernel compatibility path when the safe capacity query is absent. */
-   s->vram_vertex = !max_vertex_supported &&
-                    !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &vertex) &&
+   /* This optional parameter lets new Mesa retain the coherent-DMA path on
+    * older kernels. The P690-only class-0 path is never inferred from a PCI
+    * id alone. */
+   s->vram_vertex = !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &vertex) &&
                     vertex.value == 1;
    s->bound_range = s->vram_vertex &&
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &bound_range) &&

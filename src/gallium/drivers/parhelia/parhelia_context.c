@@ -246,11 +246,12 @@ ph_triangle_batch_limit(const struct ph_context *ctx)
 static inline unsigned
 ph_pending_vertex_limit(const struct ph_context *ctx)
 {
-   /* New kernels report the size of their private coherent class-3 upload.
-    * The screen clamps it to pending_vertices.  CREATE_VERTEX is retained
-    * only for an older kernel and uses that same userspace array bound. */
+   /* Class-3 submits copy vertices through the kernel's 4096-dword coherent
+    * slot.  CREATE_VERTEX relocations name the bounded local-VRAM ring and
+    * carry no submit vertex payload, so their aggregate can instead use all
+    * storage addressable by the 221 one-triangle DRAW packets. */
    return ctx->vram_vertex_enabled ? PH_BATCH_VERTEX_DWORDS :
-      ph_screen(ctx->base.screen)->max_vertex_dwords;
+                                     PH_BATCH_DWORDS;
 }
 
 static int ph_drain_batch(struct ph_context *ctx);
@@ -372,7 +373,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
       } else {
          /* The request has not reached the doorbell.  Retry through the
           * synchronous CREATE_VERTEX path below; a large local-VRAM batch
-          * cannot fall back to an older kernel's smaller class-3 copy slot. */
+          * cannot fall back to the kernel's 4096-dword class-3 copy slot. */
          if (getenv("PARHELIA_TRACE"))
             fprintf(stderr,
                     "parhelia: async vertex slot exhausted; retrying synchronously\n");
@@ -3861,10 +3862,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
                             getenv("PARHELIA_BATCH_AGGREGATE") != NULL;
    if (ctx->aggregate_batches && getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
-              "parhelia: experimental aggregation enabled: up to %u command dwords, %u class-3/%u compatibility vertex dwords, %u packets, %u relocs\n",
-              PH_BATCH_DWORDS,
-              ph_screen(screen)->max_vertex_dwords,
-              PH_BATCH_VERTEX_DWORDS,
+              "parhelia: experimental aggregation enabled: up to %u command dwords, %u class-3/%u class-0 vertex dwords, %u packets, %u relocs\n",
+              PH_BATCH_DWORDS, PH_BATCH_DWORDS, PH_BATCH_VERTEX_DWORDS,
               PH_BATCH_PACKETS, PH_BATCH_RELOCS);
    if (ctx->aggregate_state_batches && getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,

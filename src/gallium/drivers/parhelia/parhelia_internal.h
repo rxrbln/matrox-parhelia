@@ -20,7 +20,6 @@ struct parhelia_screen {
    bool stateful_submit;
    bool native_share;
    bool texture_upload;
-   unsigned max_vertex_dwords;
    uint64_t vram_size;
 };
 
