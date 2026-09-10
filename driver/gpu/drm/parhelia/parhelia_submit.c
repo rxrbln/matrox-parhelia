@@ -1666,7 +1666,7 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	struct drm_gem_vram_object *bo;
 	unsigned long align_pages;
 	u8 layout;
-	u32 allocation_height, pitch;
+	u32 allocation_height, pitch_pixels, pitch;
 	size_t bo_size;
 	u32 handle;
 	int ret;
@@ -1701,8 +1701,16 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	else
 		allocation_height = ALIGN(args->height,
 			pdev->chip->tile_layout == PARHELIA_TILE_64X16_4K ? 16 : 32);
-	bo_size = ALIGN((size_t)ALIGN(args->width, 64) * 4 * allocation_height,
-			8192);
+	/* Layout 2 addresses 32x16 texture blocks with a power-of-two row
+	 * pitch.  Returning the render-target ALIGN(width, 64) pitch here
+	 * underallocated NPOT images such as 300x300 before the transient upload
+	 * path made that mismatch observable without a raw BAR mapping. */
+	if (args->flags & PARHELIA_CREATE_RENDER_TEXTURE)
+		pitch_pixels = roundup_pow_of_two(max_t(u32, args->width, 32));
+	else
+		pitch_pixels = ALIGN(args->width, 64);
+	pitch = pitch_pixels * 4;
+	bo_size = ALIGN((size_t)pitch * allocation_height, 8192);
 	bo = drm_gem_vram_create(drm, bo_size, align_pages);
 	if (IS_ERR(bo))
 		return PTR_ERR(bo);
@@ -1714,7 +1722,6 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 		layout = PARHELIA_BO_LAYOUT_NATIVE_64X16;
 	else
 		layout = PARHELIA_BO_LAYOUT_NATIVE_64X32;
-	pitch = ALIGN(args->width, 64) * 4;
 	parhelia_bo_set_layout(bo, layout, args->width, args->height, pitch);
 	if (layout == PARHELIA_BO_LAYOUT_TEXTURE)
 		parhelia_bo_make_unmappable(bo);

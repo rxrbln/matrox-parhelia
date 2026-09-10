@@ -492,7 +492,8 @@ int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
 	void *source;
 	int ret;
 
-	if (!texture_upload_probe)
+	if (!texture_upload_probe || pdev->pdev->device != 0x2539 ||
+	    !pdev->raw_aperture_owned)
 		return -EOPNOTSUPP;
 	if (!args->data || !args->handle || !args->size || args->flags ||
 	    args->pad || !IS_ALIGNED(args->offset, 4) ||
