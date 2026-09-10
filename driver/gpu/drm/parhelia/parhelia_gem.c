@@ -32,8 +32,7 @@ MODULE_PARM_DESC(texture_upload_trace,
 
 static atomic_t texture_upload_trace_count = ATOMIC_INIT(0);
 
-static_assert(IS_ALIGNED(SZ_8K, sizeof(u32)));
-static_assert(SZ_8K / sizeof(u32) <= GENMASK(13, 0));
+static_assert(SZ_8K <= GENMASK(13, 0));
 
 static bool parhelia_upload_trace_root(struct parhelia_device *pdev, u32 value[3])
 {
@@ -656,7 +655,9 @@ int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
 			ret = -EINVAL;
 			goto out_disable;
 		}
-		width = bytes / sizeof(u32);
+		/* Vendor format 0x10 is 8 bpp.  Type 0 describes a raw byte row, so
+		 * the pixel width and byte count are identical. */
+		width = bytes;
 		if (!width || width > GENMASK(13, 0)) {
 			ret = -E2BIG;
 			goto out_disable;
