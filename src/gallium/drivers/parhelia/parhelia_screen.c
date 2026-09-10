@@ -28,6 +28,24 @@
 static void ph_resource_destroy(struct pipe_screen *pscreen,
                                 struct pipe_resource *pres);
 
+static bool
+ph_bo_layout_native(const struct parhelia_screen *screen, uint32_t layout)
+{
+   return (screen->tile_layout == PARHELIA_TILE_64X16_4K &&
+           layout == PARHELIA_BO_LAYOUT_NATIVE_64X16) ||
+          (screen->tile_layout == PARHELIA_TILE_64X32_8K &&
+           layout == PARHELIA_BO_LAYOUT_NATIVE_64X32);
+}
+
+static bool
+ph_query_bo(struct parhelia_screen *screen, uint32_t handle,
+            struct drm_parhelia_get_bo_info *info)
+{
+   memset(info, 0, sizeof(*info));
+   info->handle = handle;
+   return !ioctl(screen->fd, DRM_IOCTL_PARHELIA_GET_BO_INFO, info);
+}
+
 /* Fragment NIR is inspected by the Parhelia state translator and executed by
  * draw's software fragment path; vertex NIR is executed by draw as well.  Use
  * the established no-integer lowering contract for that combination. */
@@ -253,14 +271,21 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
 static struct pipe_resource *
 ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *templ)
 {
+   struct parhelia_screen *screen = ph_screen(pscreen);
    struct parhelia_resource *r = CALLOC_STRUCT(parhelia_resource);
+   const bool share_native = screen->native_share &&
+      (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
+                      PIPE_BIND_SHARED));
+   const unsigned max_width = share_native ? 4096 : 1024;
+   const unsigned max_height = share_native ? 4096 : 768;
    unsigned mip_levels;
    if (!r)
       return NULL;
    r->linear_fd = -1;
    r->base = *templ;
    r->base.screen = pscreen;
-   r->tile_layout = ph_screen(pscreen)->tile_layout;
+   r->tile_layout = screen->tile_layout;
+   r->native_shared = share_native;
    pipe_reference_init(&r->base.reference, 1);
    if (templ->target == PIPE_BUFFER) {
       r->size = templ->width0;
@@ -269,7 +294,8 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
          goto fail;
       return &r->base;
    }
-   if (templ->width0 > 1024 || templ->height0 > 768 || templ->depth0 != 1 ||
+   if (templ->width0 > max_width || templ->height0 > max_height ||
+       templ->depth0 != 1 ||
        templ->array_size != 1) {
       fprintf(stderr,
               "parhelia: reject resource target=%u format=%u %ux%ux%u array=%u levels=%u bind=%#x\n",
@@ -313,7 +339,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * well (bind=0xa), although it never binds its 16..512px atlases as a
     * target.  Treat this measured sampler extent as texture storage; the
     * actual 640x480 colour/depth images remain in the bank-separated class. */
-   if ((templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
+   if (!share_native && (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
        templ->width0 <= 512 && templ->height0 <= 512 &&
        !(templ->bind & PIPE_BIND_DEPTH_STENCIL))
       create.flags = PARHELIA_CREATE_RENDER_TEXTURE;
@@ -323,6 +349,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       goto fail;
    }
    r->handle = create.handle;
+   r->handle_owned = true;
    r->size = create.size;
    /* The DRM allocation ABI reports byte pitch, while the recovered surface
     * descriptor and p3d_tile_offset_layout() both consume pitch in pixels. */
@@ -338,8 +365,9 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       r->map = NULL;
       goto fail;
    }
-   if (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
-                      PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW)) {
+   if (!share_native &&
+       (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
+                       PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW))) {
       /* CREATE_DUMB is a modeset-only ioctl and is unavailable through a
        * render node.  A second render allocation is valid linear sampler
        * storage when its descriptor selects texture layout 0; it also gives
@@ -414,10 +442,71 @@ ph_resource_from_handle(struct pipe_screen *pscreen,
                         const struct pipe_resource *templ,
                         struct winsys_handle *whandle, unsigned usage)
 {
+   struct parhelia_screen *screen = ph_screen(pscreen);
+   struct drm_parhelia_get_bo_info info;
    struct pipe_resource render_templ = *templ;
    struct pipe_resource *pres;
    struct parhelia_resource *r;
+   uint32_t imported_handle = 0;
+   bool imported_owned = false;
    (void)usage;
+
+   if (screen->native_share && !whandle->offset) {
+      if (whandle->type == WINSYS_HANDLE_TYPE_FD) {
+         if (drmPrimeFDToHandle(screen->fd, whandle->handle,
+                                &imported_handle))
+            return NULL;
+         imported_owned = true;
+      } else if (whandle->type == WINSYS_HANDLE_TYPE_SHARED) {
+         struct drm_gem_open open = {.name = whandle->handle};
+         if (ioctl(screen->fd, DRM_IOCTL_GEM_OPEN, &open))
+            return NULL;
+         imported_handle = open.handle;
+         imported_owned = true;
+      } else if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
+         imported_handle = whandle->handle;
+      }
+      if (imported_handle && ph_query_bo(screen, imported_handle, &info) &&
+          ph_bo_layout_native(screen, info.layout)) {
+         if (!info.pitch || (info.pitch & 255) ||
+             info.pitch < (uint64_t)ALIGN_POT(templ->width0, 64) * 4 ||
+             info.width < templ->width0 || info.height < templ->height0) {
+            if (imported_owned) {
+               struct drm_gem_close close = {.handle = imported_handle};
+               ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
+            }
+            return NULL;
+         }
+         r = CALLOC_STRUCT(parhelia_resource);
+         if (!r) {
+            if (imported_owned) {
+               struct drm_gem_close close = {.handle = imported_handle};
+               ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
+            }
+            return NULL;
+         }
+         r->linear_fd = -1;
+         r->base = *templ;
+         r->base.screen = pscreen;
+         r->handle = imported_handle;
+         r->handle_owned = imported_owned;
+         r->size = info.size;
+         r->stride = info.pitch / 4;
+         r->tile_layout = screen->tile_layout;
+         r->native_shared = true;
+         pipe_reference_init(&r->base.reference, 1);
+         if (getenv("PARHELIA_TRACE"))
+            fprintf(stderr,
+                    "parhelia: import native resource=%p handle=%u %ux%u bind=%#x pitch_B=%u layout=%u\n",
+                    (void *)r, r->handle, templ->width0, templ->height0,
+                    templ->bind, info.pitch, info.layout);
+         return &r->base;
+      }
+      if (imported_owned) {
+         struct drm_gem_close close = {.handle = imported_handle};
+         ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
+      }
+   }
 
    /* The imported image is linear presentation storage.  Allocate a native
     * tiled shadow for every renderable import and resolve explicitly.
@@ -505,7 +594,7 @@ ph_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *pres)
    }
    if (r->map)
       munmap(r->map, r->size);
-   if (r->handle) {
+   if (r->handle_owned && r->handle) {
       struct drm_gem_close close = {.handle = r->handle};
       ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &close);
    }
@@ -519,6 +608,38 @@ ph_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *ctx,
                        unsigned usage)
 {
    struct parhelia_resource *r = ph_resource(pres);
+   if (r->native_shared) {
+      int prime_fd;
+
+      if (getenv("PARHELIA_TRACE"))
+         fprintf(stderr,
+                 "parhelia: export native resource=%p handle=%u type=%u pitch_B=%u\n",
+                 (void *)r, r->handle, whandle->type, r->stride * 4);
+      whandle->stride = r->stride * 4;
+      whandle->offset = 0;
+      /* The matching KMS and Xorg driver query the GEM layout explicitly.
+       * INVALID must never be inferred as LINEAR for a Parhelia dma-buf. */
+      whandle->modifier = DRM_FORMAT_MOD_INVALID;
+      if (whandle->type == WINSYS_HANDLE_TYPE_FD) {
+         if (drmPrimeHandleToFD(ph_screen(pscreen)->fd, r->handle,
+                                DRM_CLOEXEC | DRM_RDWR, &prime_fd))
+            return false;
+         whandle->handle = prime_fd;
+         return true;
+      }
+      if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
+         whandle->handle = r->handle;
+         return true;
+      }
+      if (whandle->type == WINSYS_HANDLE_TYPE_SHARED) {
+         struct drm_gem_flink flink = {.handle = r->handle};
+         if (ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_FLINK, &flink))
+            return false;
+         whandle->handle = flink.name;
+         return true;
+      }
+      return false;
+   }
    if (!r->linear_handle)
       return false;
    ph_resource_resolve_linear(r);
@@ -592,6 +713,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param stateful = {
       .param = PARHELIA_PARAM_STATEFUL_SUBMIT,
    };
+   struct drm_parhelia_get_param native_share = {
+      .param = PARHELIA_PARAM_NATIVE_SHARE,
+   };
    (void)config;
    if (!s)
       return NULL;
@@ -639,6 +763,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->stateful_submit = s->async_submit &&
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &stateful) &&
       stateful.value == 1;
+   s->native_share =
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &native_share) &&
+      native_share.value == 1;
    /* u_init_pipe_screen_caps() queries DRM_CAP_PRIME through this callback.
     * Install it first so GBM uses the DRI image path for ARGB scanout rather
     * than its restricted dumb-buffer fallback. */

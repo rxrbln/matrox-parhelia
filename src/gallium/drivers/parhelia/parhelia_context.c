@@ -3180,8 +3180,12 @@ ph_flush(struct pipe_context *p, struct pipe_fence_handle **fence,
    (void)flags;
    ph_submit_vertices(ctx);
    ph_wait_async(ctx);
-   if (ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture)
-      ph_resource_resolve_linear(ph_resource(ctx->fb.cbufs[0].texture));
+   if (ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture) {
+      struct parhelia_resource *color =
+         ph_resource(ctx->fb.cbufs[0].texture);
+      if (!color->native_shared)
+         ph_resource_resolve_linear(color);
+   }
    if (fence)
       *fence = NULL;
 }
@@ -3203,7 +3207,8 @@ ph_flush_resource(struct pipe_context *p, struct pipe_resource *resource)
               resource->target == PIPE_BUFFER ? 0 :
                  ph_resource(resource)->tiled_dirty,
               ctx->submit_error);
-   if (resource->target != PIPE_BUFFER)
+   if (resource->target != PIPE_BUFFER &&
+       !ph_resource(resource)->native_shared)
       ph_resource_resolve_linear(ph_resource(resource));
 }
 

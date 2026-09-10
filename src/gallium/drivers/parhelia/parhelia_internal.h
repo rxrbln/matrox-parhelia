@@ -18,6 +18,7 @@ struct parhelia_screen {
    bool bound_range;
    bool async_submit;
    bool stateful_submit;
+   bool native_share;
    uint64_t vram_size;
 };
 
@@ -28,11 +29,13 @@ struct parhelia_screen {
 struct parhelia_resource {
    struct pipe_resource base;
    uint32_t handle;
+   bool handle_owned;
    uint64_t size, mmap_offset;
    unsigned stride;
    uint32_t tile_layout;
    void *map;
    void *malloc_data;
+   bool native_shared;
 
    uint32_t linear_handle;
    uint64_t linear_size;

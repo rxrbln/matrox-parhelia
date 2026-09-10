@@ -4,7 +4,7 @@
 
 #include <stdint.h>
 
-#include "drm-uapi/parhelia_drm.h"
+#include "parhelia_drm.h"
 #include "reference/parhelia3d.h"
 
 #define PH_BATCH_PACKETS 221

@@ -21,7 +21,7 @@
  * SPDX-License-Identifier: GPL-2.0
  */
 #include "parhelia3d.h"
-#include "drm-uapi/parhelia_drm.h"
+#include "../parhelia_drm.h"
 
 #define P3D_TILE_W	64u
 #define P3D_TILE_H	32u
