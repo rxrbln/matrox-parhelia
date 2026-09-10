@@ -21,17 +21,28 @@ static inline __u32 parhelia_vertex_bind_mode(const __u32 *cmd, __u32 length)
 }
 
 /* Storage ids are independent of execution order. The first n blocks are
- * userspace CALLs, followed by three opening/EOB/drain blocks per logical
- * section and then separate stage CALLs. Every entry gets its own primary
- * CALL; a coalesced submission publishes the resulting span once.
+ * userspace packet storage, followed by three opening/EOB/drain blocks per
+ * logical section and then separate stage CALLs. packet_spans[] is zero for
+ * those synthetic blocks and initially one for each userspace block. A later
+ * validated pass may combine adjacent packet-storage blocks into one CALL
+ * without changing any packet bytes or hardware header boundaries.
  */
 #define PARHELIA_CALL_CAPACITY 224u
 struct parhelia_call_plan {
 	__u32 blocks[PARHELIA_CALL_CAPACITY];
+	__u16 packet_spans[PARHELIA_CALL_CAPACITY];
 	__u32 stage_modes[PARHELIA_CALL_CAPACITY];
 	__u32 stage_parent[PARHELIA_CALL_CAPACITY];
 	__u32 count, stages, sync_sections;
 };
+
+static inline void parhelia_plan_append(struct parhelia_call_plan *plan,
+		__u32 block, __u16 packet_span)
+{
+	plan->blocks[plan->count] = block;
+	plan->packet_spans[plan->count] = packet_span;
+	plan->count++;
+}
 
 static inline int parhelia_plan_calls(struct parhelia_call_plan *plan,
 		__u32 n, __u32 opening, int full_sync)
@@ -49,18 +60,18 @@ static inline int parhelia_plan_calls(struct parhelia_call_plan *plan,
 		return -E2BIG;
 	for (i = 0; i < n; i++) {
 		if (i == opening)
-			plan->blocks[plan->count++] = n;
-		plan->blocks[plan->count++] = i;
+			parhelia_plan_append(plan, n, 0);
+		parhelia_plan_append(plan, i, 1);
 		if (plan->stage_modes[i]) {
-			plan->blocks[plan->count++] = n + 3 + plan->stages;
+			parhelia_plan_append(plan, n + 3 + plan->stages, 0);
 			plan->stage_parent[plan->stages++] = i;
 		}
 	}
 	if (opening == n)
-		plan->blocks[plan->count++] = n;
-	plan->blocks[plan->count++] = n + 1;
+		parhelia_plan_append(plan, n, 0);
+	parhelia_plan_append(plan, n + 1, 0);
 	if (!full_sync)
-		plan->blocks[plan->count++] = n + 2;
+		parhelia_plan_append(plan, n + 2, 0);
 	return 0;
 }
 
@@ -86,26 +97,26 @@ static inline int parhelia_plan_calls_stateful(struct parhelia_call_plan *plan,
 
 	for (i = 0; i < boundary; i++) {
 		if (i == opening0)
-			plan->blocks[plan->count++] = n;
-		plan->blocks[plan->count++] = i;
+			parhelia_plan_append(plan, n, 0);
+		parhelia_plan_append(plan, i, 1);
 		if (plan->stage_modes[i]) {
-			plan->blocks[plan->count++] = n + 6 + plan->stages;
+			parhelia_plan_append(plan, n + 6 + plan->stages, 0);
 			plan->stage_parent[plan->stages++] = i;
 		}
 	}
-	plan->blocks[plan->count++] = n + 1;
-	plan->blocks[plan->count++] = n + 2;
+	parhelia_plan_append(plan, n + 1, 0);
+	parhelia_plan_append(plan, n + 2, 0);
 	for (i = boundary; i < n; i++) {
 		if (i == opening1)
-			plan->blocks[plan->count++] = n + 3;
-		plan->blocks[plan->count++] = i;
+			parhelia_plan_append(plan, n + 3, 0);
+		parhelia_plan_append(plan, i, 1);
 		if (plan->stage_modes[i]) {
-			plan->blocks[plan->count++] = n + 6 + plan->stages;
+			parhelia_plan_append(plan, n + 6 + plan->stages, 0);
 			plan->stage_parent[plan->stages++] = i;
 		}
 	}
-	plan->blocks[plan->count++] = n + 4;
-	plan->blocks[plan->count++] = n + 5;
+	parhelia_plan_append(plan, n + 4, 0);
+	parhelia_plan_append(plan, n + 5, 0);
 	return 0;
 }
 

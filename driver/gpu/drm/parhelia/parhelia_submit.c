@@ -441,6 +441,90 @@ static bool parhelia_packet_has_reloc(const struct drm_parhelia_reloc *relocs,
 	return false;
 }
 
+/* The P690 depth test establishes that each triangle needs its own 0x8f
+ * hardware packet, not its own secondary CALL. Keep every three-dword packet
+ * byte-exact while allowing consecutive packets to share one coherent
+ * secondary range. Synthetic stage/fence blocks in the execution plan break
+ * a run naturally. Other packet classes stay one-CALL-per-packet until they
+ * have an equally direct hardware interlock test. */
+static bool parhelia_is_coalescible_range_packet(const u32 *commands,
+		const struct drm_parhelia_packet *packet)
+{
+	return packet->length == 3 && commands[packet->offset] == 0x8f000001;
+}
+
+static u32 parhelia_packet_span_dwords(
+		const struct drm_parhelia_packet *packets, u32 first, u32 count)
+{
+	u32 i, words = 0;
+
+	for (i = 0; i < count; i++)
+		words += packets[first + i].length;
+	return words;
+}
+
+static void parhelia_coalesce_range_calls(struct parhelia_call_plan *plan,
+		const u32 *commands, const struct drm_parhelia_packet *packets,
+		u32 packet_count)
+{
+	u32 in = 0, out = 0;
+
+	while (in < plan->count) {
+		u32 block = plan->blocks[in];
+		u32 run = plan->packet_spans[in];
+		u32 words;
+
+		if (block >= packet_count || run != 1 ||
+		    !parhelia_is_coalescible_range_packet(commands, &packets[block]))
+			goto copy_one;
+		words = packets[block].length;
+		while (in + run < plan->count) {
+			u32 next = plan->blocks[in + run];
+			u32 next_words;
+
+			if (plan->packet_spans[in + run] != 1 ||
+			    next != block + run || next >= packet_count ||
+			    packets[next].offset != packets[next - 1].offset +
+						    packets[next - 1].length ||
+			    !parhelia_is_coalescible_range_packet(commands,
+							 &packets[next]))
+				break;
+			next_words = packets[next].length;
+			if (words > PARHELIA_DMA_BLOCK_DWORDS - next_words)
+				break;
+			words += next_words;
+			run++;
+		}
+		plan->blocks[out] = block;
+		plan->packet_spans[out] = run;
+		out++;
+		in += run;
+		continue;
+
+copy_one:
+		plan->blocks[out] = block;
+		plan->packet_spans[out] = plan->packet_spans[in];
+		out++;
+		in++;
+	}
+	plan->count = out;
+}
+
+static u32 parhelia_copy_packet_span(u32 *dst, const u32 *commands,
+		const struct drm_parhelia_packet *packets, u32 first, u32 count)
+{
+	u32 i, words = 0;
+
+	/* Copy each individually validated packet. This never relies on gaps in a
+	 * caller-provided offset table containing harmless command data. */
+	for (i = 0; i < count; i++) {
+		memcpy(dst + words, commands + packets[first + i].offset,
+		       packets[first + i].length * sizeof(*commands));
+		words += packets[first + i].length;
+	}
+	return words;
+}
+
 /* Called with submit_lock held, after every relocation and private patch. */
 static void parhelia_shadow_filter_plan(const struct parhelia_reg_shadow *shadow_base,
 		const u32 *commands, const struct drm_parhelia_packet *packets,
@@ -476,9 +560,105 @@ static void parhelia_shadow_filter_plan(const struct parhelia_reg_shadow *shadow
 
 		if (block < packet_count && test_bit(block, omit))
 			continue;
-		plan->blocks[out++] = block;
+		plan->blocks[out] = block;
+		plan->packet_spans[out] = plan->packet_spans[i];
+		out++;
 	}
 	plan->count = out;
+}
+
+static int parhelia_range_call_static_selftest(void)
+{
+	const struct drm_parhelia_packet gapped_packets[] = {
+		{ .offset = 0, .length = 3 },
+		{ .offset = 4, .length = 3 },
+	};
+	const u32 gapped_commands[] = {
+		0x8f000001, 0, 3, 0xdeadbeef,
+		0x8f000001, 3, 6,
+	};
+	const struct drm_parhelia_packet packets[] = {
+		{ .offset = 0, .length = 3 },
+		{ .offset = 3, .length = 3 },
+		{ .offset = 6, .length = 3 },
+		{ .offset = 9, .length = 3 },
+		{ .offset = 12, .length = 3 },
+	};
+	u32 commands[] = {
+		1, 0x212121ac, 0x3fff8842,
+		0x8f000001, 0, 3,
+		0x8f000001, 3, 6,
+		0x8f000001, 6, 9,
+		0x97080001, 0x11111003, 0x1111103f,
+	};
+	u32 copied[6] = { };
+	struct parhelia_call_plan *plan;
+	int ret = -EINVAL;
+
+	plan = kzalloc(sizeof(*plan), GFP_KERNEL);
+	if (!plan)
+		return -ENOMEM;
+	/* A required stage after packet 2 must split the two 0x8f runs. */
+	plan->stage_modes[2] = 1;
+	if (parhelia_plan_calls(plan, ARRAY_SIZE(packets), 0, 0))
+		goto out;
+	parhelia_coalesce_range_calls(plan, commands, packets,
+		ARRAY_SIZE(packets));
+	if (plan->count != 8 || plan->blocks[0] != 5 ||
+	    plan->packet_spans[0] || plan->blocks[1] != 0 ||
+	    plan->packet_spans[1] != 1 || plan->blocks[2] != 1 ||
+	    plan->packet_spans[2] != 2 || plan->blocks[3] != 8 ||
+	    plan->packet_spans[3] || plan->blocks[4] != 3 ||
+	    plan->packet_spans[4] != 1 || plan->blocks[5] != 4 ||
+	    plan->packet_spans[5] != 1 || plan->blocks[6] != 6 ||
+	    plan->packet_spans[6] || plan->blocks[7] != 7 ||
+	    plan->packet_spans[7])
+		goto out;
+
+	/* Relocation patching happens after planning. The eventual bulk copy must
+	 * therefore contain the patched operands while retaining both headers. */
+	commands[7] = 0x22222003;
+	commands[8] = 0x2222203f;
+	if (parhelia_copy_packet_span(copied, commands, packets,
+				       plan->blocks[2], plan->packet_spans[2]) != 6 ||
+	    memcmp(copied, commands + 3, sizeof(copied)) ||
+	    copied[0] != 0x8f000001 || copied[3] != 0x8f000001 ||
+	    copied[4] != 0x22222003 || copied[5] != 0x2222203f)
+		goto out;
+
+	/* A logical state boundary keeps the runs on its two sides separate and
+	 * leaves both opening/EOB/drain triples in their original order. */
+	commands[0] = 0x8f000001;
+	commands[1] = 0;
+	commands[2] = 3;
+	memset(plan, 0, sizeof(*plan));
+	if (parhelia_plan_calls_stateful(plan, 4, 2, 0, 2))
+		goto out;
+	parhelia_coalesce_range_calls(plan, commands, packets, 4);
+	if (plan->count != 8 || plan->blocks[0] != 4 ||
+	    plan->packet_spans[0] || plan->blocks[1] != 0 ||
+	    plan->packet_spans[1] != 2 || plan->blocks[2] != 5 ||
+	    plan->packet_spans[2] || plan->blocks[3] != 6 ||
+	    plan->packet_spans[3] || plan->blocks[4] != 7 ||
+	    plan->packet_spans[4] || plan->blocks[5] != 2 ||
+	    plan->packet_spans[5] != 2 || plan->blocks[6] != 8 ||
+	    plan->packet_spans[6] || plan->blocks[7] != 9 ||
+	    plan->packet_spans[7])
+		goto out;
+
+	/* Plan compaction is independently defensive about offsets. A gap never
+	 * becomes unvalidated content in a shared secondary CALL. */
+	memset(plan, 0, sizeof(*plan));
+	parhelia_plan_append(plan, 0, 1);
+	parhelia_plan_append(plan, 1, 1);
+	parhelia_coalesce_range_calls(plan, gapped_commands, gapped_packets, 2);
+	if (plan->count != 2 || plan->blocks[0] || plan->packet_spans[0] != 1 ||
+	    plan->blocks[1] != 1 || plan->packet_spans[1] != 1)
+		goto out;
+	ret = 0;
+out:
+	kfree(plan);
+	return ret;
 }
 
 static int parhelia_shadow_plan_static_selftest(void)
@@ -1017,8 +1197,10 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 	ret = parhelia_shadow_static_selftest();
 	if (!ret)
 		ret = parhelia_shadow_plan_static_selftest();
+	if (!ret)
+		ret = parhelia_range_call_static_selftest();
 	if (ret) {
-		dev_err(&pdev->pdev->dev, "state-shadow static selftest failed\n");
+		dev_err(&pdev->pdev->dev, "submit static selftest failed\n");
 		return ret;
 	}
 
@@ -2231,6 +2413,9 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	}
 	if (ret)
 		goto out_relocs;
+	if (coalesce_primary && !trace_submit && !full_sync && !post_draw_wb)
+		parhelia_coalesce_range_calls(plan, commands, packets,
+			args->packet_count);
 	total_calls = plan->count;
 
 
@@ -2822,9 +3007,21 @@ retry_slot:
 		u32 words;
 
 		if (block_id < args->packet_count) {
+			u32 packet_span = plan->packet_spans[i];
+
+			if (!packet_span || packet_span > args->packet_count - block_id) {
+				ret = -EINVAL;
+				goto out_unpin;
+			}
+			words = parhelia_packet_span_dwords(packets, block_id,
+						       packet_span);
+			if (!words || words > PARHELIA_DMA_BLOCK_DWORDS) {
+				ret = -EINVAL;
+				goto out_unpin;
+			}
 			if (async)
 				ret = parhelia_async_block_assign(async_slot, block,
-					packets[block_id].length);
+					words);
 			else if (!block->cpu) {
 				block->cpu = dmam_alloc_coherent(&pdev->pdev->dev,
 					PARHELIA_DMA_BLOCK_DWORDS * sizeof(u32), &block->bus, GFP_KERNEL);
@@ -2834,8 +3031,8 @@ retry_slot:
 			}
 			if (ret)
 				goto out_unpin;
-			words = packets[block_id].length;
-			memcpy(block->cpu, commands + packets[block_id].offset, words * sizeof(*commands));
+			parhelia_copy_packet_span(block->cpu, commands, packets,
+						 block_id, packet_span);
 		} else if (block_id >= stage_base) {
 			u32 parent = plan->stage_parent[block_id - stage_base];
 
