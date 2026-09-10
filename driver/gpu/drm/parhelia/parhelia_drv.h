@@ -140,6 +140,8 @@ struct parhelia_bios {
  * 1..19 for their whole mapped/pinned lifetime.
  */
 #define PARHELIA_HOST_APERTURE_SLOT(n)	((n) * 0x10)
+#define PARHELIA_LOCAL_BANK_B_BASE	0x08000000u
+#define PARHELIA_HOST_APERTURE_BASE	0x10000000u
 #define PARHELIA_HOST_APERTURE_VALID	BIT(28)
 #define PARHELIA_HOST_APERTURE_SLOTS	20
 #define PARHELIA_HOST_APERTURE_ALIGN	SZ_256K
@@ -468,6 +470,9 @@ void parhelia_submit_fini(struct parhelia_device *pdev);
 int parhelia_submit_init(struct parhelia_device *pdev);
 int parhelia_vram_pin(struct drm_gem_vram_object *bo);
 void parhelia_vram_unpin(struct drm_gem_vram_object *bo);
+int parhelia_vram_gpu_addr(struct parhelia_device *pdev,
+			   struct drm_gem_vram_object *bo, u64 offset,
+			   u64 length, u32 *gpu_addr);
 int parhelia_cursor_init(struct parhelia_device *pdev);
 void parhelia_state_shadow_invalidate(struct parhelia_device *pdev,
 				      const char *reason);

@@ -534,7 +534,7 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	struct drm_gem_object *gem;
 	struct drm_gem_vram_object *gbo;
 	struct parhelia_bo *bo;
-	s64 offset;
+	u32 address;
 	u32 dc;
 	u32 dct;
 	u32 format;
@@ -554,8 +554,9 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 		return;
 	gbo = drm_gem_vram_of_gem(gem);
 	bo = to_parhelia_bo(gem);
-	offset = drm_gem_vram_offset(gbo);
-	if (offset < 0 || offset > 0x0ffffc00 || !IS_ALIGNED(offset, 1024))
+	if (parhelia_vram_gpu_addr(pdev, gbo, 0, gbo->bo.base.size,
+				   &address) ||
+	    address > 0x0ffffc00 || !IS_ALIGNED(address, 1024))
 		return;
 	pitch = bo->gpu_pitch / 4;
 
@@ -593,7 +594,7 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	parhelia_write(pdev, dc + PARHELIA_DC_HDISP, (m->hdisplay - 1) << 16);
 	parhelia_write(pdev, dc + PARHELIA_DC_YPAN, 0);
 	parhelia_write(pdev, dc + PARHELIA_DC_VDISP, m->vdisplay - 1);
-	parhelia_write(pdev, dc + PARHELIA_DC_START, offset & 0x0ffffc00);
+	parhelia_write(pdev, dc + PARHELIA_DC_START, address & 0x0ffffc00);
 	parhelia_write(pdev, dc + PARHELIA_DC_FORMAT, format);
 	parhelia_pipe_load_gamma(pipe, crtc_state->gamma_lut);
 	/* Do not mirror this into MMIO 0x0004/0x0008.  The complete engine
@@ -640,17 +641,18 @@ static void parhelia_pipe_update(struct drm_simple_display_pipe *pipe,
 		if (!old_state->fb || old_state->fb != state->fb) {
 			struct drm_gem_object *gem = drm_gem_fb_get_obj(state->fb, 0);
 			struct parhelia_bo *bo = gem ? to_parhelia_bo(gem) : NULL;
-			s64 offset = gem ? drm_gem_vram_offset(drm_gem_vram_of_gem(gem)) :
-					   -ENODEV;
+			u32 address;
 
-			if (offset >= 0 && offset <= 0x0ffffc00 &&
-			    IS_ALIGNED(offset, 1024)) {
+			if (gem && !parhelia_vram_gpu_addr(pdev,
+					drm_gem_vram_of_gem(gem), 0, gem->size,
+					&address) &&
+			    address <= 0x0ffffc00 && IS_ALIGNED(address, 1024)) {
 				u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
 				u32 format = 0x32030000 |
 					     (bo->gpu_pitch / 4);
 
 				parhelia_write(pdev, dc + PARHELIA_DC_START,
-					       offset & 0x0ffffc00);
+					       address & 0x0ffffc00);
 				parhelia_write(pdev, dc + PARHELIA_DC_FORMAT, format);
 			}
 		}
@@ -719,7 +721,7 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	struct drm_framebuffer *fb = plane_state->fb;
 	struct drm_gem_object *gem;
 	struct parhelia_bo *bo;
-	s64 offset;
+	u32 address;
 	u32 cpp, pitch_pixels;
 
 	if (crtc_state->color_mgmt_changed) {
@@ -747,8 +749,9 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	    bo->gpu_pitch / cpp != ALIGN(fb->width, 64) ||
 	    bo->gpu_pitch / cpp > 0x3fff)
 		return -EINVAL;
-	offset = drm_gem_vram_offset(&bo->gbo);
-	if (offset < 0 || offset > 0x0ffffc00 || !IS_ALIGNED(offset, 1024))
+	if (parhelia_vram_gpu_addr(to_parhelia(pipe->crtc.dev), &bo->gbo,
+				   0, bo->gbo.bo.base.size, &address) ||
+	    address > 0x0ffffc00 || !IS_ALIGNED(address, 1024))
 		return -EINVAL;
 	return 0;
 }

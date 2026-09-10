@@ -1100,8 +1100,7 @@ static int parhelia_mode7_copy_indices(struct parhelia_device *pdev,
 	struct drm_gem_vram_object *dst;
 	struct iosys_map src_map = { }, dst_map = { };
 	void *snapshot;
-	s64 offset;
-	u32 gpu_end;
+	u32 address;
 	int ret;
 
 	if (mode7->transport == PARHELIA_MODE7_TRANSPORT_DMA)
@@ -1155,15 +1154,15 @@ out_unreserve:
 	if (ret)
 		goto out_unpin;
 
-	offset = drm_gem_vram_offset(dst);
-	if (offset < 0 || offset > U32_MAX || (offset & 3) ||
-	    check_add_overflow((u32)offset, mode7->index_length, &gpu_end) ||
-	    gpu_end > pdev->vram_size) {
-		ret = -EINVAL;
+	ret = parhelia_vram_gpu_addr(pdev, dst, 0, mode7->index_length,
+				     &address);
+	if (ret || (address & 3)) {
+		if (!ret)
+			ret = -EINVAL;
 		goto out_unpin;
 	}
 	mode7->index_copy = dst;
-	mode7->index_copy_offset = (u32)offset;
+	mode7->index_copy_offset = address;
 	kvfree(snapshot);
 	return 0;
 
@@ -1235,7 +1234,7 @@ static int parhelia_validate_mode7_contract(const u32 *commands,
 }
 
 /* The only engine-facing mode-7 addresses are derived after ownership and
- * bounds checks.  Class 0 is encoded by the raw local-VRAM offset; no client
+ * bounds checks.  Class 0 uses the translated local-memory address; no client
  * supplied address bits survive either patch. */
 static int parhelia_mode7_patch_addresses(
 		u32 *commands, const struct drm_parhelia_packet *packets,
@@ -1243,7 +1242,6 @@ static int parhelia_mode7_patch_addresses(
 		struct parhelia_device *pdev)
 {
 	const struct drm_gem_vram_object *stream_bo;
-	s64 stream_offset;
 	u32 stream_gpu, stream_end, index_end, stream_size;
 	u32 *index_cmd;
 
@@ -1266,14 +1264,16 @@ static int parhelia_mode7_patch_addresses(
 	stream_size = stream_bo->bo.base.size;
 	if (!mode7->index_copy || !stream_size || mode7->stream_offset >= stream_size)
 		return -EINVAL;
-	stream_offset = drm_gem_vram_offset((struct drm_gem_vram_object *)stream_bo);
-	if (stream_offset < 0 || stream_offset > U32_MAX || (stream_offset & 3) ||
-	    check_add_overflow((u32)stream_offset, mode7->stream_offset, &stream_gpu) ||
-	    stream_gpu >= pdev->vram_size ||
+	if (parhelia_vram_gpu_addr(pdev,
+				    (struct drm_gem_vram_object *)stream_bo,
+				    mode7->stream_offset,
+				    stream_size - mode7->stream_offset,
+				    &stream_gpu) ||
+	    (stream_gpu & 3) ||
 	    check_add_overflow(stream_gpu, stream_size - mode7->stream_offset, &stream_end) ||
-	    stream_end > pdev->vram_size ||
+	    stream_end > PARHELIA_HOST_APERTURE_BASE ||
 	    check_add_overflow(mode7->index_copy_offset, mode7->index_length, &index_end) ||
-	    index_end > pdev->vram_size)
+	    index_end > PARHELIA_HOST_APERTURE_BASE)
 		return -EINVAL;
 
 	commands[packets[mode7->stream_packet].offset + mode7->stream_dword] = stream_gpu;
@@ -1435,7 +1435,6 @@ static int parhelia_bound_range_validate_and_patch(
 	struct parhelia_mode7_state state = { };
 	struct drm_gem_vram_object *bo;
 	const u32 *stream, *prim, *bounds, *reset;
-	s64 bo_offset;
 	u32 first_range, range_count, bytes, stream_gpu, stream_end, i;
 
 	if (!bound->stream_seen || bound->stream_dword != 2 || packet_count < 6 ||
@@ -1507,11 +1506,11 @@ static int parhelia_bound_range_validate_and_patch(
 	    bound->stream_offset > bo->bo.base.size ||
 	    bytes > bo->bo.base.size - bound->stream_offset)
 		return -EINVAL;
-	bo_offset = drm_gem_vram_offset(bo);
-	if (bo_offset < 0 || bo_offset > U32_MAX || (bo_offset & 3) ||
-	    check_add_overflow((u32)bo_offset, bound->stream_offset, &stream_gpu) ||
+	if (parhelia_vram_gpu_addr(pdev, bo, bound->stream_offset, bytes,
+				    &stream_gpu) ||
+	    (stream_gpu & 3) ||
 	    check_add_overflow(stream_gpu, bytes, &stream_end) ||
-	    stream_end > pdev->vram_size)
+	    stream_end > PARHELIA_HOST_APERTURE_BASE)
 		return -EINVAL;
 	commands[packets[bound->stream_packet].offset + bound->stream_dword] =
 		stream_gpu;
@@ -1643,13 +1642,12 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 		return -EINVAL;
 	if (!to_parhelia(drm)->raw_aperture_owned)
 		return -EOPNOTSUPP;
-	/* SUN90 changes its local-memory addressing at 64 MiB.  A 640x480
-	 * type-2 surface placed at 63 MiB was reproducibly split there: the part
-	 * below the boundary de-tiled correctly and the part above was fetched
-	 * through the other memory-controller mapping.  Align each P690 surface
-	 * base to 32 MiB, separating colour/depth objects far enough to avoid the
-	 * alias while charging TTM only for the tiled extent actually addressed.
-	 * Earlier silicon retains its hardware-proven 8 KiB surface alignment.
+	/* SUN90's two local-memory banks are discontinuous in engine address
+	 * space.  A 640x480 type-2 surface placed at 63 MiB was reproducibly split
+	 * at the physical half-VRAM boundary.  Align each P690 surface base to
+	 * 32 MiB so ordinary render targets cannot straddle that boundary while
+	 * charging TTM only for the tiled extent actually addressed.  Earlier
+	 * silicon retains its hardware-proven 8 KiB surface alignment.
 	 */
 	align_pages = pdev->pdev->device == 0x2539 &&
 		      !(args->flags & (PARHELIA_CREATE_RENDER_LINEAR |
@@ -2132,8 +2130,7 @@ retry_slot:
 		}
 		if (reloc->type == PARHELIA_RELOC_DRAW_VRAM) {
 			struct parhelia_vertex_bo *vertex_bo;
-			s64 offset;
-			u32 range_end, gpu_end;
+			u32 range_end, gpu_start, gpu_end;
 
 			if (pdev->pdev->device != PARHELIA_P690) {
 				ret = -EOPNOTSUPP;
@@ -2163,15 +2160,17 @@ retry_slot:
 				ret = -EINVAL;
 				goto out_unpin;
 			}
-			offset = drm_gem_vram_offset(vertex_bo->bo);
-			if (offset < 0 || offset > U32_MAX || (offset & 3) ||
-			    check_add_overflow((u32)offset, range_end, &gpu_end) ||
-			    gpu_end > pdev->vram_size) {
+			if (parhelia_vram_gpu_addr(pdev, vertex_bo->bo,
+						    reloc->dword, reloc->delta,
+						    &gpu_start) ||
+			    (gpu_start & 3) ||
+			    check_add_overflow(gpu_start, reloc->delta, &gpu_end) ||
+			    gpu_end > PARHELIA_HOST_APERTURE_BASE) {
 				ret = -EINVAL;
 				goto out_unpin;
 			}
-			packet_cmd[1] = (u32)offset + reloc->dword;
-			packet_cmd[2] = (u32)offset + range_end;
+			packet_cmd[1] = gpu_start;
+			packet_cmd[2] = gpu_end;
 			draw_relocated[reloc->packet] = true;
 			vram_vertex_draw = true;
 			continue;
@@ -2375,8 +2374,12 @@ retry_slot:
 			}
 			pinned[i] = drm_gem_vram_of_gem(objects[i]);
 		}
-		packet_cmd[reloc->dword] =
-			drm_gem_vram_offset(drm_gem_vram_of_gem(objects[i])) + reloc->delta;
+		ret = parhelia_vram_gpu_addr(pdev,
+				drm_gem_vram_of_gem(objects[i]), reloc->delta,
+				objects[i]->size - reloc->delta,
+				&packet_cmd[reloc->dword]);
+		if (ret)
+			goto out_unpin;
 	}
 	if (mode7.stream_seen || mode7.index_seen) {
 		ret = parhelia_validate_mode7_contract(commands, packets,

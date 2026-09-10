@@ -50,6 +50,52 @@ bool parhelia_gem_is_owned(const struct drm_gem_object *gem)
 	       gem->funcs == &parhelia_host_object_funcs;
 }
 
+/*
+ * TTM and CPU mappings use BAR0 byte offsets.  The graphics and display
+ * engines instead see two local-memory banks in a fixed 256 MiB address
+ * window: bank A starts at 0 and bank B at 128 MiB.  On a 128 MiB board this
+ * leaves the engine address range 64..128 MiB unmapped, although those bytes
+ * are contiguous in BAR0.
+ *
+ * Validate in BAR coordinates first.  A translated bank-B address can be
+ * larger than pdev->vram_size and is nevertheless valid.  Conversely, one
+ * linear engine range cannot cross the discontinuity between the two banks.
+ */
+int parhelia_vram_gpu_addr(struct parhelia_device *pdev,
+			   struct drm_gem_vram_object *bo, u64 offset,
+			   u64 length, u32 *gpu_addr)
+{
+	u64 bo_size = bo->bo.base.size;
+	u64 bank_size = pdev->vram_size >> 1;
+	u64 physical, physical_end, gpu;
+	s64 placement;
+
+	if (!length || offset > bo_size || length > bo_size - offset ||
+	    !bank_size)
+		return -EINVAL;
+
+	placement = drm_gem_vram_offset(bo);
+	if (placement < 0 || (u64)placement > pdev->vram_size ||
+	    bo_size > pdev->vram_size - (u64)placement)
+		return -ERANGE;
+	if (check_add_overflow((u64)placement, offset, &physical) ||
+	    check_add_overflow(physical, length, &physical_end))
+		return -EOVERFLOW;
+	if (physical < bank_size && physical_end > bank_size)
+		return -ERANGE;
+
+	if (physical >= bank_size)
+		gpu = PARHELIA_LOCAL_BANK_B_BASE + physical - bank_size;
+	else
+		gpu = physical;
+	if (gpu >= PARHELIA_HOST_APERTURE_BASE ||
+	    length > PARHELIA_HOST_APERTURE_BASE - gpu)
+		return -ERANGE;
+
+	*gpu_addr = gpu;
+	return 0;
+}
+
 static void parhelia_host_descriptor_disable(struct parhelia_bo *bo)
 {
 	struct parhelia_device *pdev = to_parhelia(bo->gbo.bo.base.dev);
@@ -238,7 +284,8 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	struct parhelia_bo *bo;
 	unsigned long align_pages, native_align_pages, slot;
 	u32 gpu_pitch_pixels, host_pitch_pixels, alloc_height;
-	s64 aperture_offset, surface_offset;
+	s64 aperture_offset;
+	u32 surface_address;
 	size_t host_size, native_size, size, reservation_size;
 	u32 handle;
 	int ret;
@@ -305,9 +352,9 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	ret = parhelia_vram_pin(gbo);
 	if (ret)
 		goto out_gbo;
-	surface_offset = drm_gem_vram_offset(gbo);
-	if (surface_offset < 0 || surface_offset > U32_MAX) {
-		ret = -ERANGE;
+	ret = parhelia_vram_gpu_addr(pdev, gbo, 0, gbo->bo.base.size,
+				     &surface_address);
+	if (ret) {
 		goto out_unpin_gbo;
 	}
 
@@ -325,7 +372,7 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 		PARHELIA_BO_LAYOUT_NATIVE_64X16 : PARHELIA_BO_LAYOUT_NATIVE_64X32;
 	bo->host_aperture = true;
 	gbo->bo.base.funcs = &parhelia_host_object_funcs;
-	parhelia_host_descriptor_enable(pdev, bo, surface_offset);
+	parhelia_host_descriptor_enable(pdev, bo, surface_address);
 	mutex_unlock(&pdev->aperture_lock);
 
 	ret = drm_gem_handle_create(file, &gbo->bo.base, &handle);

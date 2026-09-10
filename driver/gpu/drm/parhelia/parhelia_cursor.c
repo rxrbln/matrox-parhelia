@@ -282,7 +282,7 @@ int parhelia_cursor_init(struct parhelia_device *pdev)
 	struct parhelia_cursor *cursor;
 	struct drm_gem_vram_object *image;
 	struct iosys_map image_map = {};
-	s64 offset;
+	u32 address;
 	int ret;
 
 	cursor = drmm_universal_plane_alloc(&pdev->drm, struct parhelia_cursor,
@@ -308,14 +308,13 @@ int parhelia_cursor_init(struct parhelia_device *pdev)
 	ttm_bo_unreserve(&image->bo);
 	if (ret)
 		goto err_unpin;
-	offset = drm_gem_vram_offset(image);
-	if (offset < 0 || offset > U32_MAX) {
-		ret = -ERANGE;
+	ret = parhelia_vram_gpu_addr(pdev, image, 0, PARHELIA_CURSOR_SIZE,
+				     &address);
+	if (ret)
 		goto err_unmap;
-	}
 	cursor->image = image;
 	cursor->image_map = image_map;
-	cursor->image_offset = offset;
+	cursor->image_offset = address;
 	iosys_map_memset(&cursor->image_map, 0, 0, PARHELIA_CURSOR_SIZE);
 
 	ret = drmm_add_action_or_reset(&pdev->drm, parhelia_cursor_release,
