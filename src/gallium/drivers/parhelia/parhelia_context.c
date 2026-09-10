@@ -3177,12 +3177,17 @@ ph_flush(struct pipe_context *p, struct pipe_fence_handle **fence,
          unsigned flags)
 {
    struct ph_context *ctx = ph_context(p);
+   struct parhelia_resource *color = NULL;
    (void)flags;
    ph_submit_vertices(ctx);
-   ph_wait_async(ctx);
-   if (ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture) {
-      struct parhelia_resource *color =
-         ph_resource(ctx->fb.cbufs[0].texture);
+   if (ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture)
+      color = ph_resource(ctx->fb.cbufs[0].texture);
+   /* The X server's native DRI2 blit submits synchronously on the same
+    * device.  The kernel submit lock drains prior async render work before
+    * executing it, so waiting here would serialize the pipeline twice. */
+   if (!color || !color->native_shared)
+      ph_wait_async(ctx);
+   if (color) {
       if (!color->native_shared)
          ph_resource_resolve_linear(color);
    }
@@ -3196,10 +3201,11 @@ ph_flush_resource(struct pipe_context *p, struct pipe_resource *resource)
    struct ph_context *ctx = ph_context(p);
 
    ph_submit_vertices(ctx);
-   /* Resource flush permits the caller to map or present this object.  A
-    * synchronous resolve orders GPU work, but it cannot protect the CPU
-    * fallback path from reading a queued tiled result early. */
-   ph_wait_async(ctx);
+   /* Native presentation is ordered by the server's synchronous GPU blit.
+    * Linear exports still need the client wait before their CPU resolve. */
+   if (resource->target == PIPE_BUFFER ||
+       !ph_resource(resource)->native_shared)
+      ph_wait_async(ctx);
    if (getenv("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: flush resource=%p target=%u dirty=%u error=%d\n",
