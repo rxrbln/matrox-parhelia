@@ -21,7 +21,7 @@
 #define DRM_PARHELIA_CREATE_RENDER	0x02
 #define DRM_PARHELIA_CREATE_VERTEX	0x03
 #define DRM_PARHELIA_WAIT_FENCE		0x04
-#define DRM_PARHELIA_GET_BO_INFO		0x05
+#define DRM_PARHELIA_GET_BO_INFO	0x05
 
 #define DRM_IOCTL_PARHELIA_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_PARHELIA_GET_PARAM, \
@@ -55,7 +55,7 @@
  * scanout. Both 32-bit colour and S8Z24 use this storage. The kernel reserves
  * a conservative non-aliasing extent and 8KiB placement alignment; @size is
  * that reserved extent, not width*height*4. No GPU addresses are exported.
- * Currently supported logical extent: at most 1024x768, flags must be zero.
+ * Currently supported logical extent: at most 2048x2048.
  * Mapping requires the kernel-owned raw host-aperture baseline.
  */
 struct drm_parhelia_create_render {
@@ -81,6 +81,28 @@ struct drm_parhelia_create_vertex {
 	__u32 handle; /* out */
 	__u64 mmap_offset; /* out: DRM file mmap offset */
 };
+
+#define PARHELIA_BO_LAYOUT_LINEAR		0
+#define PARHELIA_BO_LAYOUT_NATIVE_64X32	1
+#define PARHELIA_BO_LAYOUT_NATIVE_64X16	2
+#define PARHELIA_BO_LAYOUT_TEXTURE		3
+#define PARHELIA_BO_INFO_HOST_APERTURE	(1u << 0)
+
+struct drm_parhelia_get_bo_info {
+	__u32 handle;
+	__u32 flags;
+	__u32 layout;
+	__u32 width;
+	__u32 height;
+	__u32 pitch; /* out: native GPU byte pitch, not dumb host pitch */
+	__u32 pad;
+	__u64 size;
+};
+
+/* Native sharing is intentionally same-device: FLINK/OPEN or a self-imported
+ * PRIME fd preserves object identity for GET_BO_INFO.  The physical layout is
+ * not DRM_FORMAT_MOD_LINEAR and is not portable to another DRM device.
+ */
 
 #define PARHELIA_PARAM_CHIP_ID		0
 #define PARHELIA_PARAM_VRAM_SIZE	1
@@ -110,9 +132,6 @@ struct drm_parhelia_create_vertex {
 #define PARHELIA_PARAM_BOUND_RANGE	19
 /* Kernel can insert owned EOB/DWGSYNC brackets at batch-boundary relocs. */
 #define PARHELIA_PARAM_STATEFUL_SUBMIT	20
-/* Native render and scanout BOs retain their physical tiled layout across
- * PRIME.  Userspace identifies them with GET_BO_INFO rather than guessing
- * from a mapping or treating DRM_FORMAT_MOD_INVALID as linear. */
 #define PARHELIA_PARAM_NATIVE_SHARE	21
 
 #define PARHELIA_TEXTURE_PIPES_PAIRED	0
@@ -127,26 +146,6 @@ struct drm_parhelia_get_param {
 	__u64 value;
 	__u32 param;
 	__u32 pad;
-};
-
-#define PARHELIA_BO_LAYOUT_LINEAR	0
-#define PARHELIA_BO_LAYOUT_NATIVE_64X32	1
-#define PARHELIA_BO_LAYOUT_NATIVE_64X16	2
-#define PARHELIA_BO_LAYOUT_TEXTURE	3
-#define PARHELIA_BO_HOST_APERTURE	(1u << 0)
-
-/* Query metadata attached to a GEM handle.  @pitch is the GPU surface pitch
- * in bytes.  A dumb BO may expose a wider CPU aperture pitch from
- * CREATE_DUMB while retaining this native pitch for rendering and display. */
-struct drm_parhelia_get_bo_info {
-	__u32 handle;
-	__u32 flags;
-	__u32 layout;
-	__u32 width;
-	__u32 height;
-	__u32 pitch;
-	__u32 pad;
-	__u64 size;
 };
 
 /* One secondary CALL span in @commands, in dwords. Usually one packet;
