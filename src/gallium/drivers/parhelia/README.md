@@ -21,8 +21,10 @@ behind one terminal EOB/DWGSYNC. Leading colour and depth clears share that
 submit; a clear or blit after rendering remains a drain boundary. The driver
 accounts for the kernel's hidden WARP-stage CALLs as well as packet, command,
 vertex, relocation, and resource limits before appending each sequence.
-When the kernel exposes `CREATE_VERTEX`, aggregation uses the larger bounded
-local-VRAM ring instead of inheriting the 4096-dword class-3 copy limit.
+Mesa queries the kernel's coherent class-3 vertex capacity and clamps it to
+its 6630-dword staging array.  New kernels can therefore aggregate a nearly
+full 4080-dword Quake 3 draw with following small draws without exposing a
+programmable BAR aperture; old kernels retain the 4096-dword fallback.
 
 The adapter also accepts transformed/lit fixed-function reference state.
 `parhelia_batch_reference()` imports the COMPLETE original C gears scene,

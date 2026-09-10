@@ -373,7 +373,8 @@ parhelia_batch_submit_flags(int fd, const struct parhelia_batch *batch,
                             const void *vertices, unsigned vertex_dwords,
                             unsigned flags, uint32_t *fence)
 {
-   if (!batch || (!vertices && vertex_dwords) || !fence || vertex_dwords > 4096)
+   if (!batch || (!vertices && vertex_dwords) || !fence ||
+       vertex_dwords > PH_BATCH_VERTEX_DWORDS)
       return -EINVAL;
    struct drm_parhelia_submit submit = {
       .commands = (uintptr_t)batch->commands,
