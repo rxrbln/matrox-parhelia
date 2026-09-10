@@ -9,6 +9,7 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
+#include <linux/io.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
 #include <linux/slab.h>
@@ -32,6 +33,156 @@
 static bool trace_submit;
 module_param(trace_submit, bool, 0400);
 MODULE_PARM_DESC(trace_submit, "Trace coherent retirement of each pre-draw state packet");
+
+/* Diagnose writes to three pixels in the fixed Quake root-window corruption
+ * band.  This is deliberately read-only and default-off.  While enabled,
+ * async requests are serialized so a completion-time change can be assigned
+ * to one submit rather than to any of several requests in flight. */
+static bool submit_root_probe;
+module_param(submit_root_probe, bool, 0400);
+MODULE_PARM_DESC(submit_root_probe,
+		 "Trace submit metadata when known root pixels change (default false)");
+
+static atomic64_t submit_root_probe_seq = ATOMIC64_INIT(0);
+
+struct parhelia_root_probe_reloc {
+	u32 type;
+	u32 packet;
+	u32 dword;
+	u32 handle;
+	u32 delta;
+	u32 target;
+	u32 target_end;
+};
+
+struct parhelia_root_probe_trace {
+	u64 seq;
+	u32 before[3];
+	u32 packet_count;
+	u32 command_dwords;
+	u32 reloc_count;
+	DECLARE_BITMAP(classes, 256);
+	struct parhelia_root_probe_reloc relocs[];
+};
+
+static bool parhelia_root_probe_read(struct parhelia_device *pdev, u32 value[3])
+{
+	static const struct {
+		u16 x;
+		u16 y;
+	} probe[] = { { 0, 402 }, { 64, 402 }, { 0, 418 } };
+	u32 base, ctrl, dims, width, height, pitch;
+	unsigned int i;
+
+	base = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1));
+	ctrl = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1) + 8);
+	dims = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1) + 12);
+	width = ctrl & GENMASK(13, 0);
+	height = dims & GENMASK(13, 0);
+	if (!(base & PARHELIA_HOST_APERTURE_VALID) ||
+	    ((ctrl >> 24) & 0x3f) != 0x30 || ((ctrl >> 16) & 7) != 3 ||
+	    width <= 64 || height <= 418)
+		return false;
+	base &= GENMASK(27, 0);
+	pitch = roundup_pow_of_two(max(width, 32u)) * sizeof(u32);
+	for (i = 0; i < ARRAY_SIZE(probe); i++) {
+		u64 offset = (u64)base + (u64)probe[i].y * pitch +
+			     (u64)probe[i].x * sizeof(u32);
+
+		if (offset > pdev->vram_size - sizeof(u32))
+			return false;
+		value[i] = readl((u8 __iomem *)pdev->vram + offset);
+	}
+	return true;
+}
+
+static struct parhelia_root_probe_trace *
+parhelia_root_probe_prepare(struct parhelia_device *pdev,
+			    const struct drm_parhelia_submit *args,
+			    const struct drm_parhelia_packet *packets,
+			    const struct drm_parhelia_reloc *relocs,
+			    const u32 *commands)
+{
+	struct parhelia_root_probe_trace *trace;
+	u32 i;
+
+	if (!submit_root_probe)
+		return NULL;
+	trace = kzalloc(struct_size(trace, relocs, args->reloc_count), GFP_KERNEL);
+	if (!trace) {
+		dev_warn_ratelimited(&pdev->pdev->dev,
+			"root probe metadata allocation failed\n");
+		return NULL;
+	}
+	if (!parhelia_root_probe_read(pdev, trace->before)) {
+		dev_warn_ratelimited(&pdev->pdev->dev,
+			"root probe cannot read slot-1 native framebuffer view\n");
+		kfree(trace);
+		return NULL;
+	}
+	trace->seq = atomic64_inc_return(&submit_root_probe_seq);
+	trace->packet_count = args->packet_count;
+	trace->command_dwords = args->command_dwords;
+	trace->reloc_count = args->reloc_count;
+	for (i = 0; i < args->packet_count; i++)
+		__set_bit(commands[packets[i].offset] >> 24, trace->classes);
+	for (i = 0; i < args->reloc_count; i++) {
+		const struct drm_parhelia_reloc *src = &relocs[i];
+		struct parhelia_root_probe_reloc *dst = &trace->relocs[i];
+		const u32 *cmd;
+
+		dst->type = src->type;
+		dst->packet = src->packet;
+		dst->dword = src->dword;
+		dst->handle = src->handle;
+		dst->delta = src->delta;
+		if (src->type == PARHELIA_RELOC_BATCH_BOUNDARY ||
+		    src->packet >= args->packet_count)
+			continue;
+		cmd = commands + packets[src->packet].offset;
+		switch (src->type) {
+		case PARHELIA_RELOC_DRAW:
+		case PARHELIA_RELOC_DRAW_VRAM:
+		case PARHELIA_RELOC_INDEX_VRAM:
+		case PARHELIA_RELOC_INDEX_DMA:
+			dst->target = cmd[1];
+			dst->target_end = cmd[2];
+			break;
+		default:
+			if (src->dword < packets[src->packet].length)
+				dst->target = cmd[src->dword];
+			break;
+		}
+	}
+	return trace;
+}
+
+static void
+parhelia_root_probe_complete(struct parhelia_device *pdev,
+			     struct parhelia_root_probe_trace *trace,
+			     const char *phase)
+{
+	u32 after[3], i;
+
+	if (!trace || !parhelia_root_probe_read(pdev, after) ||
+	    !memcmp(trace->before, after, sizeof(after)))
+		return;
+	dev_err(&pdev->pdev->dev,
+		"root probe changed: seq=%llu phase=%s packets=%u dwords=%u relocs=%u classes=%*pb values=%08x/%08x/%08x->%08x/%08x/%08x\n",
+		trace->seq, phase, trace->packet_count, trace->command_dwords,
+		trace->reloc_count, 256, trace->classes,
+		trace->before[0], trace->before[1], trace->before[2],
+		after[0], after[1], after[2]);
+	for (i = 0; i < trace->reloc_count; i++) {
+		const struct parhelia_root_probe_reloc *reloc = &trace->relocs[i];
+
+		dev_err(&pdev->pdev->dev,
+			"root probe seq=%llu reloc=%u type=%u packet=%u dword=%u handle=%u delta=%#x target=%#x..%#x\n",
+			trace->seq, i, reloc->type, reloc->packet, reloc->dword,
+			reloc->handle, reloc->delta, reloc->target,
+			reloc->target_end);
+	}
+}
 
 /* The vendor queues all primary CALLs, its final writeback, and then rings the
  * producer doorbell once.  The original bring-up path deliberately published
@@ -648,6 +799,12 @@ static void parhelia_slot_release_locked(struct parhelia_device *pdev,
 
 	if (slot->state != PARHELIA_SLOT_QUEUED)
 		return;
+	if (slot->root_probe) {
+		parhelia_root_probe_complete(pdev, slot->root_probe,
+					     error ? "async-error" : "async-complete");
+		kfree(slot->root_probe);
+		slot->root_probe = NULL;
+	}
 	if (slot->out_fence) {
 		if (error)
 			dma_fence_set_error(&slot->out_fence->base, -EIO);
@@ -1917,6 +2074,7 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	struct parhelia_mode3_submit mode3 = { };
 	struct parhelia_bound_range_submit bound_range = { };
 	struct parhelia_shadow_txn *shadow_txn = NULL;
+	struct parhelia_root_probe_trace *root_probe = NULL;
 	u32 *commands, *primary;
 	void *vertex_cpu = pdev->vertex_cpu;
 	dma_addr_t vertex_bus = pdev->vertex_bus;
@@ -2051,6 +2209,14 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 retry_slot:
 	mutex_lock(&pdev->submit_lock);
 	parhelia_retire_locked(pdev);
+	if (async && submit_root_probe && pdev->queued_slots) {
+		mutex_unlock(&pdev->submit_lock);
+		ret = wait_event_interruptible_timeout(pdev->submit_waitq,
+			pdev->wedged || !pdev->queued_slots, msecs_to_jiffies(10));
+		if (ret < 0)
+			goto out_relocs;
+		goto retry_slot;
+	}
 	if (async) {
 		u32 slot_index;
 		u32 needed = total_calls * PARHELIA_CALL_DWORDS + 3;
@@ -2715,6 +2881,8 @@ retry_slot:
 	}
 	if (args->vertex_dwords)
 		parhelia_warp_trace_vertex(pdev, "before");
+	root_probe = parhelia_root_probe_prepare(pdev, args, packets, relocs,
+						 commands);
 	dma_wmb();
 	if (async) {
 		/* 0x0404 restarts the primary fetcher.  It is written only for the
@@ -2728,6 +2896,8 @@ retry_slot:
 				       lower_32_bits(primary_bus));
 			pdev->primary_armed = true;
 		}
+		async_slot->root_probe = root_probe;
+		root_probe = NULL;
 		parhelia_write(pdev, PARHELIA_MMIO_RING_END,
 			lower_32_bits(primary_bus + primary_words * sizeof(u32)) | 3);
 		parhelia_write(pdev, 0x0314, 1);
@@ -2902,6 +3072,16 @@ timeout:
 	goto out_unlock;
 
 out_unpin:
+	if (!async && root_probe)
+		parhelia_root_probe_complete(pdev, root_probe,
+					     ret ? "sync-error" : "sync-complete");
+	/* An async failure before the trace becomes slot-owned also ends here. */
+	if (root_probe) {
+		if (async && ret)
+			parhelia_root_probe_complete(pdev, root_probe, "async-error");
+		kfree(root_probe);
+		root_probe = NULL;
+	}
 	if (async && ret == -ENOMEM)
 		dev_warn_ratelimited(&pdev->pdev->dev,
 			"async submit allocation failed in %s (packets=%u commands=%u relocs=%u)\n",

@@ -262,6 +262,8 @@ struct parhelia_submit_fence {
 	spinlock_t lock;
 };
 
+struct parhelia_root_probe_trace;
+
 struct parhelia_submit_slot {
 	enum parhelia_slot_state state;
 	struct drm_file *file;
@@ -288,6 +290,7 @@ struct parhelia_submit_slot {
 	u32 reloc_count;
 	struct drm_gem_vram_object *mode7_index_copy;
 	struct parhelia_submit_fence *out_fence;
+	struct parhelia_root_probe_trace *root_probe;
 };
 
 /* CREATE_VERTEX retains one GEM reference and one VRAM pin for each entry.
