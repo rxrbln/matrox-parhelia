@@ -24,25 +24,88 @@ MODULE_PARM_DESC(reset_on_probe, "Reset PCI function before initialization (brin
 
 DEFINE_DRM_GEM_FOPS(parhelia_fops);
 
+#define PARHELIA_TRACED_IOCTL(_name, _fn, _a0, _a1, _a2)                \
+static int _name(struct drm_device *drm, void *data, struct drm_file *file) \
+{                                                                       \
+	int ret;                                                         \
+	parhelia_root_trace_check(to_parhelia(drm), #_name ":enter",     \
+				  (_a0), (_a1), (_a2));                     \
+	ret = _fn(drm, data, file);                                      \
+	parhelia_root_trace_check(to_parhelia(drm), #_name ":exit",      \
+				  (u64)(s64)ret, (_a1), (_a2));             \
+	return ret;                                                       \
+}
+
+PARHELIA_TRACED_IOCTL(parhelia_traced_get_param, parhelia_get_param_ioctl,
+	((struct drm_parhelia_get_param *)data)->param, 0, 0)
+PARHELIA_TRACED_IOCTL(parhelia_traced_submit, parhelia_submit_ioctl,
+	((struct drm_parhelia_submit *)data)->packet_count,
+	((struct drm_parhelia_submit *)data)->reloc_count,
+	((struct drm_parhelia_submit *)data)->flags)
+PARHELIA_TRACED_IOCTL(parhelia_traced_create_render, parhelia_create_render_ioctl,
+	((struct drm_parhelia_create_render *)data)->width,
+	((struct drm_parhelia_create_render *)data)->height,
+	((struct drm_parhelia_create_render *)data)->flags)
+PARHELIA_TRACED_IOCTL(parhelia_traced_create_vertex, parhelia_create_vertex_ioctl,
+	((struct drm_parhelia_create_vertex *)data)->size,
+	((struct drm_parhelia_create_vertex *)data)->flags, 0)
+PARHELIA_TRACED_IOCTL(parhelia_traced_wait_fence, parhelia_wait_fence_ioctl,
+	((struct drm_parhelia_wait_fence *)data)->fence,
+	((struct drm_parhelia_wait_fence *)data)->timeout_ns, 0)
+PARHELIA_TRACED_IOCTL(parhelia_traced_get_bo_info, parhelia_get_bo_info_ioctl,
+	((struct drm_parhelia_get_bo_info *)data)->handle, 0, 0)
+PARHELIA_TRACED_IOCTL(parhelia_traced_upload_render, parhelia_upload_render_ioctl,
+	((struct drm_parhelia_upload_render *)data)->handle,
+	((struct drm_parhelia_upload_render *)data)->offset,
+	((struct drm_parhelia_upload_render *)data)->size)
+
+static int parhelia_traced_dumb_create(struct drm_file *file,
+				       struct drm_device *drm,
+				       struct drm_mode_create_dumb *args)
+{
+	int ret;
+
+	parhelia_root_trace_check(to_parhelia(drm), "dumb_create:enter",
+				  args->width, args->height, args->bpp);
+	ret = parhelia_dumb_create(file, drm, args);
+	parhelia_root_trace_check(to_parhelia(drm), "dumb_create:exit",
+				  (u64)(s64)ret, args->handle, args->pitch);
+	return ret;
+}
+
+static int parhelia_traced_dumb_map_offset(struct drm_file *file,
+					   struct drm_device *drm,
+					   uint32_t handle, uint64_t *offset)
+{
+	int ret;
+
+	parhelia_root_trace_check(to_parhelia(drm), "dumb_map:enter",
+				  handle, 0, 0);
+	ret = drm_gem_ttm_dumb_map_offset(file, drm, handle, offset);
+	parhelia_root_trace_check(to_parhelia(drm), "dumb_map:exit",
+				  (u64)(s64)ret, handle, ret ? 0 : *offset);
+	return ret;
+}
+
 static void parhelia_postclose(struct drm_device *drm, struct drm_file *file)
 {
 	parhelia_submit_postclose(to_parhelia(drm), file);
 }
 
 static const struct drm_ioctl_desc parhelia_ioctls[] = {
-	DRM_IOCTL_DEF_DRV(PARHELIA_GET_PARAM, parhelia_get_param_ioctl,
+	DRM_IOCTL_DEF_DRV(PARHELIA_GET_PARAM, parhelia_traced_get_param,
 			  DRM_RENDER_ALLOW),
-	DRM_IOCTL_DEF_DRV(PARHELIA_SUBMIT, parhelia_submit_ioctl,
+	DRM_IOCTL_DEF_DRV(PARHELIA_SUBMIT, parhelia_traced_submit,
 			  DRM_RENDER_ALLOW),
-	DRM_IOCTL_DEF_DRV(PARHELIA_CREATE_RENDER, parhelia_create_render_ioctl,
+	DRM_IOCTL_DEF_DRV(PARHELIA_CREATE_RENDER, parhelia_traced_create_render,
 			  DRM_RENDER_ALLOW),
-	DRM_IOCTL_DEF_DRV(PARHELIA_CREATE_VERTEX, parhelia_create_vertex_ioctl,
+	DRM_IOCTL_DEF_DRV(PARHELIA_CREATE_VERTEX, parhelia_traced_create_vertex,
 			  DRM_RENDER_ALLOW),
-	DRM_IOCTL_DEF_DRV(PARHELIA_WAIT_FENCE, parhelia_wait_fence_ioctl,
+	DRM_IOCTL_DEF_DRV(PARHELIA_WAIT_FENCE, parhelia_traced_wait_fence,
 			  DRM_RENDER_ALLOW),
-	DRM_IOCTL_DEF_DRV(PARHELIA_GET_BO_INFO, parhelia_get_bo_info_ioctl,
+	DRM_IOCTL_DEF_DRV(PARHELIA_GET_BO_INFO, parhelia_traced_get_bo_info,
 			  DRM_RENDER_ALLOW),
-	DRM_IOCTL_DEF_DRV(PARHELIA_UPLOAD_RENDER, parhelia_upload_render_ioctl,
+	DRM_IOCTL_DEF_DRV(PARHELIA_UPLOAD_RENDER, parhelia_traced_upload_render,
 			  DRM_RENDER_ALLOW),
 };
 
@@ -54,8 +117,8 @@ static const struct drm_driver parhelia_driver = {
 	.num_ioctls = ARRAY_SIZE(parhelia_ioctls),
 	.gem_create_object = parhelia_gem_create_object,
 	.debugfs_init = drm_vram_mm_debugfs_init,
-	.dumb_create = parhelia_dumb_create,
-	.dumb_map_offset = drm_gem_ttm_dumb_map_offset,
+	.dumb_create = parhelia_traced_dumb_create,
+	.dumb_map_offset = parhelia_traced_dumb_map_offset,
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,
 	.major = 1,
@@ -252,6 +315,9 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	if (ret)
 		return ret;
 	ret = drmm_mutex_init(drm, &pdev->aperture_lock);
+	if (ret)
+		return ret;
+	ret = drmm_mutex_init(drm, &pdev->root_trace_lock);
 	if (ret)
 		return ret;
 	bitmap_zero(pdev->aperture_slots, PARHELIA_HOST_APERTURE_SLOTS);

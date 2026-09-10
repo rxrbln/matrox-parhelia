@@ -3,6 +3,8 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
+#include <linux/sched.h>
+#include <linux/sizes.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 
@@ -32,39 +34,95 @@ MODULE_PARM_DESC(texture_upload_trace,
 
 static atomic_t texture_upload_trace_count = ATOMIC_INIT(0);
 
+static bool root_transition_trace;
+module_param(root_transition_trace, bool, 0400);
+MODULE_PARM_DESC(root_transition_trace,
+	"Trace root sample transitions at every Parhelia ioctl/mmap boundary");
+
 static_assert(SZ_8K <= GENMASK(13, 0));
 
-static bool parhelia_upload_trace_root(struct parhelia_device *pdev, u32 value[3])
+static bool parhelia_read_root_samples(struct parhelia_device *pdev, u32 value[3])
 {
 	static const struct {
 		u16 x;
 		u16 y;
 	} probe[] = { { 0, 402 }, { 64, 402 }, { 0, 418 } };
-	u32 base, ctrl, dims, width, height, pitch;
+	u64 bank_size = pdev->vram_size >> 1;
+	u32 surface, ctrl, dims, pitch, height;
+	u64 physical_base;
 	unsigned int i;
 
-	if (!texture_upload_trace)
-		return false;
-	base = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1));
+	surface = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1) + 4);
 	ctrl = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1) + 8);
 	dims = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1) + 12);
-	width = ctrl & GENMASK(13, 0);
+	pitch = ctrl & GENMASK(13, 0);
 	height = dims & GENMASK(13, 0);
-	if (!(base & PARHELIA_HOST_APERTURE_VALID) ||
+	if (!(parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1)) &
+	      PARHELIA_HOST_APERTURE_VALID) || !bank_size ||
+	    pdev->chip->tile_layout != PARHELIA_TILE_64X16_4K ||
 	    ((ctrl >> 24) & 0x3f) != PARHELIA_HOST_FORMAT_XRGB8888 ||
-	    ((ctrl >> 16) & 7) != 3 || width <= 64 || height <= 418)
+	    ((ctrl >> 16) & 7) != 3 || pitch <= 64 || (pitch & 63) ||
+	    height <= 418)
 		return false;
-	base &= GENMASK(27, 0);
-	pitch = roundup_pow_of_two(max(width, 32u)) * sizeof(u32);
+	if (surface < bank_size)
+		physical_base = surface;
+	else if (surface >= PARHELIA_LOCAL_BANK_B_BASE &&
+		 surface - PARHELIA_LOCAL_BANK_B_BASE < bank_size)
+		physical_base = bank_size + surface - PARHELIA_LOCAL_BANK_B_BASE;
+	else
+		return false;
 	for (i = 0; i < ARRAY_SIZE(probe); i++) {
-		u64 offset = (u64)base + (u64)probe[i].y * pitch +
-			     (u64)probe[i].x * sizeof(u32);
+		u32 x = probe[i].x, y = probe[i].y;
+		u32 tpr = pitch / 64, tcol = x / 64, trow = y / 16;
+		u32 ix = x & 63, iy = y & 15;
+		u32 x5 = ((ix >> 5) & 1) ^ (trow & 1);
+		u32 in_tile;
+		u64 offset;
+
+		in_tile = (ix & 1) | (((ix >> 1) & 1) << 1) |
+			  (((ix >> 2) & 1) << 2) | (((iy >> 1) & 1) << 3) |
+			  (((ix >> 3) & 1) << 4) | (((ix >> 4) & 1) << 5) |
+			  ((iy & 1) << 6) | (x5 << 7) |
+			  (((iy >> 2) & 1) << 8) | (((iy >> 3) & 1) << 9);
+		offset = physical_base +
+			 ((u64)trow * tpr + tcol) * SZ_4K +
+			 in_tile * sizeof(u32);
 
 		if (offset > pdev->vram_size - sizeof(u32))
 			return false;
 		value[i] = readl((u8 __iomem *)pdev->vram + offset);
 	}
 	return true;
+}
+
+void parhelia_root_trace_check(struct parhelia_device *pdev,
+			       const char *event, u64 arg0, u64 arg1, u64 arg2)
+{
+	u32 value[3];
+	u64 seq;
+
+	if (!root_transition_trace ||
+	    !parhelia_read_root_samples(pdev, value))
+		return;
+	mutex_lock(&pdev->root_trace_lock);
+	seq = ++pdev->root_trace_seq;
+	if (!pdev->root_trace_valid) {
+		memcpy(pdev->root_trace_value, value, sizeof(value));
+		pdev->root_trace_valid = true;
+		dev_info(&pdev->pdev->dev,
+			 "root transition baseline: seq=%llu event=%s pid=%d comm=%s values=%08x/%08x/%08x args=%#llx/%#llx/%#llx\n",
+			 seq, event, task_pid_nr(current), current->comm,
+			 value[0], value[1], value[2], arg0, arg1, arg2);
+	} else if (memcmp(pdev->root_trace_value, value, sizeof(value))) {
+		dev_err(&pdev->pdev->dev,
+			"root transition: seq=%llu event=%s pid=%d comm=%s values=%08x/%08x/%08x->%08x/%08x/%08x args=%#llx/%#llx/%#llx\n",
+			seq, event, task_pid_nr(current), current->comm,
+			pdev->root_trace_value[0], pdev->root_trace_value[1],
+			pdev->root_trace_value[2], value[0], value[1], value[2],
+			arg0, arg1, arg2);
+		memcpy(pdev->root_trace_value, value, sizeof(value));
+	}
+	mutex_unlock(&pdev->root_trace_lock);
 }
 
 static void parhelia_bootstrap_reservation_release(struct drm_device *drm,
@@ -260,7 +318,10 @@ void parhelia_host_aperture_fini(struct parhelia_device *pdev)
 static void parhelia_host_object_free(struct drm_gem_object *gem)
 {
 	struct parhelia_bo *bo = to_parhelia_bo(gem);
+	struct parhelia_device *pdev = to_parhelia(gem->dev);
 
+	parhelia_root_trace_check(pdev, "host_free:enter", bo->layout,
+				  gem->size, bo->aperture_slot);
 	/* A VMA owns a GEM reference, so this cannot run while the translated BAR
 	 * range remains accessible.  Revoke the descriptor before either address
 	 * range can return to TTM.
@@ -272,19 +333,66 @@ static void parhelia_host_object_free(struct drm_gem_object *gem)
 		drm_gem_vram_put(bo->aperture_reservation);
 		bo->aperture_reservation = NULL;
 	}
+	parhelia_root_trace_check(pdev, "host_free:exit", bo->layout,
+				  gem->size, bo->aperture_slot);
 	drm_gem_vram_put(&bo->gbo);
 }
 
 static void parhelia_raw_object_free(struct drm_gem_object *gem)
 {
+	struct parhelia_device *pdev = to_parhelia(gem->dev);
+
+	parhelia_root_trace_check(pdev, "raw_free:enter",
+				  to_parhelia_bo(gem)->layout, gem->size, 0);
 	drm_gem_vram_put(drm_gem_vram_of_gem(gem));
+}
+
+static int parhelia_raw_object_vmap(struct drm_gem_object *gem,
+				    struct iosys_map *map)
+{
+	struct parhelia_device *pdev = to_parhelia(gem->dev);
+	int ret;
+
+	parhelia_root_trace_check(pdev, "raw_vmap:enter",
+				  to_parhelia_bo(gem)->layout, gem->size, 0);
+	ret = drm_gem_ttm_vmap(gem, map);
+	parhelia_root_trace_check(pdev, "raw_vmap:exit", (u64)(s64)ret,
+				  to_parhelia_bo(gem)->layout, gem->size);
+	return ret;
+}
+
+static void parhelia_raw_object_vunmap(struct drm_gem_object *gem,
+				       struct iosys_map *map)
+{
+	struct parhelia_device *pdev = to_parhelia(gem->dev);
+
+	parhelia_root_trace_check(pdev, "raw_vunmap:enter",
+				  to_parhelia_bo(gem)->layout, gem->size, 0);
+	drm_gem_ttm_vunmap(gem, map);
+	parhelia_root_trace_check(pdev, "raw_vunmap:exit",
+				  to_parhelia_bo(gem)->layout, gem->size, 0);
+}
+
+static int parhelia_raw_object_mmap(struct drm_gem_object *gem,
+				    struct vm_area_struct *vma)
+{
+	struct parhelia_device *pdev = to_parhelia(gem->dev);
+	int ret;
+
+	parhelia_root_trace_check(pdev, "raw_mmap:enter",
+				  to_parhelia_bo(gem)->layout, gem->size,
+				  vma->vm_end - vma->vm_start);
+	ret = drm_gem_ttm_mmap(gem, vma);
+	parhelia_root_trace_check(pdev, "raw_mmap:exit", (u64)(s64)ret,
+				  to_parhelia_bo(gem)->layout, gem->size);
+	return ret;
 }
 
 static const struct drm_gem_object_funcs parhelia_raw_object_funcs = {
 	.free = parhelia_raw_object_free,
-	.vmap = drm_gem_ttm_vmap,
-	.vunmap = drm_gem_ttm_vunmap,
-	.mmap = drm_gem_ttm_mmap,
+	.vmap = parhelia_raw_object_vmap,
+	.vunmap = parhelia_raw_object_vunmap,
+	.mmap = parhelia_raw_object_mmap,
 	.print_info = drm_gem_ttm_print_info,
 };
 
@@ -303,6 +411,8 @@ static int parhelia_host_object_vmap(struct drm_gem_object *gem,
 	void __iomem *addr;
 	int ret = 0;
 
+	parhelia_root_trace_check(pdev, "host_vmap:enter", bo->layout,
+				  gem->size, bo->aperture_slot);
 	mutex_lock(&pdev->aperture_lock);
 	if (!pdev->aperture_live || !bo->host_aperture) {
 		ret = -ENODEV;
@@ -311,13 +421,21 @@ static int parhelia_host_object_vmap(struct drm_gem_object *gem,
 		iosys_map_set_vaddr_iomem(map, addr);
 	}
 	mutex_unlock(&pdev->aperture_lock);
+	parhelia_root_trace_check(pdev, "host_vmap:exit", (u64)(s64)ret,
+				  bo->layout, gem->size);
 	return ret;
 }
 
 static void parhelia_host_object_vunmap(struct drm_gem_object *gem,
 					struct iosys_map *map)
 {
+	struct parhelia_device *pdev = to_parhelia(gem->dev);
+
+	parhelia_root_trace_check(pdev, "host_vunmap:enter",
+				  to_parhelia_bo(gem)->layout, gem->size, 0);
 	iosys_map_clear(map);
+	parhelia_root_trace_check(pdev, "host_vunmap:exit",
+				  to_parhelia_bo(gem)->layout, gem->size, 0);
 }
 
 static void parhelia_host_vm_open(struct vm_area_struct *vma)
@@ -348,6 +466,8 @@ static int parhelia_host_object_mmap(struct drm_gem_object *gem,
 	u64 map_offset, node_start;
 	int ret;
 
+	parhelia_root_trace_check(pdev, "host_mmap:enter", bo->layout,
+				  gem->size, vma->vm_end - vma->vm_start);
 	mutex_lock(&pdev->aperture_lock);
 	if (!pdev->aperture_live || !bo->host_aperture) {
 		ret = -ENODEV;
@@ -376,6 +496,8 @@ static int parhelia_host_object_mmap(struct drm_gem_object *gem,
 	ret = vm_iomap_memory(vma, base, bo->host_size - map_offset);
 out_unlock:
 	mutex_unlock(&pdev->aperture_lock);
+	parhelia_root_trace_check(pdev, "host_mmap:exit", (u64)(s64)ret,
+				  bo->layout, gem->size);
 	return ret;
 }
 
@@ -687,12 +809,13 @@ int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
 		parhelia_write(pdev, reg,
 			       PARHELIA_HOST_APERTURE_VALID | (u32)aperture_offset);
 		parhelia_read(pdev, reg);
-		watch_root = parhelia_upload_trace_root(pdev, root_before);
+		watch_root = texture_upload_trace &&
+			parhelia_read_root_samples(pdev, root_before);
 		memcpy_toio((u8 __iomem *)pdev->vram + aperture_offset,
 			    (u8 *)source + copied, bytes);
 		wmb();
 		parhelia_read(pdev, reg);
-		if (watch_root && parhelia_upload_trace_root(pdev, root_after) &&
+		if (watch_root && parhelia_read_root_samples(pdev, root_after) &&
 		    memcmp(root_before, root_after, sizeof(root_before)))
 			dev_err(&pdev->pdev->dev,
 				"texture upload changed root probes: handle=%u surface=%#x copied=%#llx bytes=%#x values=%08x/%08x/%08x -> %08x/%08x/%08x\n",

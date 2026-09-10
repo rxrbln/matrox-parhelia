@@ -354,6 +354,13 @@ struct parhelia_device {
 	struct mutex aperture_lock;
 	DECLARE_BITMAP(aperture_slots, PARHELIA_HOST_APERTURE_SLOTS);
 	bool aperture_live;
+	/* Default-off root corruption tracer.  The saved sample survives across
+	 * ioctl and mmap boundaries, so a userspace store between two kernel
+	 * entries is reported at the next boundary. */
+	struct mutex root_trace_lock;
+	u32 root_trace_value[3];
+	u64 root_trace_seq;
+	bool root_trace_valid;
 	struct mutex submit_lock;
 	struct list_head vertex_bos;
 	/* The primary ring is small. Secondary packets use independently allocated
@@ -470,6 +477,8 @@ void parhelia_bo_make_unmappable(struct drm_gem_vram_object *gbo);
 bool parhelia_texture_upload_enabled(void);
 bool parhelia_bo_is_native(const struct parhelia_bo *bo);
 bool parhelia_gem_is_owned(const struct drm_gem_object *gem);
+void parhelia_root_trace_check(struct parhelia_device *pdev,
+			       const char *event, u64 arg0, u64 arg1, u64 arg2);
 void parhelia_host_aperture_fini(struct parhelia_device *pdev);
 int parhelia_host_aperture_reserve_bootstrap(struct parhelia_device *pdev);
 int parhelia_engine_init(struct parhelia_device *pdev);
