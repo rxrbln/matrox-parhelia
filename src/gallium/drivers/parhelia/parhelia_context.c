@@ -34,13 +34,6 @@
 #include "parhelia_internal.h"
 
 #define PH_VRAM_VERTEX_SLOTS 3
-/* Until the P690 proves longer cross-state streams, the opt-in aggregator is
- * kept well below both the UAPI bounds and the 50 ms kernel watchdog. */
-#define PH_AGGREGATE_SUBMITS 2
-#define PH_AGGREGATE_COMMAND_DWORDS 1024
-#define PH_AGGREGATE_VERTEX_DWORDS 1024
-#define PH_AGGREGATE_PACKETS 64
-#define PH_AGGREGATE_RELOCS 96
 
 struct ph_velems {
    unsigned count;
@@ -486,41 +479,14 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
                 struct parhelia_resource *r2, struct parhelia_resource *r3)
 {
    struct parhelia_resource *resources[4] = {r0, r1, r2, r3};
-   unsigned boundary_relocs = ctx->aggregate_state_batches &&
-                              ctx->pending_batch.packet_count ? 1 : 0;
    int ret;
 
-   /* Same-state aggregation extends only the draw tail.  Cross-state
+   /* Same-state aggregation extends only the draw tail and can keep appending
+    * until one of the batch's real storage limits is reached.  Cross-state
     * aggregation records a kernel-owned boundary which restores each logical
-    * EOB/DWGSYNC bracket.  Keep both paths bounded to two submissions and make
-    * the cross-state hardware-validation path explicit. */
+    * EOB/DWGSYNC bracket; its guarded append helper admits only the one marker
+    * supported by the current kernel ABI. */
    if (!ctx->aggregate_batches)
-      return ph_submit_batch_now(ctx, batch, vertices, vertex_dwords);
-
-   if (ctx->pending_batch.packet_count &&
-       (ctx->pending_submit_count == PH_AGGREGATE_SUBMITS ||
-        batch->command_count > PH_AGGREGATE_COMMAND_DWORDS -
-                                  ctx->pending_batch.command_count ||
-        vertex_dwords > PH_AGGREGATE_VERTEX_DWORDS -
-                           ctx->pending_vertex_dwords ||
-        batch->packet_count > PH_AGGREGATE_PACKETS -
-                                 ctx->pending_batch.packet_count ||
-        boundary_relocs > PH_AGGREGATE_RELOCS -
-                            ctx->pending_batch.reloc_count ||
-        batch->reloc_count > PH_AGGREGATE_RELOCS -
-                                ctx->pending_batch.reloc_count -
-                                boundary_relocs)) {
-      ret = ph_drain_batch(ctx);
-      if (ret)
-         return ret;
-   }
-   /* A single established batch may legitimately exceed the experimental
-    * aggregate caps.  Submit it unchanged rather than making opt-in alter a
-    * previously working stream. */
-   if (batch->command_count > PH_AGGREGATE_COMMAND_DWORDS ||
-       vertex_dwords > PH_AGGREGATE_VERTEX_DWORDS ||
-       batch->packet_count > PH_AGGREGATE_PACKETS ||
-       batch->reloc_count > PH_AGGREGATE_RELOCS)
       return ph_submit_batch_now(ctx, batch, vertices, vertex_dwords);
 
    if (ctx->pending_resource_count +
@@ -3178,14 +3144,20 @@ ph_flush(struct pipe_context *p, struct pipe_fence_handle **fence,
 {
    struct ph_context *ctx = ph_context(p);
    struct parhelia_resource *color = NULL;
-   (void)flags;
    ph_submit_vertices(ctx);
    if (ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture)
       color = ph_resource(ctx->fb.cbufs[0].texture);
    /* The X server's native DRI2 blit submits synchronously on the same
     * device.  The kernel submit lock drains prior async render work before
     * executing it, so waiting here would serialize the pipeline twice. */
-   if (!color || !color->native_shared)
+   /* A native window swap is followed by the X server's synchronous blit on
+    * this same device and can remain pipelined.  A finish hint is the GL
+    * completion contract, and a caller asking for a fence cannot be given a
+    * NULL fence until this driver implements a real pipe_fence_handle. */
+   if (!color || !color->native_shared ||
+       (flags & PIPE_FLUSH_HINT_FINISH) ||
+       ((flags & PIPE_FLUSH_FENCE_FD) && fence) ||
+       (fence && !(flags & PIPE_FLUSH_END_OF_FRAME)))
       ph_wait_async(ctx);
    if (color) {
       if (!color->native_shared)
@@ -3724,9 +3696,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
                             getenv("PARHELIA_BATCH_AGGREGATE") != NULL;
    if (ctx->aggregate_batches && getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
-              "parhelia: experimental aggregation enabled: at most %u submits, %u command/vertex dwords, %u packets, %u relocs\n",
-              PH_AGGREGATE_SUBMITS, PH_AGGREGATE_COMMAND_DWORDS,
-              PH_AGGREGATE_PACKETS, PH_AGGREGATE_RELOCS);
+              "parhelia: experimental aggregation enabled: up to %u command/vertex dwords, %u packets, %u relocs\n",
+              PH_BATCH_DWORDS, PH_BATCH_PACKETS, PH_BATCH_RELOCS);
    if (ctx->aggregate_state_batches && getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: preserving per-state EOB/DWGSYNC boundaries inside aggregate submits\n");

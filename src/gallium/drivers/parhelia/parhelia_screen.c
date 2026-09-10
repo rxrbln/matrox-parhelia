@@ -776,6 +776,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct pipe_caps *caps = (struct pipe_caps *)&s->base.caps;
    caps->max_render_targets = 1;
    caps->max_texture_2d_size = 1024;
+   /* There is no pipe fence object yet.  Native window swaps are ordered by
+    * the following Present blit, so the DRI frontend must not request a NULL
+    * fence solely to throttle every swap in the client. */
+   caps->throttle = false;
    caps->glsl_feature_level = caps->glsl_feature_level_compatibility = 120;
    caps->essl_feature_level = 100;
    caps->npot_textures = true;
