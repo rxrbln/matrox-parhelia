@@ -71,23 +71,51 @@ static bool parhelia_root_probe_read(struct parhelia_device *pdev, u32 value[3])
 		u16 x;
 		u16 y;
 	} probe[] = { { 0, 402 }, { 64, 402 }, { 0, 418 } };
-	u32 base, ctrl, dims, width, height, pitch;
+	u64 bank_size = pdev->vram_size >> 1;
+	u32 surface, ctrl, dims, pitch, height;
+	u64 physical_base;
 	unsigned int i;
 
-	base = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1));
+	/* Descriptor word 0 is the CPU aperture coordinate.  Word 1 is the
+	 * graphics-engine surface address.  The old probe incorrectly added a
+	 * linear row offset to word 0; that reads unrelated BAR storage rather
+	 * than the root surface's native 64x16 layout. */
+	surface = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1) + 4);
 	ctrl = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1) + 8);
 	dims = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1) + 12);
-	width = ctrl & GENMASK(13, 0);
+	pitch = ctrl & GENMASK(13, 0);
 	height = dims & GENMASK(13, 0);
-	if (!(base & PARHELIA_HOST_APERTURE_VALID) ||
+	if (!(parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1)) &
+	      PARHELIA_HOST_APERTURE_VALID) || !bank_size ||
+	    pdev->chip->tile_layout != PARHELIA_TILE_64X16_4K ||
 	    ((ctrl >> 24) & 0x3f) != 0x30 || ((ctrl >> 16) & 7) != 3 ||
-	    width <= 64 || height <= 418)
+	    pitch <= 64 || (pitch & 63) || height <= 418)
 		return false;
-	base &= GENMASK(27, 0);
-	pitch = roundup_pow_of_two(max(width, 32u)) * sizeof(u32);
+	/* Undo parhelia_vram_gpu_addr(): bank A is identity, while bank B's
+	 * engine window begins at 128 MiB and maps to the second half of BAR0. */
+	if (surface < bank_size)
+		physical_base = surface;
+	else if (surface >= PARHELIA_LOCAL_BANK_B_BASE &&
+		 surface - PARHELIA_LOCAL_BANK_B_BASE < bank_size)
+		physical_base = bank_size + surface - PARHELIA_LOCAL_BANK_B_BASE;
+	else
+		return false;
 	for (i = 0; i < ARRAY_SIZE(probe); i++) {
-		u64 offset = (u64)base + (u64)probe[i].y * pitch +
-			     (u64)probe[i].x * sizeof(u32);
+		u32 x = probe[i].x, y = probe[i].y;
+		u32 tpr = pitch / 64, tcol = x / 64, trow = y / 16;
+		u32 ix = x & 63, iy = y & 15;
+		u32 x5 = ((ix >> 5) & 1) ^ (trow & 1);
+		u32 in_tile;
+		u64 offset;
+
+		/* P690 64x16/4 KiB native swizzle.  in_tile is a dword index. */
+		in_tile = (ix & 1) | (((ix >> 1) & 1) << 1) |
+			  (((ix >> 2) & 1) << 2) | (((iy >> 1) & 1) << 3) |
+			  (((ix >> 3) & 1) << 4) | (((ix >> 4) & 1) << 5) |
+			  ((iy & 1) << 6) | (x5 << 7) |
+			  (((iy >> 2) & 1) << 8) | (((iy >> 3) & 1) << 9);
+		offset = physical_base +
+			 ((u64)trow * tpr + tcol) * SZ_4K + in_tile * sizeof(u32);
 
 		if (offset > pdev->vram_size - sizeof(u32))
 			return false;
