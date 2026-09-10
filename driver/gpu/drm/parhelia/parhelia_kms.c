@@ -554,7 +554,9 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 		return;
 	gbo = drm_gem_vram_of_gem(gem);
 	bo = to_parhelia_bo(gem);
-	if (parhelia_vram_gpu_addr(pdev, gbo, 0, gbo->bo.base.size,
+	/* DC_START is a framebuffer-aperture byte offset.  It does not use the
+	 * graphics engine's discontinuous bank-A/bank-B address encoding. */
+	if (parhelia_vram_bar_addr(pdev, gbo, 0, gbo->bo.base.size,
 				   &address) ||
 	    address > 0x0ffffc00 || !IS_ALIGNED(address, 1024))
 		return;
@@ -643,7 +645,7 @@ static void parhelia_pipe_update(struct drm_simple_display_pipe *pipe,
 			struct parhelia_bo *bo = gem ? to_parhelia_bo(gem) : NULL;
 			u32 address;
 
-			if (gem && !parhelia_vram_gpu_addr(pdev,
+			if (gem && !parhelia_vram_bar_addr(pdev,
 					drm_gem_vram_of_gem(gem), 0, gem->size,
 					&address) &&
 			    address <= 0x0ffffc00 && IS_ALIGNED(address, 1024)) {
@@ -749,7 +751,7 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	    bo->gpu_pitch / cpp != ALIGN(fb->width, 64) ||
 	    bo->gpu_pitch / cpp > 0x3fff)
 		return -EINVAL;
-	if (parhelia_vram_gpu_addr(to_parhelia(pipe->crtc.dev), &bo->gbo,
+	if (parhelia_vram_bar_addr(to_parhelia(pipe->crtc.dev), &bo->gbo,
 				   0, bo->gbo.bo.base.size, &address) ||
 	    address > 0x0ffffc00 || !IS_ALIGNED(address, 1024))
 		return -EINVAL;

@@ -470,6 +470,9 @@ void parhelia_submit_fini(struct parhelia_device *pdev);
 int parhelia_submit_init(struct parhelia_device *pdev);
 int parhelia_vram_pin(struct drm_gem_vram_object *bo);
 void parhelia_vram_unpin(struct drm_gem_vram_object *bo);
+int parhelia_vram_bar_addr(struct parhelia_device *pdev,
+			   struct drm_gem_vram_object *bo, u64 offset,
+			   u64 length, u32 *bar_addr);
 int parhelia_vram_gpu_addr(struct parhelia_device *pdev,
 			   struct drm_gem_vram_object *bo, u64 offset,
 			   u64 length, u32 *gpu_addr);

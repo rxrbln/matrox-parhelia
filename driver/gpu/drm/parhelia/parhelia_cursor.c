@@ -308,7 +308,9 @@ int parhelia_cursor_init(struct parhelia_device *pdev)
 	ttm_bo_unreserve(&image->bo);
 	if (ret)
 		goto err_unpin;
-	ret = parhelia_vram_gpu_addr(pdev, image, 0, PARHELIA_CURSOR_SIZE,
+	/* The cursor belongs to the display fetch path and therefore takes the
+	 * framebuffer-aperture placement, like DC_START. */
+	ret = parhelia_vram_bar_addr(pdev, image, 0, PARHELIA_CURSOR_SIZE,
 				     &address);
 	if (ret)
 		goto err_unmap;

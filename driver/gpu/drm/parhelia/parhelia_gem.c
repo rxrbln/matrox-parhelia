@@ -50,9 +50,32 @@ bool parhelia_gem_is_owned(const struct drm_gem_object *gem)
 	       gem->funcs == &parhelia_host_object_funcs;
 }
 
+/* Validate and return the CPU/display-controller view of a TTM placement. */
+int parhelia_vram_bar_addr(struct parhelia_device *pdev,
+			   struct drm_gem_vram_object *bo, u64 offset,
+			   u64 length, u32 *bar_addr)
+{
+	u64 bo_size = bo->bo.base.size;
+	u64 physical;
+	s64 placement;
+
+	if (!length || offset > bo_size || length > bo_size - offset)
+		return -EINVAL;
+	placement = drm_gem_vram_offset(bo);
+	if (placement < 0 || (u64)placement > pdev->vram_size ||
+	    bo_size > pdev->vram_size - (u64)placement)
+		return -ERANGE;
+	if (check_add_overflow((u64)placement, offset, &physical) ||
+	    physical > U32_MAX || length > pdev->vram_size - physical)
+		return -EOVERFLOW;
+
+	*bar_addr = physical;
+	return 0;
+}
+
 /*
- * TTM and CPU mappings use BAR0 byte offsets.  The graphics and display
- * engines instead see two local-memory banks in a fixed 256 MiB address
+ * TTM and CPU mappings use BAR0 byte offsets.  The graphics engine instead
+ * sees two local-memory banks in a fixed 256 MiB address
  * window: bank A starts at 0 and bank B at 128 MiB.  On a 128 MiB board this
  * leaves the engine address range 64..128 MiB unmapped, although those bytes
  * are contiguous in BAR0.
@@ -65,22 +88,18 @@ int parhelia_vram_gpu_addr(struct parhelia_device *pdev,
 			   struct drm_gem_vram_object *bo, u64 offset,
 			   u64 length, u32 *gpu_addr)
 {
-	u64 bo_size = bo->bo.base.size;
 	u64 bank_size = pdev->vram_size >> 1;
 	u64 physical, physical_end, gpu;
-	s64 placement;
+	u32 bar_addr;
+	int ret;
 
-	if (!length || offset > bo_size || length > bo_size - offset ||
-	    !bank_size)
+	if (!bank_size)
 		return -EINVAL;
-
-	placement = drm_gem_vram_offset(bo);
-	if (placement < 0 || (u64)placement > pdev->vram_size ||
-	    bo_size > pdev->vram_size - (u64)placement)
-		return -ERANGE;
-	if (check_add_overflow((u64)placement, offset, &physical) ||
-	    check_add_overflow(physical, length, &physical_end))
-		return -EOVERFLOW;
+	ret = parhelia_vram_bar_addr(pdev, bo, offset, length, &bar_addr);
+	if (ret)
+		return ret;
+	physical = bar_addr;
+	physical_end = physical + length;
 	if (physical < bank_size && physical_end > bank_size)
 		return -ERANGE;
 
