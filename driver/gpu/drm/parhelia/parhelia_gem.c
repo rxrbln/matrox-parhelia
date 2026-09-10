@@ -35,6 +35,39 @@ static atomic_t texture_upload_trace_count = ATOMIC_INIT(0);
 static_assert(IS_ALIGNED(SZ_8K, sizeof(u32)));
 static_assert(SZ_8K / sizeof(u32) <= GENMASK(13, 0));
 
+static bool parhelia_upload_trace_root(struct parhelia_device *pdev, u32 value[3])
+{
+	static const struct {
+		u16 x;
+		u16 y;
+	} probe[] = { { 0, 402 }, { 64, 402 }, { 0, 418 } };
+	u32 base, ctrl, dims, width, height, pitch;
+	unsigned int i;
+
+	if (!texture_upload_trace)
+		return false;
+	base = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1));
+	ctrl = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1) + 8);
+	dims = parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(1) + 12);
+	width = ctrl & GENMASK(13, 0);
+	height = dims & GENMASK(13, 0);
+	if (!(base & PARHELIA_HOST_APERTURE_VALID) ||
+	    ((ctrl >> 24) & 0x3f) != PARHELIA_HOST_FORMAT_XRGB8888 ||
+	    ((ctrl >> 16) & 7) != 3 || width <= 64 || height <= 418)
+		return false;
+	base &= GENMASK(27, 0);
+	pitch = roundup_pow_of_two(max(width, 32u)) * sizeof(u32);
+	for (i = 0; i < ARRAY_SIZE(probe); i++) {
+		u64 offset = (u64)base + (u64)probe[i].y * pitch +
+			     (u64)probe[i].x * sizeof(u32);
+
+		if (offset > pdev->vram_size - sizeof(u32))
+			return false;
+		value[i] = readl((u8 __iomem *)pdev->vram + offset);
+	}
+	return true;
+}
+
 static void parhelia_bootstrap_reservation_release(struct drm_device *drm,
 						   void *data)
 {
@@ -615,6 +648,8 @@ int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
 	dims = BIT(16) | 1;
 	for (copied = 0; copied < args->size;) {
 		u32 bytes = min_t(u64, args->size - copied, SZ_8K);
+		u32 root_before[3], root_after[3];
+		bool watch_root;
 		u32 width;
 
 		if (!IS_ALIGNED(bytes, sizeof(u32))) {
@@ -651,10 +686,19 @@ int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
 		parhelia_write(pdev, reg,
 			       PARHELIA_HOST_APERTURE_VALID | (u32)aperture_offset);
 		parhelia_read(pdev, reg);
+		watch_root = parhelia_upload_trace_root(pdev, root_before);
 		memcpy_toio((u8 __iomem *)pdev->vram + aperture_offset,
 			    (u8 *)source + copied, bytes);
 		wmb();
 		parhelia_read(pdev, reg);
+		if (watch_root && parhelia_upload_trace_root(pdev, root_after) &&
+		    memcmp(root_before, root_after, sizeof(root_before)))
+			dev_err(&pdev->pdev->dev,
+				"texture upload changed root probes: handle=%u surface=%#x copied=%#llx bytes=%#x values=%08x/%08x/%08x -> %08x/%08x/%08x\n",
+				args->handle, surface_address,
+				(unsigned long long)copied, bytes,
+				root_before[0], root_before[1], root_before[2],
+				root_after[0], root_after[1], root_after[2]);
 		copied += bytes;
 	}
 	/* Make every posted host write visible before the surface may be bound by
