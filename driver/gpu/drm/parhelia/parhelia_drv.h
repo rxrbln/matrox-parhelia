@@ -13,6 +13,7 @@
 #include <linux/i2c.h>
 
 #include <drm/drm_device.h>
+#include <drm/drm_mm.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_gem_vram_helper.h>
 #include <linux/iosys-map.h>
@@ -145,6 +146,8 @@ struct parhelia_bios {
 #define PARHELIA_HOST_APERTURE_VALID	BIT(28)
 #define PARHELIA_HOST_APERTURE_SLOTS	20
 #define PARHELIA_HOST_APERTURE_ALIGN	SZ_256K
+#define PARHELIA_HOST_APERTURE_LIMIT	SZ_16M
+#define PARHELIA_HOST_APERTURE_FIRST	(2 * PARHELIA_HOST_APERTURE_ALIGN)
 #define PARHELIA_DC_LUT_INDEX		0x038
 #define PARHELIA_DC_LUT_R		0x03c
 #define PARHELIA_DC_LUT_G		0x040
@@ -314,13 +317,33 @@ struct parhelia_reg_shadow {
 	DECLARE_BITMAP(valid, PARHELIA_INDEXED_REGS);
 };
 
+struct parhelia_bo;
+
+/* One entry in the P690's 24-bit class-0 virtual address space.  The drm_mm
+ * node includes the vendor-required trailing 256 KiB guard.  Only map_size
+ * bytes starting at node.start may be exposed to a CPU or engine client.
+ * Entries are kept in ascending node.start order and occupy a dense hardware
+ * slot prefix after the permanent slot-zero identity descriptor.
+ */
+struct parhelia_aperture_mapping {
+	struct drm_mm_node node;
+	struct list_head link;
+	struct parhelia_bo *owner;
+	u32 surface;
+	u32 ctrl;
+	u32 dims;
+	u32 map_size;
+	u8 slot;
+	bool active;
+};
+
 /* All driver-created GEM objects use this wrapper.  Most retain the standard
  * raw TTM mapping.  Dumb framebuffers additionally own a long-lived host
  * aperture descriptor which gives their native bytes a CPU-linear alias.
  */
 struct parhelia_bo {
 	struct drm_gem_vram_object gbo;
-	struct drm_gem_vram_object *aperture_reservation;
+	struct parhelia_aperture_mapping aperture;
 	u32 width;
 	u32 height;
 	u32 gpu_pitch;
@@ -352,7 +375,9 @@ struct parhelia_device {
 	struct mutex ddc_lock;
 	/* Slots 1..19 and their BAR0 ranges are global hardware state. */
 	struct mutex aperture_lock;
-	DECLARE_BITMAP(aperture_slots, PARHELIA_HOST_APERTURE_SLOTS);
+	struct drm_mm aperture_mm;
+	struct list_head aperture_mappings;
+	u8 aperture_mapping_count;
 	bool aperture_live;
 	/* Default-off root corruption tracer.  The saved sample survives across
 	 * ioctl and mmap boundaries, so a userspace store between two kernel
@@ -481,6 +506,16 @@ void parhelia_root_trace_check(struct parhelia_device *pdev,
 			       const char *event, u64 arg0, u64 arg1, u64 arg2);
 void parhelia_host_aperture_fini(struct parhelia_device *pdev);
 int parhelia_host_aperture_reserve_bootstrap(struct parhelia_device *pdev);
+void parhelia_host_aperture_init(struct parhelia_device *pdev);
+int parhelia_host_aperture_acquire(struct parhelia_device *pdev,
+				   struct parhelia_aperture_mapping *mapping,
+				   u32 map_size, u32 surface, u32 ctrl,
+				   u32 dims, struct parhelia_bo *owner);
+int parhelia_host_aperture_retarget(struct parhelia_device *pdev,
+				    struct parhelia_aperture_mapping *mapping,
+				    u32 surface, u32 ctrl, u32 dims);
+void parhelia_host_aperture_release(struct parhelia_device *pdev,
+				    struct parhelia_aperture_mapping *mapping);
 int parhelia_engine_init(struct parhelia_device *pdev);
 int parhelia_warp_init(struct parhelia_device *pdev);
 void parhelia_warp_trace_vertex(struct parhelia_device *pdev, const char *phase);
