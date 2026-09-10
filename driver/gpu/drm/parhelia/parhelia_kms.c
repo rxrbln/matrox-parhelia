@@ -657,22 +657,29 @@ static void parhelia_scanout_copy(struct parhelia_device *pdev,
 	u32 last_tx = DIV_ROUND_UP(damage->x2, 64);
 	u32 first_ty = damage->y1 / tile_h;
 	u32 last_ty = DIV_ROUND_UP(damage->y2, tile_h);
+	u32 blit_x1 = first_tx * 64;
+	u32 blit_y1 = first_ty * tile_h;
+	u32 blit_x2 = min_t(u32, fb->width, last_tx * 64);
+	u32 blit_y2 = min_t(u32, fb->height, last_ty * tile_h);
 	u32 tx, ty;
 	int blit_ret = -ENODEV;
 
 	if (!pdev->scanout_bo || !pdev->scanout_tile || !src)
 		return;
 
-	/* The normal path is an engine resolve ordered with all render submits.
-	 * Keep the mapped tile conversion below as a correctness fallback for the
-	 * classic 64x32 chips until their blit layout is verified. */
+	/* Type-3 destinations are updated in complete 64-by-tile-height units.
+	 * Expand userspace damage to those boundaries so an unaligned window copy
+	 * cannot scatter pixels within every touched tile.  The source is the full
+	 * linear frontbuffer, so the added border contains the current pixels.
+	 * Keep the mapped conversion below as a correctness fallback for classic
+	 * 64x32 chips until their blit layout is verified. */
 	if (src_offset >= 0 && dst_offset >= 0)
 		blit_ret = parhelia_submit_linear_to_tiled(pdev, src_offset,
 					       fb->pitches[0] / 4, dst_offset,
 					       pdev->scanout_pitch,
-					       damage->x1, damage->y1,
-					       drm_rect_width(damage),
-					       drm_rect_height(damage));
+					       blit_x1, blit_y1,
+					       blit_x2 - blit_x1,
+					       blit_y2 - blit_y1);
 	if (!blit_ret) {
 		dev_info_once(&pdev->pdev->dev,
 			      "using GPU linear-to-native KMS damage resolves\n");
@@ -1124,7 +1131,20 @@ int parhelia_modeset_init(struct parhelia_device *pdev)
 	drm->mode_config.min_height = 1;
 	drm->mode_config.max_width = 2048;
 	drm->mode_config.max_height = 2048;
-	drm->mode_config.prefer_shadow = 1;
+	/* Dumb buffers are deliberately linear, and dirtyfb resolves damaged
+	 * rectangles into the private native-tiled scanout BO.  Advertising a
+	 * userspace shadow here makes the modesetting DDX allocate another
+	 * system-memory framebuffer and copy each damaged region into the linear
+	 * dumb BO before the resolve.  It is redundant and especially expensive
+	 * for software-composited GL windows.  Let userspace draw/map the linear
+	 * dumb BO directly; Xorg's normal Damage -> DIRTYFB path still tells us
+	 * exactly which rectangles need the GPU linear-to-tiled resolve.
+	 *
+	 * This flag only controls DRM_CAP_DUMB_PREFER_SHADOW.  The kernel's
+	 * drm_shadow_plane_state below remains necessary to vmap imported GEM
+	 * objects for the CPU fallback and is unrelated to an Xorg ShadowFB.
+	 */
+	drm->mode_config.prefer_shadow = 0;
 	ret = drm_mode_create_dvi_i_properties(drm);
 	if (ret)
 		return ret;
