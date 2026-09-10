@@ -58,6 +58,8 @@ int parhelia_engine_init(struct parhelia_device *pdev)
 {
 	int ret;
 
+	parhelia_root_trace_check(pdev, "engine_init:enter",
+				  pdev->engine_initialized, init_aperture, 0);
 	if (pdev->engine_initialized)
 		return 0;
 	/* Reset and WARP initialization write engine state outside normal submit. */
@@ -65,6 +67,7 @@ int parhelia_engine_init(struct parhelia_device *pdev)
 
 	parhelia_apply_vid_reset(pdev, 0);
 	parhelia_apply_vid_reset(pdev, 1);
+	parhelia_root_trace_check(pdev, "engine_init:video_reset", 0, 0, 0);
 	parhelia_rmw(pdev, 0x1c00, ~0u, 0x00808020u);
 	parhelia_rmw(pdev, 0x1c04, ~0u, 0x00000020u);
 	udelay(10);
@@ -101,6 +104,8 @@ int parhelia_engine_init(struct parhelia_device *pdev)
 			 parhelia_read(pdev, 0), parhelia_read(pdev, 4),
 			 parhelia_read(pdev, 8), parhelia_read(pdev, 12));
 	}
+	parhelia_root_trace_check(pdev, "engine_init:aperture",
+				  pdev->raw_aperture_owned, 0, 0);
 	parhelia_rmw(pdev, 0x0300, 0xe0e0ff3fu, 0x100u);
 	parhelia_write(pdev, 0x0308,
 		       pdev->pdev->device == PARHELIA_8X ? 0x83u : 0x01u);
@@ -120,11 +125,17 @@ int parhelia_engine_init(struct parhelia_device *pdev)
 	parhelia_write(pdev, PARHELIA_MMIO_RING_END,
 		       lower_32_bits(pdev->primary_bus) | 3);
 	pci_set_master(pdev->pdev);
+	parhelia_root_trace_check(pdev, "engine_init:ring_armed",
+				  lower_32_bits(pdev->primary_bus),
+				  lower_32_bits(pdev->writeback_bus), 0);
 	ret = parhelia_warp_init(pdev);
+	parhelia_root_trace_check(pdev, "engine_init:warp_exit",
+				  (u64)(s64)ret, 0, 0);
 	if (ret) {
 		pci_clear_master(pdev->pdev);
 		return ret;
 	}
 	pdev->engine_initialized = true;
+	parhelia_root_trace_check(pdev, "engine_init:exit", 1, 0, 0);
 	return 0;
 }
