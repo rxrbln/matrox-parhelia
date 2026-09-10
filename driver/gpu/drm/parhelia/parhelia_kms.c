@@ -533,6 +533,7 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	struct drm_framebuffer *fb = plane_state->fb;
 	struct drm_gem_object *gem;
 	struct drm_gem_vram_object *gbo;
+	struct parhelia_bo *bo;
 	s64 offset;
 	u32 dc;
 	u32 dct;
@@ -552,10 +553,11 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	if (!gem)
 		return;
 	gbo = drm_gem_vram_of_gem(gem);
+	bo = to_parhelia_bo(gem);
 	offset = drm_gem_vram_offset(gbo);
-	if (offset < 0)
+	if (offset < 0 || offset > 0x0ffffc00 || !IS_ALIGNED(offset, 1024))
 		return;
-	pitch = fb->pitches[0] / 4;
+	pitch = bo->gpu_pitch / 4;
 
 	format = fb->format->format == DRM_FORMAT_RGB565 ? 0x28000000 : 0x32000000;
 	/* Type 3 is the native display/render-target layout. */
@@ -637,13 +639,15 @@ static void parhelia_pipe_update(struct drm_simple_display_pipe *pipe,
 		wmb();
 		if (!old_state->fb || old_state->fb != state->fb) {
 			struct drm_gem_object *gem = drm_gem_fb_get_obj(state->fb, 0);
+			struct parhelia_bo *bo = gem ? to_parhelia_bo(gem) : NULL;
 			s64 offset = gem ? drm_gem_vram_offset(drm_gem_vram_of_gem(gem)) :
 					   -ENODEV;
 
-			if (offset >= 0) {
+			if (offset >= 0 && offset <= 0x0ffffc00 &&
+			    IS_ALIGNED(offset, 1024)) {
 				u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
 				u32 format = 0x32030000 |
-					     (state->fb->pitches[0] / 4);
+					     (bo->gpu_pitch / 4);
 
 				parhelia_write(pdev, dc + PARHELIA_DC_START,
 					       offset & 0x0ffffc00);
@@ -713,6 +717,9 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 			       struct drm_crtc_state *crtc_state)
 {
 	struct drm_framebuffer *fb = plane_state->fb;
+	struct drm_gem_object *gem;
+	struct parhelia_bo *bo;
+	s64 offset;
 	u32 cpp, pitch_pixels;
 
 	if (crtc_state->color_mgmt_changed) {
@@ -726,16 +733,22 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 
 	if (!fb)
 		return 0;
-	if (!drm_gem_fb_get_obj(fb, 0) ||
-	    !parhelia_gem_is_owned(drm_gem_fb_get_obj(fb, 0)) ||
-	    !parhelia_bo_is_native(to_parhelia_bo(drm_gem_fb_get_obj(fb, 0))))
+	gem = drm_gem_fb_get_obj(fb, 0);
+	if (!gem || !parhelia_gem_is_owned(gem))
+		return -EINVAL;
+	bo = to_parhelia_bo(gem);
+	if (!parhelia_bo_is_native(bo))
 		return -EINVAL;
 	cpp = fb->format->cpp[0];
 	if (cpp != 4 || fb->pitches[0] % cpp)
 		return -EINVAL;
 	pitch_pixels = fb->pitches[0] / cpp;
-	if (pitch_pixels != roundup_pow_of_two(max_t(u32, fb->width, 64)) ||
-	    pitch_pixels > 0x3fff)
+	if (pitch_pixels != (bo->host_aperture ? bo->host_pitch : bo->gpu_pitch) / cpp ||
+	    bo->gpu_pitch / cpp != ALIGN(fb->width, 64) ||
+	    bo->gpu_pitch / cpp > 0x3fff)
+		return -EINVAL;
+	offset = drm_gem_vram_offset(&bo->gbo);
+	if (offset < 0 || offset > 0x0ffffc00 || !IS_ALIGNED(offset, 1024))
 		return -EINVAL;
 	return 0;
 }
@@ -806,7 +819,9 @@ parhelia_fb_create(struct drm_device *drm, struct drm_file *file,
 		goto out_put;
 	}
 	bo = to_parhelia_bo(gem);
-	if (!parhelia_bo_is_native(bo) || bo->pitch != mode_cmd->pitches[0] ||
+	if (!parhelia_bo_is_native(bo) ||
+	    (bo->host_aperture ? bo->host_pitch : bo->gpu_pitch) !=
+		mode_cmd->pitches[0] ||
 	    bo->width < mode_cmd->width || bo->height < mode_cmd->height) {
 		fb = ERR_PTR(-EINVAL);
 		goto out_put;

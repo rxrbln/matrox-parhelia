@@ -94,10 +94,15 @@ struct drm_parhelia_get_bo_info {
 	__u32 layout;
 	__u32 width;
 	__u32 height;
-	__u32 pitch;
+	__u32 pitch; /* out: native GPU byte pitch, not dumb host pitch */
 	__u32 pad;
 	__u64 size;
 };
+
+/* Native sharing is intentionally same-device: FLINK/OPEN or a self-imported
+ * PRIME fd preserves object identity for GET_BO_INFO.  The physical layout is
+ * not DRM_FORMAT_MOD_LINEAR and is not portable to another DRM device.
+ */
 
 #define PARHELIA_PARAM_CHIP_ID		0
 #define PARHELIA_PARAM_VRAM_SIZE	1

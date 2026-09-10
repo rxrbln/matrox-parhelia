@@ -318,8 +318,11 @@ struct parhelia_bo {
 	struct drm_gem_vram_object *aperture_reservation;
 	u32 width;
 	u32 height;
-	u32 pitch;
+	u32 gpu_pitch;
+	u32 host_pitch;
+	u32 alloc_height;
 	u32 aperture_offset;
+	size_t host_size;
 	u8 layout;
 	u8 aperture_slot;
 	bool host_aperture;
@@ -345,6 +348,7 @@ struct parhelia_device {
 	/* Slots 1..19 and their BAR0 ranges are global hardware state. */
 	struct mutex aperture_lock;
 	DECLARE_BITMAP(aperture_slots, PARHELIA_HOST_APERTURE_SLOTS);
+	bool aperture_live;
 	struct mutex submit_lock;
 	struct list_head vertex_bos;
 	/* The primary ring is small. Secondary packets use independently allocated
@@ -453,9 +457,10 @@ struct drm_gem_object *parhelia_gem_create_object(struct drm_device *drm, size_t
 int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 			 struct drm_mode_create_dumb *args);
 void parhelia_bo_set_layout(struct drm_gem_vram_object *gbo, u8 layout,
-			    u32 width, u32 height, u32 pitch);
+			    u32 width, u32 height, u32 gpu_pitch);
 bool parhelia_bo_is_native(const struct parhelia_bo *bo);
 bool parhelia_gem_is_owned(const struct drm_gem_object *gem);
+void parhelia_host_aperture_fini(struct parhelia_device *pdev);
 int parhelia_engine_init(struct parhelia_device *pdev);
 int parhelia_warp_init(struct parhelia_device *pdev);
 void parhelia_warp_trace_vertex(struct parhelia_device *pdev, const char *phase);

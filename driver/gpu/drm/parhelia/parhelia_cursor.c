@@ -102,7 +102,6 @@ static void parhelia_cursor_upload(struct parhelia_cursor *cursor,
 {
 	struct drm_framebuffer *fb = state->fb;
 	struct drm_gem_object *gem;
-	struct drm_gem_vram_object *source;
 	struct iosys_map source_map = {};
 	u32 palette[16] = { 0 };
 	unsigned int palette_count = 0;
@@ -119,21 +118,14 @@ static void parhelia_cursor_upload(struct parhelia_cursor *cursor,
 	gem = drm_gem_fb_get_obj(fb, 0);
 	if (!gem)
 		goto out_free;
-	source = drm_gem_vram_of_gem(gem);
-	ret = ttm_bo_reserve(&source->bo, true, false, NULL);
+	ret = drm_gem_vmap(gem, &source_map);
 	if (ret)
 		goto out_free;
-	ret = drm_gem_vram_vmap(source, &source_map);
-	if (ret) {
-		ttm_bo_unreserve(&source->bo);
-		goto out_free;
-	}
 	for (y = 0; y < fb->height; y++)
 		iosys_map_memcpy_from(&pixels[y * PARHELIA_CURSOR_WIDTH],
 				      &source_map, (size_t)y * fb->pitches[0],
 				      fb->width * sizeof(u32));
-	drm_gem_vram_vunmap(source, &source_map);
-	ttm_bo_unreserve(&source->bo);
+	drm_gem_vunmap(gem, &source_map);
 
 	for (i = 0; i < PARHELIA_CURSOR_WIDTH * PARHELIA_CURSOR_HEIGHT; i++)
 		if (pixels[i] >> 24)

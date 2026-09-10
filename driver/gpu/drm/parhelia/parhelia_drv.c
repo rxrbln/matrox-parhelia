@@ -297,6 +297,9 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 		pdev->irq_installed = false;
 		return dev_err_probe(&pci->dev, ret, "cannot initialize WARP engine\n");
 	}
+	mutex_lock(&pdev->aperture_lock);
+	pdev->aperture_live = pdev->raw_aperture_owned;
+	mutex_unlock(&pdev->aperture_lock);
 
 	/* Engine initialization enabled mastering only after installing our span. */
 	ret = drm_dev_register(drm, 0);
@@ -321,6 +324,7 @@ static void parhelia_pci_remove(struct pci_dev *pci)
 		free_irq(pci->irq, to_parhelia(drm));
 	}
 	parhelia_submit_fini(to_parhelia(drm));
+	parhelia_host_aperture_fini(to_parhelia(drm));
 }
 
 static struct pci_driver parhelia_pci_driver = {

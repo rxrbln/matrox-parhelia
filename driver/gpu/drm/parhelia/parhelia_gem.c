@@ -28,14 +28,14 @@ struct drm_gem_object *parhelia_gem_create_object(struct drm_device *drm, size_t
 }
 
 void parhelia_bo_set_layout(struct drm_gem_vram_object *gbo, u8 layout,
-			    u32 width, u32 height, u32 pitch)
+			    u32 width, u32 height, u32 gpu_pitch)
 {
 	struct parhelia_bo *bo = container_of(gbo, struct parhelia_bo, gbo);
 
 	bo->layout = layout;
 	bo->width = width;
 	bo->height = height;
-	bo->pitch = pitch;
+	bo->gpu_pitch = gpu_pitch;
 }
 
 bool parhelia_bo_is_native(const struct parhelia_bo *bo)
@@ -56,11 +56,31 @@ static void parhelia_host_descriptor_disable(struct parhelia_bo *bo)
 
 	mutex_lock(&pdev->aperture_lock);
 	if (bo->host_aperture) {
-		parhelia_write(pdev, PARHELIA_HOST_APERTURE_SLOT(bo->aperture_slot), 0);
-		parhelia_read(pdev,
-			      PARHELIA_HOST_APERTURE_SLOT(bo->aperture_slot));
-		__clear_bit(bo->aperture_slot, pdev->aperture_slots);
+		if (pdev->aperture_live) {
+			parhelia_write(pdev,
+				       PARHELIA_HOST_APERTURE_SLOT(bo->aperture_slot), 0);
+			parhelia_read(pdev,
+				      PARHELIA_HOST_APERTURE_SLOT(bo->aperture_slot));
+			__clear_bit(bo->aperture_slot, pdev->aperture_slots);
+		}
 		bo->host_aperture = false;
+	}
+	mutex_unlock(&pdev->aperture_lock);
+}
+
+void parhelia_host_aperture_fini(struct parhelia_device *pdev)
+{
+	unsigned int slot;
+
+	mutex_lock(&pdev->aperture_lock);
+	if (pdev->aperture_live) {
+		for (slot = 1; slot < PARHELIA_HOST_APERTURE_SLOTS; slot++)
+			parhelia_write(pdev, PARHELIA_HOST_APERTURE_SLOT(slot), 0);
+		parhelia_read(pdev,
+			      PARHELIA_HOST_APERTURE_SLOT(PARHELIA_HOST_APERTURE_SLOTS - 1));
+		bitmap_clear(pdev->aperture_slots, 1,
+			     PARHELIA_HOST_APERTURE_SLOTS - 1);
+		pdev->aperture_live = false;
 	}
 	mutex_unlock(&pdev->aperture_lock);
 }
@@ -101,11 +121,18 @@ static int parhelia_host_object_vmap(struct drm_gem_object *gem,
 {
 	struct parhelia_bo *bo = to_parhelia_bo(gem);
 	struct parhelia_device *pdev = to_parhelia(gem->dev);
+	void __iomem *addr;
+	int ret = 0;
 
-	if (!bo->host_aperture)
-		return -EINVAL;
-	iosys_map_set_vaddr_iomem(map, (u8 __iomem *)pdev->vram + bo->aperture_offset);
-	return 0;
+	mutex_lock(&pdev->aperture_lock);
+	if (!pdev->aperture_live || !bo->host_aperture) {
+		ret = -ENODEV;
+	} else {
+		addr = (u8 __iomem *)pdev->vram + bo->aperture_offset;
+		iosys_map_set_vaddr_iomem(map, addr);
+	}
+	mutex_unlock(&pdev->aperture_lock);
+	return ret;
 }
 
 static void parhelia_host_object_vunmap(struct drm_gem_object *gem,
@@ -139,11 +166,27 @@ static int parhelia_host_object_mmap(struct drm_gem_object *gem,
 	struct parhelia_bo *bo = to_parhelia_bo(gem);
 	struct parhelia_device *pdev = to_parhelia(gem->dev);
 	resource_size_t base;
+	u64 map_offset, node_start;
+	int ret;
 
-	if (!bo->host_aperture || vma->vm_end - vma->vm_start > gem->size)
-		return -EINVAL;
+	mutex_lock(&pdev->aperture_lock);
+	if (!pdev->aperture_live || !bo->host_aperture) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+	node_start = drm_vma_node_start(&gem->vma_node);
+	if (vma->vm_pgoff < node_start) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+	map_offset = (u64)(vma->vm_pgoff - node_start) << PAGE_SHIFT;
+	if (map_offset >= bo->host_size ||
+	    vma->vm_end - vma->vm_start > bo->host_size - map_offset) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
 
-	base = pci_resource_start(pdev->pdev, 0) + bo->aperture_offset;
+	base = pci_resource_start(pdev->pdev, 0) + bo->aperture_offset + map_offset;
 	/* drm_gem_mmap() has already consumed the fake GEM offset.  The physical
 	 * mapping begins at the descriptor's BAR0 aperture range.
 	 */
@@ -151,7 +194,10 @@ static int parhelia_host_object_mmap(struct drm_gem_object *gem,
 	vma->vm_ops = &parhelia_host_vm_ops;
 	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
-	return vm_iomap_memory(vma, base, gem->size);
+	ret = vm_iomap_memory(vma, base, bo->host_size - map_offset);
+out_unlock:
+	mutex_unlock(&pdev->aperture_lock);
+	return ret;
 }
 
 static const struct drm_gem_object_funcs parhelia_host_object_funcs = {
@@ -168,8 +214,8 @@ static int parhelia_host_descriptor_enable(struct parhelia_device *pdev,
 {
 	u32 reg = PARHELIA_HOST_APERTURE_SLOT(bo->aperture_slot);
 	u32 ctrl = (PARHELIA_HOST_FORMAT_XRGB8888 << 24) |
-		   (3u << 16) | bo->width;
-	u32 dims = BIT(16) | bo->height;
+		   (3u << 16) | (bo->gpu_pitch / 4);
+	u32 dims = BIT(16) | bo->alloc_height;
 
 	/* Descriptor words 1..3 are private until VALID is written last. */
 	parhelia_write(pdev, reg, 0);
@@ -191,28 +237,37 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	struct drm_gem_vram_object *reservation = NULL, *gbo = NULL;
 	struct parhelia_bo *bo;
 	unsigned long align_pages, native_align_pages, slot;
-	u32 pitch_pixels, alloc_height;
+	u32 gpu_pitch_pixels, host_pitch_pixels, alloc_height;
 	s64 aperture_offset, surface_offset;
-	size_t size, reservation_size;
+	size_t host_size, native_size, size, reservation_size;
 	u32 handle;
 	int ret;
 
 	if (!args->width || !args->height || args->width > 2048 ||
 	    args->height > 2048 || args->bpp != 32 || !pdev->raw_aperture_owned)
 		return -EINVAL;
-	pitch_pixels = roundup_pow_of_two(max_t(u32, args->width, 64));
+	gpu_pitch_pixels = ALIGN(args->width, 64);
+	host_pitch_pixels = roundup_pow_of_two(max_t(u32, args->width, 64));
 	alloc_height = ALIGN(args->height,
 			     pdev->chip->tile_layout == PARHELIA_TILE_64X16_4K ?
 			     16 : 32);
-	if (check_mul_overflow((size_t)pitch_pixels * 4, (size_t)alloc_height,
-			       &size))
+	if (check_mul_overflow((size_t)host_pitch_pixels * 4,
+			       (size_t)alloc_height, &host_size) ||
+	    check_mul_overflow((size_t)gpu_pitch_pixels * 4,
+			       (size_t)alloc_height, &native_size))
 		return -EOVERFLOW;
-	size = PAGE_ALIGN(size);
-	reservation_size = ALIGN(size, PARHELIA_HOST_APERTURE_ALIGN) +
+	host_size = PAGE_ALIGN(host_size);
+	native_size = PAGE_ALIGN(native_size);
+	size = max(host_size, native_size);
+	reservation_size = ALIGN(host_size, PARHELIA_HOST_APERTURE_ALIGN) +
 			   PARHELIA_HOST_APERTURE_ALIGN;
 	align_pages = PARHELIA_HOST_APERTURE_ALIGN / PAGE_SIZE;
 
 	mutex_lock(&pdev->aperture_lock);
+	if (!pdev->aperture_live) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
 	slot = find_next_zero_bit(pdev->aperture_slots,
 				  PARHELIA_HOST_APERTURE_SLOTS, 1);
 	if (slot == PARHELIA_HOST_APERTURE_SLOTS) {
@@ -260,8 +315,11 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	bo->aperture_reservation = reservation;
 	bo->width = args->width;
 	bo->height = args->height;
-	bo->pitch = pitch_pixels * 4;
+	bo->gpu_pitch = gpu_pitch_pixels * 4;
+	bo->host_pitch = host_pitch_pixels * 4;
+	bo->alloc_height = alloc_height;
 	bo->aperture_offset = aperture_offset;
+	bo->host_size = host_size;
 	bo->aperture_slot = slot;
 	bo->layout = pdev->chip->tile_layout == PARHELIA_TILE_64X16_4K ?
 		PARHELIA_BO_LAYOUT_NATIVE_64X16 : PARHELIA_BO_LAYOUT_NATIVE_64X32;
@@ -275,10 +333,10 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 		drm_gem_object_put(&gbo->bo.base);
 		return ret;
 	}
-	drm_gem_object_put(&gbo->bo.base);
 	args->handle = handle;
-	args->pitch = bo->pitch;
-	args->size = size;
+	args->pitch = host_pitch_pixels * 4;
+	args->size = host_size;
+	drm_gem_object_put(&gbo->bo.base);
 	return 0;
 
 out_unpin_gbo:
@@ -318,7 +376,7 @@ int parhelia_get_bo_info_ioctl(struct drm_device *drm, void *data,
 	args->layout = bo->layout;
 	args->width = bo->width;
 	args->height = bo->height;
-	args->pitch = bo->pitch;
+	args->pitch = bo->gpu_pitch;
 	args->size = gem->size;
 	drm_gem_object_put(gem);
 	return 0;
