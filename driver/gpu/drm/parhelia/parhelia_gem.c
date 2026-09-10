@@ -10,6 +10,7 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_ttm_helper.h>
 #include <drm/drm_ioctl.h>
+#include <drm/drm_managed.h>
 
 #include "parhelia_drv.h"
 
@@ -23,6 +24,59 @@ static bool texture_upload_probe;
 module_param(texture_upload_probe, bool, 0400);
 MODULE_PARM_DESC(texture_upload_probe,
 	"Enable guarded type-0 transient-aperture texture uploads");
+
+static bool texture_upload_trace;
+module_param(texture_upload_trace, bool, 0400);
+MODULE_PARM_DESC(texture_upload_trace,
+	"Log up to 4096 transient texture-upload aperture chunks");
+
+static atomic_t texture_upload_trace_count = ATOMIC_INIT(0);
+
+static_assert(IS_ALIGNED(SZ_8K, sizeof(u32)));
+static_assert(SZ_8K / sizeof(u32) <= GENMASK(13, 0));
+
+static void parhelia_bootstrap_reservation_release(struct drm_device *drm,
+						   void *data)
+{
+	struct drm_gem_vram_object *reservation = data;
+
+	parhelia_vram_unpin(reservation);
+	drm_gem_vram_put(reservation);
+}
+
+int parhelia_host_aperture_reserve_bootstrap(struct parhelia_device *pdev)
+{
+	struct drm_gem_vram_object *reservation;
+	s64 offset;
+	int ret;
+
+	/* Slot zero permanently describes BAR coordinates [0, 256 KiB).  Keep
+	 * TTM from placing any object there even though normal mappings use slots
+	 * 1..19; otherwise a stray access through the bootstrap descriptor can
+	 * alias live storage.  This runs before any other driver VRAM allocation.
+	 */
+	reservation = drm_gem_vram_create(&pdev->drm,
+					  PARHELIA_HOST_APERTURE_ALIGN, 1);
+	if (IS_ERR(reservation))
+		return PTR_ERR(reservation);
+	ret = parhelia_vram_pin(reservation);
+	if (ret)
+		goto out_put;
+	offset = drm_gem_vram_offset(reservation);
+	if (offset != 0) {
+		ret = -ERANGE;
+		goto out_unpin;
+	}
+	return drmm_add_action_or_reset(&pdev->drm,
+					parhelia_bootstrap_reservation_release,
+					reservation);
+
+out_unpin:
+	parhelia_vram_unpin(reservation);
+out_put:
+	drm_gem_vram_put(reservation);
+	return ret;
+}
 
 struct drm_gem_object *parhelia_gem_create_object(struct drm_device *drm, size_t size)
 {
@@ -383,7 +437,8 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	if (ret)
 		goto out_reservation;
 	aperture_offset = drm_gem_vram_offset(reservation);
-	if (aperture_offset < 0 || aperture_offset >= PARHELIA_HOST_APERTURE_VALID ||
+	if (aperture_offset < PARHELIA_HOST_APERTURE_ALIGN ||
+	    aperture_offset >= PARHELIA_HOST_APERTURE_VALID ||
 	    !IS_ALIGNED(aperture_offset, PARHELIA_HOST_APERTURE_ALIGN)) {
 		ret = -ERANGE;
 		goto out_unpin_reservation;
@@ -549,7 +604,7 @@ int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
 	if (ret)
 		goto out_reservation;
 	aperture_offset = drm_gem_vram_offset(reservation);
-	if (aperture_offset < 0 ||
+	if (aperture_offset < PARHELIA_HOST_APERTURE_ALIGN ||
 	    aperture_offset >= PARHELIA_HOST_APERTURE_VALID ||
 	    !IS_ALIGNED(aperture_offset, PARHELIA_HOST_APERTURE_ALIGN)) {
 		ret = -ERANGE;
@@ -560,6 +615,17 @@ int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
 	dims = BIT(16) | 1;
 	for (copied = 0; copied < args->size;) {
 		u32 bytes = min_t(u64, args->size - copied, SZ_8K);
+		u32 width;
+
+		if (!IS_ALIGNED(bytes, sizeof(u32))) {
+			ret = -EINVAL;
+			goto out_disable;
+		}
+		width = bytes / sizeof(u32);
+		if (!width || width > GENMASK(13, 0)) {
+			ret = -E2BIG;
+			goto out_disable;
+		}
 
 		ret = parhelia_vram_gpu_addr(pdev, &bo->gbo,
 				args->offset + copied, bytes, &surface_address);
@@ -568,7 +634,15 @@ int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
 		/* 0x10/type 0 is the measured byte-linear bootstrap format.  Mesa
 		 * supplies the already-swizzled native bytes, so this is an opaque
 		 * view and cannot apply the 32x16 texture transform a second time. */
-		ctrl = (0x10u << 24) | bytes;
+		ctrl = (0x10u << 24) | width;
+		if (texture_upload_trace &&
+		    atomic_inc_return(&texture_upload_trace_count) <= 4096)
+			dev_info(&pdev->pdev->dev,
+				 "texture upload slot=%lu aperture=%#llx surface=%#x copied=%#llx total=%#llx bo_offset=%#llx bytes=%#x ctrl=%#x\n",
+				 slot, (unsigned long long)aperture_offset,
+				 surface_address, (unsigned long long)copied,
+				 (unsigned long long)args->size,
+				 (unsigned long long)args->offset, bytes, ctrl);
 		parhelia_write(pdev, reg, 0);
 		parhelia_write(pdev, reg + 4, surface_address);
 		parhelia_write(pdev, reg + 8, ctrl);

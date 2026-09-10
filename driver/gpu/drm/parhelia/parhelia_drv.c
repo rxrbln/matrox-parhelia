@@ -256,6 +256,10 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 		return ret;
 	bitmap_zero(pdev->aperture_slots, PARHELIA_HOST_APERTURE_SLOTS);
 	__set_bit(0, pdev->aperture_slots);
+	ret = parhelia_host_aperture_reserve_bootstrap(pdev);
+	if (ret)
+		return dev_err_probe(&pci->dev, ret,
+				     "cannot reserve bootstrap aperture range\n");
 	INIT_LIST_HEAD(&pdev->vertex_bos);
 	pdev->primary_cpu = dmam_alloc_coherent(&pci->dev,
 			PARHELIA_PRIMARY_DWORDS * sizeof(u32),

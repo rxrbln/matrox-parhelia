@@ -468,6 +468,7 @@ bool parhelia_texture_upload_enabled(void);
 bool parhelia_bo_is_native(const struct parhelia_bo *bo);
 bool parhelia_gem_is_owned(const struct drm_gem_object *gem);
 void parhelia_host_aperture_fini(struct parhelia_device *pdev);
+int parhelia_host_aperture_reserve_bootstrap(struct parhelia_device *pdev);
 int parhelia_engine_init(struct parhelia_device *pdev);
 int parhelia_warp_init(struct parhelia_device *pdev);
 void parhelia_warp_trace_vertex(struct parhelia_device *pdev, const char *phase);
