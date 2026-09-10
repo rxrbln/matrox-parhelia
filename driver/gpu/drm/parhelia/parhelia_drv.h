@@ -226,10 +226,7 @@ struct parhelia_bios {
 #define PARHELIA_ASYNC_PRIMARY_DWORDS	(PARHELIA_ASYNC_SLOTS * PARHELIA_SLOT_PRIMARY_DWORDS)
 #define PARHELIA_MAX_RELOCS		(PARHELIA_MAX_USER_PACKETS + 64u)
 #define PARHELIA_DMA_BLOCK_DWORDS	4096u
-/* One 128 KiB coherent class-3 upload per submit slot.  This is deliberately
- * independent from command storage: large transformed draws should not force
- * a new ioctl merely because the old 16 KiB vertex scratch filled first. */
-#define PARHELIA_VERTEX_DWORDS		32768u
+#define PARHELIA_VERTEX_DWORDS		4096u
 #define PARHELIA_VERTEX_BO_MAX_SIZE	(1u << 20)
 
 /* Heap-relative instruction entries. Runtime GET_PARAM returns the DMA

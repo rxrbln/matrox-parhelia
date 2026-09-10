@@ -2261,9 +2261,6 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		args->value = pdev->pdev->device == PARHELIA_P690 &&
 			pdev->raw_aperture_owned && parhelia_texture_upload_enabled();
 		break;
-	case PARHELIA_PARAM_MAX_VERTEX_DWORDS:
-		args->value = PARHELIA_VERTEX_DWORDS;
-		break;
 	default:
 		return -EINVAL;
 	}
