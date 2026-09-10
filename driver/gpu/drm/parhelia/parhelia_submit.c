@@ -1622,171 +1622,6 @@ static int parhelia_wait_fence(struct parhelia_device *pdev, u32 fence)
 	return -ETIMEDOUT;
 }
 
-/*
- * Synchronous KMS copy from a CPU-visible type-1 XRGB8888 surface to the
- * native type-3 scanout layout.  This is the same slot-2 -> slot-0 BITBLT
- * exercised by the vendor driver, submitted through the kernel-owned DMA
- * buffers so display updates never expose addresses or packets to userspace.
- *
- * The caller owns the lifetime and placement of both VRAM ranges.  submit_lock
- * makes this copy coherent with render-node work; completion is observed with
- * the normal DWGSYNC fence before scanout is allowed to consume the result.
- */
-int parhelia_submit_linear_to_tiled(struct parhelia_device *pdev,
-				    u32 src_base, u32 src_pitch,
-				    u32 dst_base, u32 dst_pitch,
-				    u32 x, u32 y, u32 width, u32 height)
-{
-	static const u8 order[] = { 1, 0, 2, 3 };
-	struct parhelia_dma_block *blocks = pdev->dma_blocks;
-	u32 *cmd, *primary = pdev->primary_cpu;
-	u32 done, fence = 0, fence_step, tag, words = 0;
-	u64 src_end, dst_end;
-	unsigned int i, waited;
-	int ret;
-
-	if (pdev->chip->tile_layout != PARHELIA_TILE_64X16_4K)
-		return -EOPNOTSUPP;
-	if (!width || !height || src_pitch > 0x3fff || dst_pitch > 0x3fff ||
-	    x >= src_pitch || x >= dst_pitch || width > src_pitch - x ||
-	    width > dst_pitch - x || x > U16_MAX || y > U16_MAX ||
-	    width > U16_MAX - x || height > U16_MAX - y ||
-	    (src_base & 3) || (dst_base & 3))
-		return -EINVAL;
-
-	/* The linear bound is exact.  The tiled bound charges complete 64x16
-	 * P690 tiles touched by the requested bottom scanline. */
-	src_end = src_base + ((u64)(y + height - 1) * src_pitch + x + width) * 4;
-	dst_end = dst_base + (u64)DIV_ROUND_UP(dst_pitch, 64) *
-		DIV_ROUND_UP(y + height, 16) * 4096;
-	if (src_end > pdev->vram_size || dst_end > pdev->vram_size)
-		return -EINVAL;
-
-retry:
-	mutex_lock(&pdev->submit_lock);
-	parhelia_retire_locked(pdev);
-	if (pdev->queued_slots) {
-		mutex_unlock(&pdev->submit_lock);
-		ret = wait_event_timeout(pdev->submit_waitq,
-			READ_ONCE(pdev->wedged) || !READ_ONCE(pdev->queued_slots),
-			usecs_to_jiffies(PARHELIA_FENCE_TIMEOUT_US) + 1);
-		if (ret)
-			goto retry;
-		return -EBUSY;
-	}
-	if (pdev->wedged) {
-		ret = -EIO;
-		goto out_unlock;
-	}
-	ret = parhelia_engine_init(pdev);
-	if (ret)
-		goto out_unlock;
-
-	/* An earlier asynchronous span may have retired while leaving its primary
-	 * fetcher armed.  It must be idle before replacing the primary base. */
-	if (pdev->primary_armed) {
-		ret = parhelia_wait_dma_idle(pdev);
-		if (ret)
-			goto timeout;
-		pdev->primary_armed = false;
-		pdev->primary_put = 0;
-		pdev->primary_get = 0;
-	}
-
-	for (i = 0; i < ARRAY_SIZE(order); i++) {
-		struct parhelia_dma_block *block = &blocks[i];
-
-		if (!block->cpu) {
-			block->cpu = dmam_alloc_coherent(&pdev->pdev->dev,
-				PARHELIA_DMA_BLOCK_DWORDS * sizeof(u32), &block->bus,
-				GFP_KERNEL);
-			if (!block->cpu) {
-				ret = -ENOMEM;
-				goto out_unlock;
-			}
-		}
-	}
-
-	cmd = blocks[0].cpu;
-	cmd[0] = 0x0000000b;
-	cmd[1] = 0x8d8c8988;
-	cmd[2] = dst_base;
-	cmd[3] = (0x32u << 24) | (3u << 16) | dst_pitch;
-	cmd[4] = src_base;
-	cmd[5] = (0x32u << 24) | (1u << 16) | src_pitch;
-	cmd[6] = 0xc2c1c0c9;
-	cmd[7] = 0xffffffff;
-	cmd[8] = 0x000002c2;
-	cmd[9] = (y << 16) | x;
-	cmd[10] = (y << 16) | x;
-	cmd[11] = 0x212121e3;
-	cmd[12] = (height << 16) | width;
-
-	done = parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE) & ~7u;
-	if (done > U32_MAX - 24) {
-		ret = -EOVERFLOW;
-		goto out_unlock;
-	}
-	fence = done + 8;
-	fence_step = replay_fences ? 16 : 8;
-	parhelia_emit_fences(blocks, 1, fence, fence + fence_step, 0x000002c2);
-	fence += fence_step;
-
-	for (i = 0; i < ARRAY_SIZE(order); i++) {
-		struct parhelia_dma_block *block = &blocks[order[i]];
-		u32 block_words = order[i] == 0 ? 13 : order[i] == 1 ? 5 :
-			order[i] == 2 ? 3 : 6;
-
-		primary[words++] = PARHELIA_CALL_HEADER;
-		primary[words++] = 0;
-		primary[words++] = lower_32_bits(block->bus) | 2;
-		primary[words++] = lower_32_bits(block->bus + block_words * 4) | 3;
-		primary[words++] = 0;
-	}
-	tag = ++pdev->next_dma_tag;
-	if (!tag)
-		tag = ++pdev->next_dma_tag;
-	primary[words++] = 0x21212425;
-	primary[words++] = tag;
-	primary[words++] = lower_32_bits(pdev->writeback_bus) + 0x20;
-
-	dma_wmb();
-	parhelia_write(pdev, PARHELIA_MMIO_RING_START,
-		       lower_32_bits(pdev->primary_bus));
-	parhelia_write(pdev, PARHELIA_MMIO_RING_END,
-		       lower_32_bits(pdev->primary_bus + words * sizeof(u32)) | 3);
-	parhelia_write(pdev, 0x0314, 1);
-	for (waited = 0; waited < PARHELIA_FENCE_TIMEOUT_US; waited++) {
-		if (READ_ONCE(((u32 *)pdev->writeback_cpu)[8]) == tag)
-			break;
-		udelay(1);
-	}
-	if (waited == PARHELIA_FENCE_TIMEOUT_US) {
-		ret = -ETIMEDOUT;
-		goto timeout;
-	}
-	dma_rmb();
-	ret = parhelia_wait_fence(pdev, fence);
-	if (ret)
-		goto timeout;
-	parhelia_state_shadow_invalidate(pdev, "KMS linear-to-tiled blit");
-	mutex_unlock(&pdev->submit_lock);
-	return 0;
-
-timeout:
-	dev_err(&pdev->pdev->dev,
-		"KMS blit timeout: BM=%08x prim=%08x/%08x fence=%08x want=%08x\n",
-		parhelia_read(pdev, 0x08f0), parhelia_read(pdev, 0x0404),
-		parhelia_read(pdev, 0x0408),
-		parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE), fence);
-	pdev->wedged = true;
-	parhelia_state_shadow_invalidate(pdev, "KMS blit timeout");
-	pci_clear_master(pdev->pdev);
-out_unlock:
-	mutex_unlock(&pdev->submit_lock);
-	return ret;
-}
-
 int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 				 struct drm_file *file)
 {
@@ -1794,12 +1629,13 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	struct parhelia_device *pdev = to_parhelia(drm);
 	struct drm_gem_vram_object *bo;
 	unsigned long align_pages;
-	u32 allocation_height;
+	u8 layout;
+	u32 allocation_height, pitch;
 	size_t bo_size;
 	u32 handle;
 	int ret;
 
-	if (!args->width || args->width > 1024 || !args->height || args->height > 768 ||
+	if (!args->width || args->width > 2048 || !args->height || args->height > 2048 ||
 	    args->flags & ~(PARHELIA_CREATE_RENDER_LINEAR | PARHELIA_CREATE_RENDER_TEXTURE) ||
 	    ((args->flags & PARHELIA_CREATE_RENDER_LINEAR) &&
 	     (args->flags & PARHELIA_CREATE_RENDER_TEXTURE)) || args->pad ||
@@ -1835,6 +1671,16 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	bo = drm_gem_vram_create(drm, bo_size, align_pages);
 	if (IS_ERR(bo))
 		return PTR_ERR(bo);
+	if (args->flags & PARHELIA_CREATE_RENDER_LINEAR)
+		layout = PARHELIA_BO_LAYOUT_LINEAR;
+	else if (args->flags & PARHELIA_CREATE_RENDER_TEXTURE)
+		layout = PARHELIA_BO_LAYOUT_TEXTURE;
+	else if (pdev->chip->tile_layout == PARHELIA_TILE_64X16_4K)
+		layout = PARHELIA_BO_LAYOUT_NATIVE_64X16;
+	else
+		layout = PARHELIA_BO_LAYOUT_NATIVE_64X32;
+	pitch = ALIGN(args->width, 64) * 4;
+	parhelia_bo_set_layout(bo, layout, args->width, args->height, pitch);
 	ret = drm_gem_handle_create(file, &bo->bo.base, &handle);
 	if (!ret)
 		args->mmap_offset = drm_vma_node_offset_addr(&bo->bo.base.vma_node);
@@ -1842,7 +1688,7 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	if (ret)
 		return ret;
 	args->handle = handle;
-	args->pitch = ALIGN(args->width, 64) * 4;
+	args->pitch = pitch;
 	args->size = bo_size;
 	return 0;
 }
@@ -1994,6 +1840,9 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		args->value = stateful_submit && pdev->async_primary_cpu &&
 			!trace_submit && !full_sync && !post_draw_wb &&
 			coalesce_primary;
+		break;
+	case PARHELIA_PARAM_NATIVE_SHARE:
+		args->value = pdev->raw_aperture_owned;
 		break;
 	default:
 		return -EINVAL;

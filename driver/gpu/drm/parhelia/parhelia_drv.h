@@ -4,6 +4,7 @@
 
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/sizes.h>
 #include <linux/list.h>
 #include <linux/workqueue.h>
 #include <linux/dma-fence.h>
@@ -16,7 +17,7 @@
 #include <drm/drm_gem_vram_helper.h>
 #include <linux/iosys-map.h>
 
-#include <drm/parhelia_drm.h>
+#include "parhelia_drm.h"
 
 struct drm_file;
 struct drm_gem_vram_object;
@@ -135,11 +136,13 @@ struct parhelia_bios {
 
 /* Host-aperture surface descriptors.  BAR0 accesses falling inside a valid
  * descriptor are translated between a CPU-linear view and the surface layout
- * named by CTRL.  Keep slot 0 for the engine bootstrap and dedicate slot 1 to
- * the active KMS framebuffer. */
+ * named by CTRL.  Slot 0 remains the engine bootstrap; dumb BOs own slots
+ * 1..19 for their whole mapped/pinned lifetime.
+ */
 #define PARHELIA_HOST_APERTURE_SLOT(n)	((n) * 0x10)
 #define PARHELIA_HOST_APERTURE_VALID	BIT(28)
-#define PARHELIA_HOST_APERTURE_KMS_SLOT	1
+#define PARHELIA_HOST_APERTURE_SLOTS	20
+#define PARHELIA_HOST_APERTURE_ALIGN	SZ_256K
 #define PARHELIA_DC_LUT_INDEX		0x038
 #define PARHELIA_DC_LUT_R		0x03c
 #define PARHELIA_DC_LUT_G		0x040
@@ -306,6 +309,27 @@ struct parhelia_reg_shadow {
 	DECLARE_BITMAP(valid, PARHELIA_INDEXED_REGS);
 };
 
+/* All driver-created GEM objects use this wrapper.  Most retain the standard
+ * raw TTM mapping.  Dumb framebuffers additionally own a long-lived host
+ * aperture descriptor which gives their native bytes a CPU-linear alias.
+ */
+struct parhelia_bo {
+	struct drm_gem_vram_object gbo;
+	struct drm_gem_vram_object *aperture_reservation;
+	u32 width;
+	u32 height;
+	u32 pitch;
+	u32 aperture_offset;
+	u8 layout;
+	u8 aperture_slot;
+	bool host_aperture;
+};
+
+static inline struct parhelia_bo *to_parhelia_bo(struct drm_gem_object *gem)
+{
+	return container_of(drm_gem_vram_of_gem(gem), struct parhelia_bo, gbo);
+}
+
 struct parhelia_device {
 	struct drm_device drm;
 	struct pci_dev *pdev;
@@ -315,17 +339,12 @@ struct parhelia_device {
 	resource_size_t vram_size;
 	struct parhelia_bios bios;
 	struct drm_simple_display_pipe pipe;
-	/* Userspace framebuffers stay linear.  The display controller scans this
-	 * private native-layout image, updated from atomic plane damage. */
-	struct drm_gem_vram_object *scanout_bo;
-	struct iosys_map scanout_map;
-	u8 *scanout_tile;
-	size_t scanout_size;
-	u32 scanout_pitch;
-	u32 scanout_height;
 	struct parhelia_output outputs[PARHELIA_MAX_OUTPUTS];
 	u8 num_outputs;
 	struct mutex ddc_lock;
+	/* Slots 1..19 and their BAR0 ranges are global hardware state. */
+	struct mutex aperture_lock;
+	DECLARE_BITMAP(aperture_slots, PARHELIA_HOST_APERTURE_SLOTS);
 	struct mutex submit_lock;
 	struct list_head vertex_bos;
 	/* The primary ring is small. Secondary packets use independently allocated
@@ -428,18 +447,22 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 			  struct drm_file *file);
 int parhelia_wait_fence_ioctl(struct drm_device *drm, void *data,
 				     struct drm_file *file);
+int parhelia_get_bo_info_ioctl(struct drm_device *drm, void *data,
+			       struct drm_file *file);
+struct drm_gem_object *parhelia_gem_create_object(struct drm_device *drm, size_t size);
+int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
+			 struct drm_mode_create_dumb *args);
+void parhelia_bo_set_layout(struct drm_gem_vram_object *gbo, u8 layout,
+			    u32 width, u32 height, u32 pitch);
+bool parhelia_bo_is_native(const struct parhelia_bo *bo);
+bool parhelia_gem_is_owned(const struct drm_gem_object *gem);
 int parhelia_engine_init(struct parhelia_device *pdev);
 int parhelia_warp_init(struct parhelia_device *pdev);
 void parhelia_warp_trace_vertex(struct parhelia_device *pdev, const char *phase);
 void parhelia_submit_fini(struct parhelia_device *pdev);
 int parhelia_submit_init(struct parhelia_device *pdev);
-int parhelia_submit_linear_to_tiled(struct parhelia_device *pdev,
-				    u32 src_base, u32 src_pitch,
-				    u32 dst_base, u32 dst_pitch,
-				    u32 x, u32 y, u32 width, u32 height);
 int parhelia_vram_pin(struct drm_gem_vram_object *bo);
 void parhelia_vram_unpin(struct drm_gem_vram_object *bo);
-void parhelia_scanout_fini(struct parhelia_device *pdev);
 int parhelia_cursor_init(struct parhelia_device *pdev);
 void parhelia_state_shadow_invalidate(struct parhelia_device *pdev,
 				      const char *reason);

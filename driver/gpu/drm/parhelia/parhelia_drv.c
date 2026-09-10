@@ -24,14 +24,6 @@ MODULE_PARM_DESC(reset_on_probe, "Reset PCI function before initialization (brin
 
 DEFINE_DRM_GEM_FOPS(parhelia_fops);
 
-static int parhelia_dumb_create(struct drm_file *file, struct drm_device *dev,
-				struct drm_mode_create_dumb *args)
-{
-	/* Dumb buffers are ordinary linear storage.  Native tile-row padding is
-	 * private to the KMS scanout object. */
-	return drm_gem_vram_fill_create_dumb(file, dev, 0, SZ_4K, args);
-}
-
 static void parhelia_postclose(struct drm_device *drm, struct drm_file *file)
 {
 	parhelia_submit_postclose(to_parhelia(drm), file);
@@ -48,6 +40,8 @@ static const struct drm_ioctl_desc parhelia_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(PARHELIA_WAIT_FENCE, parhelia_wait_fence_ioctl,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(PARHELIA_GET_BO_INFO, parhelia_get_bo_info_ioctl,
+			  DRM_RENDER_ALLOW),
 };
 
 static const struct drm_driver parhelia_driver = {
@@ -56,6 +50,7 @@ static const struct drm_driver parhelia_driver = {
 	.postclose = parhelia_postclose,
 	.ioctls = parhelia_ioctls,
 	.num_ioctls = ARRAY_SIZE(parhelia_ioctls),
+	.gem_create_object = parhelia_gem_create_object,
 	.debugfs_init = drm_vram_mm_debugfs_init,
 	.dumb_create = parhelia_dumb_create,
 	.dumb_map_offset = drm_gem_ttm_dumb_map_offset,
@@ -254,6 +249,11 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	ret = drmm_mutex_init(drm, &pdev->submit_lock);
 	if (ret)
 		return ret;
+	ret = drmm_mutex_init(drm, &pdev->aperture_lock);
+	if (ret)
+		return ret;
+	bitmap_zero(pdev->aperture_slots, PARHELIA_HOST_APERTURE_SLOTS);
+	__set_bit(0, pdev->aperture_slots);
 	INIT_LIST_HEAD(&pdev->vertex_bos);
 	pdev->primary_cpu = dmam_alloc_coherent(&pci->dev,
 			PARHELIA_PRIMARY_DWORDS * sizeof(u32),
@@ -321,7 +321,6 @@ static void parhelia_pci_remove(struct pci_dev *pci)
 		free_irq(pci->irq, to_parhelia(drm));
 	}
 	parhelia_submit_fini(to_parhelia(drm));
-	parhelia_scanout_fini(to_parhelia(drm));
 }
 
 static struct pci_driver parhelia_pci_driver = {

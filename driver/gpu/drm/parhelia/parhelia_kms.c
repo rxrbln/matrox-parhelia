@@ -524,210 +524,6 @@ static void parhelia_apply_vid_reset(struct parhelia_device *pdev,
 		       ~PARHELIA_DCT_RESET);
 }
 
-static unsigned int parhelia_scanout_tile_height(struct parhelia_device *pdev)
-{
-	return pdev->chip->tile_layout == PARHELIA_TILE_64X32_8K ? 32 : 16;
-}
-
-static size_t parhelia_scanout_pixel_offset(struct parhelia_device *pdev,
-					    u32 x, u32 y, u32 pitch)
-{
-	u32 tile_h = parhelia_scanout_tile_height(pdev);
-	u32 tile_bytes = 64 * tile_h * 4;
-	u32 tiles_per_row = pitch / 64;
-	u32 tile_x = x / 64;
-	u32 tile_y = y / tile_h;
-	u32 ix = x & 63;
-	u32 iy = y & (tile_h - 1);
-	u32 x5 = ((ix >> 5) & 1) ^ (tile_y & 1);
-	u32 i;
-
-	i = (ix & 1) |
-	    (((ix >> 1) & 1) << 1) |
-	    (((ix >> 2) & 1) << 2) |
-	    (((iy >> 1) & 1) << 3) |
-	    (((ix >> 3) & 1) << 4) |
-	    (((ix >> 4) & 1) << 5) |
-	    ((iy & 1) << 6) |
-	    (x5 << 7) |
-	    (((iy >> 2) & 1) << 8) |
-	    (((iy >> 3) & 1) << 9);
-	if (tile_h == 32)
-		i |= ((iy >> 4) & 1) << 10;
-
-	return ((size_t)tile_y * tiles_per_row + tile_x) * tile_bytes + i * 4;
-}
-
-static void parhelia_scanout_release(struct parhelia_device *pdev)
-{
-	struct drm_gem_vram_object *bo = pdev->scanout_bo;
-
-	if (!bo)
-		return;
-	if (!ttm_bo_reserve(&bo->bo, false, false, NULL)) {
-		drm_gem_vram_vunmap(bo, &pdev->scanout_map);
-		ttm_bo_unreserve(&bo->bo);
-	}
-	parhelia_vram_unpin(bo);
-	drm_gem_vram_put(bo);
-	pdev->scanout_bo = NULL;
-	iosys_map_clear(&pdev->scanout_map);
-	kfree(pdev->scanout_tile);
-	pdev->scanout_tile = NULL;
-	pdev->scanout_size = 0;
-	pdev->scanout_pitch = 0;
-	pdev->scanout_height = 0;
-}
-
-void parhelia_scanout_fini(struct parhelia_device *pdev)
-{
-	parhelia_scanout_release(pdev);
-}
-
-static int parhelia_scanout_ensure(struct parhelia_device *pdev,
-				   u32 pitch, u32 height)
-{
-	struct drm_gem_vram_object *bo;
-	struct iosys_map map = { };
-	u32 tile_h = parhelia_scanout_tile_height(pdev);
-	u32 alloc_height = ALIGN(height, tile_h);
-	size_t size = PAGE_ALIGN((size_t)pitch * alloc_height * 4);
-	u8 *tile;
-	int ret;
-
-	if (pdev->scanout_bo && pdev->scanout_pitch == pitch &&
-	    pdev->scanout_height >= alloc_height)
-		return 0;
-
-	bo = drm_gem_vram_create(&pdev->drm, size,
-				 pdev->chip->tile_layout == PARHELIA_TILE_64X32_8K ? 2 : 1);
-	if (IS_ERR(bo))
-		return PTR_ERR(bo);
-	ret = parhelia_vram_pin(bo);
-	if (ret)
-		goto err_put;
-	ret = ttm_bo_reserve(&bo->bo, true, false, NULL);
-	if (ret)
-		goto err_unpin;
-	ret = drm_gem_vram_vmap(bo, &map);
-	ttm_bo_unreserve(&bo->bo);
-	if (ret)
-		goto err_unpin;
-	tile = kmalloc(64 * tile_h * 4, GFP_KERNEL);
-	if (!tile) {
-		ret = -ENOMEM;
-		goto err_unmap;
-	}
-
-	parhelia_scanout_release(pdev);
-	pdev->scanout_bo = bo;
-	pdev->scanout_map = map;
-	pdev->scanout_tile = tile;
-	pdev->scanout_size = size;
-	pdev->scanout_pitch = pitch;
-	pdev->scanout_height = alloc_height;
-	return 0;
-
-err_unmap:
-	if (!ttm_bo_reserve(&bo->bo, false, false, NULL)) {
-		drm_gem_vram_vunmap(bo, &map);
-		ttm_bo_unreserve(&bo->bo);
-	}
-err_unpin:
-	parhelia_vram_unpin(bo);
-err_put:
-	drm_gem_vram_put(bo);
-	return ret;
-}
-
-static void parhelia_scanout_copy(struct parhelia_device *pdev,
-				  struct drm_framebuffer *fb,
-				  const struct iosys_map *src,
-				  const struct drm_rect *damage, bool fresh)
-{
-	struct drm_gem_object *src_gem = drm_gem_fb_get_obj(fb, 0);
-	struct drm_gem_vram_object *src_bo = src_gem ?
-		drm_gem_vram_of_gem(src_gem) : NULL;
-	s64 src_offset = src_bo ? drm_gem_vram_offset(src_bo) : -ENODEV;
-	s64 dst_offset = pdev->scanout_bo ?
-		drm_gem_vram_offset(pdev->scanout_bo) : -ENODEV;
-	u32 tile_h = parhelia_scanout_tile_height(pdev);
-	u32 tile_bytes = 64 * tile_h * 4;
-	u32 first_tx = damage->x1 / 64;
-	u32 last_tx = DIV_ROUND_UP(damage->x2, 64);
-	u32 first_ty = damage->y1 / tile_h;
-	u32 last_ty = DIV_ROUND_UP(damage->y2, tile_h);
-	u32 blit_x1 = first_tx * 64;
-	u32 blit_y1 = first_ty * tile_h;
-	u32 blit_x2 = min_t(u32, fb->width, last_tx * 64);
-	u32 blit_y2 = min_t(u32, fb->height, last_ty * tile_h);
-	u32 tx, ty;
-	int blit_ret = -ENODEV;
-
-	if (!pdev->scanout_bo || !pdev->scanout_tile || !src)
-		return;
-
-	/* Type-3 destinations are updated in complete 64-by-tile-height units.
-	 * Expand userspace damage to those boundaries so an unaligned window copy
-	 * cannot scatter pixels within every touched tile.  The source is the full
-	 * linear frontbuffer, so the added border contains the current pixels.
-	 * Keep the mapped conversion below as a correctness fallback for classic
-	 * 64x32 chips until their blit layout is verified. */
-	if (src_offset >= 0 && dst_offset >= 0)
-		blit_ret = parhelia_submit_linear_to_tiled(pdev, src_offset,
-					       fb->pitches[0] / 4, dst_offset,
-					       pdev->scanout_pitch,
-					       blit_x1, blit_y1,
-					       blit_x2 - blit_x1,
-					       blit_y2 - blit_y1);
-	if (!blit_ret) {
-		dev_info_once(&pdev->pdev->dev,
-			      "using GPU linear-to-native KMS damage resolves\n");
-		wmb();
-		return;
-	}
-	dev_warn_once(&pdev->pdev->dev,
-		      "GPU KMS resolve unavailable (%d, src=%lld dst=%lld); using CPU tile conversion\n",
-		      blit_ret, src_offset, dst_offset);
-
-	for (ty = first_ty; ty < last_ty; ty++) {
-		for (tx = first_tx; tx < last_tx; tx++) {
-			size_t tile_base = ((size_t)ty * (pdev->scanout_pitch / 64) + tx) *
-					   tile_bytes;
-			u32 x1 = max_t(u32, damage->x1, tx * 64);
-			u32 x2 = min_t(u32, damage->x2, min_t(u32, fb->width, (tx + 1) * 64));
-			u32 y1 = max_t(u32, damage->y1, ty * tile_h);
-			u32 y2 = min_t(u32, damage->y2, min_t(u32, fb->height,
-								   (ty + 1) * tile_h));
-			u32 x, y;
-
-			if (fresh)
-				memset(pdev->scanout_tile, 0, tile_bytes);
-			else
-				iosys_map_memcpy_from(pdev->scanout_tile,
-						      &pdev->scanout_map, tile_base,
-						      tile_bytes);
-			for (y = y1; y < y2; y++) {
-				u8 row[64 * 4];
-
-				iosys_map_memcpy_from(row, src,
-						      (size_t)y * fb->pitches[0] + x1 * 4,
-						      (x2 - x1) * 4);
-				for (x = x1; x < x2; x++) {
-					size_t off = parhelia_scanout_pixel_offset(pdev, x, y,
-									      pdev->scanout_pitch);
-
-					memcpy(pdev->scanout_tile + off - tile_base,
-					       row + (x - x1) * 4, 4);
-				}
-			}
-			iosys_map_memcpy_to(&pdev->scanout_map, tile_base,
-					    pdev->scanout_tile, tile_bytes);
-		}
-	}
-	wmb();
-}
-
 static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 				 struct drm_crtc_state *crtc_state,
 				 struct drm_plane_state *plane_state)
@@ -735,8 +531,8 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
 	struct drm_display_mode *m = &crtc_state->adjusted_mode;
 	struct drm_framebuffer *fb = plane_state->fb;
-	struct drm_shadow_plane_state *shadow;
-	struct drm_rect full;
+	struct drm_gem_object *gem;
+	struct drm_gem_vram_object *gbo;
 	s64 offset;
 	u32 dc;
 	u32 dct;
@@ -749,29 +545,25 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 
 	if (!fb)
 		return;
-	/* Stop fetch before replacing or releasing the old private scanout BO. */
+	/* Stop fetch before selecting the new native surface. */
 	parhelia_write(pdev, dc + PARHELIA_DC_CTRL,
 		       parhelia_read(pdev, dc + PARHELIA_DC_CTRL) & ~1);
-	pitch = roundup_pow_of_two(max_t(u32, fb->width, 64));
-	if (parhelia_scanout_ensure(pdev, pitch, fb->height)) {
-		dev_err(&pdev->pdev->dev, "cannot allocate tiled scanout for %ux%u\n",
-			fb->width, fb->height);
+	gem = drm_gem_fb_get_obj(fb, 0);
+	if (!gem)
 		return;
-	}
-	shadow = to_drm_shadow_plane_state(plane_state);
-	full = DRM_RECT_INIT(0, 0, fb->width, fb->height);
-	parhelia_scanout_copy(pdev, fb, &shadow->data[0], &full, true);
-	offset = drm_gem_vram_offset(pdev->scanout_bo);
+	gbo = drm_gem_vram_of_gem(gem);
+	offset = drm_gem_vram_offset(gbo);
 	if (offset < 0)
 		return;
+	pitch = fb->pitches[0] / 4;
 
 	format = fb->format->format == DRM_FORMAT_RGB565 ? 0x28000000 : 0x32000000;
 	/* Type 3 is the native display/render-target layout. */
-	format |= 0x00030000 | pdev->scanout_pitch;
-
-	/* BAR mappings and PRIME buffers retain ordinary linear semantics. */
-	parhelia_write(pdev,
-		       PARHELIA_HOST_APERTURE_SLOT(PARHELIA_HOST_APERTURE_KMS_SLOT), 0);
+	format |= 0x00030000 | pitch;
+	/* CPU stores through the host aperture must reach VRAM before scanout is
+	 * enabled.  There is no second image and no layout resolve.
+	 */
+	wmb();
 
 	if (parhelia_program_clock(pdev, m->clock, head)) {
 		dev_err(&pdev->pdev->dev,
@@ -835,14 +627,29 @@ static void parhelia_pipe_update(struct drm_simple_display_pipe *pipe,
 {
 	struct drm_plane_state *state = pipe->plane.state;
 	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
-	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(state);
 	struct drm_pending_vblank_event *event;
-	struct drm_rect damage;
 
 	if (state->fb && pipe->crtc.state->active) {
-		if (drm_atomic_helper_damage_merged(old_state, state, &damage))
-			parhelia_scanout_copy(pdev, state->fb, &shadow->data[0],
-					      &damage, false);
+		/* A dirty update only publishes WC writes already made through the
+		 * surface's linear aperture.  A real framebuffer change selects the
+		 * new native surface and is latched by the normal atomic/vblank path.
+		 */
+		wmb();
+		if (!old_state->fb || old_state->fb != state->fb) {
+			struct drm_gem_object *gem = drm_gem_fb_get_obj(state->fb, 0);
+			s64 offset = gem ? drm_gem_vram_offset(drm_gem_vram_of_gem(gem)) :
+					   -ENODEV;
+
+			if (offset >= 0) {
+				u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
+				u32 format = 0x32030000 |
+					     (state->fb->pitches[0] / 4);
+
+				parhelia_write(pdev, dc + PARHELIA_DC_START,
+					       offset & 0x0ffffc00);
+				parhelia_write(pdev, dc + PARHELIA_DC_FORMAT, format);
+			}
+		}
 	}
 	if (pipe->crtc.state->color_mgmt_changed)
 		parhelia_pipe_load_gamma(pipe, pipe->crtc.state->gamma_lut);
@@ -919,14 +726,16 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 
 	if (!fb)
 		return 0;
+	if (!drm_gem_fb_get_obj(fb, 0) ||
+	    !parhelia_gem_is_owned(drm_gem_fb_get_obj(fb, 0)) ||
+	    !parhelia_bo_is_native(to_parhelia_bo(drm_gem_fb_get_obj(fb, 0))))
+		return -EINVAL;
 	cpp = fb->format->cpp[0];
 	if (cpp != 4 || fb->pitches[0] % cpp)
 		return -EINVAL;
 	pitch_pixels = fb->pitches[0] / cpp;
-	/* Userspace storage is linear and may have any valid stride.  The private
-	 * scanout image gets the fetcher's required power-of-two pitch. */
-	if (pitch_pixels < fb->width ||
-	    roundup_pow_of_two(max_t(u32, fb->width, 64)) > 0x3fff)
+	if (pitch_pixels != roundup_pow_of_two(max_t(u32, fb->width, 64)) ||
+	    pitch_pixels > 0x3fff)
 		return -EINVAL;
 	return 0;
 }
@@ -934,23 +743,12 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 static int parhelia_pipe_begin_fb_access(struct drm_simple_display_pipe *pipe,
 					 struct drm_plane_state *plane_state)
 {
-	int ret;
-
-	/* Pin the linear source in VRAM for the engine fast path, then establish
-	 * the CPU mapping retained by the layout-conversion fallback. */
-	ret = drm_gem_vram_plane_helper_prepare_fb(&pipe->plane, plane_state);
-	if (ret)
-		return ret;
-	ret = drm_gem_simple_kms_begin_shadow_fb_access(pipe, plane_state);
-	if (ret)
-		drm_gem_vram_plane_helper_cleanup_fb(&pipe->plane, plane_state);
-	return ret;
+	return drm_gem_vram_plane_helper_prepare_fb(&pipe->plane, plane_state);
 }
 
 static void parhelia_pipe_end_fb_access(struct drm_simple_display_pipe *pipe,
 					struct drm_plane_state *plane_state)
 {
-	drm_gem_simple_kms_end_shadow_fb_access(pipe, plane_state);
 	drm_gem_vram_plane_helper_cleanup_fb(&pipe->plane, plane_state);
 }
 
@@ -964,17 +762,64 @@ static const struct drm_simple_display_pipe_funcs parhelia_pipe_funcs = {
 	.disable_vblank = parhelia_pipe_disable_vblank,
 	.begin_fb_access = parhelia_pipe_begin_fb_access,
 	.end_fb_access = parhelia_pipe_end_fb_access,
-	.reset_plane = drm_gem_simple_kms_reset_shadow_plane,
-	.duplicate_plane_state = drm_gem_simple_kms_duplicate_shadow_plane_state,
-	.destroy_plane_state = drm_gem_simple_kms_destroy_shadow_plane_state,
 };
 
 static const uint32_t parhelia_formats[] = {
 	DRM_FORMAT_XRGB8888,
 };
 
+static int parhelia_fb_dirty(struct drm_framebuffer *fb,
+			     struct drm_file *file, unsigned int flags,
+			     unsigned int color, struct drm_clip_rect *clips,
+			     unsigned int num_clips)
+{
+	/* The framebuffer is already the scanout surface.  DIRTYFB is only the
+	 * CPU-write publication point and must never enter an atomic commit tail.
+	 */
+	wmb();
+	return 0;
+}
+
+static const struct drm_framebuffer_funcs parhelia_fb_funcs = {
+	.destroy = drm_gem_fb_destroy,
+	.create_handle = drm_gem_fb_create_handle,
+	.dirty = parhelia_fb_dirty,
+};
+
+static struct drm_framebuffer *
+parhelia_fb_create(struct drm_device *drm, struct drm_file *file,
+		   const struct drm_format_info *info,
+		   const struct drm_mode_fb_cmd2 *mode_cmd)
+{
+	struct drm_gem_object *gem;
+	struct parhelia_bo *bo;
+	struct drm_framebuffer *fb;
+
+	if ((info->format != DRM_FORMAT_XRGB8888 &&
+	     info->format != DRM_FORMAT_ARGB8888) || mode_cmd->offsets[0])
+		return ERR_PTR(-EINVAL);
+	gem = drm_gem_object_lookup(file, mode_cmd->handles[0]);
+	if (!gem)
+		return ERR_PTR(-ENOENT);
+	if (!parhelia_gem_is_owned(gem)) {
+		fb = ERR_PTR(-EINVAL);
+		goto out_put;
+	}
+	bo = to_parhelia_bo(gem);
+	if (!parhelia_bo_is_native(bo) || bo->pitch != mode_cmd->pitches[0] ||
+	    bo->width < mode_cmd->width || bo->height < mode_cmd->height) {
+		fb = ERR_PTR(-EINVAL);
+		goto out_put;
+	}
+	fb = drm_gem_fb_create_with_funcs(drm, file, info, mode_cmd,
+					  &parhelia_fb_funcs);
+out_put:
+	drm_gem_object_put(gem);
+	return fb;
+}
+
 static const struct drm_mode_config_funcs parhelia_mode_config_funcs = {
-	.fb_create = drm_gem_fb_create_with_dirty,
+	.fb_create = parhelia_fb_create,
 	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
@@ -1131,18 +976,9 @@ int parhelia_modeset_init(struct parhelia_device *pdev)
 	drm->mode_config.min_height = 1;
 	drm->mode_config.max_width = 2048;
 	drm->mode_config.max_height = 2048;
-	/* Dumb buffers are deliberately linear, and dirtyfb resolves damaged
-	 * rectangles into the private native-tiled scanout BO.  Advertising a
-	 * userspace shadow here makes the modesetting DDX allocate another
-	 * system-memory framebuffer and copy each damaged region into the linear
-	 * dumb BO before the resolve.  It is redundant and especially expensive
-	 * for software-composited GL windows.  Let userspace draw/map the linear
-	 * dumb BO directly; Xorg's normal Damage -> DIRTYFB path still tells us
-	 * exactly which rectangles need the GPU linear-to-tiled resolve.
-	 *
-	 * This flag only controls DRM_CAP_DUMB_PREFER_SHADOW.  The kernel's
-	 * drm_shadow_plane_state below remains necessary to vmap imported GEM
-	 * objects for the CPU fallback and is unrelated to an Xorg ShadowFB.
+	/* Dumb buffers are native surfaces scanned out directly.  Their mmap is a
+	 * CPU-linear hardware aperture alias of those same bytes, so userspace can
+	 * draw without ShadowFB and DIRTYFB needs only publish WC stores.
 	 */
 	drm->mode_config.prefer_shadow = 0;
 	ret = drm_mode_create_dvi_i_properties(drm);
