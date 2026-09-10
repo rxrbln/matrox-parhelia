@@ -144,10 +144,12 @@ struct ph_context {
    uint32_t pending_vertices[PH_BATCH_DWORDS];
    unsigned pending_vertex_dwords;
    unsigned pending_submit_count;
+   unsigned pending_stage_calls;
    struct pipe_resource *pending_resources[PH_BATCH_RELOCS];
    unsigned pending_resource_count;
    bool aggregate_batches;
    bool aggregate_state_batches;
+   bool aggregate_state_stream;
    /* Hardware-proven P690 one-pass diffuse x lightmap path. */
    bool p690_multitexture;
    bool trace_multitex_emitted;
@@ -409,6 +411,44 @@ ph_release_pending_resources(struct ph_context *ctx)
    ctx->pending_resource_count = 0;
 }
 
+/* parhelia_vertex_bind_mode() in the kernel turns this exact vertex-program
+ * bind into a second primary CALL immediately after its parent packet.  The
+ * submit ABI admits 221 userspace packets because three of the 224 hardware
+ * CALL slots are reserved for opening/EOB/drain, so account for these hidden
+ * calls before combining complete state sequences. */
+static unsigned
+ph_batch_stage_calls(const struct parhelia_batch *batch)
+{
+   unsigned stages = 0;
+
+   for (unsigned i = 0; i < batch->packet_count; i++) {
+      const struct drm_parhelia_packet *packet = &batch->packets[i];
+      const uint32_t *cmd;
+
+      if (packet->offset > batch->command_count ||
+          packet->length > batch->command_count - packet->offset)
+         continue;
+      cmd = batch->commands + packet->offset;
+      if ((packet->length == 8 || packet->length == 10) &&
+          cmd[0] == packet->length - 2 && cmd[1] == 0x212121ddu &&
+          cmd[4] == 0x20000002u && cmd[5] == cmd[4] &&
+          ((packet->length == 8 && cmd[3] == 0x3e403c3cu && cmd[7] == 2) ||
+           (packet->length == 10 && cmd[3] == 0x41403c3cu &&
+            cmd[6] == cmd[7] && cmd[8] == 0x2121213eu && cmd[9] == 2)))
+         stages++;
+   }
+   return stages;
+}
+
+static bool
+ph_batch_has_draw(const struct parhelia_batch *batch)
+{
+   for (unsigned i = 0; i < batch->reloc_count; i++)
+      if (batch->relocs[i].type == PARHELIA_RELOC_DRAW)
+         return true;
+   return false;
+}
+
 static int
 ph_drain_batch(struct ph_context *ctx)
 {
@@ -418,10 +458,11 @@ ph_drain_batch(struct ph_context *ctx)
       return 0;
    if (getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
-              "parhelia: aggregate submits=%u commands=%u packets=%u relocs=%u vertices=%u resources=%u\n",
+              "parhelia: aggregate submits=%u commands=%u packets=%u stages=%u relocs=%u vertices=%u resources=%u\n",
               ctx->pending_submit_count,
               ctx->pending_batch.command_count,
               ctx->pending_batch.packet_count,
+              ctx->pending_stage_calls,
               ctx->pending_batch.reloc_count,
               ctx->pending_vertex_dwords,
               ctx->pending_resource_count);
@@ -433,6 +474,7 @@ ph_drain_batch(struct ph_context *ctx)
    memset(&ctx->pending_batch, 0, sizeof(ctx->pending_batch));
    ctx->pending_vertex_dwords = 0;
    ctx->pending_submit_count = 0;
+   ctx->pending_stage_calls = 0;
    if (ret)
       ctx->submit_error = ret;
    return ret;
@@ -479,23 +521,50 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
                 struct parhelia_resource *r2, struct parhelia_resource *r3)
 {
    struct parhelia_resource *resources[4] = {r0, r1, r2, r3};
+   unsigned stage_calls;
+   bool draw_batch;
    int ret;
 
-   /* Same-state aggregation extends only the draw tail and can keep appending
-    * until one of the batch's real storage limits is reached.  Cross-state
-    * aggregation records a kernel-owned boundary which restores each logical
-    * EOB/DWGSYNC bracket; its guarded append helper admits only the one marker
-    * supported by the current kernel ABI. */
+   /* Same-state aggregation extends only the draw tail.  State-stream mode
+    * keeps every complete state and DRAW sequence while sharing one terminal
+    * EOB/DWGSYNC.  The older stateful experiment instead retains the one
+    * internal fence boundary supported by the current kernel ABI. */
    if (!ctx->aggregate_batches)
       return ph_submit_batch_now(ctx, batch, vertices, vertex_dwords);
 
+   stage_calls = ph_batch_stage_calls(batch);
+   draw_batch = ph_batch_has_draw(batch);
+   if (ctx->aggregate_state_stream && ctx->pending_batch.packet_count &&
+       ph_batch_has_draw(&ctx->pending_batch) && !draw_batch) {
+      /* A clear/blit after rendering must observe the preceding pixel-pipe
+       * drain.  In the other direction p3d_emit_state() explicitly rebinds
+       * the surfaces and 3D engine, so leading colour/depth clears can share
+       * the draw stream exactly as p3d_emit_clear_frame() does. */
+      ret = ph_drain_batch(ctx);
+      if (ret)
+         return ret;
+   }
+   if (ctx->aggregate_state_stream &&
+       batch->packet_count + stage_calls > PH_BATCH_PACKETS)
+      return -E2BIG;
+   if (ctx->aggregate_state_stream && ctx->pending_batch.packet_count &&
+       ctx->pending_batch.packet_count + ctx->pending_stage_calls +
+          batch->packet_count + stage_calls > PH_BATCH_PACKETS) {
+      ret = ph_drain_batch(ctx);
+      if (ret)
+         return ret;
+   }
    if (ctx->pending_resource_count +
        ph_pending_new_resources(ctx, resources) > PH_BATCH_RELOCS) {
       ret = ph_drain_batch(ctx);
       if (ret)
          return ret;
    }
-   ret = ctx->aggregate_state_batches ?
+   ret = ctx->aggregate_state_stream ?
+      parhelia_batch_append(
+         &ctx->pending_batch, ctx->pending_vertices,
+         &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords) :
+      ctx->aggregate_state_batches ?
       parhelia_batch_append_stateful(
          &ctx->pending_batch, ctx->pending_vertices,
          &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords) :
@@ -507,7 +576,11 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
       ret = ph_drain_batch(ctx);
       if (ret)
          return ret;
-      ret = ctx->aggregate_state_batches ?
+      ret = ctx->aggregate_state_stream ?
+         parhelia_batch_append(
+            &ctx->pending_batch, ctx->pending_vertices,
+            &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords) :
+         ctx->aggregate_state_batches ?
          parhelia_batch_append_stateful(
             &ctx->pending_batch, ctx->pending_vertices,
             &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords) :
@@ -518,6 +591,7 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
    if (ret)
       return ret;
    ctx->pending_submit_count++;
+   ctx->pending_stage_calls += stage_calls;
    ph_reference_pending_resources(ctx, resources);
    return 0;
 }
@@ -3171,7 +3245,15 @@ ph_flush(struct pipe_context *p, struct pipe_fence_handle **fence,
 {
    struct ph_context *ctx = ph_context(p);
    struct parhelia_resource *color = NULL;
+
    ph_submit_vertices(ctx);
+   /* The following X-server blit can order against an async kernel request,
+    * but it cannot see an aggregate still owned by this userspace context. */
+   if (ctx->aggregate_batches && ph_drain_batch(ctx)) {
+      if (fence)
+         *fence = NULL;
+      return;
+   }
    if (ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture)
       color = ph_resource(ctx->fb.cbufs[0].texture);
    /* The X server's native DRI2 blit submits synchronously on the same
@@ -3200,6 +3282,11 @@ ph_flush_resource(struct pipe_context *p, struct pipe_resource *resource)
    struct ph_context *ctx = ph_context(p);
 
    ph_submit_vertices(ctx);
+   /* Export/present consumers can observe only work already handed to the
+    * kernel.  Keep it asynchronous for native resources, then rely on the
+    * server's ordered blit; CPU-visible resources wait below. */
+   if (ctx->aggregate_batches && ph_drain_batch(ctx))
+      return;
    /* Native presentation is ordered by the server's synchronous GPU blit.
     * Linear exports still need the client wait before their CPU resolve. */
    if (resource->target == PIPE_BUFFER ||
@@ -3739,7 +3826,10 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->aggregate_state_batches =
       ph_screen(screen)->stateful_submit &&
       getenv("PARHELIA_BATCH_DIFFERENT_STATE") != NULL;
-   ctx->aggregate_batches = ctx->aggregate_state_batches ||
+   ctx->aggregate_state_stream =
+      debug_get_bool_option("PARHELIA_BATCH_STATE_STREAM", false);
+   ctx->aggregate_batches = ctx->aggregate_state_stream ||
+                            ctx->aggregate_state_batches ||
                             getenv("PARHELIA_BATCH_AGGREGATE") != NULL;
    if (ctx->aggregate_batches && getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
@@ -3748,6 +3838,9 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    if (ctx->aggregate_state_batches && getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: preserving per-state EOB/DWGSYNC boundaries inside aggregate submits\n");
+   if (ctx->aggregate_state_stream && getenv("PARHELIA_TRACE_BATCH"))
+      fprintf(stderr,
+              "parhelia: complete ordered state streams share one terminal EOB/DWGSYNC\n");
    /* Older kernels remain usable for the single-texture renderer.  A bound
     * second unit is rejected at submit time until the matching kernel WARP
     * program is installed. */

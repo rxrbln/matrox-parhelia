@@ -16,6 +16,12 @@ No DDX implementation or userspace MMIO code is linked. WARP upload and the
 global fence counter belong exclusively to the kernel. The scratch primary
 ring produced by the reference is never submitted to the kernel.
 
+`PARHELIA_BATCH_STATE_STREAM=1` queues complete ordered 3D state sequences
+behind one terminal EOB/DWGSYNC. Leading colour and depth clears share that
+submit; a clear or blit after rendering remains a drain boundary. The driver
+accounts for the kernel's hidden WARP-stage CALLs as well as packet, command,
+vertex, relocation, and resource limits before appending each sequence.
+
 The adapter also accepts transformed/lit fixed-function reference state.
 `parhelia_batch_reference()` imports the COMPLETE original C gears scene,
 including GPU colour/depth clears, grouped constants and face-group boundaries.
