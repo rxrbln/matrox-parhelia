@@ -141,7 +141,7 @@ struct ph_context {
     * visibility boundary is reached.  Resource references keep every GEM
     * handle alive until the kernel has copied and pinned the aggregate. */
    struct parhelia_batch pending_batch;
-   uint32_t pending_vertices[PH_BATCH_DWORDS];
+   uint32_t pending_vertices[PH_BATCH_VERTEX_DWORDS];
    unsigned pending_vertex_dwords;
    unsigned pending_submit_count;
    unsigned pending_stage_calls;
@@ -243,6 +243,17 @@ ph_triangle_batch_limit(const struct ph_context *ctx)
              PH_BATCH_MAX_DRAWS - 3 : PH_BATCH_MAX_DRAWS;
 }
 
+static inline unsigned
+ph_pending_vertex_limit(const struct ph_context *ctx)
+{
+   /* Class-3 submits copy vertices through the kernel's 4096-dword coherent
+    * slot.  CREATE_VERTEX relocations name the bounded local-VRAM ring and
+    * carry no submit vertex payload, so their aggregate can instead use all
+    * storage addressable by the 221 one-triangle DRAW packets. */
+   return ctx->vram_vertex_enabled ? PH_BATCH_VERTEX_DWORDS :
+                                     PH_BATCH_DWORDS;
+}
+
 static int ph_drain_batch(struct ph_context *ctx);
 
 /* A queued class-3 submission owns its command and vertex copies in the
@@ -292,7 +303,7 @@ static void
 ph_create_vertex_ring(struct ph_context *ctx)
 {
    struct drm_parhelia_create_vertex create = {
-      .size = PH_VRAM_VERTEX_SLOTS * sizeof(ctx->vertices),
+      .size = PH_VRAM_VERTEX_SLOTS * sizeof(ctx->pending_vertices),
    };
    struct parhelia_screen *screen = ph_screen(ctx->base.screen);
    void *map;
@@ -301,7 +312,7 @@ ph_create_vertex_ring(struct ph_context *ctx)
        ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_VERTEX, &create))
       return;
    if (!create.handle ||
-       create.size < PH_VRAM_VERTEX_SLOTS * sizeof(ctx->vertices)) {
+       create.size < PH_VRAM_VERTEX_SLOTS * sizeof(ctx->pending_vertices)) {
       if (create.handle) {
          struct drm_gem_close close = {.handle = create.handle};
          ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
@@ -333,9 +344,9 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
    uint64_t bytes = (uint64_t)vertex_dwords * sizeof(uint32_t);
 
    if (vertices && vertex_dwords && screen->async_submit &&
-       ctx->vram_vertex_enabled && bytes <= sizeof(ctx->vertices)) {
+       ctx->vram_vertex_enabled && bytes <= sizeof(ctx->pending_vertices)) {
       unsigned slot = ctx->vram_vertex_slot;
-      uint64_t offset = (uint64_t)slot * sizeof(ctx->vertices);
+      uint64_t offset = (uint64_t)slot * sizeof(ctx->pending_vertices);
 
       if (ctx->vram_vertex_fence[slot]) {
          ret = parhelia_wait_fence(screen->fd, ctx->vram_vertex_fence[slot],
@@ -357,12 +368,21 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
       }
       if (ret != -EOPNOTSUPP && ret != -ENOMEM)
          return ret;
-      if (ret == -EOPNOTSUPP)
+      if (ret == -EOPNOTSUPP) {
          ctx->vram_vertex_enabled = false;
+      } else {
+         /* The request has not reached the doorbell.  Retry through the
+          * synchronous CREATE_VERTEX path below; a large local-VRAM batch
+          * cannot fall back to the kernel's 4096-dword class-3 copy slot. */
+         if (getenv("PARHELIA_TRACE"))
+            fprintf(stderr,
+                    "parhelia: async vertex slot exhausted; retrying synchronously\n");
+         screen->async_submit = false;
+      }
    }
    if (vertices && vertex_dwords && !screen->async_submit &&
        ctx->vram_vertex_enabled &&
-       bytes <= ctx->vram_vertex_size) {
+       bytes <= sizeof(ctx->pending_vertices)) {
       memcpy(ctx->vram_vertices, vertices, bytes);
 	  /* The map can be write-combined. Finish the CPU store before the ioctl
 	   * arms class-0 fetching; the kernel's fence then makes reuse safe. */
@@ -550,6 +570,15 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
    if (ctx->aggregate_state_stream && ctx->pending_batch.packet_count &&
        ctx->pending_batch.packet_count + ctx->pending_stage_calls +
           batch->packet_count + stage_calls > PH_BATCH_PACKETS) {
+      ret = ph_drain_batch(ctx);
+      if (ret)
+         return ret;
+   }
+   if (vertex_dwords > ph_pending_vertex_limit(ctx))
+      return -E2BIG;
+   if (ctx->pending_vertex_dwords &&
+       vertex_dwords > ph_pending_vertex_limit(ctx) -
+                          ctx->pending_vertex_dwords) {
       ret = ph_drain_batch(ctx);
       if (ret)
          return ret;
@@ -3833,8 +3862,9 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
                             getenv("PARHELIA_BATCH_AGGREGATE") != NULL;
    if (ctx->aggregate_batches && getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
-              "parhelia: experimental aggregation enabled: up to %u command/vertex dwords, %u packets, %u relocs\n",
-              PH_BATCH_DWORDS, PH_BATCH_PACKETS, PH_BATCH_RELOCS);
+              "parhelia: experimental aggregation enabled: up to %u command dwords, %u class-3/%u class-0 vertex dwords, %u packets, %u relocs\n",
+              PH_BATCH_DWORDS, PH_BATCH_DWORDS, PH_BATCH_VERTEX_DWORDS,
+              PH_BATCH_PACKETS, PH_BATCH_RELOCS);
    if (ctx->aggregate_state_batches && getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: preserving per-state EOB/DWGSYNC boundaries inside aggregate submits\n");

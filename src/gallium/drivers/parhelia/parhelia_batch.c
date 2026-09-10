@@ -427,16 +427,16 @@ parhelia_batch_append(struct parhelia_batch *dst, uint32_t *dst_vertices,
        dst->command_count > PH_BATCH_DWORDS ||
        dst->packet_count > PH_BATCH_PACKETS ||
        dst->reloc_count > PH_BATCH_RELOCS ||
-       *dst_vertex_dwords > PH_BATCH_DWORDS ||
+       *dst_vertex_dwords > PH_BATCH_VERTEX_DWORDS ||
        src->command_count > PH_BATCH_DWORDS ||
        src->packet_count > PH_BATCH_PACKETS ||
        src->reloc_count > PH_BATCH_RELOCS ||
-       src_vertex_dwords > PH_BATCH_DWORDS)
+       src_vertex_dwords > PH_BATCH_VERTEX_DWORDS)
       return -EINVAL;
    if (src->command_count > PH_BATCH_DWORDS - dst->command_count ||
        src->packet_count > PH_BATCH_PACKETS - dst->packet_count ||
        src->reloc_count > PH_BATCH_RELOCS - dst->reloc_count ||
-       src_vertex_dwords > PH_BATCH_DWORDS - *dst_vertex_dwords)
+       src_vertex_dwords > PH_BATCH_VERTEX_DWORDS - *dst_vertex_dwords)
       return -E2BIG;
 
    for (unsigned i = 0; i < src->packet_count; i++) {

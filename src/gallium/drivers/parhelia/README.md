@@ -21,6 +21,8 @@ behind one terminal EOB/DWGSYNC. Leading colour and depth clears share that
 submit; a clear or blit after rendering remains a drain boundary. The driver
 accounts for the kernel's hidden WARP-stage CALLs as well as packet, command,
 vertex, relocation, and resource limits before appending each sequence.
+When the kernel exposes `CREATE_VERTEX`, aggregation uses the larger bounded
+local-VRAM ring instead of inheriting the 4096-dword class-3 copy limit.
 
 The adapter also accepts transformed/lit fixed-function reference state.
 `parhelia_batch_reference()` imports the COMPLETE original C gears scene,
