@@ -1415,11 +1415,12 @@ ph_use_rgb_alpha_two_pass(struct ph_context *ctx, bool textured,
    if (ctx->fs->sampler_mask != BITFIELD_BIT(0) ||
        ctx->fs->texenv != P3D_TEXENV_MODULATE ||
        texture->base.target != PIPE_TEXTURE_2D ||
-       texture->base.format != PIPE_FORMAT_R8G8B8A8_UNORM || !texture->map ||
+       texture->base.format != PIPE_FORMAT_R8G8B8A8_UNORM ||
+       !texture->upload_texture || !texture->handle || !texture->map ||
        (color->base.format != PIPE_FORMAT_B8G8R8A8_UNORM &&
-       color->base.format != PIPE_FORMAT_B8G8R8X8_UNORM) || !color->linear_map ||
+        color->base.format != PIPE_FORMAT_B8G8R8X8_UNORM) || !color->handle ||
        (ctx->dsa->depth_enabled &&
-        (!zs->linear_map ||
+        (!zs->handle ||
          ctx->fb.zsbuf.format != PIPE_FORMAT_Z24_UNORM_S8_UINT)) ||
        sampler->min_img_filter != PIPE_TEX_FILTER_LINEAR ||
        sampler->mag_img_filter != PIPE_TEX_FILTER_LINEAR ||
@@ -1523,13 +1524,11 @@ ph_rgb_alpha_hud_primitive(struct ph_context *ctx,
     * failure, so admit that exact image independently of screen position. */
    if (ctx->cpu_alpha_hash == UINT64_C(0xe98fa2a3b0349695))
       return xmax - xmin <= 48.0f && ymax - ymin <= 48.0f;
-   /* The small glyph textures are the live HUD path.  Do not route the
-    * 256x256 loading atlas through CPU composition: it forces a full render
-    * surface resolve/upload for every loading frame and prevents cgame from
-    * reaching the map. */
-   if (texture->base.width0 > 64 || texture->base.height0 > 64)
+   /* The live HUD includes a 128x128 atlas drawn as an 80x60 bottom sprite.
+    * Keep larger loading/projected atlases out of this narrow route. */
+   if (texture->base.width0 > 128 || texture->base.height0 > 128)
       return false;
-   return xmax - xmin <= 96.0f && ymax - ymin <= 48.0f &&
+   return xmax - xmin <= 96.0f && ymax - ymin <= 64.0f &&
           (ymax <= 64.0f || ymin >= 340.0f);
 }
 
