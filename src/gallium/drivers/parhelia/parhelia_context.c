@@ -1497,6 +1497,16 @@ ph_use_rgb_alpha_two_pass(struct ph_context *ctx, bool textured,
    if (texture->rgb5a1_packed)
       ph_restore_rgba_tiled(texture);
    ph_resource_upload_tiled(texture);
+
+   /* XRGB has no destination alpha to preserve.  The two hardware passes
+    * therefore implement the complete visible source-over result for every
+    * RGBA texture accepted above; no application fingerprint or screen-space
+    * heuristic is needed.  Keep the image classification below only for a
+    * true ARGB target, whose alpha-channel equation P690 cannot reproduce
+    * from sampled RGB. */
+   if (color->base.format == PIPE_FORMAT_B8G8R8X8_UNORM)
+      return true;
+
    if (ctx->cpu_alpha_hash_resource != texture ||
        ctx->cpu_alpha_hash_handle != texture->handle ||
        ctx->cpu_alpha_hash_generation != texture->content_generation) {
@@ -1533,16 +1543,18 @@ ph_use_rgb_alpha_two_pass(struct ph_context *ctx, bool textured,
  * 640x480 virtual screen.  The engine's first top-right glyph lies at
  * y=32..64, so this needs the complete 64-pixel HUD band. */
 static bool
-ph_rgb_alpha_hud_primitive(struct ph_context *ctx,
-                           const struct prim_header *prim, int pos, int col)
+ph_rgb_alpha_primitive(struct ph_context *ctx,
+                       const struct prim_header *prim, int pos, int col)
 {
 	const struct parhelia_resource *texture;
+   const struct parhelia_resource *color;
    float xmin = FLT_MAX, ymin = FLT_MAX;
    float xmax = -FLT_MAX, ymax = -FLT_MAX;
 
    if (pos < 0)
       return false;
 	texture = ph_resource(ctx->sampler_views[0]->texture);
+   color = ph_resource(ctx->fb.cbufs[0].texture);
 
    for (unsigned i = 0; i < 3; i++) {
       const float *p = prim->v[i]->data[pos];
@@ -1563,6 +1575,12 @@ ph_rgb_alpha_hud_primitive(struct ph_context *ctx,
          if (fabsf(prim->v[i]->data[col][3] - a) > 0.0001f)
             return false;
    }
+
+   /* ph_use_rgb_alpha_two_pass() established the exact XRGB equation and all
+    * texture, blend, depth and stencil requirements.  Position and atlas size
+    * do not affect correctness on this framebuffer format. */
+   if (color->base.format == PIPE_FORMAT_B8G8R8X8_UNORM)
+      return true;
    /* The live q3dm1 fingerprint is the centered 24x24 reticle.  It lies
     * outside the HUD bands below and is the most visible sampled-alpha
     * failure, so admit that exact image independently of screen position. */
@@ -2844,7 +2862,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 				  col >= 0);
 	rgb_alpha_two_pass = ph_use_rgb_alpha_two_pass(ctx, textured,
 	                                               multitextured, col >= 0) &&
-		  ph_rgb_alpha_hud_primitive(ctx, prim, pos, col);
+		  ph_rgb_alpha_primitive(ctx, prim, pos, col);
 	alpha_micro = !rgb_alpha_two_pass &&
 	              ph_use_alpha_micro(ctx, textured, multitextured, depth,
 	                                 col >= 0);
