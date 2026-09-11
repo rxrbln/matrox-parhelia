@@ -208,6 +208,9 @@ struct ph_context {
 	/* One-draw P690 route: unit 0 supplies RGB and the alpha companion on
 	 * unit 1 supplies fragment alpha for blending or the comparator. */
 	bool native_sampled_alpha;
+	/* Process-start diagnostic selection for the two native sampled-alpha
+	 * classes.  Parse it once; this predicate runs for every triangle. */
+	unsigned native_sampled_alpha_modes;
    /* Hashing a tiled RGBA base level is O(texture pixels).  The draw frontend
     * calls the state predicate per triangle, so retain the result until this
     * texture receives a new linear upload. */
@@ -1210,7 +1213,6 @@ static bool
 ph_use_native_sampled_alpha(struct ph_context *ctx, bool textured,
                             bool multitextured, bool depth)
 {
-   const char *mode = getenv("PARHELIA_NATIVE_SAMPLED_ALPHA");
    const struct pipe_rt_blend_state *blend =
       ctx->blend ? &ctx->blend->rt[0] : NULL;
    const struct pipe_sampler_state *sampler;
@@ -1220,9 +1222,8 @@ ph_use_native_sampled_alpha(struct ph_context *ctx, bool textured,
    /* Keep the newly proven combiner route explicit until both live Q3 draw
     * classes have passed sustained scene testing.  "cutout" and "blend"
     * isolate the two state classes; "all" enables both. */
-   if (!mode || (strcmp(mode, "cutout") && strcmp(mode, "blend") &&
-                 strcmp(mode, "all")) ||
-       !textured || multitextured || !ctx->p690_multitexture ||
+   if (!ctx->native_sampled_alpha_modes || !textured || multitextured ||
+       !ctx->p690_multitexture ||
        !ctx->warp_textured_multitex || !ctx->fs || !ctx->dsa || !blend ||
        ctx->fs->sampler_mask != BITFIELD_BIT(0) ||
        ctx->fs->texenv != P3D_TEXENV_MODULATE ||
@@ -1282,11 +1283,8 @@ ph_use_native_sampled_alpha(struct ph_context *ctx, bool textured,
       fabsf(ctx->dsa->alpha_ref_value - 0.5f) <= 0.0001f &&
       depth && ctx->dsa->depth_enabled && ctx->dsa->depth_writemask &&
       ctx->dsa->depth_func == PIPE_FUNC_LEQUAL && !blend->blend_enable;
-   if (!strcmp(mode, "cutout"))
-      return cutout;
-   if (!strcmp(mode, "blend"))
-      return source_over;
-   return source_over || cutout;
+   return (source_over && (ctx->native_sampled_alpha_modes & 2)) ||
+          (cutout && (ctx->native_sampled_alpha_modes & 1));
 }
 
 static bool
@@ -4517,6 +4515,7 @@ struct pipe_context *
 ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
 {
    struct ph_context *ctx = CALLOC_STRUCT(ph_context);
+   const char *native_alpha_mode = getenv("PARHELIA_NATIVE_SAMPLED_ALPHA");
    struct drm_parhelia_get_param warp = {
       .param = PARHELIA_PARAM_WARP_PASSTHROUGH,
    };
@@ -4535,6 +4534,14 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       return NULL;
    ctx->base.screen = screen;
    ctx->base.priv = priv;
+   if (native_alpha_mode) {
+      if (!strcmp(native_alpha_mode, "cutout"))
+         ctx->native_sampled_alpha_modes = 1;
+      else if (!strcmp(native_alpha_mode, "blend"))
+         ctx->native_sampled_alpha_modes = 2;
+      else if (!strcmp(native_alpha_mode, "all"))
+         ctx->native_sampled_alpha_modes = 3;
+   }
    parhelia_batch_negotiate_limits(ph_screen(screen)->kernel_max_packets,
                                    false, &ctx->batch_limits);
    if (ioctl(ph_screen(screen)->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &warp) ||
