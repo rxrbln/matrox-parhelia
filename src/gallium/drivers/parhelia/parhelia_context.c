@@ -350,9 +350,12 @@ ph_create_vertex_ring(struct ph_context *ctx)
    parhelia_batch_negotiate_limits(screen->kernel_max_packets, true,
                                    &mapped_limits);
    slot_bytes = (uint64_t)mapped_limits.vertex_dwords * sizeof(uint32_t);
-   slot_count = screen->async_slots &&
-                screen->async_slots + 1 <= PH_VRAM_VERTEX_SLOTS_MAX ?
-                screen->async_slots + 1 : PH_VRAM_VERTEX_LEGACY_SLOTS;
+   /* Keep one kernel request slot free.  Filling all eight moves throttling
+    * into the kernel's coarse queue-full wait; seven subranges instead wait
+    * for the exact oldest fence only when this userspace ring wraps. */
+   slot_count = screen->async_slots > PH_VRAM_VERTEX_LEGACY_SLOTS &&
+                screen->async_slots <= PH_VRAM_VERTEX_SLOTS_MAX ?
+                screen->async_slots - 1 : PH_VRAM_VERTEX_LEGACY_SLOTS;
    create.size = slot_count * slot_bytes;
    if (!screen->vram_vertex ||
        ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_VERTEX, &create))
@@ -402,10 +405,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
       uint64_t offset = (uint64_t)slot * ctx->vram_vertex_slot_dwords *
                         sizeof(uint32_t);
 
-      /* With queue-depth+1 subranges, acceptance of the intervening queue
-       * depth submits proves this slot's earlier request has retired before
-       * wrap.  Older kernels expose no depth and retain explicit waits. */
-      if (!screen->async_slots && ctx->vram_vertex_fence[slot]) {
+      if (ctx->vram_vertex_fence[slot]) {
          ret = parhelia_wait_fence(screen->fd, ctx->vram_vertex_fence[slot],
                                    -1, NULL);
          if (ret)

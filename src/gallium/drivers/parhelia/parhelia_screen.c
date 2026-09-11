@@ -869,7 +869,7 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
                      async.value == 1;
    if (s->async_submit &&
        !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &async_slots) &&
-       async_slots.value > 0 && async_slots.value < PH_VRAM_VERTEX_SLOTS_MAX)
+       async_slots.value > 0 && async_slots.value <= PH_VRAM_VERTEX_SLOTS_MAX)
       s->async_slots = async_slots.value;
    s->pack_adjacent_packets = s->async_submit &&
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &pack_adjacent) &&

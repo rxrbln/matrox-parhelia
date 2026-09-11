@@ -9,7 +9,7 @@
 #include "parhelia_mipmap.h"
 
 #define PH_VRAM_VERTEX_LEGACY_SLOTS 3
-#define PH_VRAM_VERTEX_SLOTS_MAX 9
+#define PH_VRAM_VERTEX_SLOTS_MAX 8
 
 struct parhelia_screen {
    struct pipe_screen base;
