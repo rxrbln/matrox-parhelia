@@ -151,6 +151,22 @@ the independently recovered 32-row allocation granularity of layout 2/3.
 The surface object therefore carries the 8-KiB alignment into allocation.  The
 memory manager chooses the eventual local byte origin independently.
 
+The Windows allocation and attach path preserves that origin.  The surface
+manager at `mtxpserd.dll:0x39c50` first selects an allocator table through
+`manager+0x358`: the outer selection consumes allocation option `+0x18`, while
+the nested class is derived from `option[1] * 26 + option[0]` at
+`0x39cb8..0x39cd2`.  This selects a heap/policy object before allocation; it
+does not alter the address returned by that object.  The selected allocator's
+first virtual method is called at `0x39ce3..0x39ce6` with the complete
+allocation options, including the previously computed alignment.
+
+On success the returned `MmBlock *` is passed directly to the common attach
+routine at `0x97aa0`.  That routine stores the block at `surface+0x68`, loads
+`MmBlock+0x20` at `0x97aaa`, and writes it as the surface engine base at
+`surface+0x78` at `0x97aad`.  Its following branches only OR memory-class tag
+bits 2 or 3 for non-local storage; they do not transform local origin bits.
+This is the Windows counterpart of the Linux X attach path below.
+
 ## Linux X suballocates surfaces and keeps CPU mapping separate
 
 The saved Linux X driver's dynamic symbols expose its complete emulated
