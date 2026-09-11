@@ -1,11 +1,16 @@
 # Gallium masked and rectangular clear design
 
 This note specifies the GPU path for Gallium colour, depth, and stencil clears
-in the current Parhelia Mesa/DRM stack.  It is an implementation recipe, not a
-claim that the code already has these semantics.  At present
-`parhelia_context.c:ph_clear()` discards `color_clear_mask`,
-`stencil_clear_mask`, and `scissor_state`, and any depth or stencil request
-overwrites the complete S8Z24 word over the complete framebuffer.
+in the current Parhelia Mesa/DRM stack.
+
+**Status 2026-09-11: implemented in Mesa `96d8758` and verified on P690.**  The
+recipe below was followed with two hardware corrections, recorded in the
+"P690 hardware result" section at the end: the 2D fill addresses tiled rows
+with y bits 0 and 1 swapped relative to the 3-D layout, and P690 render
+targets are allocated in 16-row, not 32-row, tile rows.  Before that commit
+`ph_clear()` discarded `color_clear_mask`, `stencil_clear_mask`, and
+`scissor_state`, and any depth or stencil request overwrote the complete S8Z24
+word over the complete framebuffer.
 
 The required operation is the already working 2D solid fill with a bit-plane
 write mask.  It needs no CPU readback or per-resource depth/stencil shadow.
@@ -107,8 +112,10 @@ alignment, format `0x32` or `0x36`, and the overflow-safe relations
 `x <= surface_width`, `width <= surface_width-x`, `y <= surface_alloc_height`,
 and `height <= surface_alloc_height-y`.  The existing full-clear entry point
 can remain as an all-ones-mask wrapper.  Do not require a rectangular clear's
-height to be a multiple of 32; only the backing allocation height has that
-constraint.  The engine handles rectangles that begin or end inside a tile.
+height to be a multiple of the tile height; only the backing allocation has
+that constraint (16 rows on P690, see below).  The engine accepts rectangles
+that begin or end inside a tile, but on P690 only after the row-order
+correction in the hardware-result section.
 
 ## Mask construction
 
@@ -255,3 +262,94 @@ the firing `0x138c`, followed by GPU readback values matching the equations
 above.  No depth compression or hierarchical-clear state exists in the open
 stream, so there is no metadata packet to invalidate; the functional depth and
 stencil draw in step 3 is the hardware check for that assumption.
+
+## P690 hardware result (2026-09-11)
+
+Implemented in Mesa `96d8758` (`parhelia_batch_clear_rect_surface()`,
+`ph_clear()`, `ph_clear_render_target()`, `ph_clear_depth_stencil()`), tested
+on the P690 target (`chip=0x2539 tile_layout=1`, i.e. 64x16 tiles) with the
+kernel at `66a1392`.
+
+### Fill row order differs from the 3-D tile layout
+
+The first live masked-clear run matched almost every pixel, but rectangles
+whose last row was `4k+1` left that row unfilled and filled row `4k+2`
+instead.  `parhelia_drm_test --fill-geometry-probe BASE` isolates this: 128
+two-column fills cover every start row modulo 16 and heights 1..8, and the
+result is read back through `DOWNLOAD_RENDER` and the verified 3-D tile model
+(`p3d_tile_offset_layout()`).  At bases 0, 16, 64, 144 and 224, every raw
+fill of 2D rows `[y0, y0+h)` lands exactly on 3-D rows
+`{fill_row(y) : y0 <= y < y0+h}`, with
+
+```
+fill_row(y) = (y & ~3) | ((y & 1) << 1) | ((y >> 1) & 1)
+```
+
+That is, inside every 4-row group the type-2 fill destination swaps y bits 0
+and 1 (tile dword-index bits 6 and 3) compared with the 3-D rasterizer.  Rows
+`4k` and `4k+3` are unchanged, columns are unaffected, and the Z24S8 format
+`0x36` behaves identically.  `fill_row` is an involution, so whole 4-row
+groups map onto themselves: full clears and every clear covering complete
+groups were always correct, which is why the old full-surface clear never
+showed it.  The 3-D depth and stencil units agree with the CPU tile model
+(below), so the fill, not the model, is the side with the other row order.
+
+`parhelia_batch_clear_rect_surface(..., row_swizzle=true)` therefore emits
+the aligned body of a rectangle as one fill and maps the at most three head
+and three tail rows through `fill_row`, merging touching fill-space runs.  At
+most three 15-dword packets result (for example rows 2..9 become fill rows
+`{1}`, `[3,9)`, `{10}`).  The corrected pass of the same probe lands exactly on
+the requested rows at all five bases.
+
+Only the P690 64x16 layout is characterized.  Mesa advertises
+`clear_scissored`/`clear_masked` only there; the 64x32 layout keeps full
+clears, and its partial-row fill order is unverified.
+
+Open question: whether the type-2 *source* of the 2D BITBLT (used by readback
+and native Present) has the same row order as the fill.  A test through a
+`PARHELIA_CREATE_RENDER_LINEAR` companion was inconclusive: after a fenced
+type-2 to type-1 blit, the CPU mapping of that linear BO still held its
+pre-blit sentinel, so the linear readback path itself needs investigation
+before the blit source order can be measured.
+
+### Allocation height
+
+The kernel allocates tiled P690 targets as `ALIGN(height, 16)` rows
+(`parhelia_create_render_ioctl()`), but the previous `ph_clear()` filled
+`ALIGN(height, 32)` rows.  For heights with `h mod 32` in 1..16 every full
+clear wrote up to 16 rows past the allocation, into the neighbouring packed
+native target (e.g. a 300x300 window: 304 rows allocated, 320 cleared).  The
+clear now uses the layout's tile height, and the batch validator accepts
+16-row multiples.
+
+### PLNWT and 3-D colour masks
+
+The fill writes 0x1324 explicitly on every clear, including full clears; the
+earlier packet inherited whatever colour mask the preceding 3-D draw had left
+there.  In the 3-D state, `glColorMask(0,0,0,0)` previously produced
+0xffffffff because `p3d_colour_mask()` treated four cleared flags as "unset";
+Mesa now sets `mask_explicit` and emits 0.
+
+### Results
+
+* `parhelia-drm-test --selftest`: 34/34, including the exact 15-dword packet,
+  two same-handle relocations, bounds rejection and the split-run vectors.
+* `--fill-geometry-probe`: raw rows match `fill_row` and corrected rows match
+  the request, 0/128 differing cases at each of five bases.
+* `--masked-clear-probe`, all 0/65536 mismatches:
+  * colour PLNWT rectangles crossing x=63/64 and y=31/32, 1x1 and 3-wide;
+  * Z24S8 depth-only, stencil-mask 0x5a and combined rectangles;
+  * depth LESS plus stencil EQUAL 0x9c against the merged words, a masked
+    clear queued between draws without a wait, and colour masks 0 and R;
+  * disabled depth writes and a zero stencil write mask preserving Z24S8.
+* `xf86-video-parhelia/tools/parhelia-gl-clear-test.c` through GLX, Gallium and `glReadPixels`,
+  all 0/65536 mismatches: scissored and colour-masked `glClear`, scissored
+  depth-only, masked-stencil and combined clears, and a full depth-only clear
+  that preserves stencil (the old driver overwrote stencil on every
+  depth-only clear, e.g. each Q3 frame).
+* ioquake3 (OpenGL 1) stayed live beside glxgears.  Gears performance is
+  unchanged by this commit at equal optimization level (A/B: 458-460 FPS
+  before versus 455-459 FPS after, both built through the T2 `-Os` wrapper).
+
+The kernel state-shadow cache was left at its default (disabled) for these
+runs; the clear packets carry relocations and are never elided by it.

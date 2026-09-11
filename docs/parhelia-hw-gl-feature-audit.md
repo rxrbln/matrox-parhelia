@@ -12,7 +12,8 @@ The three principal source files had SHA-256 prefixes `644bd1a1` (context),
 the affected rows rather than assuming this snapshot still applies.  This
 snapshot includes Mesa commits `e4a6857` (unit lines), `83c89f6` (2x
 anisotropy), `78a7bd5` (stencil, scissor, and blend state), and `eb7c52e`
-(batched consecutive lines).
+(batched consecutive lines).  Rows 29, 30, 38 and 40 and the counts were
+re-audited on 2026-09-11 after Mesa `96d8758` (masked/scissored clears).
 
 Status has a deliberately strict meaning:
 
@@ -76,8 +77,8 @@ invalidates register addresses derived directly from region-2 indices
 |---:|---|:---:|---|---|
 | 27 | ARGB/XRGB 32-bit tiled render target and render-to-texture | **I+T** | Format support, native/share resources and color binding are present (`parhelia_screen.c:145-174,317-539`; `parhelia_context.c:2753-2760`). | Native target tiling is hardware solved (`parhelia-3d-integrated.md:357-381`); owned render targets pass the integrated path (`parhelia-own-render-target.md:1-80`). |
 | 28 | Z24 depth attachment, clear, compare functions and write mask | **I+T** | Z24/S8 formats are accepted (`parhelia_screen.c:162-165`); compare/write state is emitted (`parhelia_context.c:963-975,2863-2871`; `reference/p3d_state.c:430-455`). | Open-driver depth is measured (`parhelia-3d-state-complete.md:177-232`) and full-scene coverage agrees within 0.008% (`parhelia-gears-test.md:34-58`). |
-| 29 | stencil clear | **I+G** | `ph_clear` packs depth and stencil together (`parhelia_context.c:4242-4262`), but the callback ignores stencil write masks and no retained open-driver result isolates stencil clear. | S8Z24 is the established depth/stencil format (`parhelia-gigacolor-faa-hardware-status.md:45-48`). |
-| 30 | stencil test, compare, ref/read/write masks, ops and wrap | **I+G** | The front-face Gallium stencil state and dynamic reference are lowered into compare, three operations, read/write masks and the shared S8Z24 packet (`parhelia_context.c:928-975,3716-3726,4149-4157`; `reference/p3d_state.c:430-455`).  The exact register words pass an offline self-test (`parhelia_drm_test.c:1150-1191`); two-sided stencil and a retained live result remain absent. | The contiguous hardware state and wrap operations are decoded (`parhelia-pixel-pipeline-complete.md:392-528`; `parhelia-gl-limits.md:581-582,789`). |
+| 29 | stencil clear | **I+T** | Mesa `96d8758`: `ph_clear_zs()` builds the PLNWT mask from `PIPE_CLEAR_DEPTH`/`PIPE_CLEAR_STENCIL` and the stencil write mask, so depth-only, stencil-only and partial-stencil clears preserve the other bits of the S8Z24 word. | `parhelia_drm_test --masked-clear-probe` and `xf86-video-parhelia/tools/parhelia-gl-clear-test.c` pass with 0/65536 mismatches on P690, including a full depth-only clear that preserves stencil (`parhelia-gallium-masked-clear-design.md`, hardware result). |
+| 30 | stencil test, compare, ref/read/write masks, ops and wrap | **I+G** | The front-face Gallium stencil state and dynamic reference are lowered into compare, three operations, read/write masks and the shared S8Z24 packet (`parhelia_context.c:928-975,3716-3726,4149-4157`; `reference/p3d_state.c:430-455`).  The exact register words pass an offline self-test (`parhelia_drm_test.c:1150-1191`).  A live P690 probe now proves EQUAL with KEEP operations and a zero write mask against GPU-merged stencil words (`--masked-clear-probe`, 2026-09-11); the other operations, wrap and two-sided stencil remain live-unvalidated. | The contiguous hardware state and wrap operations are decoded (`parhelia-pixel-pipeline-complete.md:392-528`; `parhelia-gl-limits.md:581-582,789`). |
 | 31 | alpha test from vertex alpha | **I+T** | All compare functions and 8-bit reference are translated (`parhelia_context.c:883-891,958-962`) and emitted (`reference/p3d_state.c:418-428`). | The P690 vertex-alpha cutout controls color and depth correctly (`parhelia-p690-rgb-companion-alpha-cutout.md:154-164`). |
 | 32 | P690 sampled-texture alpha test and source-alpha blend | **I+G** | A unit-1 RGB companion route exists but requires `PARHELIA_NATIVE_SAMPLED_ALPHA=cutout|blend|all` (`parhelia_context.c:1356-1432,4841-4868`).  It is deliberately excluded from default production selection after live spatial/VRAM failures. | The ordinary one-unit route is explicitly unproven (`parhelia-p690-q3-sampled-alpha-final-audit.md:6-16,64-99`); the companion probe proves only the uniform sample and records the missing spatial proof (`parhelia-p690-native-alpha-live-failure.md:62-110`). |
 | 33 | ADD blending with ordinary factors | **I+T** | Factor mapping and enable are emitted (`parhelia_context.c:893-914,978-991`; `reference/p3d_state.c:75-92`). | Depth/vertex-alpha source-over and additive forms pass hardware probes (`parhelia-q3-ui-additive-blend.md:37-73`). |
@@ -85,9 +86,9 @@ invalidates register addresses derived directly from region-2 indices
 | 35 | SUBTRACT, REVERSE_SUBTRACT, MIN and MAX blend equations | **I+G** | Gallium equations now reach the shared hardware equation field; MIN/MAX select the required canonical factors (`parhelia_context.c:916-926,978-991`; `reference/p3d_state.c:75-92`).  Exact ADD/SUBTRACT/MIN words pass offline tests (`parhelia_drm_test.c:855-882`), but the new equations lack retained live results. | Hardware equations are confirmed from the vendor emitter (`parhelia-gl-limits.md:786`; `parhelia-fragment-ops.md:729-738`). |
 | 36 | constant blend color/factors | **I+G** | All constant factor cases, dynamic blend-color state, and the two packed 10-bit register values are connected (`parhelia_context.c:893-949,978-991,4139-4147`; `reference/p3d_state.c:418-428`).  Exact words pass offline tests (`parhelia_drm_test.c:855-882,1150-1191`), but no retained live result exercises them. | The hardware opcode/register route is confirmed (`parhelia-gl-limits.md:601,787`; `parhelia-blend-alpha-encoding.md:6-12`). |
 | 37 | logic operations | **M** | No logic-op state or ROP translation exists. | The hardware state-slot route and 16 operations are documented at `parhelia-gl-limits.md:788`. |
-| 38 | per-channel color write mask | **I+T** | Gallium masks become four emitter fields (`parhelia_context.c:992-995`; `reference/p3d_state.c:594-597`). | The byte mask is capture-confirmed (`parhelia-3d-coverage.md:58`; `parhelia-pixel-pipeline-complete.md:530-551`). |
+| 38 | per-channel color write mask | **I+T** | Gallium masks become four emitter fields (`parhelia_context.c:992-995`; `reference/p3d_state.c:594-597`).  Mesa `96d8758` marks them explicit, so `glColorMask(0,0,0,0)` emits 0x1324 = 0 instead of the former all-channels default; mask 0 and R-only draws pass live on P690 (`--masked-clear-probe`). | The byte mask is capture-confirmed (`parhelia-3d-coverage.md:58`; `parhelia-pixel-pipeline-complete.md:530-551`). |
 | 39 | dithering | **I+G** | Gallium dither reaches the blend word (`parhelia_context.c:2762`; `reference/p3d_state.c:75-92`), but no retained current-Mesa visual test isolates on/off behavior or format gates. | Dither is part of the decoded BLENDCTL contract (`parhelia-blend-alpha-encoding.md:6-12`). |
-| 40 | masked/scissored color, depth and stencil clears | **C** | `ph_clear` ignores `color_mask`, `stencil_mask`, and the supplied scissor (`parhelia_context.c:4242-4251`) and fills the whole selected surface. | The vendor clear record carries mask and rectangle (`parhelia-gl-feature-map.md:136-147`). |
+| 40 | masked/scissored color, depth and stencil clears | **I+T** | Mesa `96d8758`: `ph_clear()` passes the clamped scissor rectangle and PLNWT mask to `parhelia_batch_clear_rect_surface()`; `clear_scissored`/`clear_masked` are advertised on the P690 64x16 layout, and `clear_render_target`/`clear_depth_stencil` use the same fill.  The fill's P690 row order (y bits 0/1 swapped) is corrected by splitting partial 4-row groups. | Hardware fill-geometry probe (raw and corrected, five bases), masked-clear probe and GL-level `glClear` test all pass on P690; the vendor clear record carries mask and rectangle (`parhelia-gl-feature-map.md:136-147`; `parhelia-gallium-masked-clear-design.md`). |
 | 41 | GigaColor X2R10G10B10 render target/scanout | **M** | Format support exposes no tested 10-bit target and the draw emitter hard-codes color format `0x32` (`parhelia_context.c:2756-2760`). | `0x34` X2R10G10B10 is binary-proven but still needs a P690 3-D target test (`parhelia-gigacolor-faa-hardware-status.md:19-62`). |
 
 ## Textures and sampling
@@ -136,28 +137,27 @@ The 64 positive hardware-feature rows classify as follows:
 
 | status | rows | share |
 |---|---:|---:|
-| I+T | 12 | 18.8% |
-| I+G | 19 | 29.7% |
+| I+T | 14 | 21.9% |
+| I+G | 18 | 28.1% |
 | M | 26 | 40.6% |
-| C | 7 | 10.9% |
+| C | 6 | 9.4% |
 
 Counting a gated/partial row as half complete gives a rough hardware-feature
-coverage of **21.5/64 = 33.6%**.  This is an engineering inventory, not a GL
+coverage of **23/64 = 35.9%**.  This is an engineering inventory, not a GL
 conformance score: rows deliberately represent user-visible feature families,
 and a small state such as scissor has the same weight as a large compiler such
 as programmable WARP.  The result nevertheless quantifies the opportunity:
-**52/64 rows (81.3%) still require default enablement, validation,
-implementation, or correction**, and 33/64 (51.6%) are wholly missing or
-contradicted.  The first number includes the 19 useful-but-gated or unvalidated
+**50/64 rows (78.1%) still require default enablement, validation,
+implementation, or correction**, and 32/64 (50.0%) are wholly missing or
+contradicted.  The first number includes the 18 useful-but-gated or unvalidated
 rows; the second is the narrower estimate of functionality with no usable
 implementation or a current correctness contradiction.
 
 The highest-impact next implementations, ordered by benefit versus recovered
 evidence, are:
 
-1. **Masked/scissored clear.**  The ordinary draw-scissor path is now connected,
-   but clear still drops masks and rectangles.  The exact vendor clear record is
-   recovered, so this is the remaining high-impact scissor correctness hole.
+1. **Masked/scissored clear — done 2026-09-11 (rows 29, 40).**  Implemented
+   and hardware-verified; see `parhelia-gallium-masked-clear-design.md`.
 2. **Native points and remaining line modes.**  Unit-width untextured
    `GL_LINES` is connected and offline-tested.  Points still emit no pixels;
    textured/smooth/wide lines and strips/loops remain absent despite decoded
