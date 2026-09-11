@@ -378,6 +378,8 @@ void parhelia_bo_set_layout(struct drm_gem_vram_object *gbo, u8 layout,
 	struct parhelia_bo *bo = container_of(gbo, struct parhelia_bo, gbo);
 
 	bo->layout = layout;
+	bo->placement_class = parhelia_bo_is_native(bo) ?
+		PARHELIA_PLACEMENT_RENDER : PARHELIA_PLACEMENT_GENERIC;
 	bo->width = width;
 	bo->height = height;
 	bo->gpu_pitch = gpu_pitch;
@@ -729,6 +731,10 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	if (IS_ERR(gbo))
 		return PTR_ERR(gbo);
 	bo = container_of(gbo, struct parhelia_bo, gbo);
+	/* Keep long-lived scanout allocations between the exact 32 MiB native
+	 * render/depth anchors.  Their host-aperture descriptor makes the physical
+	 * address immutable for the object's lifetime. */
+	bo->placement_class = PARHELIA_PLACEMENT_SCANOUT;
 
 	mutex_lock(&pdev->aperture_lock);
 	ret = parhelia_aperture_alloc_locked(pdev, &bo->aperture, host_size);

@@ -367,6 +367,7 @@ struct parhelia_aperture_mapping {
  */
 struct parhelia_bo {
 	struct drm_gem_vram_object gbo;
+	struct ttm_place p690_placements[4];
 	struct parhelia_aperture_mapping aperture;
 	u32 width;
 	u32 height;
@@ -377,8 +378,13 @@ struct parhelia_bo {
 	size_t host_size;
 	u8 layout;
 	u8 aperture_slot;
+	u8 placement_class;
 	bool host_aperture;
 };
+
+#define PARHELIA_PLACEMENT_GENERIC	0
+#define PARHELIA_PLACEMENT_RENDER	1
+#define PARHELIA_PLACEMENT_SCANOUT	2
 
 static inline struct parhelia_bo *to_parhelia_bo(struct drm_gem_object *gem)
 {
