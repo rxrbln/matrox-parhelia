@@ -366,6 +366,11 @@ module_param(vram_vertex, bool, 0400);
 MODULE_PARM_DESC(vram_vertex,
 		 "Enable hardware-tested dedicated DMA32 P690 vertex buffers (default true)");
 
+static bool trace_vram_reloc;
+module_param(trace_vram_reloc, bool, 0400);
+MODULE_PARM_DESC(trace_vram_reloc,
+		 "Trace physical and engine addresses patched into render relocations");
+
 /* Permit one ioctl to carry two complete logical state batches.  The kernel
  * retains each batch's opening/EOB/DWGSYNC bracket and coalesces only the final
  * primary producer update. */
@@ -1361,7 +1366,8 @@ static int parhelia_validate_packet(const u32 *cmd,
 }
 
 /* True when @dword is the data operand of a texture/surface base write. */
-static bool parhelia_is_vram_operand(const u32 *cmd, u32 length, u32 dword)
+static bool parhelia_vram_operand_reg(const u32 *cmd, u32 length, u32 dword,
+				      u32 *reg)
 {
 	u32 pos = 1;
 
@@ -1374,18 +1380,28 @@ static bool parhelia_is_vram_operand(const u32 *cmd, u32 length, u32 dword)
 
 			if (index == 0x21)
 				break;
-			if (pos == dword)
-				return parhelia_vram_register(index);
+			if (pos == dword) {
+				if (!parhelia_vram_register(index))
+					return false;
+				if (reg)
+					*reg = 0x1000 + index * sizeof(u32);
+				return true;
+			}
 			pos++;
 		}
 	}
 	return false;
 }
 
+static bool parhelia_is_vram_operand(const u32 *cmd, u32 length, u32 dword)
+{
+	return parhelia_vram_operand_reg(cmd, length, dword, NULL);
+}
+
 /* Keep one engine-visible allocation wholly inside either physical VRAM bank.
- * SUN90 encodes bank B at 128 MiB, so a linear surface may not cross the
- * half-VRAM discontinuity.  Two bounded placements let TTM pack many small
- * clients into each bank instead of forcing every surface onto a 32 MiB base.
+ * SUN90 encodes bank B at 128 MiB, so a surface may not cross the half-VRAM
+ * discontinuity.  Render-target alignment is imposed by CREATE_RENDER and is
+ * preserved while TTM chooses one of these bounded placements.
  */
 static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 				    u64 vram_size, bool split_banks)
@@ -1585,9 +1601,87 @@ static void parhelia_slot_release_locked(struct parhelia_device *pdev,
 	slot->state = PARHELIA_SLOT_FREE;
 	if (pdev->queued_slots)
 		pdev->queued_slots--;
-	if (!pdev->queued_slots)
+	if (!pdev->queued_slots) {
 		pdev->primary_get = pdev->primary_put;
+		pdev->queue_owner = NULL;
+	}
 	wake_up_all(&pdev->submit_waitq);
+}
+
+/* Native targets use a small set of hardware-proven placements.  Do not hold
+ * one client's placements pinned while accepting another client's queue: the
+ * first contender requests a handoff, which stops the current owner appending
+ * and lets DWGSYNC retirement drain the queue.  TTM can then preserve and
+ * evict the old targets before pinning the new file's surfaces. */
+static bool parhelia_async_file_turn(struct parhelia_device *pdev,
+				     struct drm_file *file)
+{
+	if (!pdev->queued_slots) {
+		if (pdev->queue_next && pdev->queue_next != file)
+			return false;
+		pdev->queue_owner = file;
+		if (pdev->queue_next == file)
+			pdev->queue_next = NULL;
+		return true;
+	}
+	if (pdev->queue_owner == file && !pdev->queue_next)
+		return true;
+	if (pdev->queue_owner != file && !pdev->queue_next)
+		pdev->queue_next = file;
+	return false;
+}
+
+static bool parhelia_async_file_turn_ready(struct parhelia_device *pdev,
+					    struct drm_file *file)
+{
+	return !READ_ONCE(pdev->queued_slots) &&
+	       (!READ_ONCE(pdev->queue_next) ||
+		READ_ONCE(pdev->queue_next) == file);
+}
+
+static void parhelia_async_file_turn_cancel(struct parhelia_device *pdev,
+					     struct drm_file *file)
+{
+	mutex_lock(&pdev->submit_lock);
+	if (pdev->queue_next == file) {
+		pdev->queue_next = NULL;
+		wake_up_all(&pdev->submit_waitq);
+	}
+	mutex_unlock(&pdev->submit_lock);
+}
+
+static int parhelia_async_file_turn_static_selftest(void)
+{
+	struct parhelia_device *pdev;
+	struct drm_file *a = (struct drm_file *)1UL;
+	struct drm_file *b = (struct drm_file *)2UL;
+	struct drm_file *c = (struct drm_file *)3UL;
+	int ret = -EINVAL;
+
+	pdev = kzalloc(sizeof(*pdev), GFP_KERNEL);
+	if (!pdev)
+		return -ENOMEM;
+	/* A owns live work; B requests the first handoff.  A must then stop
+	 * appending, and a later C may not displace B. */
+	pdev->queued_slots = 2;
+	pdev->queue_owner = a;
+	if (!parhelia_async_file_turn(pdev, a) ||
+	    parhelia_async_file_turn(pdev, b) || pdev->queue_next != b ||
+	    parhelia_async_file_turn(pdev, a) ||
+	    parhelia_async_file_turn(pdev, c) || pdev->queue_next != b)
+		goto out;
+	/* Once A drains, only B can claim the empty queue. */
+	pdev->queued_slots = 0;
+	pdev->queue_owner = NULL;
+	if (parhelia_async_file_turn(pdev, a) ||
+	    parhelia_async_file_turn(pdev, c) ||
+	    !parhelia_async_file_turn(pdev, b) || pdev->queue_next ||
+	    pdev->queue_owner != b)
+		goto out;
+	ret = 0;
+out:
+	kfree(pdev);
+	return ret;
 }
 
 /* submit_lock serializes both the producer and retirement.  DWGSYNC is the
@@ -1745,7 +1839,9 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 	u32 i;
 	int ret;
 
-	ret = parhelia_vram_placement_static_selftest();
+	ret = parhelia_async_file_turn_static_selftest();
+	if (!ret)
+		ret = parhelia_vram_placement_static_selftest();
 	if (!ret)
 		ret = parhelia_shadow_static_selftest();
 	if (!ret)
@@ -2653,11 +2749,16 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 		return -EINVAL;
 	if (!to_parhelia(drm)->raw_aperture_owned)
 		return -EOPNOTSUPP;
-	/* parhelia_vram_pin() supplies separate placements for P690's two physical
-	 * banks.  Surface alignment therefore describes the native tile only; a
-	 * 32 MiB object alignment left just three usable anchors and made several
-	 * independent GL clients exhaust VRAM with one-megabyte render targets. */
-	align_pages = max_t(unsigned long, 1, 8192 / PAGE_SIZE);
+	/* P690 live rendering currently requires native colour/depth targets on a
+	 * 32 MiB base.  The vendor allocator documents a smaller surface-layout
+	 * alignment, but arbitrary 8 KiB placements corrupt raster output on this
+	 * chip; retain the hardware-proven constraint until its address folding is
+	 * fully decoded. */
+	align_pages = pdev->pdev->device == PARHELIA_P690 &&
+		      !(args->flags & (PARHELIA_CREATE_RENDER_LINEAR |
+				       PARHELIA_CREATE_RENDER_TEXTURE)) ?
+			      SZ_32M / PAGE_SIZE :
+			      max_t(unsigned long, 1, SZ_8K / PAGE_SIZE);
 	/* Tiled surfaces occupy complete hardware tile rows.  Rounding only the
 	 * final byte count underallocates a partial row whenever pitch spans more
 	 * than one tile (300x300 on P690 was one 4 KiB tile short). */
@@ -3055,6 +3156,21 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 retry_slot:
 	mutex_lock(&pdev->submit_lock);
 	parhelia_retire_locked(pdev);
+	if (pdev->wedged) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+	if (async && !parhelia_async_file_turn(pdev, file)) {
+		mutex_unlock(&pdev->submit_lock);
+		ret = wait_event_interruptible_timeout(pdev->submit_waitq,
+			pdev->wedged || parhelia_async_file_turn_ready(pdev, file),
+			msecs_to_jiffies(10));
+		if (ret < 0) {
+			parhelia_async_file_turn_cancel(pdev, file);
+			goto out_relocs;
+		}
+		goto retry_slot;
+	}
 	if (async && submit_root_probe && pdev->queued_slots) {
 		mutex_unlock(&pdev->submit_lock);
 		ret = wait_event_interruptible_timeout(pdev->submit_waitq,
@@ -3158,10 +3274,6 @@ retry_slot:
 		if (ret < 0)
 			goto out_relocs;
 		goto retry_slot;
-	}
-	if (pdev->wedged) {
-		ret = -EIO;
-		goto out_unlock;
 	}
 	ret = parhelia_engine_init(pdev);
 	if (ret)
@@ -3463,6 +3575,22 @@ retry_slot:
 				&packet_cmd[reloc->dword]);
 		if (ret)
 			goto out_unpin;
+		if (trace_vram_reloc && j == i) {
+			struct parhelia_bo *pbo = to_parhelia_bo(objects[i]);
+			u32 target_reg = 0, bar_addr = 0;
+			s64 node = drm_gem_vram_offset(&pbo->gbo);
+
+			parhelia_vram_operand_reg(packet_cmd, packet->length,
+				reloc->dword, &target_reg);
+			parhelia_vram_bar_addr(pdev, &pbo->gbo, 0,
+				objects[i]->size, &bar_addr);
+			dev_info(&pdev->pdev->dev,
+				 "VRAM reloc pid=%d file=%p handle=%u reg=%#x layout=%u size=%zu node=%#llx bar=%#x delta=%#x gpu=%#x pin_count=%u\n",
+				 task_pid_nr(current), file, reloc->handle, target_reg,
+				 pbo->layout, objects[i]->size, (unsigned long long)node,
+				 bar_addr, reloc->delta, packet_cmd[reloc->dword],
+				 pbo->gbo.bo.pin_count);
+		}
 	}
 	if (mode7.stream_seen || mode7.index_seen) {
 		ret = parhelia_validate_mode7_contract(commands, packets,
@@ -4132,6 +4260,12 @@ void parhelia_submit_postclose(struct parhelia_device *pdev,
 retry:
 	mutex_lock(&pdev->submit_lock);
 	parhelia_retire_locked(pdev);
+	if (pdev->queue_next == file) {
+		pdev->queue_next = NULL;
+		wake_up_all(&pdev->submit_waitq);
+	}
+	if (!pdev->queued_slots && pdev->queue_owner == file)
+		pdev->queue_owner = NULL;
 	if (!pdev->wedged) {
 		for (i = 0; i < PARHELIA_ASYNC_SLOTS; i++) {
 			struct parhelia_submit_slot *slot = &pdev->slots[i];

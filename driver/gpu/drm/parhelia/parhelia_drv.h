@@ -432,6 +432,11 @@ struct parhelia_device {
 	u32 primary_put;
 	u32 primary_get;
 	u32 queued_slots;
+	/* The P690's proven 32 MiB native-target placements provide three live
+	 * anchors.  Drain at DRM-file handoff so TTM can evict the old client's
+	 * unpinned targets before the next client consumes those anchors. */
+	struct drm_file *queue_owner;
+	struct drm_file *queue_next;
 	u32 next_fence;
 	u32 first_fence;
 	bool primary_armed;
