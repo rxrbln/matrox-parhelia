@@ -506,7 +506,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	nd = p3d_descriptors(desc, st->tex != NULL, st->has_depth,
 			     st->pos_desc, st->col_desc,
 			     st->tex && st->tex->env == P3D_TEXENV_REPLACE,
-			     st->tex1 != NULL, st->vertex_alpha);
+			     st->tex1 != NULL || st->second_texcoord_probe,
+			     st->vertex_alpha);
 
 	rw[0].reg = P3D_R_ATTR_PRESENT; rw[0].val = p3d_attr_present(desc, nd);
 	rw[1].reg = P3D_R_ATTR_MAP0;    rw[1].val = 0x00287210u;

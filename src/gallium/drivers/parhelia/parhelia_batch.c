@@ -155,10 +155,14 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
        (!!input->tex != !!texture0_handle) ||
        (!!input->tex1 != !!texture1_handle) ||
        (!input->tex && input->tex1) ||
-       (input->tex && input->tex->base) ||
+	       (input->tex && input->tex->base) ||
 	       (input->tex1 && input->tex1->base) ||
-	       (input->dw_per_vertex != 5 + !!input->has_depth +
-	        2 * (!!input->tex + !!input->tex1) + !!input->vertex_alpha) ||
+	       (input->second_texcoord_probe &&
+	        (!input->tex || input->tex1 || input->has_depth ||
+	         input->vertex_alpha || input->transform)) ||
+	       (input->dw_per_vertex != 5u + !!input->has_depth +
+	        2 * (!!input->tex + !!input->tex1 +
+	             !!input->second_texcoord_probe) + !!input->vertex_alpha) ||
 	       /* RGBA fetch is restricted to the verified one-texture MODULATE
 	        * source-alpha ADD form.  The depth+RGBA alpha-test combination is
 	        * deliberately test-only: it proves the descriptor and texture-alpha

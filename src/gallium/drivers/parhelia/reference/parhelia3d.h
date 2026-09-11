@@ -359,6 +359,11 @@ struct p3d_state {
 	unsigned	   dw_per_vertex;
 	const struct p3d_texture *tex;	/* unit 0 */
 	const struct p3d_texture *tex1;	/* unit 1; NULL = single unit */	/* NULL = untextured */
+	/* Diagnostic only: fetch a second two-component coordinate into v8 and
+	 * advertise sets 0/1 while keeping a single sampler/combiner stage.  This
+	 * separates the multitexture WARP program's o4 output from unit-1 texture
+	 * state.  Gallium never sets this field. */
+	int		   second_texcoord_probe;
 	/* 1 selects the P690-proven single live pipe.  Value 2 is diagnostic
 	 * only: it additionally retains the vendor's disabled unit-1 pipe mask
 	 * (0x0001000c), while issuing no second sampler descriptor. */
