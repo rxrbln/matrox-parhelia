@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 /*
  * Userspace ABI for the Matrox Parhelia render node.
  *
