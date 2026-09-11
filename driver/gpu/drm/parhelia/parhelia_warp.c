@@ -179,6 +179,295 @@ static int warp_gate_ready(struct parhelia_device *pdev)
 	return -ETIMEDOUT;
 }
 
+/* ---- userspace program upload ------------------------------------------
+ *
+ * A WARP program supplied by a render-node client executes on the vertex
+ * engine, which can write the constant file.  That file is the engine's
+ * block-state file, so it holds surface base addresses: an unvalidated
+ * program is an arbitrary-DMA primitive.  The accepted subset is therefore a
+ * whitelist of arithmetic bundles with literal, bounded register indices.
+ * Every rule is documented in docs/parhelia-p690-warp-isa-re.md section 9.
+ */
+
+#define WARP_W2_OPCODE(w2)	(((w2) >> 23) & 0xffu)
+#define WARP_W2_F2B(w2)		(((w2) >> 31) & 1u)
+#define WARP_W1_SOP(w1)		(((w1) >> 9) & 0xfu)
+#define WARP_W1_IDXSEL(w1)	(((w1) >> 13) & 1u)
+#define WARP_W1_EXTHI(w1)	(((w1) >> 14) & 7u)
+#define WARP_W1_EXTSEL(w1)	(((w1) >> 17) & 7u)
+#define WARP_W1_RESERVED(w1)	(((w1) >> 20) & 3u)
+#define WARP_W1_F1I(w1)		(((w1) >> 27) & 7u)
+
+static const u32 warp_end[3] = { 0x00000200, 0x00040000, 0x14c00000 };
+static const u32 warp_nop[3] = { 0x00000200, 0x00040000, 0x00000000 };
+static const u32 warp_wra[3] = { 0x00080200, 0x00440000, 0xb01a21a2 };
+static const u32 warp_wra_tail[3] = { 0x00080200, 0x00440000, 0x301a21a2 };
+
+/* Primary opcodes with an established meaning.  Anything else, and the whole
+ * control class below 0x60, is rejected: without branches a program cannot
+ * loop, so it cannot stall the engine. */
+static bool warp_primary_allowed(u32 op)
+{
+	switch (op) {
+	case 0x60: case 0x61: case 0x62: case 0x63: case 0x66:
+	case 0x6d: case 0x71: case 0x73: case 0x75: case 0x76:
+	case 0x77: case 0x78: case 0x89: case 0x8a:
+	case 0x8b: case 0x8c: case 0x8d:
+	case 0x91: case 0x92: case 0x93: case 0x94:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* mova (9) and getidx (8) set up relative addressing, which the index bounds
+ * below cannot cover, so they are not accepted. */
+static bool warp_secondary_allowed(u32 sop)
+{
+	switch (sop) {
+	case 0: case 1: case 4: case 5: case 7:
+	case 0xc: case 0xd: case 0xe:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static const u32 warp_file_limit[4] = { 15, 31, 15, 255 };
+
+static bool warp_operand_ok(u32 file, u32 index, u32 exthi, bool extended)
+{
+	u32 full = extended ? index | (exthi << 4) : index;
+
+	return full <= warp_file_limit[file];
+}
+
+/* Destination files: 0 latch T#, 1 temp r#, 2 output o#, 3 constant c#. */
+static bool warp_destination_ok(u32 file, u32 index, u32 mask)
+{
+	if (!mask)
+		return true;		/* an idle port names no register */
+	switch (file) {
+	case 0:
+		return index <= 15;
+	case 1:
+		return index <= 15;
+	case 2:
+		return index <= 11;
+	default:
+		return false;		/* the constant file is engine state */
+	}
+}
+
+static int warp_validate_program(struct parhelia_device *pdev, const u32 *code,
+				 u32 count)
+{
+	bool ended = false;
+	u32 i;
+
+	for (i = 0; i < count; i++) {
+		const u32 *ins = code + i * 3;
+		u32 w0 = ins[0], w1 = ins[1], w2 = ins[2];
+		u32 op = WARP_W2_OPCODE(w2), sop = WARP_W1_SOP(w1);
+		u32 extsel = WARP_W1_EXTSEL(w1), exthi = WARP_W1_EXTHI(w1);
+		u32 n;
+
+		if (!memcmp(ins, warp_end, sizeof(warp_end))) {
+			ended = true;
+			continue;
+		}
+		if (!memcmp(ins, warp_nop, sizeof(warp_nop)) ||
+		    !memcmp(ins, warp_wra, sizeof(warp_wra)) ||
+		    !memcmp(ins, warp_wra_tail, sizeof(warp_wra_tail)))
+			continue;
+		/* Everything past this point must be an arithmetic bundle. */
+		if (!WARP_W2_F2B(w2) || !warp_primary_allowed(op) ||
+		    !warp_secondary_allowed(sop))
+			goto reject;
+		/* No relative addressing: every index is a literal. */
+		if (WARP_W1_F1I(w1) == 4 || WARP_W1_F1I(w1) == 5 ||
+		    WARP_W1_F1I(w1) == 6 || WARP_W1_F1I(w1) == 7 ||
+		    WARP_W1_IDXSEL(w1) || WARP_W1_RESERVED(w1))
+			goto reject;
+		if (extsel > 2 && exthi)
+			goto reject;
+		if (!warp_destination_ok((w0 >> 8) & 3u, (w0 >> 4) & 0xfu, w0 & 0xfu) ||
+		    !warp_destination_ok((w0 >> 18) & 3u, (w0 >> 14) & 0xfu,
+					 (w0 >> 10) & 0xfu))
+			goto reject;
+		for (n = 0; n < 3; n++) {
+			u32 file = n == 0 ? (w1 >> 7) & 3u :
+				   n == 1 ? w1 & 3u : (w0 >> 25) & 3u;
+			u32 index = n == 0 ? (w1 >> 2) & 0xfu :
+				    n == 1 ? (w0 >> 27) & 0xfu :
+					     (w0 >> 20) & 0xfu;
+
+			if (!warp_operand_ok(file, index, exthi, extsel == n))
+				goto reject;
+		}
+	}
+	if (!ended)
+		goto reject;
+	return 0;
+
+reject:
+	dev_dbg(&pdev->pdev->dev, "WARP program rejected at instruction %u\n", i);
+	return -EINVAL;
+}
+
+static u32 warp_user_entry(struct parhelia_device *pdev, u32 slot)
+{
+	u32 instruction = (slot - 1) * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS;
+
+	return ((u32)(pdev->warp_user_bus / 12) * 4 + instruction * 4) | 3u;
+}
+
+bool parhelia_warp_entry_allowed(struct parhelia_device *pdev,
+				 struct drm_file *file, u32 entry)
+{
+	static const u32 driver_entries[] = {
+		PARHELIA_WARP_PASSTHROUGH_ENTRY, PARHELIA_WARP_TEXTURED_ENTRY,
+		PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY,
+		PARHELIA_WARP_TRANSFORM_ENTRY, PARHELIA_WARP_LIGHTING_ENTRY,
+		PARHELIA_WARP_REPLACE_ENTRY,
+		PARHELIA_WARP_CONSTANT_LOADER_ENTRY, PARHELIA_WARP_PROBE_ENTRY,
+		PARHELIA_WARP_KIND6_ENTRY, PARHELIA_WARP_KIND12_ENTRY,
+		PARHELIA_WARP_PUBLISH_ENTRY, PARHELIA_WARP_BASE_ENTRY,
+		PARHELIA_WARP_STAGE_A_ENTRY, PARHELIA_WARP_STAGE_B_ENTRY,
+		PARHELIA_WARP_STAGE_C_ENTRY,
+	};
+	u32 i;
+
+	/* 0 and 2 are the two literal binding values the vendor stream uses in
+	 * place of an entry; they name no instruction. */
+	if (entry == 0 || entry == 2)
+		return true;
+	for (i = 0; i < ARRAY_SIZE(driver_entries); i++)
+		if (entry == parhelia_warp_entry(pdev, driver_entries[i]))
+			return true;
+	if (!pdev->warp_user_cpu)
+		return false;
+	mutex_lock(&pdev->warp_user_lock);
+	for (i = 0; i < PARHELIA_WARP_USER_SLOTS; i++) {
+		if (pdev->warp_user_owner[i] == file &&
+		    entry == warp_user_entry(pdev, i + 1)) {
+			mutex_unlock(&pdev->warp_user_lock);
+			return true;
+		}
+	}
+	mutex_unlock(&pdev->warp_user_lock);
+	return false;
+}
+
+void parhelia_warp_postclose(struct parhelia_device *pdev, struct drm_file *file)
+{
+	u32 i;
+
+	if (!pdev->warp_user_cpu)
+		return;
+	mutex_lock(&pdev->warp_user_lock);
+	for (i = 0; i < PARHELIA_WARP_USER_SLOTS; i++)
+		if (pdev->warp_user_owner[i] == file)
+			pdev->warp_user_owner[i] = NULL;
+	mutex_unlock(&pdev->warp_user_lock);
+}
+
+static int warp_user_claim(struct parhelia_device *pdev, struct drm_file *file,
+			   u32 *slot)
+{
+	u32 i, held = 0, free_slot = 0;
+
+	lockdep_assert_held(&pdev->warp_user_lock);
+	if (*slot) {
+		if (*slot > PARHELIA_WARP_USER_SLOTS ||
+		    pdev->warp_user_owner[*slot - 1] != file)
+			return -EINVAL;
+		return 0;
+	}
+	for (i = 0; i < PARHELIA_WARP_USER_SLOTS; i++) {
+		if (pdev->warp_user_owner[i] == file)
+			held++;
+		else if (!pdev->warp_user_owner[i] && !free_slot)
+			free_slot = i + 1;
+	}
+	if (held >= PARHELIA_WARP_USER_FILE_SLOTS)
+		return -EBUSY;
+	if (!free_slot)
+		return -ENOSPC;
+	pdev->warp_user_owner[free_slot - 1] = file;
+	*slot = free_slot;
+	return 0;
+}
+
+int parhelia_warp_program_ioctl(struct drm_device *drm, void *data,
+				struct drm_file *file)
+{
+	struct parhelia_device *pdev = to_parhelia(drm);
+	struct drm_parhelia_warp_program *args = data;
+	u32 *code = NULL;
+	u32 slot;
+	int ret;
+
+	if (args->pad || (args->flags & ~PARHELIA_WARP_PROGRAM_FREE))
+		return -EINVAL;
+	if (!pdev->warp_user_cpu)
+		return -EOPNOTSUPP;
+
+	if (args->flags & PARHELIA_WARP_PROGRAM_FREE) {
+		if (!args->slot || args->slot > PARHELIA_WARP_USER_SLOTS ||
+		    args->count || args->code)
+			return -EINVAL;
+		mutex_lock(&pdev->warp_user_lock);
+		if (pdev->warp_user_owner[args->slot - 1] != file) {
+			mutex_unlock(&pdev->warp_user_lock);
+			return -EINVAL;
+		}
+		pdev->warp_user_owner[args->slot - 1] = NULL;
+		mutex_unlock(&pdev->warp_user_lock);
+		args->entry = 0;
+		return 0;
+	}
+
+	if (!args->count || args->count > PARHELIA_WARP_USER_SLOT_INSTRUCTIONS)
+		return -EINVAL;
+	code = memdup_user(u64_to_user_ptr(args->code),
+			   array_size(args->count, 12));
+	if (IS_ERR(code))
+		return PTR_ERR(code);
+	ret = warp_validate_program(pdev, code, args->count);
+	if (ret)
+		goto out;
+
+	/* The store is fetched by the engine, so nothing may be executing from
+	 * it while it is rewritten.  Drain, then wait for the WARP gate. */
+	ret = parhelia_submit_idle_lock(pdev);
+	if (ret)
+		goto out;
+	ret = warp_gate_ready(pdev);
+	if (ret) {
+		mutex_unlock(&pdev->submit_lock);
+		goto out;
+	}
+	mutex_lock(&pdev->warp_user_lock);
+	slot = args->slot;
+	ret = warp_user_claim(pdev, file, &slot);
+	if (!ret) {
+		memcpy(pdev->warp_user_cpu +
+		       (slot - 1) * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS * 12,
+		       code, args->count * 12);
+		dma_wmb();
+		args->slot = slot;
+		args->entry = warp_user_entry(pdev, slot);
+	}
+	mutex_unlock(&pdev->warp_user_lock);
+	mutex_unlock(&pdev->submit_lock);
+out:
+	kfree(code);
+	return ret;
+}
+
+
+
 static void warp_upload(struct parhelia_device *pdev, unsigned int instruction,
 			const u32 *code, size_t dwords)
 {
@@ -516,6 +805,18 @@ int parhelia_warp_init(struct parhelia_device *pdev)
 	pad = (384 - allocation_bus % 384) % 384;
 	pdev->warp_cpu = allocation + pad;
 	pdev->warp_bus = allocation_bus + pad;
+	/* A second heap for validated userspace programs.  Instruction fetch is
+	 * a class-3 bus master read, so its entries are formed the same way; a
+	 * failed allocation only disables the upload ioctl. */
+	mutex_init(&pdev->warp_user_lock);
+	allocation = dmam_alloc_coherent(&pdev->pdev->dev,
+		PARHELIA_WARP_USER_INSTRUCTIONS * 12 + 383,
+		&allocation_bus, GFP_KERNEL);
+	if (allocation) {
+		pad = (384 - allocation_bus % 384) % 384;
+		pdev->warp_user_cpu = allocation + pad;
+		pdev->warp_user_bus = allocation_bus + pad;
+	}
 	ret = warp_load_residents(pdev);
 	if (ret)
 		return ret;

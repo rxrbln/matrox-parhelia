@@ -255,6 +255,15 @@ struct parhelia_bios {
 #define PARHELIA_WARP_CONSTANT_LOADER_ENTRY	(2400u * 4)
 #define PARHELIA_WARP_PROBE_ENTRY	(2528u * 4)
 
+/* Userspace program heap.  Slot ids are 1-based across the ABI; slot 0 means
+ * "not allocated".  One slot holds a whole program including its END and the
+ * trailing padding bundle. */
+#define PARHELIA_WARP_USER_SLOTS		32u
+#define PARHELIA_WARP_USER_SLOT_INSTRUCTIONS	64u
+#define PARHELIA_WARP_USER_FILE_SLOTS		8u
+#define PARHELIA_WARP_USER_INSTRUCTIONS \
+	(PARHELIA_WARP_USER_SLOTS * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS)
+
 struct parhelia_dma_block {
 	void *cpu;
 	dma_addr_t bus;
@@ -488,6 +497,13 @@ struct parhelia_device {
 	u64 reg_shadow_invalidations;
 	void *warp_cpu;
 	dma_addr_t warp_bus;
+	/* Second instruction heap holding validated userspace WARP programs.
+	 * Instruction fetch is a class-3 bus master read, so a second coherent
+	 * allocation is as good an instruction source as the resident one. */
+	void *warp_user_cpu;
+	dma_addr_t warp_user_bus;
+	struct mutex warp_user_lock;
+	struct drm_file *warp_user_owner[PARHELIA_WARP_USER_SLOTS];
 	bool engine_initialized;
 	bool raw_aperture_owned;
 	bool wedged;
@@ -592,6 +608,11 @@ void parhelia_host_aperture_release(struct parhelia_device *pdev,
 int parhelia_engine_init(struct parhelia_device *pdev);
 int parhelia_warp_init(struct parhelia_device *pdev);
 void parhelia_warp_trace_vertex(struct parhelia_device *pdev, const char *phase);
+int parhelia_warp_program_ioctl(struct drm_device *drm, void *data,
+				struct drm_file *file);
+void parhelia_warp_postclose(struct parhelia_device *pdev, struct drm_file *file);
+bool parhelia_warp_entry_allowed(struct parhelia_device *pdev,
+				 struct drm_file *file, u32 entry);
 void parhelia_submit_fini(struct parhelia_device *pdev);
 int parhelia_submit_init(struct parhelia_device *pdev);
 int parhelia_vram_pin(struct drm_gem_vram_object *bo);

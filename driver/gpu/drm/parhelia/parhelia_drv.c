@@ -91,6 +91,10 @@ PARHELIA_TRACED_IOCTL(parhelia_traced_download_render, parhelia_download_render_
 	((struct drm_parhelia_upload_render *)data)->handle,
 	((struct drm_parhelia_upload_render *)data)->offset,
 	((struct drm_parhelia_upload_render *)data)->size)
+PARHELIA_TRACED_IOCTL(parhelia_traced_warp_program, parhelia_warp_program_ioctl,
+	((struct drm_parhelia_warp_program *)data)->slot,
+	((struct drm_parhelia_warp_program *)data)->count,
+	((struct drm_parhelia_warp_program *)data)->flags)
 
 static int parhelia_traced_dumb_create(struct drm_file *file,
 				       struct drm_device *drm,
@@ -123,6 +127,7 @@ static int parhelia_traced_dumb_map_offset(struct drm_file *file,
 static void parhelia_postclose(struct drm_device *drm, struct drm_file *file)
 {
 	parhelia_submit_postclose(to_parhelia(drm), file);
+	parhelia_warp_postclose(to_parhelia(drm), file);
 }
 
 static const struct drm_ioctl_desc parhelia_ioctls[] = {
@@ -141,6 +146,8 @@ static const struct drm_ioctl_desc parhelia_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(PARHELIA_UPLOAD_RENDER, parhelia_traced_upload_render,
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(PARHELIA_DOWNLOAD_RENDER, parhelia_traced_download_render,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(PARHELIA_WARP_PROGRAM, parhelia_traced_warp_program,
 			  DRM_RENDER_ALLOW),
 };
 

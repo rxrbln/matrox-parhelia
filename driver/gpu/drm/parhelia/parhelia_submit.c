@@ -1315,7 +1315,19 @@ static bool parhelia_vram_register(u32 index)
 	return index == 0x77 || (index >= 0x88 && index <= 0x8e && !(index & 1));
 }
 
-static int parhelia_validate_reglist(const u32 *cmd, u32 length)
+/* The WARP entry is a class-3 instruction-fetch address.  A client that may
+ * write it freely can point the vertex engine at arbitrary system memory and
+ * have the resulting program write the surface-base block, so only entries
+ * this kernel handed out are accepted.  See
+ * docs/parhelia-p690-warp-isa-re.md section 9.3. */
+static bool parhelia_warp_entry_register(u32 index)
+{
+	return index == 0x40 || index == 0x41;	/* 0x1100, 0x1104 */
+}
+
+static int parhelia_validate_reglist(struct parhelia_device *pdev,
+				     struct drm_file *file,
+				     const u32 *cmd, u32 length)
 {
 	u32 pos = 1;
 
@@ -1345,6 +1357,9 @@ static int parhelia_validate_reglist(const u32 *cmd, u32 length)
 			/* This operand must be populated by a GEM relocation. */
 			if (parhelia_vram_register(index) && cmd[pos])
 				return -EACCES;
+			if (parhelia_warp_entry_register(index) &&
+			    !parhelia_warp_entry_allowed(pdev, file, cmd[pos]))
+				return -EACCES;
 			pos++;
 		}
 	}
@@ -1352,7 +1367,8 @@ static int parhelia_validate_reglist(const u32 *cmd, u32 length)
 	return pos == length ? 0 : -EINVAL;
 }
 
-static int parhelia_validate_packet(const u32 *cmd,
+static int parhelia_validate_packet(struct parhelia_device *pdev,
+				    struct drm_file *file, const u32 *cmd,
 				    const struct drm_parhelia_packet *packet)
 {
 	u32 header, words;
@@ -1368,7 +1384,8 @@ static int parhelia_validate_packet(const u32 *cmd,
 
 	switch (header >> 24) {
 	case 0x00:
-		return parhelia_validate_reglist(&cmd[packet->offset], words);
+		return parhelia_validate_reglist(pdev, file, &cmd[packet->offset],
+						 words);
 	case 0x97:
 		return words == 3 ? 0 : -EINVAL;
 	case 0x8f:
@@ -3219,6 +3236,14 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 	case PARHELIA_PARAM_WARP_CONSTANT_LOADER:
 		args->value = parhelia_warp_entry(pdev, PARHELIA_WARP_CONSTANT_LOADER_ENTRY);
 		break;
+	case PARHELIA_PARAM_WARP_PROGRAM_INSTRUCTIONS:
+		args->value = pdev->warp_user_cpu ?
+			PARHELIA_WARP_USER_SLOT_INSTRUCTIONS : 0;
+		break;
+	case PARHELIA_PARAM_WARP_PROGRAM_SLOTS:
+		args->value = pdev->warp_user_cpu ?
+			PARHELIA_WARP_USER_FILE_SLOTS : 0;
+		break;
 	case PARHELIA_PARAM_TILE_LAYOUT:
 		args->value = pdev->chip->tile_layout;
 		break;
@@ -3422,7 +3447,7 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 			ret = -EINVAL;
 			goto out_relocs;
 		}
-		ret = parhelia_validate_packet(commands, &packets[i]);
+		ret = parhelia_validate_packet(pdev, file, commands, &packets[i]);
 		if (ret) {
 			goto out_relocs;
 		}
