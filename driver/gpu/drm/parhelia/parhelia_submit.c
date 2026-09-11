@@ -352,10 +352,10 @@ module_param(mode3_screen_test, bool, 0400);
 MODULE_PARM_DESC(mode3_screen_test,
 		 "Enable the isolated P690 mode-3 bound-range screen test (default false)");
 
-static bool mode3_bound_range = true;
+static bool mode3_bound_range;
 module_param(mode3_bound_range, bool, 0400);
 MODULE_PARM_DESC(mode3_bound_range,
-		 "Enable hardware-tested P690 one-triangle-per-packet mode-3 rendering (default true)");
+		 "Enable P690 one-triangle-per-packet mode-3 rendering (experimental, default false)");
 
 /* BAR0 is a programmable host-aperture window, not a linear CPU view of local
  * memory.  CREATE_VERTEX therefore uses a dedicated DMA32 GEM object and the
