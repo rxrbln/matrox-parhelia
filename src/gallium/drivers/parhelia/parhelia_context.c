@@ -6176,8 +6176,10 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->aggregate_state_batches =
       ph_screen(screen)->stateful_submit &&
       ph_env("PARHELIA_BATCH_DIFFERENT_STATE");
+   /* One terminal EOB/DWGSYNC per ordered state stream instead of one per
+    * state: 9% in the ioquake3 timedemo. */
    ctx->aggregate_state_stream =
-      debug_get_bool_option("PARHELIA_BATCH_STATE_STREAM", false);
+      debug_get_bool_option("PARHELIA_BATCH_STATE_STREAM", true);
    ctx->aggregate_batches = ctx->aggregate_state_stream ||
                             ctx->aggregate_state_batches ||
                             ph_env("PARHELIA_BATCH_AGGREGATE");
