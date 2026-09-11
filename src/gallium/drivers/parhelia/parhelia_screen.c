@@ -322,6 +322,28 @@ ph_resource_upload_texture(struct parhelia_resource *r)
    if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr, "parhelia: texture upload handle=%u size=%llu\n",
               r->handle, (unsigned long long)r->size);
+   /* PARHELIA_VERIFY_UPLOAD=1 reads every texture upload back. */
+   if (ph_env("PARHELIA_VERIFY_UPLOAD")) {
+      uint32_t *back = malloc(r->size);
+      struct drm_parhelia_upload_render download = upload;
+      const uint32_t *want = r->map;
+      size_t first = SIZE_MAX, bad = 0;
+
+      download.data = (uintptr_t)back;
+      if (back && !ioctl(ph_screen(r->base.screen)->fd,
+                         DRM_IOCTL_PARHELIA_DOWNLOAD_RENDER, &download)) {
+         for (size_t i = 0; i < r->size / 4; i++)
+            if (back[i] != want[i]) {
+               first = MIN2(first, i);
+               bad++;
+            }
+         if (bad)
+            fprintf(stderr, "parhelia: texture %ux%u upload handle=%u: %zu/%llu dwords differ from byte %#zx\n",
+                    r->base.width0, r->base.height0, r->handle, bad,
+                    (unsigned long long)r->size / 4, first * 4);
+      }
+      free(back);
+   }
    return 0;
 }
 

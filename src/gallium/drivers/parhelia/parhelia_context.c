@@ -3262,6 +3262,31 @@ ph_submit_vertices(struct ph_context *ctx)
       ctx->submit_error = ret;
       goto out;
    }
+   /* PARHELIA_VERIFY_DRAW=1 compares the sampled texture's VRAM with its
+    * CPU image before every draw (debug only: waits for idle). */
+   if (texture && texture->upload_texture && ph_env("PARHELIA_VERIFY_DRAW") &&
+       !ph_wait_async(ctx)) {
+      uint32_t *back = malloc(texture->size);
+      struct drm_parhelia_upload_render down = {
+         .data = (uintptr_t)back, .size = texture->size,
+         .handle = texture->handle,
+      };
+      const uint32_t *want = texture->map;
+      size_t first = SIZE_MAX, bad = 0;
+
+      if (back && !ioctl(ph_screen(ctx->base.screen)->fd,
+                         DRM_IOCTL_PARHELIA_DOWNLOAD_RENDER, &down))
+         for (size_t i = 0; i < texture->size / 4; i++)
+            if (back[i] != want[i]) {
+               first = MIN2(first, i);
+               bad++;
+            }
+      if (bad)
+         fprintf(stderr, "parhelia: texture %ux%u handle=%u before draw: %zu dwords differ from byte %#zx (vram %08x cpu %08x)\n",
+                 texture->base.width0, texture->base.height0,
+                 texture->handle, bad, first * 4, back[first], want[first]);
+      free(back);
+   }
    if (ctx->native_sampled_alpha &&
        (ret = ph_prepare_alpha_companions(ctx, texture, sampler, true))) {
       ctx->submit_error = ret;
@@ -5536,8 +5561,15 @@ ph_resource_copy_region(struct pipe_context *p,
    }
    if (dst->target == PIPE_BUFFER || src->target == PIPE_BUFFER)
       return;
-   ph_copy_texture_box(ctx, dst, dst_level, dstx, dsty, src, src_level,
-                       src_box, src_box->width, src_box->height);
+   bool ok = ph_copy_texture_box(ctx, dst, dst_level, dstx, dsty, src,
+                                 src_level, src_box, src_box->width,
+                                 src_box->height);
+   if (ph_env("PARHELIA_TRACE_COPY"))
+      fprintf(stderr, "parhelia: copy %ux%u l%u -> %ux%u l%u at %d,%d box %d,%d %dx%d: %s (err %d)\n",
+              src->width0, src->height0, src_level, dst->width0,
+              dst->height0, dst_level, dstx, dsty, src_box->x, src_box->y,
+              src_box->width, src_box->height, ok ? "ok" : "FAILED",
+              ctx->submit_error);
 }
 
 static void
