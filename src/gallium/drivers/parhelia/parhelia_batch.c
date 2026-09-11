@@ -277,6 +277,7 @@ static int batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
                         uint32_t source_handle,
                         unsigned triangle_count,
                         unsigned vertex_dwords,
+                        unsigned vertices_per_primitive,
                         bool bound_ranges);
 
 int
@@ -326,7 +327,8 @@ parhelia_batch_clear_surface(struct parhelia_batch *batch, uint32_t handle,
    p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_clear(&cs, &surface, value, 0, 0, width, height);
-   return batch_finish(batch, &cs, calls, handle, 0, 0, 0, 0, 0, 0, false);
+   return batch_finish(batch, &cs, calls, handle, 0, 0, 0, 0, 0, 0, 0,
+                       false);
 }
 
 int
@@ -360,7 +362,7 @@ parhelia_batch_blit(struct parhelia_batch *batch,
    p3d_emit_blit(&cs, &dst, dst_type, dst_x, dst_y,
                  &src, src_type, src_x, src_y, width, height);
    return batch_finish(batch, &cs, calls, dst_handle, 0, 0, 0, src_handle,
-                       0, 0, false);
+                       0, 0, 0, false);
 }
 
 int
@@ -401,7 +403,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
    int ret;
 
    if (!batch || !input || !colour_handle || !triangle_count ||
-       triangle_count > PH_BATCH_MAX_DRAWS || input->prim != P3D_TRIANGLES ||
+       triangle_count > PH_BATCH_MAX_DRAWS ||
+       (input->prim != P3D_TRIANGLES && input->prim != P3D_LINES) ||
        !input->screen_w || !input->screen_h || input->screen_h > 0xffff ||
        input->screen_w > input->colour.pitch || (input->colour.pitch & 63) ||
        input->colour.pitch > 0x3fff || input->colour.base ||
@@ -472,6 +475,7 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 	        (!input->depth_vertex_alpha || input->depth_alpha_test_probe)) ||
        (input->transform && (!input->mvp || !input->const_loader_entry)) ||
        input->base_reg_entry ||
+       (input->bound_ranges && input->prim != P3D_TRIANGLES) ||
        (input->has_depth && (!depth_handle || input->depth.base ||
          input->depth.fmt != 0x36 || input->depth.pitch != input->colour.pitch ||
          input->depth_slot > 1)))
@@ -492,6 +496,7 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
                       state.has_depth ? depth_handle : 0,
                       texture0_handle, texture1_handle, 0,
                       triangle_count, state.dw_per_vertex,
+                      p3d_vertices_per_primitive(state.prim),
                       !!state.bound_ranges);
    /* Q3 reaches this builder with already transformed window-space vertices.
     * Keep the constant-loader/WARP-transform packet cadence outside the first
@@ -542,6 +547,7 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
              uint32_t source_handle,
              unsigned triangle_count,
              unsigned vertex_dwords,
+             unsigned vertices_per_primitive,
              bool bound_ranges)
 {
    unsigned draws = 0, texture_bases = 0;
@@ -566,8 +572,9 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
          if (call->sec_len != 3 || (cmd[0] >> 24) != 0x97)
             return -EINVAL;
          batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
-            .packet = i, .dword = draws++ * 3 * vertex_dwords * 4,
-            .delta = 3 * vertex_dwords * 4,
+            .packet = i,
+            .dword = draws++ * vertices_per_primitive * vertex_dwords * 4,
+            .delta = vertices_per_primitive * vertex_dwords * 4,
             .type = PARHELIA_RELOC_DRAW,
          };
          continue;

@@ -409,6 +409,7 @@ void	 p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 /* Derived values, exposed because a driver wants them for validation. */
 uint32_t p3d_primword(enum p3d_prim prim);
 uint32_t p3d_prim_class(enum p3d_prim prim);
+unsigned p3d_vertices_per_primitive(enum p3d_prim prim);
 uint32_t p3d_surface_cfg(const struct p3d_surface *s);
 uint32_t p3d_blendctl(const struct p3d_state *st);
 uint32_t p3d_dwgctl(const struct p3d_state *st);

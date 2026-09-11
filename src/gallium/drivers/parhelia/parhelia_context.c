@@ -3390,8 +3390,133 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 
 static void ph_stage_point(struct draw_stage *s, struct prim_header *p)
 { (void)s; (void)p; }
-static void ph_stage_line(struct draw_stage *s, struct prim_header *p)
-{ (void)s; (void)p; }
+
+/* The draw module has already transformed and clipped both endpoints when it
+ * reaches this stage.  A unit-width line therefore uses the same window-space
+ * passthrough WARP program and attribute layout as an untextured triangle;
+ * only the primitive class and the two-vertex DRAW byte range differ.  The
+ * vendor GL capture confirms exactly that delta (0x10b0 = 0x0006103d).
+ *
+ * Keep textured and smooth lines outside this first native path.  Their
+ * fragment/coverage semantics need more than merely selecting the line
+ * primitive, while dropping ordinary GL_LINES altogether is an existing and
+ * much more fundamental correctness bug. */
+static void
+ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
+{
+   struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   struct parhelia_batch *batch = &ctx->build_batch;
+   struct parhelia_resource *color, *depth = NULL;
+   const struct pipe_rt_blend_state *blend =
+      ctx->blend ? &ctx->blend->rt[0] : NULL;
+   struct p3d_state state = {0};
+   float vertices[2 * 6];
+   float *dst = vertices;
+   int pos, col, ret;
+   bool has_texture;
+
+   if (ctx->submit_error || !ctx->fb.nr_cbufs ||
+       !ctx->fb.cbufs[0].texture)
+      return;
+
+   has_texture = ctx->num_sampler_views && ctx->sampler_views[0] &&
+                 ctx->sampler_views[0]->texture;
+   if (has_texture ||
+       (ctx->rasterizer && (ctx->rasterizer->line_smooth ||
+                            ctx->rasterizer->line_width >= 1.5f)))
+      return;
+
+   /* A pending triangle batch owns ctx->vertices.  Publish it before this
+    * two-vertex packet so primitive state and byte ranges cannot be mixed. */
+   ph_submit_vertices(ctx);
+   if (ctx->submit_error)
+      return;
+
+   pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
+   col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
+   if (pos < 0)
+      return;
+
+   color = ph_resource(ctx->fb.cbufs[0].texture);
+   if (ctx->fb.zsbuf.texture)
+      depth = ph_resource(ctx->fb.zsbuf.texture);
+   if (!color->handle || (depth && !depth->handle) || color->upload_texture ||
+       (depth && depth->upload_texture)) {
+      ctx->submit_error = -EINVAL;
+      return;
+   }
+   if (ctx->aggregate_batches && color->linear_dirty && ph_drain_batch(ctx))
+      return;
+   ph_resource_upload_tiled(color);
+
+   state.colour.pitch = color->stride;
+   state.colour.fmt = 0x32;
+   state.screen_w = ctx->fb.width;
+   state.screen_h = ctx->fb.height;
+   state.prim = P3D_LINES;
+   state.warp_entry = ctx->warp_passthrough;
+   state.dither = !ctx->blend || ctx->blend->dither;
+   state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
+   state.has_depth = depth != NULL;
+   state.dw_per_vertex = depth ? 6 : 5;
+   if (depth) {
+      state.depth.pitch = depth->stride;
+      state.depth.fmt = 0x36;
+      state.depth_slot = 1;
+      state.depth_test = ctx->dsa && ctx->dsa->depth_enabled;
+      state.depth_write = ctx->dsa && ctx->dsa->depth_writemask;
+      state.depth_func = ph_compare(ctx->dsa ? ctx->dsa->depth_func :
+                                               PIPE_FUNC_LESS);
+   }
+   if (ctx->dsa) {
+      state.alpha_test = ctx->dsa->alpha_enabled;
+      state.alpha_func = ph_compare(ctx->dsa->alpha_func);
+      state.alpha_ref = CLAMP((int)lrintf(ctx->dsa->alpha_ref_value * 255.0f),
+                              0, 255);
+   }
+   if (blend) {
+      state.blend = blend->blend_enable;
+      state.blend_src = ph_blend_factor(blend->rgb_src_factor);
+      state.blend_dst = ph_blend_factor(blend->rgb_dst_factor);
+      state.mask_r = !!(blend->colormask & PIPE_MASK_R);
+      state.mask_g = !!(blend->colormask & PIPE_MASK_G);
+      state.mask_b = !!(blend->colormask & PIPE_MASK_B);
+      state.mask_a = !!(blend->colormask & PIPE_MASK_A);
+   }
+
+   for (unsigned v = 0; v < 2; v++) {
+      const float *p = prim->v[v]->data[pos];
+      const float white[4] = {1, 1, 1, 1};
+      const float *c = col < 0 ? white : prim->v[v]->data[col];
+
+      *dst++ = p[0];
+      *dst++ = p[1];
+      if (depth)
+         *dst++ = CLAMP(p[2], 0.0f, 1.0f);
+      *dst++ = c[0];
+      *dst++ = c[1];
+      *dst++ = c[2];
+   }
+
+   ret = parhelia_batch_state(batch, color->handle,
+                              depth ? depth->handle : 0, &state, 1);
+   if (!ret)
+      ret = ph_submit_batch(ctx, batch, vertices, 2 * state.dw_per_vertex,
+                            color, depth, NULL, NULL);
+   if (ret) {
+      ctx->submit_error = ret;
+      return;
+   }
+   color->tiled_dirty = true;
+   color->linear_dirty = false;
+   color->mip_defined |= BITFIELD_BIT(0);
+   color->content_generation++;
+   if (depth) {
+      depth->tiled_dirty = true;
+      depth->content_generation++;
+      depth->mip_defined |= BITFIELD_BIT(0);
+   }
+}
 static void ph_stage_flush(struct draw_stage *s, unsigned flags)
 {
    /* draw_flush() ends the software frontend's draw, but each transformed
