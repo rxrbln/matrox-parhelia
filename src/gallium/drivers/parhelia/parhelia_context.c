@@ -33,6 +33,7 @@
 
 #include "parhelia_batch.h"
 #include "parhelia_internal.h"
+#include "parhelia_sampler.h"
 
 struct ph_velems {
    unsigned count;
@@ -2699,10 +2700,12 @@ ph_submit_vertices(struct ph_context *ctx)
       tex.texelcode = texture_tiled ?
          ((rgb5a1_texture ||
            texture->base.format == PIPE_FORMAT_B5G5R5A1_UNORM) ? 3 : 2) : 0;
-      tex.min_filter = sampler && sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR ?
-                          P3D_FILTER_LINEAR : P3D_FILTER_NEAREST;
-      tex.mag_filter = sampler && sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR ?
-                          P3D_FILTER_LINEAR : P3D_FILTER_NEAREST;
+      tex.min_filter = ph_sampler_image_filter(
+         sampler && sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR,
+         sampler ? sampler->max_anisotropy : 0);
+      tex.mag_filter = ph_sampler_image_filter(
+         sampler && sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR,
+         sampler ? sampler->max_anisotropy : 0);
       tex.mip_filter = texture_mipped ? ph_sampler_mip_filter(sampler) :
                                        P3D_MIP_NONE;
       tex.wrap_s = sampler && sampler->wrap_s != PIPE_TEX_WRAP_REPEAT ?
@@ -2740,10 +2743,12 @@ ph_submit_vertices(struct ph_context *ctx)
                        0x33 : 0x32;
          tex1.texelcode = texture1_tiled ?
             (texture1->base.format == PIPE_FORMAT_B5G5R5A1_UNORM ? 3 : 2) : 0;
-         tex1.min_filter = sampler1 && sampler1->min_img_filter == PIPE_TEX_FILTER_LINEAR ?
-                           P3D_FILTER_LINEAR : P3D_FILTER_NEAREST;
-         tex1.mag_filter = sampler1 && sampler1->mag_img_filter == PIPE_TEX_FILTER_LINEAR ?
-                           P3D_FILTER_LINEAR : P3D_FILTER_NEAREST;
+         tex1.min_filter = ph_sampler_image_filter(
+            sampler1 && sampler1->min_img_filter == PIPE_TEX_FILTER_LINEAR,
+            sampler1 ? sampler1->max_anisotropy : 0);
+         tex1.mag_filter = ph_sampler_image_filter(
+            sampler1 && sampler1->mag_img_filter == PIPE_TEX_FILTER_LINEAR,
+            sampler1 ? sampler1->max_anisotropy : 0);
          tex1.mip_filter = texture1_mipped ? ph_sampler_mip_filter(sampler1) :
                                             P3D_MIP_NONE;
          tex1.wrap_s = sampler1 && sampler1->wrap_s != PIPE_TEX_WRAP_REPEAT ?

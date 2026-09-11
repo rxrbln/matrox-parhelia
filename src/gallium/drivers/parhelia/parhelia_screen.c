@@ -922,6 +922,8 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    caps->glsl_feature_level = caps->glsl_feature_level_compatibility = 120;
    caps->essl_feature_level = 100;
    caps->npot_textures = true;
+   caps->anisotropic_filter = true;
+   caps->max_texture_anisotropy = 2.0f;
    /* The back-end has separate RGB/alpha factors but one shared blend
     * equation, so Gallium must not expose the separate-equation extension. */
    caps->blend_equation_separate = false;
