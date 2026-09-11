@@ -315,10 +315,10 @@ module_param(pack_adjacent_packets, bool, 0400);
 MODULE_PARM_DESC(pack_adjacent_packets,
 		 "Pack adjacent validated packets within explicit logical boundaries (experimental, default false)");
 
-static bool pack_draw_packets;
+static bool pack_draw_packets = true;
 module_param(pack_draw_packets, bool, 0400);
 MODULE_PARM_DESC(pack_draw_packets,
-		 "Pack adjacent relocated 0x97 draws into secondary CALLs (experimental, default false)");
+		 "Pack hardware-tested adjacent relocated 0x97 draws into secondary CALLs (default true)");
 
 /* The documented hardware replay uses --rrfence auto, not the unpatched
  * p3d_state counter literals. Keep that progression on the normal path.
@@ -352,19 +352,19 @@ module_param(mode3_screen_test, bool, 0400);
 MODULE_PARM_DESC(mode3_screen_test,
 		 "Enable the isolated P690 mode-3 bound-range screen test (default false)");
 
-static bool mode3_bound_range;
+static bool mode3_bound_range = true;
 module_param(mode3_bound_range, bool, 0400);
 MODULE_PARM_DESC(mode3_bound_range,
-		 "Enable P690 one-triangle-per-packet mode-3 rendering (default false)");
+		 "Enable hardware-tested P690 one-triangle-per-packet mode-3 rendering (default true)");
 
 /* BAR0 is a programmable host-aperture window, not a linear CPU view of local
  * memory.  CREATE_VERTEX therefore uses a dedicated DMA32 GEM object and the
  * proven class-3 fetch path.  Keep the historical parameter name because test
  * scripts already use it. */
-static bool vram_vertex;
+static bool vram_vertex = true;
 module_param(vram_vertex, bool, 0400);
 MODULE_PARM_DESC(vram_vertex,
-		 "Enable dedicated DMA32 P690 vertex buffers (default false)");
+		 "Enable hardware-tested dedicated DMA32 P690 vertex buffers (default true)");
 
 /* Permit one ioctl to carry two complete logical state batches.  The kernel
  * retains each batch's opening/EOB/DWGSYNC bracket and coalesces only the final

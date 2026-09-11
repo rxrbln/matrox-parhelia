@@ -22,10 +22,10 @@ static const struct drm_gem_object_funcs parhelia_host_object_funcs;
 static const struct drm_gem_object_funcs parhelia_raw_object_funcs;
 static const struct drm_gem_object_funcs parhelia_unmappable_object_funcs;
 
-static bool texture_upload_probe;
+static bool texture_upload_probe = true;
 module_param(texture_upload_probe, bool, 0400);
 MODULE_PARM_DESC(texture_upload_probe,
-	"Enable guarded type-0 transient-aperture texture uploads");
+	"Enable hardware-tested P690 type-0 transient-aperture texture uploads (default true)");
 
 static bool texture_upload_trace;
 module_param(texture_upload_trace, bool, 0400);
