@@ -2524,6 +2524,7 @@ retry_slot:
 		if (reloc->type == PARHELIA_RELOC_DRAW) {
 			if ((packet_cmd[0] >> 24) != 0x97 || draw_relocated[reloc->packet] ||
 			    (reloc->dword & 3) || !reloc->delta || (reloc->delta & 3) ||
+			    reloc->delta > PARHELIA_MAX_DRAW_DWORDS * sizeof(u32) ||
 			    reloc->handle || reloc->dword > args->vertex_dwords * sizeof(u32) ||
 			    reloc->delta > args->vertex_dwords * sizeof(u32) - reloc->dword ||
 			    vertex_object_draw) {
@@ -2547,6 +2548,7 @@ retry_slot:
 			if (host_vertex_draw || args->vertex_dwords ||
 			    (packet_cmd[0] >> 24) != 0x97 || draw_relocated[reloc->packet] ||
 			    (reloc->dword & 3) || !reloc->delta || (reloc->delta & 3) ||
+			    reloc->delta > PARHELIA_MAX_DRAW_DWORDS * sizeof(u32) ||
 			    check_add_overflow(reloc->dword, reloc->delta, &range_end)) {
 				ret = -EINVAL;
 				goto out_unpin;

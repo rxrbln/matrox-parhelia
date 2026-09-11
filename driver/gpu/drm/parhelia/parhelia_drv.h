@@ -228,6 +228,9 @@ struct parhelia_bios {
 #define PARHELIA_MAX_RELOCS		(PARHELIA_MAX_USER_PACKETS + 64u)
 #define PARHELIA_DMA_BLOCK_DWORDS	4096u
 #define PARHELIA_VERTEX_DWORDS		4096u
+/* Largest vertex interval proven through one class-3 0x97 fetch.  A submit
+ * may contain many independently relocated intervals from the same object. */
+#define PARHELIA_MAX_DRAW_DWORDS	4096u
 #define PARHELIA_VERTEX_BO_MAX_SIZE	(1u << 20)
 
 /* Heap-relative instruction entries. Runtime GET_PARAM returns the DMA
