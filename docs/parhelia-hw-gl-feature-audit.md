@@ -13,7 +13,8 @@ the affected rows rather than assuming this snapshot still applies.  This
 snapshot includes Mesa commits `e4a6857` (unit lines), `83c89f6` (2x
 anisotropy), `78a7bd5` (stencil, scissor, and blend state), and `eb7c52e`
 (batched consecutive lines).  Rows 29, 30, 38 and 40 and the counts were
-re-audited on 2026-09-11 after Mesa `96d8758` (masked/scissored clears).
+re-audited on 2026-09-11 after Mesa `96d8758` (masked/scissored clears);
+rows 3, 4, 8, 9, 15 and 16 after Mesa `7b8f33a` (point/line expansion).
 
 Status has a deliberately strict meaning:
 
@@ -41,20 +42,20 @@ invalidates register addresses derived directly from region-2 indices
 |---:|---|:---:|---|---|
 | 1 | triangle lists, Gouraud interpolation, tiled color output | **I+T** | `parhelia_context.c:3247-3487` packs transformed triangles and `:3028-3034` submits the hardware batch. | An open-driver stream and WARP program match the vendor result (`parhelia-3d-integrated.md:383-405`); Gouraud and full-scene depth coverage are hardware checked (`parhelia-gears-test.md:34-58`). |
 | 2 | flat shading | **I+G** | `parhelia_context.c:2761-2763` forwards `flatshade`; `reference/p3d_state.c:401-404` emits the flat bit.  No retained current-Mesa pixel test isolates flat provoking-color behavior. | Hardware state is documented at `parhelia-gl-feature-map.md:149-167`; quad decomposition has provoking-vertex constraints (`parhelia-vertex-submission.md:239-269`). |
-| 3 | native points, point size, point parameters/sprites | **M** | The point callback still discards every point (`parhelia_context.c:3489-3490`). | Native point state and sizes are real hardware (`parhelia-raster-clip.md:893-909`); the vendor point draw is one vertex (`parhelia-engine-context-bringup.md:5610-5632`). |
-| 4 | native lines, line strip and line loop | **I+G** | Native untextured, aliased, unit-width `GL_LINES` now emits the vendor primitive with two transformed vertices (`parhelia_context.c:3492-3618`).  The exact class, primitive word and relocations have an offline self-test (`parhelia_drm_test.c:1098-1146`); textured/smooth/wide lines, strips/loops and a retained open-driver live result remain absent. | Native line modes and the loop closing segment are decoded at `parhelia-vertex-submission.md:191-203`; open hardware rendered lines and strips (`parhelia-3d-integrated.md:339-353`). |
+| 3 | native points, point size, point parameters/sprites | **I+T** | Mesa `7b8f33a`: unit untextured points stay native; sized (1..2048), per-vertex (distance attenuation), smooth and textured points are expanded to hardware triangles in `ph_stage_point()` with GL odd/even centring; sprites use the draw module's wide-point stage (`draw_wide_point_sprites`). | `xf86-video-parhelia/tools/parhelia-gl-prim-test.c` checks exact pixel sets for sizes 1..8 at three sub-pixel offsets, textured and attenuated points on P690.  The hardware POINTSIZE registers (`parhelia-raster-clip.md:893-909`) remain unused. |
+| 4 | native lines, line strip and line loop | **I+T** | Unit untextured `GL_LINES` stay native; strips/loops arrive decomposed by the draw module; textured and smooth lines are expanded to triangles (`ph_expand_line()`, Mesa `7b8f33a`). | GL prim test: native unit line, textured unit line and smooth line coverage on P690. |
 | 5 | triangle strips, fans, polygons, quads and quad strips | **I+G** | Mesa draw decomposes these to triangles before `ph_stage_tri`; the hardware emitter contains topology codes (`reference/p3d_state.c:19-39`) but current Mesa always sets `P3D_TRIANGLES` (`parhelia_context.c:2756-2760`). | All modes are hardware-observed (`parhelia-3d-integrated.md:339-350`); exact native/decomposition rules are at `parhelia-vertex-submission.md:175-209`. |
 | 6 | hardware indexed draws | **I+G** | Gallium maps indices into software draw and expands them (`parhelia_context.c:3651-3696`).  The direct P690 ABI remains disabled and needs a guarded fast path. | Four native packet forms and eight fetch streams are proven from three vendor codebases (`parhelia-indexed-draws.md:15-35`); current-ABI limits are recorded at `parhelia-p690-native-indexed-draw-feasibility.md:8-12,68-76,121-176`. |
 | 7 | direct strided/interleaved vertex-array fetch | **I+G** | A packed hardware vertex ring exists, but arbitrary Gallium streams are first mapped through software draw (`parhelia_context.c:3664-3691`). | Hardware supports eight base/stride streams (`parhelia-indexed-draws.md:17-25,499-516`). |
-| 8 | face culling and `glFrontFace` | **M** | Rasterizer state is given to software draw (`parhelia_context.c:3727-3738`); `p3d_state.c` has a cull field but `ph_submit_vertices` never assigns it. | The complete `NONE/CW/CCW` hardware table is confirmed at `parhelia-raster-clip.md:693-745`. |
-| 9 | front/back polygon mode | **M** | The emitter has no front/back fill-state plumbing.  Point mode is discarded, while line mode can only fall into the restricted unit-width untextured path from row 4. | Independent face registers and enums are decoded at `parhelia-raster-clip.md:758-785`. |
+| 8 | face culling and `glFrontFace` | **I+T** | Draw-module culling plus the hardware 0x1130 selector (Mesa `c84e3ed`); triangles derived from points, lines and unfilled polygons are never hardware-culled (Mesa `7b8f33a`). | GL prim test: FRONT_AND_BACK and BACK cull polygons but keep wide lines and sized points. |
+| 9 | front/back polygon mode | **I+T** | The draw module's unfilled stage feeds the point/line stages, which now expand textured primitives instead of dropping them. | GL prim test: textured `GL_LINE` quad outline and `GL_POINT` corners on P690.  The hardware face registers (`parhelia-raster-clip.md:758-785`) remain unused. |
 | 10 | polygon offset fill/line/point | **M** | No depth-bias fields reach `p3d_state`; any draw-module adjustment is software. | Five hardware state values and raw factor/units behavior are established at `parhelia-raster-clip.md:791-847`. |
 | 11 | scissor | **I+G** | Mesa retains the Gallium rectangle, clamps it to the target, and emits hardware min/max corners (`parhelia_context.c:997-1003,4129-4138`; `reference/p3d_state.c:406-416`).  Exact register values have an offline self-test (`parhelia_drm_test.c:1150-1191`), but no retained open-driver live result exercises this new path. | Hardware corners and DWGCTL enable are explicit at `parhelia-raster-clip.md:988-995`; a direct standalone test clipped 15,140 pixels to 11,909 (`parhelia-gl-features.md:174-182`). |
 | 12 | hardware viewport and depth-range transform | **M** | Viewport and clip state go only to Mesa draw (`parhelia_context.c:4113-4128`); submitted vertices are already transformed. | Hardware consumes a viewport rectangle and z scale/bias (`parhelia-raster-clip.md:248-352,996-1001`). |
 | 13 | guard-band/frustum clipping | **I+G** | The emitter writes one fixed `0x12f4=32.0` (`reference/p3d_state.c:603-608`); capability-dependent 32/16 behavior, stage count, and CPU fallback are not implemented. | The hardware rules and required selection are summarized at `parhelia-raster-clip.md:380-480,1002-1004`. |
 | 14 | six user clip planes | **M** | Clip planes are consumed by Mesa draw (`parhelia_context.c:4127-4128`), not uploaded to WARP/setup state. | Dedicated plane records and the six-plane hardware path are confirmed at `parhelia-raster-clip.md:483-550`. |
-| 15 | wide lines | **M** | The native line callback explicitly rejects widths of 1.5 or greater (`parhelia_context.c:3520-3525`). | The vendor CPU expansion is fully decoded (`parhelia-raster-clip.md:911-963`); only unit-width lines are native. |
-| 16 | point, line and polygon smoothing/stipple | **M** | Sample mask and polygon stipple are no-ops (`parhelia_context.c:4159-4163,4959-4960`); the new line path explicitly excludes smoothing. | Point smoothing has real registers, line smoothing uses geometry, and polygon smoothing is ignored by the vendor (`parhelia-antialiasing.md:684-703,729-739`). |
+| 15 | wide lines | **I+T** | `max_line_width` 2048; the draw module's wide-line stage emits hardware triangles (the vendor Linux ICD also expands on the CPU, `parhelia-raster-clip.md:911-963`). | GL prim test: widths 2..4, horizontal/vertical, both directions, under face culling. |
+| 16 | point, line and polygon smoothing/stipple | **I+G** | Smooth points become an aliased disc and smooth lines a perpendicular quad (no coverage antialiasing); line stipple uses the draw module; polygon stipple and sample mask remain no-ops. | Point smoothing has real registers, line smoothing uses geometry, and polygon smoothing is ignored by the vendor (`parhelia-antialiasing.md:684-703,729-739`). |
 
 ## Transform, lighting and shaders
 
@@ -137,18 +138,18 @@ The 64 positive hardware-feature rows classify as follows:
 
 | status | rows | share |
 |---|---:|---:|
-| I+T | 14 | 21.9% |
+| I+T | 19 | 29.7% |
 | I+G | 18 | 28.1% |
-| M | 26 | 40.6% |
+| M | 21 | 32.8% |
 | C | 6 | 9.4% |
 
 Counting a gated/partial row as half complete gives a rough hardware-feature
-coverage of **23/64 = 35.9%**.  This is an engineering inventory, not a GL
+coverage of **28/64 = 43.8%**.  This is an engineering inventory, not a GL
 conformance score: rows deliberately represent user-visible feature families,
 and a small state such as scissor has the same weight as a large compiler such
 as programmable WARP.  The result nevertheless quantifies the opportunity:
-**50/64 rows (78.1%) still require default enablement, validation,
-implementation, or correction**, and 32/64 (50.0%) are wholly missing or
+**45/64 rows (70.3%) still require default enablement, validation,
+implementation, or correction**, and 27/64 (42.2%) are wholly missing or
 contradicted.  The first number includes the 18 useful-but-gated or unvalidated
 rows; the second is the narrower estimate of functionality with no usable
 implementation or a current correctness contradiction.

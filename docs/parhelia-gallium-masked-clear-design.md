@@ -3,11 +3,12 @@
 This note specifies the GPU path for Gallium colour, depth, and stencil clears
 in the current Parhelia Mesa/DRM stack.
 
-**Status 2026-09-11: implemented in Mesa `96d8758` and verified on P690.**  The
-recipe below was followed with two hardware corrections, recorded in the
-"P690 hardware result" section at the end: the 2D fill addresses tiled rows
-with y bits 0 and 1 swapped relative to the 3-D layout, and P690 render
-targets are allocated in 16-row, not 32-row, tile rows.  Before that commit
+**Status 2026-09-11: implemented in Mesa `96d8758` and verified on P690.**
+The first hardware run appeared to show a fill row order different from the
+3-D layout; that was later traced to the CPU tile model itself (see the
+correction in the "P690 hardware result" section).  The fill needs no row
+correction; only the 16-row allocation height differed from this recipe.
+Before that commit
 `ph_clear()` discarded `color_clear_mask`, `stencil_clear_mask`, and
 `scissor_state`, and any depth or stencil request overwrote the complete S8Z24
 word over the complete framebuffer.
@@ -270,47 +271,20 @@ Implemented in Mesa `96d8758` (`parhelia_batch_clear_rect_surface()`,
 on the P690 target (`chip=0x2539 tile_layout=1`, i.e. 64x16 tiles) with the
 kernel at `66a1392`.
 
-### Fill row order differs from the 3-D tile layout
+### Row order: corrected (the model, not the fill)
 
-The first live masked-clear run matched almost every pixel, but rectangles
-whose last row was `4k+1` left that row unfilled and filled row `4k+2`
-instead.  `parhelia_drm_test --fill-geometry-probe BASE` isolates this: 128
-two-column fills cover every start row modulo 16 and heights 1..8, and the
-result is read back through `DOWNLOAD_RENDER` and the verified 3-D tile model
-(`p3d_tile_offset_layout()`).  At bases 0, 16, 64, 144 and 224, every raw
-fill of 2D rows `[y0, y0+h)` lands exactly on 3-D rows
-`{fill_row(y) : y0 <= y < y0+h}`, with
-
-```
-fill_row(y) = (y & ~3) | ((y & 1) << 1) | ((y >> 1) & 1)
-```
-
-That is, inside every 4-row group the type-2 fill destination swaps y bits 0
-and 1 (tile dword-index bits 6 and 3) compared with the 3-D rasterizer.  Rows
-`4k` and `4k+3` are unchanged, columns are unaffected, and the Z24S8 format
-`0x36` behaves identically.  `fill_row` is an involution, so whole 4-row
-groups map onto themselves: full clears and every clear covering complete
-groups were always correct, which is why the old full-surface clear never
-showed it.  The 3-D depth and stencil units agree with the CPU tile model
-(below), so the fill, not the model, is the side with the other row order.
-
-`parhelia_batch_clear_rect_surface(..., row_swizzle=true)` therefore emits
-the aligned body of a rectangle as one fill and maps the at most three head
-and three tail rows through `fill_row`, merging touching fill-space runs.  At
-most three 15-dword packets result (for example rows 2..9 become fill rows
-`{1}`, `[3,9)`, `{10}`).  The corrected pass of the same probe lands exactly on
-the requested rows at all five bases.
-
-Only the P690 64x16 layout is characterized.  Mesa advertises
-`clear_scissored`/`clear_masked` only there; the 64x32 layout keeps full
-clears, and its partial-row fill order is unverified.
-
-Open question: whether the type-2 *source* of the 2D BITBLT (used by readback
-and native Present) has the same row order as the fill.  A test through a
-`PARHELIA_CREATE_RENDER_LINEAR` companion was inconclusive: after a fenced
-type-2 to type-1 blit, the CPU mapping of that linear BO still held its
-pre-blit sentinel, so the linear readback path itself needs investigation
-before the blit source order can be measured.
+The first live run matched almost every pixel, but rectangles whose last row
+was `4k+1` appeared one row off, and `--fill-geometry-probe` showed every fill
+landing on rows with y bits 0 and 1 exchanged *as decoded by
+`p3d_tile_offset_layout()`*.  Mesa `96d8758` briefly compensated by splitting
+partial 4-row groups.  A later model-free probe
+(`--raster-fill-agreement-probe`: 3-D rectangles and raw fills of the same
+64 start/height cases) produced identical raw bytes in both engines, and GL
+points read back one row off exactly where the model predicted.  The CPU model
+was wrong for P690 render targets; Mesa `cebafb6` corrects it (y bit 0 in
+dword-index bit 3, y bit 1 in bit 6) and removes the fill workaround.  With the
+corrected model every raw fill lands on exactly the requested rows at five
+bases.  See `parhelia-p690-render-order-scanout-cpu-access.md`.
 
 ### Allocation height
 
@@ -334,8 +308,8 @@ Mesa now sets `mask_explicit` and emits 0.
 
 * `parhelia-drm-test --selftest`: 34/34, including the exact 15-dword packet,
   two same-handle relocations, bounds rejection and the split-run vectors.
-* `--fill-geometry-probe`: raw rows match `fill_row` and corrected rows match
-  the request, 0/128 differing cases at each of five bases.
+* `--fill-geometry-probe` (after `cebafb6`): raw fills match the requested
+  rows, 0/128 differing cases at each of five bases.
 * `--masked-clear-probe`, all 0/65536 mismatches:
   * colour PLNWT rectangles crossing x=63/64 and y=31/32, 1x1 and 3-wide;
   * Z24S8 depth-only, stencil-mask 0x5a and combined rectangles;
