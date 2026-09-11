@@ -62,6 +62,10 @@
  * are GPU-only; CPU access must use a separate linear staging object. */
 #define PARHELIA_CREATE_RENDER_NATIVE_COLOR	(1u << 3)
 #define PARHELIA_CREATE_RENDER_NATIVE_DEPTH	(1u << 4)
+/* Native colour layout for a front-rendered display buffer, placed in the
+ * third 32 MiB band (bank B) so display refresh does not compete with the
+ * colour and texture traffic of bank A. */
+#define PARHELIA_CREATE_RENDER_NATIVE_SCANOUT	(1u << 5)
 
 /* Bring-up tiled render allocation, deliberately separate from linear dumb
  * scanout. Both 32-bit colour and S8Z24 use this storage. The kernel reserves

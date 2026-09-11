@@ -534,7 +534,20 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       create.flags = PARHELIA_CREATE_RENDER_NATIVE_DEPTH;
    else if (native_color)
       create.flags = PARHELIA_CREATE_RENDER_NATIVE_COLOR;
-   if (ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &create)) {
+   /* The X front buffer is the one front-rendered scanout image: its
+    * display refresh belongs in bank B, away from colour and textures. */
+   if (native_color &&
+       (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_USE_FRONT_RENDERING)) ==
+       (PIPE_BIND_SCANOUT | PIPE_BIND_USE_FRONT_RENDERING)) {
+      create.flags = PARHELIA_CREATE_RENDER_NATIVE_SCANOUT;
+      if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &create)) {
+         create.flags = PARHELIA_CREATE_RENDER_NATIVE_COLOR;
+         create.handle = create.pitch = 0;
+         create.size = create.mmap_offset = 0;
+      }
+   }
+   if (!create.handle &&
+       ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &create)) {
       fprintf(stderr, "parhelia: create render %ux%u failed: %s\n",
               templ->width0, templ->height0, strerror(errno));
       goto fail;
