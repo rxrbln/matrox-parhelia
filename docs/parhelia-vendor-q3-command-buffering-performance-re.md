@@ -11,18 +11,20 @@ It concentrates on user/kernel transitions, command and vertex buffering,
 bus-master DMA, fence placement, and presentation.  It changes no driver code
 and makes no target changes.
 
-The current measurement, approximately 1,599 DRM submit ioctls per second at
-9 FPS, means:
+The current measurement, approximately 2,459 asynchronous DRM submit ioctls
+per second at 30 FPS, means:
 
 ```text
-1599 / 9 = 177.67 submit ioctls per rendered frame
-1 / 9 / 177.67 = 0.625 ms of frame time per submit transition
+2459 / 30 = 81.97 submit ioctls per rendered frame
+1 / 2459 = 0.4067 ms mean interval between submit ioctls
 ```
 
-The three-slot asynchronous queue has removed the old unconditional wait after
-every ioctl, but it has not fixed the command granularity.  About 178 validated
-submissions, terminal fence sequences, object-reference sets, and syscall
-entries are still created for each frame.  The vendor architecture instead
+The interval is not the cost of an ioctl; this count alone cannot apportion CPU
+time between userspace command construction and the kernel.  It does show that
+the eight-slot asynchronous queue and packed secondary CALLs have not fixed the
+request granularity.  About 82 validated submissions, terminal fence sequences,
+object-reference sets, and syscall entries are still created for each frame.
+The vendor architecture instead
 keeps high-level state and draw records in a large mapped userspace buffer and
 enters the kernel only when that buffer fills or an explicit flush/end-of-frame
 path requires it.  The saved artifacts do not contain a clean timed vendor
@@ -30,20 +32,30 @@ frame trace, so they cannot establish an exact vendor ioctls/frame number.  They
 do establish that the number is governed by a 135,276-byte record-buffer
 threshold and explicit flushes, rather than by the number of draws.
 
-The smallest safe open-driver change has two parts:
+The current trace is dominated by aggregates containing one logical batch and
+170 or 188 packets.  Both are far below the 1,024-descriptor submit limit and
+both carry almost exactly 4,096 vertex dwords: 4,077 and 4,080 respectively.
+They are frontend-full expansions from the legacy CPU alpha-micro path, not
+kernel descriptor-full aggregates.  Raising the descriptor limit again cannot
+reduce those ioctls.  Replacing that expansion with the in-progress GPU alpha
+path is the immediate fix; the batching work below applies to the stream that
+remains afterward.
 
-1. Keep using the production `PARHELIA_RELOC_DRAW` path, enlarge its
-   kernel-owned coherent DMA32 vertex area from 16 KiB to an initial 128 KiB,
-   and aggregate complete state+draw streams by default.  This removes the
-   present 4,096-dword aggregate vertex ceiling without mapping a raw BAR or
-   changing the UAPI.  The kernel copies each aggregate once and patches the
-   validated `0x97` ranges to class-3 bus addresses.
-2. Add a bounded submit-chain form when the existing 221-packet CALL-plan cap
-   is reached.  One ioctl validates a list of ordinary chunks, each still at
-   most 221 user packets, queues them in order, and returns one terminal fence.
-   The kernel may publish more than one safe primary span internally, but the
-   application crosses the user/kernel boundary once and does not wait between
-   chunks.
+The next safe open-driver work has three parts:
+
+1. Turn on complete ordered state-stream aggregation for the supported P690
+   path, and record an explicit drain-reason counter.  Same-state aggregation
+   cannot cross Q3's frequent texture/blend/depth changes; the complete-stream
+   path already can.
+2. Replace the blanket write-map drain/wait with per-resource read/write fence
+   tracking.  A CPU write to an unrelated texture must not submit the current
+   draw stream.  A write to a texture still read by the GPU should wait only for
+   that resource or rename its backing, matching the vendor's tagged-page reuse
+   rule.
+3. Add a bounded submit-chain UAPI only after the above shows genuine 1,024
+   packet or 16,384-command-dword drains.  One ioctl should validate multiple
+   ordinary chunks, enqueue their safe 224-CALL/4,096-dword internal spans in
+   order, and return one terminal fence.
 
 This copies the vendor's batching boundary without exposing unvalidated GPU
 commands or physical addresses through a mapped ring.  In particular, the
@@ -51,6 +63,17 @@ vendor's 136 KiB allocation must not be used as evidence for a large local-
 VRAM `CREATE_VERTEX`: it is a CPU-only `vmalloc` record buffer.  The vendor
 copies ordinary system-memory vertices into a distinct DMA32 pushbuffer before
 the GPU fetches them.
+
+The direct answers from the saved artifacts are:
+
+| question | recovered behavior |
+|---|---|
+| Multiple ranges/state blocks per userspace doorbell? | Yes.  Linux and Windows keep mixed high-level records until capacity or an explicit semantic flush; adjacent opcode `0x1b` draw items share a count header.  The Linux kernel then iterates every 40-byte draw item, so one doorbell can build many hardware draw packets and CALLs. |
+| Multiple ranges/state blocks per MMIO DMA tail write? | The saved code does not prove one MMIO write for an entire high-level list.  `mtx1937` appends one five-dword secondary CALL and writes `0x408` once per invocation; the record decoder may invoke it more than once.  Persistence and lack of a wait/restart between publications are proven. |
+| Persistent DMA layout? | Yes.  The Linux kernel appends five-dword secondary-CALL records to a persistent primary ring and advances MMIO `0x408`; separate reusable storage includes an 84-page command ring and a 400-page, 8 KiB-page vertex ring. |
+| Fence/interrupt cadence? | Nonblocking tags are inserted at ordering and storage-lifetime boundaries.  Completion is checked on reuse, finish, and present back pressure.  No per-draw interrupt or wait is visible; Windows may use `Global\\MTXDMAWriteEvent` when a tagged page is still live. |
+| Main thresholds/fast paths? | Linux high-level records request `0x2106c` bytes; Windows allocates `0x2105c`.  Same-opcode records merge, state is dirty-cached, upload reuse is tagged per 8 KiB page, Windows indexed writes drain after more than 16, window-present history is six tags, and the flip queue has 32 entries. |
+| Current open-driver implication? | `coalesce_primary=true` already publishes one `0x408` tail per normal submit; `pack_draw_packets=1` lowers primary CALL/secondary work inside that submit.  Neither removes validation, pin/reference, fence, or syscall work.  Current 170/188 singletons are alpha-micro frontend expansions at about 4,096 vertex dwords; fix that path before changing the 1,024-descriptor limit. |
 
 ## Linux ICD: the user-side record buffer
 
@@ -212,7 +235,7 @@ rings.
 This is the vendor's important back-pressure rule: wait when reusing storage
 whose tag has not retired, rather than after recording or submitting every
 draw.  The 3.2 MiB vertex ring also has far more slack than the open driver's
-three roughly 21 KiB vertex slots.
+three 120 KiB vertex slots.
 
 For ordinary client arrays, `mtx1017+0x60e0` copies the staged vertices into
 the kernel pushbuffer and emits `0x17|flags,start,end` after the copied bytes.
@@ -272,10 +295,10 @@ after:  CALL -> [8f000001, 0, 3,
 
 This retains the two hardware packet/interlock boundaries while removing one
 primary CALL.  Runs must end before a kernel-inserted WARP-stage CALL,
-opening/EOB/drain record, or logical state-batch boundary.  The initial kernel
-implementation deliberately recognizes only exact three-dword `0x8f000001`
-packets; other classes remain one CALL each pending equally direct hardware
-evidence.
+opening/EOB/drain record, or logical state-batch boundary.  The kernel always
+recognizes the proven exact three-dword `0x8f000001` form and, with
+`pack_draw_packets=1`, also packs adjacent relocated `0x97` draw streams.
+General adjacent-packet packing remains a separate opt-in experiment.
 
 ## Linux kernel: bus-master DMA and producer publication
 
@@ -332,7 +355,62 @@ The page-granular vertex allocator checks retirement only before overwriting a
 live page.  This is materially different from assigning a terminal hardware
 fence and a complete kernel request object to every small Mesa batch.
 
-## Windows cross-check
+No per-draw render interrupt is visible in the saved Linux path.  Normal
+enqueue at `mtx1937` neither reads completion nor programs an interrupt; reuse
+paths consume the fence page or poll `0x41c`.  The open wrapper
+`kernel/src/mtx_irq.c:53..75` merely calls the proprietary core's `irq_fast`
+and schedules `irq_slow` when requested, so the saved source cannot enumerate
+all interrupt causes.  It does establish that IRQ delivery is outside the
+record-buffer doorbell and ordinary secondary-CALL path.  The defensible
+conclusion is therefore no interrupt per draw or per high-level record, not
+that the device never raises a render-related interrupt.
+
+## Windows OpenGL ICD: independent batching and reuse evidence
+
+The saved 32-bit Windows ICD is
+`xddm32_210_00_105_se_u_nowhql/MtxPar/MTXOGL.dll`, image base `0x10000000`;
+offsets below are virtual addresses in `scratchpad/ogl.asm`.  It independently
+implements almost the same high-level policy as the Linux ICD.
+
+The context constructor pushes `0x2105c` at `0x100077ff` and calls the buffer
+initializer at `0x10007806`.  That initializer, `0x10003590`, stores the size
+at object offset `+0x0c`, allocates the storage, sets base/current/previous at
+`+0x10/+0x14/+0x18`, and writes the initial sentinel.  The Windows request is
+16 bytes smaller than Linux's `0x2106c`, but both are approximately 135 KiB.
+
+The generic reservation routine at `0x10003640` has the same decisive
+properties:
+
+* `0x100036ae..0x100036c4` compares the requested record end with
+  `base + size`; `0x100036c8..0x100036ca` calls the sender only on capacity.
+* `0x100036cf..0x100036dd` compares the previous opcode and adds the new item
+  count to its header when equal.  Otherwise `0x100036df..0x100036ed` writes a
+  new `(opcode,count)` header.
+* Commit at `0x100033f0..0x100033fa` advances the local write pointer only.
+* Sender `0x10003400` passes one base/byte-length interval to `0x1002ad80` at
+  `0x1000342d..0x10003447` and then resets the record buffer at
+  `0x10003459..0x10003478`.  The normal `0x1002ad80` dispatch does not wait;
+  its `Sleep(10)` at `0x1002ae16..0x1002ae28` is an error fallback.
+
+The draw builder at `0x1031ca6f..0x1031ca7f` requests opcode `0x1b` with a
+`0x20`-byte element from `0x10003640`, serializes multiple elements, and calls
+commit at `0x1031cc32..0x1031cc38`.  Consecutive Windows draw descriptors thus
+share one high-level opcode/count record and one later sender call; state blocks
+and triangle ranges are not doorbelled individually.
+
+The fixed-page upload allocator at `0x10009960` proves reuse rather than draw
+cadence controls waiting.  It wraps in 8 KiB units at
+`0x10009967..0x1000999c`, compares the selected page tag with retirement at
+`0x100099a2..0x100099b2`, and flushes buffered records at
+`0x100099b4` only if that page is still live.  It then loops on retirement,
+using `WaitForSingleObject(handle,100)` at `0x10009a77..0x10009a91` when the
+DMA event facility is available or `Sleep(0)` at
+`0x10009a96..0x10009a9e` otherwise.  The imported event name is
+`Global\\MTXDMAWriteEvent`.  This may be interrupt-backed inside Windows, but
+the event is consumed on page pressure; there is no wait after every draw or
+record commit.
+
+## Windows display-driver cross-check
 
 The saved Windows display driver is
 `xddm32_210_00_105_se_u_nowhql/MtxPar/MTXPARD.dll`; offsets below are image
@@ -365,7 +443,7 @@ constructor at `0x32b60` emits the matching `0x21c0c0c0` record and allocates
 tags in `0x10` steps.  As in Linux, restart and blocking completion are special
 paths around a persistent DMA producer.
 
-## Present queueing is not the 178-per-frame problem
+## Present queueing is not the 82-per-frame problem
 
 The vendor Linux window swap uses escape `0x10`, handled by `mtx986` at
 `0x50980`.  It queues clipped native back-to-primary BITBLTs and, for a nonzero
@@ -390,8 +468,8 @@ after that render tag has retired.  Rendering retirement and retrace latching
 are therefore independent gates.
 
 The current open windowed Present path may add one ordered X-server blit per
-frame.  Even if it is synchronous, one transition is under 0.6 percent of the
-observed approximately 178 render submits per frame.  Removing Present or
+frame.  Even if it is synchronous, one transition is about 1.2 percent of the
+observed approximately 82 render submits per frame.  Removing Present or
 vblank ordering cannot account for the Q3 frame rate.  Once render batching is
 fixed, Present should enqueue one blit behind the terminal render fence and
 let the appropriate resource fence provide ordering.
@@ -401,60 +479,97 @@ let the appropriate resource fence provide ordering.
 The open code already has the right low-level safety properties: user packets
 are copied, validated, relocated, converted to kernel-owned coherent
 secondaries, referenced BOs remain live, and asynchronous slots retire from
-`0x41c`.  Its batching limits are much smaller and tied together:
+`0x41c`.  Several limits described by the first revision of this note have
+since been raised or decoupled:
 
 | resource | current open limit | vendor comparison |
 |---|---:|---:|
-| Mesa command storage | 4,096 dwords / 16 KiB | 135,276-byte high-level record request |
-| Mesa aggregate vertices | 4,096 dwords / 16 KiB | 3.2 MiB mapped vertex ring |
-| user packets per ioctl | 221 | lower command ring has 84 reusable 8 KiB pages |
-| triangles in one frontend group | 180, often less by dwords/vertex | reuse is page/tag based |
-| in-flight kernel requests | 3 | window Present 6; flip queue 32; vertex ring 400 pages |
+| Mesa command storage | 16,384 dwords / 64 KiB | 135,276-byte high-level record request |
+| Mesa aggregate vertices | 30,720 dwords / 120 KiB | 3.2 MiB mapped vertex ring |
+| user packets per ioctl | 1,024 | lower command ring has 84 reusable 8 KiB pages |
+| one frontend draw group | 180 triangles and 4,096 vertex dwords | reuse is page/tag based |
+| one packed secondary | 4,096 dwords | vendor secondary size is allocator-driven |
+| in-flight kernel requests | 8; three mapped vertex slots | window Present 6; flip queue 32; vertex ring 400 pages |
 
-The constants are `PH_BATCH_DWORDS=4096`, `PH_BATCH_PACKETS=221`, and
-`PH_BATCH_MAX_DRAWS=180` in Mesa `parhelia_batch.h`.  The kernel permits 64K
-command dwords but retains `PARHELIA_MAX_USER_PACKETS=221`, 4,096 host vertex
-dwords, and three asynchronous slots in `parhelia_drv.h`.
+The current constants are `PH_BATCH_DWORDS=16384`, `PH_BATCH_PACKETS=1024`,
+`PH_BATCH_VERTEX_DWORDS=30720`, and `PH_BATCH_MAX_DRAWS=180` in Mesa
+`parhelia_batch.h`.  The kernel advertises 1,024 user descriptors and has eight
+asynchronous slots.  Its copied-vertex fallback and each DRAW range remain
+bounded at 4,096 dwords; the mapped dedicated-DMA `CREATE_VERTEX` object is
+bounded to 1 MiB.  Adjacent relocated packet byte streams may be enclosed in
+4,096-dword secondaries when `pack_draw_packets=1`.
 
 `ph_submit_batch()` can append complete different-state streams when
-`PARHELIA_BATCH_STATE_STREAM` is set, but that setting is default-off.  It
-drains when packet+hidden-stage CALLs reach 221, resources reach the relocation
-cap, commands reach 4,096 dwords, or vertices reach 4,096 dwords.  It first
-concatenates every transformed vertex into the 16 KiB CPU-side
-`pending_vertices` array.  The production-safe drain path uses
-`PARHELIA_RELOC_DRAW`: the kernel copies that aggregate into a coherent DMA32
-slot and patches each `0x97` start/end to class 3.  The coupling remains: one
-aggregate must fit in the kernel's 4,096-dword staging range.
+`PARHELIA_BATCH_STATE_STREAM=1`, but that setting is default-off.  With a
+mapped dedicated-DMA vertex object it drains before packet+hidden-stage calls
+would exceed 1,024, commands exceed 16,384 dwords, relocations exceed 1,028,
+or aggregate vertices exceed 30,720 dwords.  The frontend still finalizes an
+individual state batch at 180 triangles or 4,096 vertex dwords; this does not
+need to become an ioctl boundary because the state-stream aggregator can append
+several such batches.
 
-An opt-in experimental drain can instead copy the aggregate into a mapped
-class-0 `CREATE_VERTEX` slot and convert relocations to
-`PARHELIA_RELOC_DRAW_VRAM`.  It is not a production solution.  BAR0 is a
-programmable host-aperture window rather than a linear CPU view of local
-memory; an observed raw `0x01364000` vertex mapping wrote into framebuffer
-rows 403/404.  The kernel therefore defaults `vram_vertex=false` and describes
-the feature as an unsafe raw-BAR experiment.
-
-The experimental class-0 helper has only three subranges.  Before writing
-one it calls `WAIT_FENCE` if that slot's prior tag is live.  This is correct,
-but it recreates frequent page-reuse back pressure with only about 64.8 KiB of
-total mapped storage, versus the vendor's 3.2 MiB/400-page CPU staging ring.
-Expanding that raw mapping would expand the scanout-corruption hazard.
+The former raw-BAR experiment has been replaced with a production dedicated
+DMA32 `CREATE_VERTEX` object.  Mesa maps three 30,720-dword slots.  Before
+writing a slot it waits for that slot's previous terminal fence, then converts
+ordinary DRAW relocations to creator-owned class-3 DMA ranges.  This is safe
+and follows the vendor's tagged-reuse principle, although three coarse slots
+provide less slack than the vendor's 400 independently tagged 8 KiB pages.
 
 On the kernel side, one ioctl performs `memdup_user` separately for packet,
 command, and relocation arrays, looks up every relocation object, constructs a
 CALL plan, prepares one slot's coherent secondary heap, creates and attaches a
-terminal `dma_fence`, and advances `0x408`.  Repeating that approximately 178
+terminal `dma_fence`, and advances `0x408`.  Repeating that approximately 82
 times per frame is substantial even when none of those calls performs a final
 busy wait.
+
+### What the current Q3 trace says
+
+The supplied large Q3 trace was captured with
+`PARHELIA_BATCH_STATE_STREAM=1`, the 1,024-packet/16,384-command/30,720-vertex
+Mesa limits, the mapped DMA vertex ring, asynchronous submit, and kernel
+`pack_draw_packets=1`.  Across the retained run it contains 18,255 aggregate
+drains representing 50,448 logical batches:
+
+```text
+aggregate drains                 18,255
+one-logical-batch drains         12,419 (68.0%)
+multi-logical-batch drains        5,836
+explicit aggregate fence waits      279
+170-packet singleton              6,677
+  commands/relocs/vertices      613 / 155 / 4,077, every occurrence
+188-packet singleton              2,644
+  commands/relocs/vertices      666 / 173 / 4,080, every occurrence
+packet count >= 975               1,368
+maximum command dwords            5,807
+maximum vertex dwords            22,644
+```
+
+The two dominant singleton shapes are capped by the legacy alpha-micro
+frontend's per-group 4,096-vertex-dword check.  They do not approach the
+aggregate command or vertex limits.  The trace also shows that complete-stream
+aggregation works for ordinary work: aggregates contain as many as 22 logical
+batches, and 1,368 drains are packed to at least 975 descriptors.  Those
+near-1,024 drains are the cases a later submit-chain can combine without
+raising the hardware CALL span.  Only 279 explicit aggregate fence waits appear
+beside 18,255 drains, so a wait after every ioctl is no longer the primary
+cadence; request construction and the remaining semantic/capacity drains are.
+
+The correct order of work is therefore measurable.  First replace the CPU
+alpha-micro geometry expansion with the GPU two-pass path and repeat the
+trace.  Then classify remaining drains by reason.  A new trace field should
+distinguish `packet`, `command`, `vertex`, `reloc`, `read-map`, `write-map`,
+`resolve`, `clear-after-draw`, `flush`, `present`, and `finish`; aggregate size
+alone cannot distinguish capacity from an ownership boundary.
 
 ## Smallest implementation plan
 
 ### Implemented foundation: pack packet runs into secondary CALLs
 
 The kernel now represents a CALL-plan entry as a first packet plus a packet
-span.  Consecutive exact `0x8f000001` packets are copied, after relocation,
-into one coherent secondary allocation and enclosed by one primary CALL.  It
-copies each already validated packet separately, so a malformed offset table
+span.  With `pack_draw_packets=1`, consecutive relocated `0x97` packet byte
+streams are copied into at most 4,096-dword secondary allocations and enclosed
+by one primary CALL.  It copies each already validated packet separately, so a
+malformed offset table
 cannot pull unchecked gap bytes into the DMA span.  WARP-stage, opening,
 EOB/drain, and logical state-boundary plan entries terminate a run.
 
@@ -465,67 +580,60 @@ gap.  This reduces primary CALL traffic for the mode-3 path without weakening
 the proven one-packet-per-triangle depth rule.  It does not by itself reduce
 the number of DRM ioctls or lift the input packet-count check.
 
-### Phase 1: enlarge the safe class-3 aggregate
+### Phase 1: finish alpha on the GPU and make state streams normal
 
-The first syscall reduction needs no new mmap ABI.  Keep
-`PARHELIA_RELOC_DRAW`, raise the kernel-owned coherent vertex capacity from
-4,096 to an initial 32,768 dwords (128 KiB), and report that capacity through
-`GET_PARAM` so Mesa does not encode a build-time assumption.  The async slot
-owns the coherent allocation until its terminal `dma_fence` retires.  On each
-submit the kernel performs one `copy_from_user`, applies `dma_wmb()` before
-the producer update, and patches every validated `0x97` range with
-`lower_32_bits(vertex_dma) + offset | 3`.
+The safe 120 KiB mapped class-3 aggregate already exists.  The trace shows its
+capacity is not the dominant singleton cause; the legacy alpha-micro path
+expands a draw on the CPU until its local 4,096-dword geometry array fills.
+Finish and image-gate the GPU two-pass alpha path first.  Then enable complete
+ordered state-stream aggregation by default on the same proven P690 path,
+rather than requiring `PARHELIA_BATCH_STATE_STREAM=1`.
 
-Mesa should separate command and vertex limits, retain transformed vertices
-in the pending aggregate up to the queried vertex limit, and make complete
-state-stream aggregation the normal P690 path after the existing image gates
-pass.  It should drain at command/packet/relocation capacity, CPU map or
-readback, a real resource hazard, explicit finish, and end-of-frame handoff.
-This costs one CPU copy per aggregate, but removes scores of ioctl validation,
-allocation, fence, and object-reference lifetimes.  The backing is system DMA
-and physically cannot alias scanout.
+Keep finalization of a frontend group separate from `ph_drain_batch()`.  State,
+texture, blend, and depth changes should append another validated logical batch
+to the pending stream.  Drain only at reported capacity, a same-resource CPU
+ownership hazard, explicit finish, or presentation handoff.
 
-### Phase 2: optional mapped DMA upload object
+### Phase 2: track hazards per resource and upload range
 
-If the aggregate copy becomes measurable, add a dedicated
-`CREATE_DMA_VERTEX` or `CREATE_UPLOAD` object.  Back it with
-`dma_alloc_coherent`/`dma_alloc_wc` under the device's 32-bit DMA mask and map
-it only through a DRM fake mmap offset.  Return a GEM handle and mmap offset,
-never the DMA address.  A new draw relocation names `{handle, offset, length}`;
-the kernel must verify that the creating file owns this exact upload-object
-type, range-check it, require the normal `0x97` packet, and patch class-3
-start/end operands from its private `dma_addr_t`.
+The vendor allocators attach retirement tags to 8 KiB pages and wait only when
+the next allocation would overwrite a live page.  Mesa currently has only
+three coarse mapped-vertex slots, and `ph_map()` drains and waits for every
+texture write whenever aggregation is enabled.  Replace that blanket rule with
+resource epochs:
 
-Do not accept imported dma-bufs, dumb/scanout BOs, TTM VRAM objects, or raw
-addresses for this relocation.  Reject allocations or subranges above
-`U32_MAX`, call `dma_wmb()` before the doorbell, and tag each userspace 8-KiB
-ring page with the terminal fence before reuse.  Those rules give Mesa the
-vendor's mapped-ring convenience while keeping commands and addresses under
-kernel control and keeping the storage physically separate from VRAM.
+1. Record the last queued GPU read and write fence on each texture/render
+   resource, and the terminal fence on each mapped vertex subrange.
+2. Before a CPU read, submit pending work that writes that resource and wait
+   for its last writer.  Before a CPU write, submit pending work that reads or
+   writes that resource and wait for the last conflicting fence.
+3. Do neither for an unrelated resource.  For frequently updated Q3 lightmaps,
+   rename or rotate upload backing so the CPU normally writes a free range
+   instead of waiting.
+4. Retain resource references for the aggregate/request lifetime; update the
+   per-resource fences only after the kernel accepts the request.
 
-The existing descriptor-managed host aperture can map a local VRAM BO without
-the raw-BAR alias: it reserves low logical aperture ranges independently of
-TTM physical offsets, keeps a 256-KiB guard, and publishes one of 19 dynamic
-descriptor slots.  A 3.2-MiB mapping would fit under its 16-MiB logical limit.
-Live P690 texture-aperture tests have nevertheless shown stale or aliased
-destination behavior, so this route needs its own hardware proof before it is
-used for vertices.  It is not the first safe performance fix.
+This change copies the vendor's actual fast path more closely than simply
+adding vertex slots.  Instrument queue-full, vertex-slot reuse, resource-read,
+and resource-write waits separately before increasing ring sizes.
 
-### Phase 3: decouple syscall count from the proven CALL-plan cap
+### Phase 3: decouple syscall count from the proven CALL-span cap
 
 Do not simply raise `PARHELIA_CALL_CAPACITY` past the tested range.  The open
-hardware work found unreliable behavior above roughly 257 CALLs, and the
-current 221-user-packet limit reserves opening/EOB/drain and hidden WARP-stage
-CALLs inside a 224-entry plan.
+hardware work found unreliable behavior above roughly 257 CALLs.  The current
+validator accepts 1,024 descriptors only because it packs eligible packet runs
+into at most 224 primary CALLs, with each secondary capped at 4,096 dwords.
 
 Add a submit-chain ioctl or a versioned extension of `drm_parhelia_submit` that
 accepts a bounded array of ordinary submit descriptors.  A practical first
-bound is 128 KiB of command records and a fixed maximum number of chunks and
-relocations.  The kernel must:
+bound is 128 KiB of command records, 64 logical chunks, and fixed relocation
+and vertex-byte maxima.  Each chunk may retain the present 1,024-descriptor
+validator bound.  The kernel must:
 
 1. copy and validate the complete descriptor list before publishing any work;
 2. validate every chunk with the existing packet and relocation rules;
-3. keep each internal CALL plan at or below the current 224-entry limit;
+3. split publication into internal spans whose packed CALL plan is at most 224
+   entries and whose secondaries remain at most 4,096 dwords;
 4. retain all GEM references, VRAM page ranges, and coherent secondaries as one
    request lifetime;
 5. preserve every internal EOB/drain or state-arm boundary already required by
@@ -537,16 +645,18 @@ relocations.  The kernel must:
    fence.  Internal ordering tags may remain; userspace needs only the final
    completion value.
 
-Mesa then keeps recording until frame end or true hazard and crosses into the
-kernel once for the common frame.  Internal hardware CALL and `0x408` cadence
-remains bounded by what has been tested; only the expensive userspace/kernel
-and per-request lifetime cadence changes.
+Mesa then keeps recording until frame end or a true same-resource hazard and
+crosses into the kernel once for the common frame.  Internal hardware CALL and
+`0x408` cadence remains bounded by what has been tested; only the expensive
+userspace/kernel and per-request lifetime cadence changes.  The existing UAPI's
+single `PARHELIA_RELOC_BATCH_BOUNDARY` is insufficient for this job: the chain
+must describe every logical section or preserve each already validated chunk
+as a section while returning one terminal request fence.
 
 A mapped raw GPU command ring is unnecessary and would weaken validation.  A
 normal userspace record builder plus one bulk ioctl obtains the relevant vendor
-property.  If copying 128 KiB later becomes measurable, sealed mapped staging
-slots can replace the copy without changing the validation and ownership
-model.
+property.  The mapped vertex upload path can remain unchanged; a chain holds
+all of its referenced subranges until the terminal fence retires.
 
 ### Phase 4: reduce GPU packet work independently
 
@@ -554,7 +664,7 @@ Native indexed draws remain a separate high-value project.  Q3's
 `glDrawElements` calls are currently expanded by Draw into one `0x97` packet
 per triangle.  A proven `0x9f` indexed path would turn each GL indexed draw into
 far fewer packets, lowering both kernel validation work and the number of
-submit-chain chunks.  It is not required to eliminate the 178 syscall entries,
+submit-chain chunks.  It is not required to eliminate the 82 syscall entries,
 and its P690 mode-7 contract should keep its own image/hang gate.
 
 ## Measurement contract
@@ -572,7 +682,7 @@ kernel primary CALLs and 0x408 publications/frame
 Also record aggregate command bytes, vertex-ring bytes/pages, packet count,
 relocation count, queue-full/page-reuse waits, terminal-fence latency, process
 user/system CPU time, and FPS.  The immediate success criterion is a large drop
-from approximately 178 DRM submits/frame with identical framebuffer hashes.
+from approximately 82 DRM submits/frame with identical framebuffer hashes.
 The architectural target is one to a few DRM submit transitions per frame;
 primary CALL count can remain larger because that is how the vendor kernel
 feeds the hardware.
@@ -594,6 +704,11 @@ wait.
   `0x50980`, `0x50680`, `0x315b0`, `0x313e0`, and `0x3a590`.
 * `scratchpad/pard.asm`: cached writer/wait at `0x91840`, `ValidateState` at
   `0xc9ac0`, primary restart at `0x328d0`, and fence constructor at `0x32b60`.
+* `scratchpad/ogl.asm`: Windows record allocation at `0x100077ff`, reserve and
+  merge at `0x10003640`, sender at `0x10003400`, draw builder at
+  `0x1031ca6f`, and 8 KiB tagged-page reuse at `0x10009960`.
+* `matroxdriver-x86_64-cvs-20090511/kernel/src/mtx_irq.c`: open Linux IRQ
+  wrapper, including the core top-half/bottom-half delegation at lines 53--75.
 * `captures/ioq3-p690-working-draw.txt`: allocations, mappings, zero-argument
   doorbells, record lengths, and command/vertex ring changes.
 * `docs/parhelia-control-commands.md` and `docs/parhelia-kernel-abi.md`:
