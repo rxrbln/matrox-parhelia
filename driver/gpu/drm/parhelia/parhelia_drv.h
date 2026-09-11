@@ -20,6 +20,7 @@
 #include <linux/iosys-map.h>
 
 #include "parhelia_drm.h"
+#include "parhelia_packets.h"
 
 struct drm_file;
 struct drm_gem_vram_object;
@@ -215,15 +216,17 @@ struct parhelia_bios {
 #define PARHELIA_DAC_SENSE_VALUE	0x16459164
 #define PARHELIA_DAC_SENSE_MODE_MASK	0xf000ffff
 
-#define PARHELIA_MAX_PACKETS		224u
-#define PARHELIA_MAX_USER_PACKETS	(PARHELIA_MAX_PACKETS - 3u)
+#define PARHELIA_LEGACY_USER_PACKETS	(PARHELIA_CALL_CAPACITY - 3u)
+#define PARHELIA_MAX_USER_PACKETS	PARHELIA_USER_PACKET_CAPACITY
+#define PARHELIA_DMA_BLOCK_CAPACITY	PARHELIA_PLAN_CAPACITY
 #define PARHELIA_MAX_COMMAND_DWORDS	(64u * 1024u)
 /* Five-dword CALL plus optional three-dword diagnostic writeback marker. */
-#define PARHELIA_PRIMARY_DWORDS		(PARHELIA_MAX_PACKETS * 8u + 16u)
+#define PARHELIA_PRIMARY_DWORDS		(PARHELIA_CALL_CAPACITY * 8u + 16u)
 #define PARHELIA_ASYNC_SLOTS		8u
-/* A normal coalesced submit has one five-word CALL per packet plus its
- * opening/EOB/drain sections, optional stage calls, and one writeback. */
-#define PARHELIA_SLOT_PRIMARY_DWORDS	(PARHELIA_MAX_PACKETS * 5u + 16u)
+/* The primary always remains bounded by the hardware CALL capacity, even
+ * when one secondary CALL contains several validated packet descriptors.
+ */
+#define PARHELIA_SLOT_PRIMARY_DWORDS	(PARHELIA_CALL_CAPACITY * 5u + 16u)
 #define PARHELIA_ASYNC_PRIMARY_DWORDS	(PARHELIA_ASYNC_SLOTS * PARHELIA_SLOT_PRIMARY_DWORDS)
 #define PARHELIA_MAX_RELOCS		(PARHELIA_MAX_USER_PACKETS + 64u)
 #define PARHELIA_DMA_BLOCK_DWORDS	4096u
@@ -280,10 +283,11 @@ struct parhelia_submit_slot {
 	u32 primary_end;
 	u32 call_count;
 	unsigned long deadline;
-	struct parhelia_dma_block blocks[PARHELIA_MAX_PACKETS];
+	struct parhelia_dma_block *blocks;
 	/* A single compact coherent secondary heap backs every packet in one
-	 * request.  Individual small dma_alloc_coherent() calls exhaust DMA32
-	 * metadata long before a Quake frame exhausts bytes. */
+	 * request. The CPU-only block index may exceed the hardware CALL count
+	 * while adjacent packet descriptors are being compacted.
+	 */
 	void *secondary_cpu;
 	dma_addr_t secondary_bus;
 	u32 secondary_dwords;
@@ -416,7 +420,7 @@ struct parhelia_device {
 	dma_addr_t vertex_bus;
 	void *writeback_cpu;
 	dma_addr_t writeback_bus;
-	struct parhelia_dma_block dma_blocks[PARHELIA_MAX_PACKETS];
+	struct parhelia_dma_block dma_blocks[PARHELIA_CALL_CAPACITY];
 	/* The synchronous diagnostic path above retains its original allocations.
 	 * Normal asynchronous renders use the isolated storage below, so no
 	 * returned ioctl can expose memory still consumed by the engine. */

@@ -28,11 +28,15 @@ static inline __u32 parhelia_vertex_bind_mode(const __u32 *cmd, __u32 length)
  * without changing any packet bytes or hardware header boundaries.
  */
 #define PARHELIA_CALL_CAPACITY 224u
+#define PARHELIA_USER_PACKET_CAPACITY 1024u
+#define PARHELIA_SYNTHETIC_BLOCK_CAPACITY 6u
+#define PARHELIA_PLAN_CAPACITY \
+	(PARHELIA_USER_PACKET_CAPACITY * 2u + PARHELIA_SYNTHETIC_BLOCK_CAPACITY)
 struct parhelia_call_plan {
-	__u32 blocks[PARHELIA_CALL_CAPACITY];
-	__u16 packet_spans[PARHELIA_CALL_CAPACITY];
-	__u32 stage_modes[PARHELIA_CALL_CAPACITY];
-	__u32 stage_parent[PARHELIA_CALL_CAPACITY];
+	__u32 blocks[PARHELIA_PLAN_CAPACITY];
+	__u16 packet_spans[PARHELIA_PLAN_CAPACITY];
+	__u32 stage_modes[PARHELIA_USER_PACKET_CAPACITY];
+	__u32 stage_parent[PARHELIA_USER_PACKET_CAPACITY];
 	__u32 count, stages, sync_sections;
 };
 
@@ -51,12 +55,12 @@ static inline int parhelia_plan_calls(struct parhelia_call_plan *plan,
 
 	plan->count = plan->stages = 0;
 	plan->sync_sections = 1;
-	if (!n || n > PARHELIA_CALL_CAPACITY - 3 || opening > n)
+	if (!n || n > PARHELIA_USER_PACKET_CAPACITY || opening > n)
 		return -EINVAL;
 	for (i = 0; i < n; i++)
 		stages += !!plan->stage_modes[i];
 	/* Reserve the drain storage even when full_sync embeds it in primary. */
-	if (n + 3 + stages > PARHELIA_CALL_CAPACITY)
+	if (n + 3 + stages > PARHELIA_PLAN_CAPACITY)
 		return -E2BIG;
 	for (i = 0; i < n; i++) {
 		if (i == opening)
@@ -87,12 +91,13 @@ static inline int parhelia_plan_calls_stateful(struct parhelia_call_plan *plan,
 
 	plan->count = plan->stages = 0;
 	plan->sync_sections = 2;
-	if (!n || boundary == 0 || boundary >= n || opening0 >= boundary ||
+	if (!n || n > PARHELIA_USER_PACKET_CAPACITY || boundary == 0 ||
+	    boundary >= n || opening0 >= boundary ||
 	    opening1 < boundary || opening1 >= n)
 		return -EINVAL;
 	for (i = 0; i < n; i++)
 		stages += !!plan->stage_modes[i];
-	if (n + 6 + stages > PARHELIA_CALL_CAPACITY)
+	if (n + 6 + stages > PARHELIA_PLAN_CAPACITY)
 		return -E2BIG;
 
 	for (i = 0; i < boundary; i++) {
@@ -118,6 +123,12 @@ static inline int parhelia_plan_calls_stateful(struct parhelia_call_plan *plan,
 	parhelia_plan_append(plan, n + 4, 0);
 	parhelia_plan_append(plan, n + 5, 0);
 	return 0;
+}
+
+static inline int
+parhelia_plan_fits_hardware(const struct parhelia_call_plan *plan)
+{
+	return plan->count <= PARHELIA_CALL_CAPACITY ? 0 : -E2BIG;
 }
 
 static inline int parhelia_is_fence_boundary(const __u32 *cmd, __u32 length)

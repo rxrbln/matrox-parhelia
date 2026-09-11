@@ -305,6 +305,20 @@ module_param(coalesce_primary, bool, 0400);
 MODULE_PARM_DESC(coalesce_primary,
 		 "Queue a normal submit's primary CALLs behind one producer doorbell (default true)");
 
+/* Vendor streams place multiple packet headers in one secondary CALL. Keep
+ * the general form opt-in until an exact-order low-level probe has passed on
+ * hardware; the default continues to pack only proven adjacent 0x8f ranges.
+ */
+static bool pack_adjacent_packets;
+module_param(pack_adjacent_packets, bool, 0400);
+MODULE_PARM_DESC(pack_adjacent_packets,
+		 "Pack adjacent validated packets into 4096-dword secondary CALLs (experimental, default false)");
+
+static bool pack_draw_packets;
+module_param(pack_draw_packets, bool, 0400);
+MODULE_PARM_DESC(pack_draw_packets,
+		 "Pack adjacent relocated 0x97 draws into secondary CALLs (experimental, default false)");
+
 /* The documented hardware replay uses --rrfence auto, not the unpatched
  * p3d_state counter literals. Keep that progression on the normal path.
  */
@@ -534,14 +548,18 @@ static bool parhelia_is_coalescible_range_packet(const u32 *commands,
 	return packet->length == 3 && commands[packet->offset] == 0x8f000001;
 }
 
-static u32 parhelia_packet_span_dwords(
-		const struct drm_parhelia_packet *packets, u32 first, u32 count)
+static int
+parhelia_packet_span_dwords(const struct drm_parhelia_packet *packets,
+			    u32 first, u32 count, u32 *words_out)
 {
 	u32 i, words = 0;
 
 	for (i = 0; i < count; i++)
-		words += packets[first + i].length;
-	return words;
+		if (check_add_overflow(words, packets[first + i].length,
+				       &words))
+			return -EOVERFLOW;
+	*words_out = words;
+	return 0;
 }
 
 static void parhelia_coalesce_range_calls(struct parhelia_call_plan *plan,
@@ -561,12 +579,14 @@ static void parhelia_coalesce_range_calls(struct parhelia_call_plan *plan,
 		words = packets[block].length;
 		while (in + run < plan->count) {
 			u32 next = plan->blocks[in + run];
-			u32 next_words;
+			u32 next_words, previous_end;
 
 			if (plan->packet_spans[in + run] != 1 ||
 			    next != block + run || next >= packet_count ||
-			    packets[next].offset != packets[next - 1].offset +
-						    packets[next - 1].length ||
+			    check_add_overflow(packets[next - 1].offset,
+					       packets[next - 1].length,
+					       &previous_end) ||
+			    packets[next].offset != previous_end ||
 			    !parhelia_is_coalescible_range_packet(commands,
 							 &packets[next]))
 				break;
@@ -574,6 +594,116 @@ static void parhelia_coalesce_range_calls(struct parhelia_call_plan *plan,
 			if (words > PARHELIA_DMA_BLOCK_DWORDS - next_words)
 				break;
 			words += next_words;
+			run++;
+		}
+		plan->blocks[out] = block;
+		plan->packet_spans[out] = run;
+		out++;
+		in += run;
+		continue;
+
+copy_one:
+		plan->blocks[out] = block;
+		plan->packet_spans[out] = plan->packet_spans[in];
+		out++;
+		in++;
+	}
+	plan->count = out;
+}
+
+/* Pack only adjacent userspace storage entries already present next to each
+ * other in the execution plan. Synthetic fence/stage entries therefore split
+ * a run without special cases. Every original packet remains separately
+ * validated and parhelia_copy_packet_span() preserves each header byte.
+ */
+static void
+parhelia_pack_adjacent_packet_calls(struct parhelia_call_plan *plan,
+				    const struct drm_parhelia_packet *packets,
+				    u32 packet_count)
+{
+	u32 in = 0, out = 0;
+
+	while (in < plan->count) {
+		u32 block = plan->blocks[in];
+		u32 run = plan->packet_spans[in];
+		u32 entries = 1, words;
+
+		if (block >= packet_count || !run || run > packet_count - block ||
+		    parhelia_packet_span_dwords(packets, block, run, &words) ||
+		    words > PARHELIA_DMA_BLOCK_DWORDS)
+			goto copy_one;
+		while (in + entries < plan->count) {
+			u32 next = plan->blocks[in + entries];
+			u32 next_span = plan->packet_spans[in + entries];
+			u32 next_words, previous_end;
+
+			if (next >= packet_count || !next_span ||
+			    next_span > packet_count - next || next != block + run ||
+			    check_add_overflow(packets[next - 1].offset,
+					       packets[next - 1].length,
+					       &previous_end) ||
+			    packets[next].offset != previous_end ||
+			    parhelia_packet_span_dwords(packets, next, next_span,
+							&next_words) ||
+			    next_words > PARHELIA_DMA_BLOCK_DWORDS - words ||
+			    run > U16_MAX - next_span)
+				break;
+			words += next_words;
+			run += next_span;
+			entries++;
+		}
+		plan->blocks[out] = block;
+		plan->packet_spans[out] = run;
+		out++;
+		in += entries;
+		continue;
+
+copy_one:
+		plan->blocks[out] = block;
+		plan->packet_spans[out] = plan->packet_spans[in];
+		out++;
+		in++;
+	}
+	plan->count = out;
+}
+
+/* This is the first narrow extension beyond the proven 0x8f range packer.
+ * Requiring the relocation bitmap means no raw 0x97 address pair can become
+ * part of a shared CALL, even though the later submit audit is also defensive.
+ */
+static void
+parhelia_coalesce_draw_calls(struct parhelia_call_plan *plan,
+			     const u32 *commands,
+			     const struct drm_parhelia_packet *packets,
+			     const bool *draw_relocated, u32 packet_count)
+{
+	u32 in = 0, out = 0;
+
+	while (in < plan->count) {
+		u32 block = plan->blocks[in];
+		u32 run = plan->packet_spans[in];
+		u32 words;
+
+		if (block >= packet_count || run != 1 || !draw_relocated[block] ||
+		    packets[block].length != 3 ||
+		    (commands[packets[block].offset] >> 24) != 0x97)
+			goto copy_one;
+		words = packets[block].length;
+		while (in + run < plan->count) {
+			u32 next = plan->blocks[in + run];
+			u32 previous_end;
+
+			if (plan->packet_spans[in + run] != 1 ||
+			    next != block + run || next >= packet_count ||
+			    !draw_relocated[next] || packets[next].length != 3 ||
+			    (commands[packets[next].offset] >> 24) != 0x97 ||
+			    check_add_overflow(packets[next - 1].offset,
+					       packets[next - 1].length,
+					       &previous_end) ||
+			    packets[next].offset != previous_end ||
+			    words > PARHELIA_DMA_BLOCK_DWORDS - packets[next].length)
+				break;
+			words += packets[next].length;
 			run++;
 		}
 		plan->blocks[out] = block;
@@ -654,6 +784,10 @@ static int parhelia_range_call_static_selftest(void)
 		{ .offset = 0, .length = 3 },
 		{ .offset = 4, .length = 3 },
 	};
+	const struct drm_parhelia_packet word_limit_packets[] = {
+		{ .offset = 0, .length = 3000 },
+		{ .offset = 3000, .length = 2000 },
+	};
 	const u32 gapped_commands[] = {
 		0x8f000001, 0, 3, 0xdeadbeef,
 		0x8f000001, 3, 6,
@@ -676,7 +810,7 @@ static int parhelia_range_call_static_selftest(void)
 	struct parhelia_call_plan *plan;
 	int ret = -EINVAL;
 
-	plan = kzalloc(sizeof(*plan), GFP_KERNEL);
+	plan = kvzalloc_obj(*plan, GFP_KERNEL);
 	if (!plan)
 		return -ENOMEM;
 	/* A required stage after packet 2 must split the two 0x8f runs. */
@@ -736,9 +870,162 @@ static int parhelia_range_call_static_selftest(void)
 	if (plan->count != 2 || plan->blocks[0] || plan->packet_spans[0] != 1 ||
 	    plan->blocks[1] != 1 || plan->packet_spans[1] != 1)
 		goto out;
+	parhelia_pack_adjacent_packet_calls(plan, gapped_packets, 2);
+	if (plan->count != 2 || plan->blocks[0] || plan->packet_spans[0] != 1 ||
+	    plan->blocks[1] != 1 || plan->packet_spans[1] != 1)
+		goto out;
+
+	/* Contiguity is insufficient when the resulting secondary CALL would
+	 * exceed the independently enforced 4096-dword fetch limit.
+	 */
+	memset(plan, 0, sizeof(*plan));
+	parhelia_plan_append(plan, 0, 1);
+	parhelia_plan_append(plan, 1, 1);
+	parhelia_pack_adjacent_packet_calls(plan, word_limit_packets, 2);
+	if (plan->count != 2 || plan->blocks[0] || plan->packet_spans[0] != 1 ||
+	    plan->blocks[1] != 1 || plan->packet_spans[1] != 1)
+		goto out;
 	ret = 0;
 out:
-	kfree(plan);
+	kvfree(plan);
+	return ret;
+}
+
+static int parhelia_large_range_call_static_selftest(void)
+{
+	struct drm_parhelia_packet *packets;
+	struct parhelia_call_plan *plan;
+	bool *draw_relocated;
+	u32 *commands;
+	u32 i, words;
+	int ret = -EINVAL;
+
+	packets = kvmalloc_array(PARHELIA_USER_PACKET_CAPACITY,
+				 sizeof(*packets), GFP_KERNEL);
+	commands = kvmalloc_array(PARHELIA_USER_PACKET_CAPACITY * 3u,
+				  sizeof(*commands), GFP_KERNEL);
+	draw_relocated = kvcalloc(PARHELIA_USER_PACKET_CAPACITY,
+				  sizeof(*draw_relocated), GFP_KERNEL);
+	plan = kvzalloc_obj(*plan, GFP_KERNEL);
+	if (!packets || !commands || !draw_relocated || !plan) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < PARHELIA_USER_PACKET_CAPACITY; i++) {
+		packets[i].offset = i * 3u;
+		packets[i].length = 3;
+		commands[i * 3u] = 0x8f000001;
+		commands[i * 3u + 1] = i * 3u;
+		commands[i * 3u + 2] = i * 3u + 3u;
+	}
+
+	/* The logical plan may exceed the hardware CALL table only while it is
+	 * still eligible for validated adjacent-range compaction.
+	 */
+	if (parhelia_plan_calls(plan, PARHELIA_USER_PACKET_CAPACITY, 0, false) ||
+	    plan->count != PARHELIA_USER_PACKET_CAPACITY + 3u ||
+	    !parhelia_plan_fits_hardware(plan))
+		goto out;
+	parhelia_coalesce_range_calls(plan, commands, packets, PARHELIA_USER_PACKET_CAPACITY);
+	if (plan->count != 4 || plan->blocks[0] != PARHELIA_USER_PACKET_CAPACITY ||
+	    plan->packet_spans[0] || plan->blocks[1] ||
+	    plan->packet_spans[1] != PARHELIA_USER_PACKET_CAPACITY ||
+	    plan->blocks[2] != PARHELIA_USER_PACKET_CAPACITY + 1u ||
+	    plan->packet_spans[2] ||
+	    plan->blocks[3] != PARHELIA_USER_PACKET_CAPACITY + 2u ||
+	    plan->packet_spans[3] || parhelia_plan_fits_hardware(plan))
+		goto out;
+	if (parhelia_packet_span_dwords(packets, plan->blocks[1],
+					plan->packet_spans[1], &words) ||
+	    words != PARHELIA_USER_PACKET_CAPACITY * 3u ||
+	    words > PARHELIA_DMA_BLOCK_DWORDS)
+		goto out;
+
+	/* Non-range packets do not gain admission merely because the userspace
+	 * descriptor table is larger: the hardware plan stays capped at 224.
+	 */
+	for (i = 0; i < PARHELIA_USER_PACKET_CAPACITY; i++)
+		commands[i * 3u] = 0x97000001;
+	memset(plan, 0, sizeof(*plan));
+	if (parhelia_plan_calls(plan, PARHELIA_USER_PACKET_CAPACITY, 0, false))
+		goto out;
+	parhelia_coalesce_range_calls(plan, commands, packets, PARHELIA_USER_PACKET_CAPACITY);
+	if (plan->count != PARHELIA_USER_PACKET_CAPACITY + 3u ||
+	    !parhelia_plan_fits_hardware(plan))
+		goto out;
+	memset(draw_relocated, 1,
+	       PARHELIA_USER_PACKET_CAPACITY * sizeof(*draw_relocated));
+	parhelia_coalesce_draw_calls(plan, commands, packets, draw_relocated,
+				     PARHELIA_USER_PACKET_CAPACITY);
+	if (plan->count != 4 || plan->blocks[0] != PARHELIA_USER_PACKET_CAPACITY ||
+	    plan->packet_spans[0] || plan->blocks[1] ||
+	    plan->packet_spans[1] != PARHELIA_USER_PACKET_CAPACITY ||
+	    plan->blocks[2] != PARHELIA_USER_PACKET_CAPACITY + 1u ||
+	    plan->packet_spans[2] ||
+	    plan->blocks[3] != PARHELIA_USER_PACKET_CAPACITY + 2u ||
+	    plan->packet_spans[3] || parhelia_plan_fits_hardware(plan))
+		goto out;
+
+	/* One unrelocated draw splits the two safe spans and stays a standalone
+	 * CALL; the production validation will subsequently reject that packet.
+	 */
+	draw_relocated[PARHELIA_USER_PACKET_CAPACITY / 2u] = false;
+	memset(plan, 0, sizeof(*plan));
+	if (parhelia_plan_calls(plan, PARHELIA_USER_PACKET_CAPACITY, 0, false))
+		goto out;
+	parhelia_coalesce_draw_calls(plan, commands, packets, draw_relocated,
+				     PARHELIA_USER_PACKET_CAPACITY);
+	if (plan->count != 6 || plan->blocks[1] ||
+	    plan->packet_spans[1] != PARHELIA_USER_PACKET_CAPACITY / 2u ||
+	    plan->blocks[2] != PARHELIA_USER_PACKET_CAPACITY / 2u ||
+	    plan->packet_spans[2] != 1 ||
+	    plan->blocks[3] != PARHELIA_USER_PACKET_CAPACITY / 2u + 1u ||
+	    plan->packet_spans[3] != PARHELIA_USER_PACKET_CAPACITY / 2u - 1u)
+		goto out;
+	draw_relocated[PARHELIA_USER_PACKET_CAPACITY / 2u] = true;
+
+	memset(plan, 0, sizeof(*plan));
+	if (parhelia_plan_calls(plan, PARHELIA_USER_PACKET_CAPACITY, 0, false))
+		goto out;
+	parhelia_pack_adjacent_packet_calls(plan, packets, PARHELIA_USER_PACKET_CAPACITY);
+	if (plan->count != 4 || plan->blocks[0] != PARHELIA_USER_PACKET_CAPACITY ||
+	    plan->packet_spans[0] || plan->blocks[1] ||
+	    plan->packet_spans[1] != PARHELIA_USER_PACKET_CAPACITY ||
+	    plan->blocks[2] != PARHELIA_USER_PACKET_CAPACITY + 1u ||
+	    plan->packet_spans[2] ||
+	    plan->blocks[3] != PARHELIA_USER_PACKET_CAPACITY + 2u ||
+	    plan->packet_spans[3] || parhelia_plan_fits_hardware(plan))
+		goto out;
+
+	memset(plan, 0, sizeof(*plan));
+	plan->stage_modes[PARHELIA_USER_PACKET_CAPACITY / 2u - 1u] = 1;
+	if (parhelia_plan_calls(plan, PARHELIA_USER_PACKET_CAPACITY, 0, false))
+		goto out;
+	parhelia_coalesce_draw_calls(plan, commands, packets, draw_relocated,
+				     PARHELIA_USER_PACKET_CAPACITY);
+	if (plan->count != 6 || plan->blocks[0] != PARHELIA_USER_PACKET_CAPACITY ||
+	    plan->packet_spans[0] || plan->blocks[1] ||
+	    plan->packet_spans[1] != PARHELIA_USER_PACKET_CAPACITY / 2u ||
+	    plan->blocks[2] != PARHELIA_USER_PACKET_CAPACITY + 3u ||
+	    plan->packet_spans[2] ||
+	    plan->blocks[3] != PARHELIA_USER_PACKET_CAPACITY / 2u ||
+	    plan->packet_spans[3] != PARHELIA_USER_PACKET_CAPACITY / 2u ||
+	    plan->blocks[4] != PARHELIA_USER_PACKET_CAPACITY + 1u ||
+	    plan->packet_spans[4] ||
+	    plan->blocks[5] != PARHELIA_USER_PACKET_CAPACITY + 2u ||
+	    plan->packet_spans[5] || parhelia_plan_fits_hardware(plan))
+		goto out;
+
+	memset(plan, 0, sizeof(*plan));
+	if (!parhelia_plan_calls(plan, PARHELIA_USER_PACKET_CAPACITY + 1u,
+				 0, false))
+		goto out;
+	ret = 0;
+out:
+	kvfree(plan);
+	kvfree(draw_relocated);
+	kvfree(commands);
+	kvfree(packets);
 	return ret;
 }
 
@@ -760,7 +1047,7 @@ static int parhelia_shadow_plan_static_selftest(void)
 	} *test;
 	int ret = -EINVAL;
 
-	test = kzalloc(sizeof(*test), GFP_KERNEL);
+	test = kvzalloc_obj(*test, GFP_KERNEL);
 	if (!test)
 		return -ENOMEM;
 	test->plan.blocks[0] = 0;
@@ -797,7 +1084,7 @@ static int parhelia_shadow_plan_static_selftest(void)
 
 	ret = 0;
 out:
-	kfree(test);
+	kvfree(test);
 	return ret;
 }
 
@@ -1180,7 +1467,7 @@ static int parhelia_async_slot_prepare(struct parhelia_device *pdev,
 				       struct parhelia_submit_slot *slot, u32 dwords)
 {
 	if (!dwords || dwords > PARHELIA_MAX_COMMAND_DWORDS +
-		    PARHELIA_MAX_PACKETS * 13u + 16u)
+		    PARHELIA_MAX_USER_PACKETS * 13u + 28u)
 		return -EINVAL;
 	if (!slot->secondary_cpu || slot->secondary_dwords < dwords) {
 		if (slot->secondary_cpu)
@@ -1199,7 +1486,8 @@ static int parhelia_async_slot_prepare(struct parhelia_device *pdev,
 		}
 		slot->secondary_dwords = dwords;
 	}
-	memset(slot->blocks, 0, sizeof(slot->blocks));
+	memset(slot->blocks, 0,
+	       array_size(PARHELIA_DMA_BLOCK_CAPACITY, sizeof(*slot->blocks)));
 	slot->secondary_put = 0;
 	return 0;
 }
@@ -1231,6 +1519,11 @@ static void parhelia_async_slot_heap_fini(struct parhelia_device *pdev,
 	slot->secondary_put = 0;
 }
 
+static void parhelia_kvfree_action(void *data)
+{
+	kvfree(data);
+}
+
 int parhelia_submit_init(struct parhelia_device *pdev)
 {
 	u32 i;
@@ -1241,6 +1534,8 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 		ret = parhelia_shadow_plan_static_selftest();
 	if (!ret)
 		ret = parhelia_range_call_static_selftest();
+	if (!ret)
+		ret = parhelia_large_range_call_static_selftest();
 	if (ret) {
 		dev_err(&pdev->pdev->dev, "submit static selftest failed\n");
 		return ret;
@@ -1265,6 +1560,15 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 	for (i = 0; i < PARHELIA_ASYNC_SLOTS; i++) {
 		struct parhelia_submit_slot *slot = &pdev->slots[i];
 
+		slot->blocks = kvcalloc(PARHELIA_DMA_BLOCK_CAPACITY,
+					sizeof(*slot->blocks), GFP_KERNEL);
+		if (slot->blocks) {
+			ret = devm_add_action_or_reset(&pdev->pdev->dev,
+						       parhelia_kvfree_action,
+						       slot->blocks);
+			if (ret)
+				return ret;
+		}
 		slot->vertex_cpu = dmam_alloc_coherent(&pdev->pdev->dev,
 			PARHELIA_VERTEX_DWORDS * sizeof(u32), &slot->vertex_bus, GFP_KERNEL);
 		slot->writeback_cpu = dmam_alloc_coherent(&pdev->pdev->dev, PAGE_SIZE,
@@ -1273,8 +1577,8 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 			sizeof(*slot->objects), GFP_KERNEL);
 		slot->pinned = devm_kcalloc(&pdev->pdev->dev, PARHELIA_MAX_RELOCS,
 			sizeof(*slot->pinned), GFP_KERNEL);
-		if (!slot->vertex_cpu || !slot->writeback_cpu || !slot->objects ||
-		    !slot->pinned)
+		if (!slot->blocks || !slot->vertex_cpu || !slot->writeback_cpu ||
+		    !slot->objects || !slot->pinned)
 			return -ENOMEM;
 		slot->state = PARHELIA_SLOT_FREE;
 	}
@@ -1926,14 +2230,14 @@ static int parhelia_bound_range_validate_and_patch(
 {
 	struct parhelia_mode7_state state = { };
 	const u32 *stream, *prim, *bounds, *reset;
-	u32 first_range, range_count, bytes, stream_bus, stream_end, i;
+	u32 first_range, range_count, vertices, bytes, stream_bus, stream_end, i;
 
 	if (!bound->stream_seen || bound->stream_dword != 2 || packet_count < 6 ||
 	    bound->stream_packet > packet_count - 6)
 		return -EINVAL;
 	first_range = bound->stream_packet + 5;
 	range_count = packet_count - first_range;
-	if (!range_count || range_count > 180)
+	if (!range_count || check_mul_overflow(range_count, 3u, &vertices))
 		return -EINVAL;
 
 	stream = commands + packets[bound->stream_packet].offset;
@@ -1948,7 +2252,7 @@ static int parhelia_bound_range_validate_and_patch(
 	    prim[1] != 0x2121212c || prim[2] != 0x0002305c ||
 	    packets[bound->stream_packet + 2].length != 4 || bounds[0] != 2 ||
 	    bounds[1] != 0x21211819 || bounds[2] ||
-	    bounds[3] != range_count * 3 ||
+	    bounds[3] != vertices ||
 	    packets[bound->stream_packet + 3].length != 3 || reset[0] != 1 ||
 	    reset[1] != 0x2121212d || reset[2])
 		return -EINVAL;
@@ -1963,7 +2267,7 @@ static int parhelia_bound_range_validate_and_patch(
 	if (state.invalid || !state.floor_seen || !state.limit_seen ||
 	    !state.prim_seen || state.prim != 0x0002305c ||
 	    !state.descriptor_index_seen || !state.descriptors_done ||
-	    state.floor || state.limit != range_count * 3 ||
+	    state.floor || state.limit != vertices ||
 	    !state.stride[0] || state.stride[0] != stream[12] ||
 	    !state.descriptors || state.descriptor_extent != state.stride[0] ||
 	    state.stream[0])
@@ -1981,7 +2285,8 @@ static int parhelia_bound_range_validate_and_patch(
 
 			if (i < first_range || i - first_range >= range_count)
 				return -EINVAL;
-			ordinal = (i - first_range) * 3;
+			if (check_mul_overflow(i - first_range, 3u, &ordinal))
+				return -EOVERFLOW;
 			if (packets[i].length != 3 || range[0] != 0x8f000001 ||
 			    range[1] != ordinal || range[2] != ordinal + 3)
 				return -EINVAL;
@@ -1992,7 +2297,7 @@ static int parhelia_bound_range_validate_and_patch(
 		}
 	}
 
-	if (check_mul_overflow(range_count * 3, state.stride[0], &bytes) ||
+	if (check_mul_overflow(vertices, state.stride[0], &bytes) ||
 	    bound->stream_offset > bound->stream_bo->dma.base.size ||
 	    bytes > bound->stream_bo->dma.base.size - bound->stream_offset)
 		return -EINVAL;
@@ -2371,10 +2676,17 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	u32 fence_step = (replay_fences || full_sync) ? 16 : 8;
 	u32 fence_span;
 	u32 first_draw;
+	bool defer_packet_packing;
 	const char *async_failure_stage = "request setup";
 	int ret = 0;
 
-	static_assert(PARHELIA_MAX_PACKETS == PARHELIA_CALL_CAPACITY);
+	static_assert(PARHELIA_MAX_USER_PACKETS == PARHELIA_USER_PACKET_CAPACITY);
+	static_assert(PARHELIA_MAX_USER_PACKETS <= U16_MAX);
+	static_assert(PARHELIA_PLAN_CAPACITY >=
+		      2u * PARHELIA_MAX_USER_PACKETS + 6u);
+	static_assert(PARHELIA_MAX_DRAW_DWORDS <= PARHELIA_DMA_BLOCK_DWORDS);
+	defer_packet_packing = coalesce_primary && !trace_submit && !full_sync &&
+		!post_draw_wb && (pack_draw_packets || pack_adjacent_packets);
 
 	if (args->flags & ~(PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC) ||
 	    !args->packet_count || args->packet_count > PARHELIA_MAX_USER_PACKETS ||
@@ -2385,6 +2697,8 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	if (async && (!(args->flags & PARHELIA_SUBMIT_FENCE) || !coalesce_primary ||
 		      trace_submit || full_sync || post_draw_wb))
 		return -EINVAL;
+	if (!async && args->packet_count > PARHELIA_LEGACY_USER_PACKETS)
+		return -E2BIG;
 	if (args->vertex_dwords && !args->vertices)
 		return -EINVAL;
 	/* Keep comparisons independent; tracing is for small diagnostic batches. */
@@ -2404,7 +2718,7 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 		ret = PTR_ERR(commands);
 		goto out_packets;
 	}
-	plan = kzalloc(sizeof(*plan), GFP_KERNEL);
+	plan = kvzalloc_obj(*plan, GFP_KERNEL);
 	if (!plan) {
 		ret = -ENOMEM;
 		goto out_commands;
@@ -2485,6 +2799,11 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	if (coalesce_primary && !trace_submit && !full_sync && !post_draw_wb)
 		parhelia_coalesce_range_calls(plan, commands, packets,
 			args->packet_count);
+	if (!defer_packet_packing) {
+		ret = parhelia_plan_fits_hardware(plan);
+		if (ret)
+			goto out_relocs;
+	}
 	total_calls = plan->count;
 
 
@@ -2501,8 +2820,22 @@ retry_slot:
 	}
 	if (async) {
 		u32 slot_index;
-		u32 needed = total_calls * PARHELIA_CALL_DWORDS + 3;
-		u32 secondary_dwords;
+		u32 needed, reserved_calls, secondary_dwords;
+		u32 stage_dwords, sync_dwords;
+
+		reserved_calls = min(total_calls, PARHELIA_CALL_CAPACITY);
+		if (check_mul_overflow(reserved_calls, PARHELIA_CALL_DWORDS,
+				       &needed) ||
+		    check_add_overflow(needed, 3u, &needed) ||
+		    check_mul_overflow(plan->stages, 13u, &stage_dwords) ||
+		    check_mul_overflow(plan->sync_sections, 14u, &sync_dwords) ||
+		    check_add_overflow(args->command_dwords, stage_dwords,
+				       &secondary_dwords) ||
+		    check_add_overflow(secondary_dwords, sync_dwords,
+				       &secondary_dwords)) {
+			ret = -EOVERFLOW;
+			goto out_unlock;
+		}
 
 		for (slot_index = 0; slot_index < PARHELIA_ASYNC_SLOTS; slot_index++)
 			if (pdev->slots[slot_index].state == PARHELIA_SLOT_FREE)
@@ -2563,8 +2896,6 @@ retry_slot:
 			goto out_unlock;
 		}
 		async_slot = &pdev->slots[slot_index];
-		secondary_dwords = args->command_dwords + plan->stages * 13u +
-			plan->sync_sections * 14u;
 		async_failure_stage = "secondary coherent heap";
 		ret = parhelia_async_slot_prepare(pdev, async_slot, secondary_dwords);
 		if (ret)
@@ -2937,6 +3268,18 @@ retry_slot:
 			goto out_unpin;
 		}
 	}
+	if (defer_packet_packing) {
+		if (pack_adjacent_packets)
+			parhelia_pack_adjacent_packet_calls(plan, packets, args->packet_count);
+		else
+			parhelia_coalesce_draw_calls(plan, commands, packets,
+						     draw_relocated,
+						     args->packet_count);
+		ret = parhelia_plan_fits_hardware(plan);
+		if (ret)
+			goto out_unpin;
+		total_calls = plan->count;
+	}
 	if (shadow_txn) {
 		lockdep_assert_held(&pdev->submit_lock);
 		parhelia_shadow_filter_plan(&pdev->reg_shadow, commands, packets,
@@ -3084,10 +3427,11 @@ retry_slot:
 				ret = -EINVAL;
 				goto out_unpin;
 			}
-			words = parhelia_packet_span_dwords(packets, block_id,
-						       packet_span);
-			if (!words || words > PARHELIA_DMA_BLOCK_DWORDS) {
-				ret = -EINVAL;
+			ret = parhelia_packet_span_dwords(packets, block_id,
+							  packet_span, &words);
+			if (ret || !words || words > PARHELIA_DMA_BLOCK_DWORDS) {
+				if (!ret)
+					ret = -EINVAL;
 				goto out_unpin;
 			}
 			if (async)
@@ -3416,7 +3760,7 @@ out_relocs:
 	kvfree(relocs);
 out_commands:
 	kfree(shadow_txn);
-	kfree(plan);
+	kvfree(plan);
 	kvfree(commands);
 out_packets:
 	kvfree(packets);
