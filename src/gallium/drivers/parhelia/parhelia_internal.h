@@ -63,6 +63,15 @@ struct parhelia_resource {
    /* Increment after any CPU-visible image write.  Predicate caches use this
     * instead of dirty flags because uploads may update both representations. */
    uint64_t content_generation;
+   /* P690 does not expose sampled alpha from its four-byte texture decoder.
+    * These texture-layout BOs are generated lazily from level zero: one
+    * carries A replicated into RGB, the other carries RGB premultiplied by A.
+    * They implement exact source-over RGB with two hardware draws. */
+   uint32_t alpha_rgb_handle;
+   uint32_t premul_rgb_handle;
+   uint64_t alpha_companion_size;
+   unsigned alpha_companion_stride;
+   uint64_t alpha_companion_generation;
    /* The texture unit walks this contiguous chain itself.  `mip_defined`
     * records levels initialized by either transfer upload or rendering, so
     * incomplete textures cannot select garbage and read maps do not replace

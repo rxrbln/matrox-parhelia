@@ -662,6 +662,14 @@ static void
 ph_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *pres)
 {
    struct parhelia_resource *r = ph_resource(pres);
+   if (r->premul_rgb_handle) {
+      struct drm_gem_close close = {.handle = r->premul_rgb_handle};
+      ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &close);
+   }
+   if (r->alpha_rgb_handle) {
+      struct drm_gem_close close = {.handle = r->alpha_rgb_handle};
+      ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &close);
+   }
    if (r->upload_texture)
       align_free(r->linear_map);
    else if (r->linear_map)

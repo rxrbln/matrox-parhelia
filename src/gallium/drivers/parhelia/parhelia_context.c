@@ -67,10 +67,13 @@ struct ph_transfer {
    void *staging;
 };
 
+struct ph_context;
 static unsigned ph_sampler_tiled_pitch(unsigned width);
 static unsigned ph_texture_cpp(enum pipe_format format);
 static bool ph_prepare_rgb5a1(struct parhelia_resource *texture);
 static void ph_restore_rgba_tiled(struct parhelia_resource *texture);
+static int ph_prepare_alpha_companions(struct ph_context *ctx,
+                                       struct parhelia_resource *texture);
 static uint64_t ph_texture_base_hash(const struct parhelia_resource *texture,
                                      bool tiled, unsigned *alpha_zero,
                                      unsigned *alpha_nonzero);
@@ -190,9 +193,10 @@ struct ph_context {
 	uint32_t cpu_cutout_hash_handle;
 	uint64_t cpu_cutout_hash_generation;
 	uint64_t cpu_cutout_hash;
-	/* Same ownership rule as cpu_alpha_cutout, but for the one observed Q3
-	 * source-alpha UI atlas. */
-	bool cpu_alpha_blend;
+	/* The one observed Q3 source-alpha UI route uses two generated RGB
+	 * companions and two native draws.  Its ten-float staging stream retains
+	 * RGBA so each hardware pass can be packed exactly. */
+	bool rgb_alpha_two_pass;
    /* Hashing a tiled RGBA base level is O(texture pixels).  The draw frontend
     * calls the state predicate per triangle, so retain the result until this
     * texture receives a new linear upload. */
@@ -1142,6 +1146,133 @@ ph_texture_base_hash(const struct parhelia_resource *texture, bool tiled,
    return hash;
 }
 
+/* Build the two ordinary 0x32 images consumed by the hardware source-over
+ * fallback.  The source stays in its normal RGBA allocation; companion BOs
+ * are refreshed only when a transfer changes level zero. */
+static int
+ph_prepare_alpha_companions(struct ph_context *ctx,
+                            struct parhelia_resource *texture)
+{
+   struct parhelia_screen *screen = ph_screen(ctx->base.screen);
+   struct drm_parhelia_create_render alpha = {
+      .width = texture->base.width0,
+      .height = texture->base.height0,
+      .flags = PARHELIA_CREATE_RENDER_TEXTURE,
+   };
+   struct drm_parhelia_create_render premul = alpha;
+   struct drm_parhelia_upload_render upload;
+   uint8_t *alpha_image = NULL, *premul_image = NULL;
+   int ret = 0;
+
+   if (texture->alpha_rgb_handle && texture->premul_rgb_handle &&
+       texture->alpha_companion_generation == texture->content_generation)
+      return 0;
+   if (!texture->map || !texture->mip.levels)
+      return -EINVAL;
+   /* A prior draw may still sample the existing companions asynchronously.
+    * UPLOAD_RENDER is a CPU write into their storage, so wait before refresh. */
+   if ((ret = ph_wait_async(ctx)))
+      return ret;
+   texture->alpha_companion_generation = UINT64_MAX;
+
+   if (!texture->alpha_rgb_handle || !texture->premul_rgb_handle) {
+      if (texture->alpha_rgb_handle) {
+         struct drm_gem_close close = {.handle = texture->alpha_rgb_handle};
+         ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
+      }
+      if (texture->premul_rgb_handle) {
+         struct drm_gem_close close = {.handle = texture->premul_rgb_handle};
+         ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
+      }
+      texture->alpha_rgb_handle = texture->premul_rgb_handle = 0;
+      if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &alpha)) {
+         ret = -errno;
+         goto out;
+      }
+      if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &premul)) {
+         ret = -errno;
+         struct drm_gem_close close = {.handle = alpha.handle};
+         ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
+         goto out;
+      }
+      if (!alpha.handle || !premul.handle || alpha.pitch != premul.pitch ||
+          alpha.size != premul.size || (alpha.pitch & 3) ||
+          alpha.size < texture->mip.size) {
+         struct drm_gem_close close = {.handle = alpha.handle};
+         ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
+         close.handle = premul.handle;
+         ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
+         ret = -EINVAL;
+         goto out;
+      }
+      texture->alpha_rgb_handle = alpha.handle;
+      texture->premul_rgb_handle = premul.handle;
+      texture->alpha_companion_size = alpha.size;
+      /* The texture unit derives its pitch from width; the allocation ABI's
+       * reported pitch may retain the render-target 64-pixel minimum. */
+      texture->alpha_companion_stride = texture->mip.level[0].pitch;
+   }
+
+   alpha_image = calloc(1, texture->alpha_companion_size);
+   premul_image = calloc(1, texture->alpha_companion_size);
+   if (!alpha_image || !premul_image) {
+      ret = -ENOMEM;
+      goto out;
+   }
+   for (unsigned y = 0; y < texture->base.height0; y++) {
+      for (unsigned x = 0; x < texture->base.width0; x++) {
+         size_t src_off = ph_mip_texel_offset(&texture->mip, 0, x, y, false);
+         size_t dst_off = p3d_texture_tile_offset(x, y,
+                                                   texture->alpha_companion_stride);
+         const uint8_t *src;
+         uint8_t *mask, *rgb;
+         unsigned a;
+
+         if (src_off + 4 > texture->size ||
+             dst_off + 4 > texture->alpha_companion_size) {
+            ret = -EOVERFLOW;
+            goto out;
+         }
+         src = (const uint8_t *)texture->map + src_off;
+         mask = alpha_image + dst_off;
+         rgb = premul_image + dst_off;
+         a = src[3];
+         mask[0] = mask[1] = mask[2] = a;
+         mask[3] = 255;
+         rgb[0] = (src[0] * a + 127) / 255;
+         rgb[1] = (src[1] * a + 127) / 255;
+         rgb[2] = (src[2] * a + 127) / 255;
+         rgb[3] = 255;
+      }
+   }
+   upload = (struct drm_parhelia_upload_render) {
+      .data = (uintptr_t)alpha_image,
+      .size = texture->alpha_companion_size,
+      .handle = texture->alpha_rgb_handle,
+   };
+   if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_UPLOAD_RENDER, &upload)) {
+      ret = -errno;
+      goto out;
+   }
+   upload.data = (uintptr_t)premul_image;
+   upload.handle = texture->premul_rgb_handle;
+   if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_UPLOAD_RENDER, &upload)) {
+      ret = -errno;
+      goto out;
+   }
+   texture->alpha_companion_generation = texture->content_generation;
+   if (getenv("PARHELIA_TRACE"))
+      fprintf(stderr,
+              "parhelia: RGB-alpha companions texture=%u alpha=%u premul=%u generation=%llu\n",
+              texture->handle, texture->alpha_rgb_handle,
+              texture->premul_rgb_handle,
+              (unsigned long long)texture->content_generation);
+out:
+   free(premul_image);
+   free(alpha_image);
+   return ret;
+}
+
 static bool
 ph_cpu_alpha_blend_depth_write_image(uint64_t image)
 {
@@ -1181,7 +1312,8 @@ ph_use_cpu_alpha_cutout(struct ph_context *ctx, bool textured,
    if (ctx->fs->sampler_mask != BITFIELD_BIT(0) ||
        ctx->fs->texenv != P3D_TEXENV_MODULATE ||
        texture->base.target != PIPE_TEXTURE_2D ||
-       texture->base.format != PIPE_FORMAT_R8G8B8A8_UNORM || !texture->map ||
+       texture->base.format != PIPE_FORMAT_R8G8B8A8_UNORM ||
+       !texture->upload_texture || !texture->map ||
        (color->base.format != PIPE_FORMAT_B8G8R8A8_UNORM &&
         color->base.format != PIPE_FORMAT_B8G8R8X8_UNORM) || !color->linear_map ||
        !zs->linear_map || sampler->min_img_filter != PIPE_TEX_FILTER_LINEAR ||
@@ -1204,6 +1336,8 @@ ph_use_cpu_alpha_cutout(struct ph_context *ctx, bool textured,
    /* Stage selection needs the same logical tiled image that submission will
     * sample.  Texture uploads are CPU copies into the mapped resource, so
     * making it current here emits no GPU work or synchronization. */
+   if (texture->rgb5a1_packed)
+      ph_restore_rgba_tiled(texture);
    ph_resource_upload_tiled(texture);
    if (ctx->cpu_cutout_hash_resource != texture ||
        ctx->cpu_cutout_hash_handle != texture->handle ||
@@ -1224,8 +1358,8 @@ ph_use_cpu_alpha_cutout(struct ph_context *ctx, bool textured,
  * samples their RGB but loses alpha before SRC_ALPHA blending, producing
  * opaque glyph quads. */
 static bool
-ph_use_cpu_alpha_blend(struct ph_context *ctx, bool textured,
-                       bool multitextured, bool has_colour)
+ph_use_rgb_alpha_two_pass(struct ph_context *ctx, bool textured,
+                          bool multitextured, bool has_colour)
 {
    const struct pipe_rt_blend_state *blend =
       ctx->blend ? &ctx->blend->rt[0] : NULL;
@@ -1315,6 +1449,8 @@ ph_use_cpu_alpha_blend(struct ph_context *ctx, bool textured,
    /* Retain the native-image signature through repeated primitives.  Image
     * generation changes even when an upload updates both backing maps and
     * clears the ordinary dirty flags. */
+   if (texture->rgb5a1_packed)
+      ph_restore_rgba_tiled(texture);
    ph_resource_upload_tiled(texture);
    if (ctx->cpu_alpha_hash_resource != texture ||
        ctx->cpu_alpha_hash_handle != texture->handle ||
@@ -1352,8 +1488,8 @@ ph_use_cpu_alpha_blend(struct ph_context *ctx, bool textured,
  * 640x480 virtual screen.  The engine's first top-right glyph lies at
  * y=32..64, so this needs the complete 64-pixel HUD band. */
 static bool
-ph_cpu_alpha_blend_hud_primitive(struct ph_context *ctx,
-                                 const struct prim_header *prim, int pos)
+ph_rgb_alpha_hud_primitive(struct ph_context *ctx,
+                           const struct prim_header *prim, int pos, int col)
 {
 	const struct parhelia_resource *texture;
    float xmin = FLT_MAX, ymin = FLT_MAX;
@@ -1369,11 +1505,23 @@ ph_cpu_alpha_blend_hud_primitive(struct ph_context *ctx,
       xmin = MIN2(xmin, p[0]); xmax = MAX2(xmax, p[0]);
       ymin = MIN2(ymin, p[1]); ymax = MAX2(ymax, p[1]);
    }
-   /* ph_use_cpu_alpha_blend() has already updated this cached signature.
+	/* ph_use_rgb_alpha_two_pass() has already updated this cached signature.
     * Hashing the whole atlas here happens once per triangle and can keep Q3
     * in its loading screen indefinitely. */
-   if (ctx->dsa->depth_enabled && ctx->dsa->depth_writemask &&
-       ctx->cpu_alpha_hash == UINT64_C(0xe98fa2a3b0349695))
+   /* RGB premultiplication commutes with interpolation only when vertex
+    * alpha is constant over the primitive.  Q3's observed HUD uses opaque
+    * white; also accept any other constant alpha without approximating it. */
+   if (col >= 0) {
+      float a = prim->v[0]->data[col][3];
+
+      for (unsigned i = 1; i < 3; i++)
+         if (fabsf(prim->v[i]->data[col][3] - a) > 0.0001f)
+            return false;
+   }
+   /* The live q3dm1 fingerprint is the centered 24x24 reticle.  It lies
+    * outside the HUD bands below and is the most visible sampled-alpha
+    * failure, so admit that exact image independently of screen position. */
+   if (ctx->cpu_alpha_hash == UINT64_C(0xe98fa2a3b0349695))
       return xmax - xmin <= 48.0f && ymax - ymin <= 48.0f;
    /* The small glyph textures are the live HUD path.  Do not route the
     * 256x256 loading atlas through CPU composition: it forces a full render
@@ -1902,6 +2050,109 @@ ph_cpu_alpha_cutout(struct ph_context *ctx, struct parhelia_resource *color,
 }
 
 static void
+ph_pack_rgb_alpha_pass(struct ph_context *ctx, bool depth, bool attenuation)
+{
+   float *dst = ctx->packed_vertices;
+
+   for (unsigned i = 0; i < ctx->triangles * 3; i++) {
+      const float *src = &ctx->vertices[i * 10];
+      float a = CLAMP(src[7], 0.0f, 1.0f);
+
+      *dst++ = src[0];
+      *dst++ = src[1];
+      if (depth)
+         *dst++ = src[2];
+      if (attenuation) {
+         *dst++ = a;
+         *dst++ = a;
+         *dst++ = a;
+      } else {
+         *dst++ = src[4] * a;
+         *dst++ = src[5] * a;
+         *dst++ = src[6] * a;
+      }
+      *dst++ = src[8];
+      *dst++ = src[9];
+   }
+}
+
+static int
+ph_submit_rgb_alpha_two_pass(struct ph_context *ctx,
+                             struct parhelia_resource *color,
+                             struct parhelia_resource *depth,
+                             struct parhelia_resource *texture,
+                             const struct p3d_texture *texture_state,
+                             const struct p3d_state *base_state)
+{
+   struct parhelia_batch attenuation_batch, additive_batch;
+   struct p3d_texture companion_tex = *texture_state;
+   struct p3d_state attenuation = *base_state, additive;
+   const unsigned dpv = depth ? 8 : 7;
+   int ret;
+
+   ret = ph_prepare_alpha_companions(ctx, texture);
+   if (ret)
+      return ret;
+   companion_tex.fmt = 0x32;
+   companion_tex.texelcode = 2;
+   companion_tex.mip_filter = P3D_MIP_NONE;
+   companion_tex.max_level = 0;
+   companion_tex.env = P3D_TEXENV_MODULATE;
+
+   attenuation.tex = &companion_tex;
+   attenuation.tex1 = NULL;
+   attenuation.warp_entry = ctx->warp_textured;
+   attenuation.dw_per_vertex = dpv;
+   attenuation.vertex_alpha = false;
+   attenuation.depth_vertex_alpha = false;
+   attenuation.depth_vertex_alpha_add = false;
+   attenuation.alpha_test = false;
+   attenuation.blend = true;
+   attenuation.blend_src = P3D_BF_ZERO;
+   attenuation.blend_dst = P3D_BF_ONE_MINUS_SRC_COLOR;
+   attenuation.depth_write = false;
+   /* The P690 cannot derive the GL destination-alpha equation from sampled
+    * RGB.  Q3 never consumes framebuffer alpha, so preserve it while updating
+    * the exact source-over RGB channels. */
+   attenuation.mask_a = false;
+   attenuation.mask_r = attenuation.mask_g = attenuation.mask_b = true;
+   additive = attenuation;
+   additive.blend_src = P3D_BF_ONE;
+   additive.blend_dst = P3D_BF_ONE;
+   additive.depth_write = base_state->depth_write;
+
+   ret = parhelia_batch_state_textured(&attenuation_batch, color->handle,
+                                        depth ? depth->handle : 0,
+                                        texture->alpha_rgb_handle,
+                                        &attenuation, ctx->triangles);
+   if (!ret)
+      ret = parhelia_batch_state_textured(&additive_batch, color->handle,
+                                           depth ? depth->handle : 0,
+                                           texture->premul_rgb_handle,
+                                           &additive, ctx->triangles);
+   if (ret)
+      return ret;
+
+   ph_pack_rgb_alpha_pass(ctx, depth != NULL, true);
+   ret = ph_submit_batch(ctx, &attenuation_batch, ctx->packed_vertices,
+                         ctx->triangles * 3 * dpv,
+                         color, depth, texture, NULL);
+   if (ret)
+      return ret;
+   ph_pack_rgb_alpha_pass(ctx, depth != NULL, false);
+   ret = ph_submit_batch(ctx, &additive_batch, ctx->packed_vertices,
+                         ctx->triangles * 3 * dpv,
+                         color, depth, texture, NULL);
+   if (!ret && getenv("PARHELIA_TRACE"))
+      fprintf(stderr,
+              "parhelia: GPU RGB-alpha two-pass triangles=%u texture=%u companions=%u/%u depth=%u/%u\n",
+              ctx->triangles, texture->handle, texture->alpha_rgb_handle,
+              texture->premul_rgb_handle, !!depth,
+              base_state->depth_write);
+   return ret;
+}
+
+static void
 ph_submit_vertices(struct ph_context *ctx)
 {
    struct parhelia_batch *batch = &ctx->build_batch;
@@ -2008,7 +2259,7 @@ ph_submit_vertices(struct ph_context *ctx)
    if (texture1 && !texture1_tiled)
       ph_resource_resolve_linear(texture1);
 
-   if (texture && texture_tiled && !texture1 && blend &&
+   if (!ctx->rgb_alpha_two_pass && texture && texture_tiled && !texture1 && blend &&
        blend->blend_enable && blend->rgb_func == PIPE_BLEND_ADD &&
        blend->alpha_func == PIPE_BLEND_ADD &&
        blend->rgb_src_factor == PIPE_BLENDFACTOR_SRC_ALPHA &&
@@ -2056,21 +2307,6 @@ ph_submit_vertices(struct ph_context *ctx)
                                                            NULL, NULL));
       goto out;
    }
-	if (ctx->cpu_alpha_blend) {
-	   if (ctx->aggregate_batches && ph_drain_batch(ctx))
-	      goto out;
-	   ph_resource_resolve_linear(color);
-	   if (depth)
-	      ph_resource_resolve_linear(depth);
-	   ph_cpu_alpha_blend(ctx, color, depth, texture, sampler);
-	   if (getenv("PARHELIA_TRACE"))
-	      fprintf(stderr,
-	              "parhelia: CPU alpha blend triangles=%u image=%#llx\n",
-	              ctx->triangles,
-	              (unsigned long long)ph_texture_base_hash(texture, true,
-	                                                        NULL, NULL));
-	   goto out;
-	}
    if (ctx->aggregate_batches && color->linear_dirty && ph_drain_batch(ctx))
       goto out;
    ph_resource_upload_tiled(color);
@@ -2199,6 +2435,16 @@ ph_submit_vertices(struct ph_context *ctx)
       state.alpha_test = false;
       state.blend = false;
    }
+	if (ctx->rgb_alpha_two_pass) {
+	   if (!texture || texture1 || !texture_tiled) {
+	      ret = -EINVAL;
+	   } else {
+	      ret = ph_submit_rgb_alpha_two_pass(ctx, color, depth, texture,
+	                                          &tex, &state);
+	   }
+	   submitted = true;
+	   goto submission_done;
+	}
 	ph_trace_alpha_test(ctx, &state, color, texture, sampler, texture_tiled);
 
    dpv = state.dw_per_vertex;
@@ -2315,6 +2561,7 @@ ph_submit_vertices(struct ph_context *ctx)
       ret = ph_submit_batch(ctx, batch, ctx->vertices,
                             ctx->triangles * 3 * dpv,
                             color, depth, texture, texture1);
+submission_done:
    if (ret)
       ctx->submit_error = ret;
    else {
@@ -2342,7 +2589,7 @@ out:
 	ctx->alpha_micro = false;
 	ctx->alpha_micro_cutout = false;
 	ctx->cpu_alpha_cutout = false;
-	ctx->cpu_alpha_blend = false;
+	ctx->rgb_alpha_two_pass = false;
 }
 
 static float
@@ -2545,14 +2792,18 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	bool alpha_micro_cutout;
 	bool alpha_micro_depth;
 	bool cpu_alpha_cutout;
-	bool cpu_alpha_blend;
+	bool rgb_alpha_two_pass;
 	unsigned dpv;
    float *dst;
 
-   vertex_alpha = ph_use_vertex_alpha(ctx, textured, multitextured, depth,
+	vertex_alpha = ph_use_vertex_alpha(ctx, textured, multitextured, depth,
 				  col >= 0);
-	alpha_micro = ph_use_alpha_micro(ctx, textured, multitextured, depth,
-	                                  col >= 0);
+	rgb_alpha_two_pass = ph_use_rgb_alpha_two_pass(ctx, textured,
+	                                               multitextured, col >= 0) &&
+		  ph_rgb_alpha_hud_primitive(ctx, prim, pos, col);
+	alpha_micro = !rgb_alpha_two_pass &&
+	              ph_use_alpha_micro(ctx, textured, multitextured, depth,
+	                                 col >= 0);
 	alpha_micro_cutout = ph_use_alpha_micro_cutout(ctx, textured,
 	                                                multitextured, depth,
 	                                                col >= 0);
@@ -2562,11 +2813,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	   vertex_alpha = false;
 	cpu_alpha_cutout = ph_use_cpu_alpha_cutout(ctx, textured, multitextured,
 								 depth, col >= 0);
-	cpu_alpha_blend = ph_use_cpu_alpha_blend(ctx, textured, multitextured,
-								  col >= 0) &&
-		  ph_cpu_alpha_blend_hud_primitive(ctx, prim, pos);
 	if (alpha_micro || alpha_micro_cutout)
-	   cpu_alpha_cutout = cpu_alpha_blend = false;
+	   cpu_alpha_cutout = rgb_alpha_two_pass = false;
 	alpha_micro_depth = depth && ctx->dsa && ctx->dsa->depth_enabled;
 	if (alpha_micro)
 	   depth = alpha_micro_depth;
@@ -2581,9 +2829,9 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 			const float *p = pos >= 0 ? prim->v[0]->data[pos] : NULL;
 			ctx->trace_cpu_alpha_stage_resource = trace_texture;
 			fprintf(stderr,
-				"parhelia: cpu-alpha stage tex=%ux%u cpu=%u micro=%u pos=%g,%g blend=%u/%u,%u alpha=%u/%u,%u mip=%u alpha-test=%u\\n",
+				"parhelia: alpha stage tex=%ux%u two-pass=%u micro=%u pos=%g,%g blend=%u/%u,%u alpha=%u/%u,%u mip=%u alpha-test=%u\\n",
 				trace_texture->base.width0, trace_texture->base.height0,
-				cpu_alpha_blend, alpha_micro, p ? p[0] : -1.0f, p ? p[1] : -1.0f,
+				rgb_alpha_two_pass, alpha_micro, p ? p[0] : -1.0f, p ? p[1] : -1.0f,
 				ctx->blend->rt[0].rgb_func,
 				ctx->blend->rt[0].rgb_src_factor,
 				ctx->blend->rt[0].rgb_dst_factor,
@@ -2620,8 +2868,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	                                  (depth ? 6 : 5);
 	if (vertex_alpha)
 	   dpv++;
-	if (cpu_alpha_cutout || cpu_alpha_blend)
-	   dpv = 10; /* XYZOOW, RGBA, ST; never reaches the GPU vertex ring. */
+	if (cpu_alpha_cutout || rgb_alpha_two_pass)
+	   dpv = 10; /* Internal XYZOOW,RGBA,ST; packed to 7/8 GPU dwords later. */
 	/* A state setter normally drains a batch before reaching this point.  The
 	 * extra guard keeps a future draw-stage change from mixing 7- and 8-dword
 	 * streams if the exact blend predicate changes within a primitive list. */
@@ -2629,7 +2877,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	                       ctx->alpha_micro != alpha_micro ||
 	                       ctx->alpha_micro_cutout != alpha_micro_cutout ||
 	                       ctx->cpu_alpha_cutout != cpu_alpha_cutout ||
-	                       ctx->cpu_alpha_blend != cpu_alpha_blend))
+	                       ctx->rgb_alpha_two_pass != rgb_alpha_two_pass))
 	   ph_submit_vertices(ctx);
 
    /* The kernel-owned vertex DMA area is 4096 dwords.  A fixed draw cap is
@@ -2671,7 +2919,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	ctx->alpha_micro = alpha_micro;
 	ctx->alpha_micro_cutout = alpha_micro_cutout;
 	ctx->cpu_alpha_cutout = cpu_alpha_cutout;
-	ctx->cpu_alpha_blend = cpu_alpha_blend;
+	ctx->rgb_alpha_two_pass = rgb_alpha_two_pass;
 	if (alpha_micro || alpha_micro_cutout) {
 	   ph_stage_alpha_micro(ctx, prim, pos, col, texcoord, depth,
 	                        alpha_micro_cutout);
@@ -2691,7 +2939,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
       const float *p = prim->v[v]->data[pos];
       const float white[4] = {1, 1, 1, 1};
       const float *c = col < 0 ? white : prim->v[v]->data[col];
-		if (cpu_alpha_cutout || cpu_alpha_blend) {
+		if (cpu_alpha_cutout || rgb_alpha_two_pass) {
 			const float *tc = prim->v[v]->data[texcoord];
 			*dst++ = p[0];
 			*dst++ = p[1];
