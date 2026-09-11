@@ -577,7 +577,7 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
              unsigned vertices_per_primitive,
              bool bound_ranges)
 {
-   unsigned draws = 0, texture_bases = 0;
+   unsigned draws = 0, texture_units = 0, selected_unit = 0;
    unsigned stream_packet = UINT32_MAX;
    if (cs->error)
       return -E2BIG;
@@ -644,6 +644,9 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
                break;
             if (pos >= call->sec_len)
                return -EINVAL;
+            /* 0x1200+4u selects the unit bank of the window at 0x11c0 */
+            if (index >= 0x80 && index <= 0x83)
+               selected_unit = index - 0x80;
             if (index == 0x77 ||
                 (index >= 0x88 && index <= 0x8e && !(index & 1))) {
                /* Even unused surface base writes get a valid GEM target;
@@ -651,11 +654,12 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
                 */
                if (cmd[pos] || batch->reloc_count >= PH_BATCH_PACKETS + 4)
                   return -EINVAL;
-               if (index == 0x77 && texture_bases >= 2)
+               if (index == 0x77 && selected_unit >= 2)
                   return -EINVAL;
-               const unsigned unit = texture_bases;
+               const unsigned unit = selected_unit;
 
-               texture_bases += index == 0x77;
+               if (index == 0x77)
+                  texture_units |= 1u << unit;
                batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
                   .packet = i, .dword = pos,
                   .delta = index == 0x77 && texture_offsets ?
@@ -672,7 +676,7 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
          }
       }
    }
-   if (texture_bases != (texture0_handle != 0) + (texture1_handle != 0))
+   if (texture_units != ((texture0_handle != 0) | (texture1_handle != 0) << 1))
       return -EINVAL;
    if (bound_ranges) {
       if (stream_packet == UINT32_MAX ||
