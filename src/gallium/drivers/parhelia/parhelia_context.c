@@ -87,13 +87,15 @@ ph_mip_texel_offset(const struct ph_mip_layout *mip, unsigned level,
                     unsigned x, unsigned y, bool linear)
 {
    const struct ph_mip_level *image = &mip->level[level];
+   unsigned physical_pitch;
+   bool native;
 
-   x += image->tail_x;
-   y += image->tail_y;
+   native = ph_mip_physical_coords(mip, level, 4, &x, &y,
+                                   &physical_pitch);
    return image->offset + (linear ?
           ((size_t)y * image->pitch + x) * 4 :
-          (mip->native_64x16_32 ?
-           p3d_tile_offset_layout(x, y, image->pitch,
+          (native ?
+           p3d_tile_offset_layout(x, y, physical_pitch,
                                   PARHELIA_TILE_64X16_4K) :
            p3d_texture_tile_offset(x, y, image->pitch)));
 }
@@ -103,13 +105,15 @@ ph_mip_texel_offset_cpp(const struct ph_mip_layout *mip, unsigned level,
                         unsigned x, unsigned y, bool linear, unsigned cpp)
 {
    const struct ph_mip_level *image = &mip->level[level];
+   unsigned physical_pitch;
+   bool native;
 
-   x += image->tail_x;
-   y += image->tail_y;
+   native = ph_mip_physical_coords(mip, level, cpp, &x, &y,
+                                   &physical_pitch);
    return image->offset + (linear ?
           ((size_t)y * image->pitch + x) * cpp :
-          (mip->native_64x16_32 && cpp == 4 ?
-           p3d_tile_offset_layout(x, y, image->pitch,
+          (native ?
+           p3d_tile_offset_layout(x, y, physical_pitch,
                                   PARHELIA_TILE_64X16_4K) :
            p3d_texture_tile_offset_cpp(x, y, image->pitch, cpp)));
 }
@@ -177,6 +181,11 @@ struct ph_context {
    bool aggregate_batches;
    bool aggregate_state_batches;
    bool aggregate_state_stream;
+   /* Submission fallback is a property of this context.  One client's
+    * transient DMA allocation failure must not change another context's
+    * execution path through mutable pipe_screen state. */
+   bool async_submit;
+   bool pack_adjacent_packets;
    /* Hardware-proven P690 one-pass diffuse x lightmap path. */
    bool p690_multitexture;
    bool trace_multitex_emitted;
@@ -434,12 +443,12 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
                     const void *vertices, unsigned vertex_dwords)
 {
    struct parhelia_screen *screen = ph_screen(ctx->base.screen);
-   bool boundary_aware = screen->pack_adjacent_packets &&
+   bool boundary_aware = ctx->pack_adjacent_packets &&
                          !ph_batch_has_full_boundary(batch);
    int ret;
    uint64_t bytes = (uint64_t)vertex_dwords * sizeof(uint32_t);
 
-   if (vertices && vertex_dwords && screen->async_submit &&
+   if (vertices && vertex_dwords && ctx->async_submit &&
        ctx->vram_vertex_enabled &&
        bytes <= (uint64_t)ctx->vram_vertex_slot_dwords * sizeof(uint32_t)) {
       unsigned slot = ctx->vram_vertex_slot;
@@ -479,11 +488,11 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
          if (getenv("PARHELIA_TRACE"))
             fprintf(stderr,
                     "parhelia: async vertex slot exhausted; retrying synchronously\n");
-         screen->async_submit = false;
-         screen->pack_adjacent_packets = false;
+         ctx->async_submit = false;
+         ctx->pack_adjacent_packets = false;
       }
    }
-   if (vertices && vertex_dwords && !screen->async_submit &&
+   if (vertices && vertex_dwords && !ctx->async_submit &&
        ctx->vram_vertex_enabled &&
        bytes <= (uint64_t)ctx->vram_vertex_slot_dwords * sizeof(uint32_t)) {
       /* Async submission can be disabled after a pre-doorbell allocation
@@ -517,7 +526,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
    }
    /* Copy-submit fallback requests retain their own kernel vertex snapshot.
     * CREATE_VERTEX submissions above use three fenced class-3 DMA subranges. */
-   if (screen->async_submit) {
+   if (ctx->async_submit) {
       ret = boundary_aware ?
          parhelia_batch_submit_async_bounded(
             screen->fd, batch, vertices, vertex_dwords, &ctx->fence) :
@@ -535,8 +544,8 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
          return ret;
       if (ret == -ENOMEM && getenv("PARHELIA_TRACE"))
          fprintf(stderr, "parhelia: async DMA32 slot exhausted; falling back to synchronous submits\n");
-      screen->async_submit = false;
-      screen->pack_adjacent_packets = false;
+      ctx->async_submit = false;
+      ctx->pack_adjacent_packets = false;
    }
    return parhelia_batch_submit(screen->fd, batch, vertices, vertex_dwords,
                                 &ctx->fence);
@@ -652,7 +661,7 @@ ph_submit_state_stream_groups(struct ph_context *ctx)
       return ret;
    while (first < ctx->pending_mark_count) {
       const bool pack_adjacent =
-         ph_screen(ctx->base.screen)->pack_adjacent_packets;
+         ctx->pack_adjacent_packets;
       unsigned first_packet = first ? ctx->pending_marks[first - 1].packets : 0;
       unsigned end = first, calls = 0;
 
@@ -697,7 +706,7 @@ ph_drain_batch(struct ph_context *ctx)
       return 0;
    packed_calls_valid = !parhelia_batch_packed_call_count(
       &ctx->pending_batch, 0, ctx->pending_batch.packet_count,
-      ph_screen(ctx->base.screen)->pack_adjacent_packets, &packed_calls);
+      ctx->pack_adjacent_packets, &packed_calls);
    if (getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: aggregate submits=%u commands=%u packets=%u stages=%u relocs=%u vertices=%u resources=%u estimated_calls=%u\n",
@@ -778,7 +787,7 @@ ph_append_state_stream(struct ph_context *ctx,
                        const struct parhelia_batch *batch,
                        const void *vertices, unsigned vertex_dwords)
 {
-   if (ph_screen(ctx->base.screen)->pack_adjacent_packets)
+   if (ctx->pack_adjacent_packets)
       return parhelia_batch_append_call_bounded_limited(
          &ctx->pending_batch, ctx->pending_vertices,
          &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
@@ -1332,23 +1341,70 @@ ph_sampler_mip_filter(const struct pipe_sampler_state *sampler)
    }
 }
 
-/* The 0528 vendor chain is decoded completely, but the exact two-level
- * code-2 packet makes this P690 stop retiring.  There is no runtime opt-in:
- * keep lower uploads isolated from the sampler until P690-specific context
- * state is recovered. */
+static unsigned
+ph_view_mip_levels(const struct parhelia_resource *texture,
+                   const struct pipe_sampler_view *view)
+{
+   unsigned levels = ph_resource_mip_levels(texture);
+
+   if (!view || view->u.tex.first_level || !levels)
+      return 1;
+   return MIN2(levels, view->u.tex.last_level + 1);
+}
+
 static bool
 ph_use_mips(const struct parhelia_resource *texture,
-            const struct pipe_sampler_state *sampler)
+            const struct pipe_sampler_state *sampler,
+            const struct pipe_sampler_view *view)
 {
-   (void)texture;
-   (void)sampler;
-   return false;
+   unsigned levels;
+
+   if (!texture || !sampler ||
+       sampler->min_mip_filter == PIPE_TEX_MIPFILTER_NONE)
+      return false;
+   levels = ph_view_mip_levels(texture, view);
+   return levels > 1 &&
+      ph_mip_ready_levels(texture->mip_defined, levels) == levels;
+}
+
+static uint32_t
+ph_sampler_filter_word(const struct p3d_texture *texture,
+                       const struct pipe_sampler_state *sampler)
+{
+   float bias = sampler ? CLAMP(sampler->lod_bias, -4.0f, 4.0f) : 0.0f;
+   int fixed_bias = (int)((bias - 4.0f) * 16.0f);
+   uint32_t word = 0x1000u |
+      ((uint32_t)texture->min_filter & 3u) |
+      (((uint32_t)texture->mag_filter & 3u) << 3) |
+      (((uint32_t)texture->mip_filter & 3u) << 6) |
+      (((uint32_t)fixed_bias & 0x1ffu) << 16);
+
+   /* The vendor builder sets this address-pipe quirk for the one asymmetric
+    * minification combination. */
+   if (texture->min_filter == P3D_FILTER_NEAREST &&
+       texture->mag_filter == P3D_FILTER_LINEAR &&
+       texture->mip_filter != P3D_MIP_NONE)
+      word |= 1u << 10;
+   return word;
+}
+
+static uint32_t
+ph_sampler_wrap_word(const struct p3d_texture *texture,
+                     const struct pipe_sampler_state *sampler)
+{
+   float min_lod = sampler ? CLAMP(sampler->min_lod, 0.0f, 15.0f) : 0.0f;
+   float max_lod = sampler ? CLAMP(sampler->max_lod, 0.0f, 15.0f) : 15.0f;
+   unsigned fixed_min = CLAMP((int)(min_lod * 16.0f), 0, 240);
+   unsigned fixed_max = CLAMP((int)(max_lod * 16.0f), 0, 240);
+
+   return ((uint32_t)texture->wrap_s & 7u) |
+      (((uint32_t)texture->wrap_t & 7u) << 3) |
+      (fixed_min << 16) | (fixed_max << 24);
 }
 
 /* P690's working OpenGL texture route is layout 2.  It accepts the complete
- * family of ordinary 2-D texture sizes used by Q3; its sampler still selects
- * level zero because ph_use_mips() keeps the unretiring mip descriptor off
- * this chip.  Scanout/presentation images retain layout 0 because they are
+ * family of ordinary 2-D texture sizes used by Q3, including vendor-layout
+ * mip chains.  Scanout/presentation images retain layout 0 because they are
  * consumed through the CPU-visible linear shadow instead. */
 static bool
 ph_auto_tiled_texture(const struct ph_context *ctx,
@@ -1406,7 +1462,7 @@ ph_use_native_sampled_alpha(struct ph_context *ctx, bool textured,
        !texture->upload_texture || !texture->handle || !texture->map ||
        !texture->mip.levels ||
        (texture->mip_defined & ~BITFIELD_BIT(0)) ||
-       ph_use_mips(texture, sampler) ||
+       ph_use_mips(texture, sampler, ctx->sampler_views[0]) ||
        ph_alpha_companion_extent(texture->base.width0) > 0x3fff ||
        ph_alpha_companion_extent(texture->base.height0) > 0x3fff ||
        !color->handle ||
@@ -2759,8 +2815,10 @@ ph_submit_vertices(struct ph_context *ctx)
          (!small_texture_linear ||
           (texture1->base.width0 >= 32 && texture1->base.height0 >= 32)) :
          ph_auto_tiled_texture(ctx, texture1, sampler1);
-   texture_mipped = texture_tiled && ph_use_mips(texture, sampler);
-   texture1_mipped = texture1_tiled && ph_use_mips(texture1, sampler1);
+   texture_mipped = texture_tiled &&
+      ph_use_mips(texture, sampler, ctx->sampler_views[0]);
+   texture1_mipped = texture1_tiled &&
+      ph_use_mips(texture1, sampler1, ctx->sampler_views[1]);
    if (!color->handle || (depth && !depth->handle)) {
       ctx->submit_error = -EINVAL;
       goto out;
@@ -2920,8 +2978,9 @@ ph_submit_vertices(struct ph_context *ctx)
       tex.wrap_t = sampler && sampler->wrap_t != PIPE_TEX_WRAP_REPEAT ?
                       P3D_WRAP_CLAMP : P3D_WRAP_REPEAT;
       tex.max_level = texture_mipped ?
-         ph_mip_ready_levels(texture->mip_defined,
-                             ph_resource_mip_levels(texture)) - 1 : 0;
+         ph_view_mip_levels(texture, ctx->sampler_views[0]) - 1 : 0;
+      tex.filter = ph_sampler_filter_word(&tex, sampler);
+      tex.wrap = ph_sampler_wrap_word(&tex, sampler);
       tex.env = ctx->fs->texenv;
       state.tex = &tex;
       state.warp_entry = (texture1 || ctx->native_sampled_alpha) ?
@@ -2963,8 +3022,9 @@ ph_submit_vertices(struct ph_context *ctx)
          tex1.wrap_t = sampler1 && sampler1->wrap_t != PIPE_TEX_WRAP_REPEAT ?
                          P3D_WRAP_CLAMP : P3D_WRAP_REPEAT;
          tex1.max_level = texture1_mipped ?
-            ph_mip_ready_levels(texture1->mip_defined,
-                                ph_resource_mip_levels(texture1)) - 1 : 0;
+            ph_view_mip_levels(texture1, ctx->sampler_views[1]) - 1 : 0;
+         tex1.filter = ph_sampler_filter_word(&tex1, sampler1);
+         tex1.wrap = ph_sampler_wrap_word(&tex1, sampler1);
          /* Quake's base world pass is diffuse times lightmap. */
          tex1.env = P3D_TEXENV_MODULATE;
          state.tex1 = &tex1;
@@ -3894,12 +3954,9 @@ ph_create_sampler_view(struct pipe_context *p, struct pipe_resource *texture,
                        const struct pipe_sampler_view *templ)
 {
    struct pipe_sampler_view *view;
-   /* The recovered sampler consumes level zero only.  A mipmapped view is
-    * still valid: bind its base image and leave level selection at zero,
-    * rather than rejecting the view and silently turning textured draws into
-    * untextured geometry. */
    if (!templ || !texture || templ->target != PIPE_TEXTURE_2D ||
-       templ->u.tex.first_level)
+       templ->u.tex.first_level ||
+       templ->u.tex.last_level > texture->last_level)
       return NULL;
    view = CALLOC_STRUCT(pipe_sampler_view);
    if (!view)
@@ -4804,11 +4861,11 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
       FREE(t);
       return NULL;
    }
-   if ((usage & PIPE_MAP_READ) ||
-       ((usage & PIPE_MAP_WRITE) && ctx->aggregate_batches)) {
+   if (usage & (PIPE_MAP_READ | PIPE_MAP_WRITE)) {
       /* A transfer map is a CPU visibility and ownership boundary.  Reads
-       * must see queued rendering; writes must not race an aggregate that
-       * still samples the old image. */
+       * must see queued rendering; writes must not pass transformed vertices
+       * still staged in this context or race an asynchronous request that
+       * samples the old image. */
       ph_submit_vertices(ctx);
       if (ph_wait_async(ctx) || ctx->submit_error) {
          FREE(t->staging);
@@ -5009,6 +5066,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->warp_passthrough = warp.value;
    ctx->warp_textured = textured.value;
    ctx->warp_replace = replace.value;
+   ctx->async_submit = ph_screen(screen)->async_submit;
+   ctx->pack_adjacent_packets = ph_screen(screen)->pack_adjacent_packets;
    ctx->aggregate_state_batches =
       ph_screen(screen)->stateful_submit &&
       getenv("PARHELIA_BATCH_DIFFERENT_STATE") != NULL;

@@ -164,4 +164,45 @@ ph_mip_ready_levels(uint16_t defined, unsigned levels)
    return ready;
 }
 
+/* Translate a logical mip texel to the coordinates consumed by the P690
+ * texture address unit.  Exhaustive coordinate-gradient sampling proves two
+ * extra address permutations hidden by flat-color tests: native levels swap
+ * the low two Y bits, while a compact 32x32 child interleaves X/Y bits before
+ * the classic texture swizzle.  For the 2x2 tail slot this naturally places
+ * its rows at physical Y=8 and Y=10. */
+static inline bool
+ph_mip_physical_coords(const struct ph_mip_layout *mip, unsigned level,
+                       unsigned cpp, unsigned *x, unsigned *y,
+                       unsigned *physical_pitch)
+{
+   const struct ph_mip_level *image = &mip->level[level];
+   const bool p690 = mip->native_64x16_32 && cpp == 4;
+   const bool tail = p690 && image->width <= 16 && image->height <= 16;
+
+   if (p690 && image->pitch == 32 && !tail) {
+      const unsigned logical_x = *x, logical_y = *y;
+
+      *x = ((logical_x >> 2) & 1u) |
+           (((logical_y >> 0) & 1u) << 1) |
+           (((logical_x >> 3) & 1u) << 2) |
+           (((logical_x >> 4) & 1u) << 3) |
+           (((logical_y >> 1) & 1u) << 4);
+      *y = (logical_y & ~31u) |
+           ((logical_x >> 0) & 1u) |
+           (((logical_x >> 1) & 1u) << 1) |
+           (((logical_y >> 4) & 1u) << 2) |
+           (((logical_y >> 2) & 1u) << 3) |
+           (((logical_y >> 3) & 1u) << 4);
+      *physical_pitch = image->pitch;
+      return false;
+   }
+
+   *x += image->tail_x;
+   if (p690)
+      *y = (*y & ~3u) | ((*y & 1u) << 1) | ((*y & 2u) >> 1);
+   *y += image->tail_y;
+   *physical_pitch = tail ? 64 : image->pitch;
+   return p690 && (image->pitch >= 64 || tail);
+}
+
 #endif

@@ -329,8 +329,12 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    const bool p690_native_texture32 = sampler_storage &&
       p3d_texture_uses_native_64x16(screen->chip_id, screen->tile_layout,
                                     util_format_get_blocksize(templ->format));
-   const unsigned max_width = share_native ? 4096 : 1024;
-   const unsigned max_height = share_native ? 4096 : 768;
+   /* CREATE_RENDER and the surface/texture descriptors all accept 2048 in
+    * either dimension.  Keep resource creation consistent with the advertised
+    * GL/DRI limit; the old 1024x768 userspace guard was a bring-up limit and
+    * rejected otherwise valid large textures and render targets. */
+   const unsigned max_width = 2048;
+   const unsigned max_height = 2048;
    unsigned mip_levels;
    if (!r)
       return NULL;
@@ -357,43 +361,52 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
               templ->bind);
       goto fail;
    }
-   /* P690 rejects the otherwise vendor-correct code-2 mip descriptor
-    * (MIP_NEAREST/max_level=1) with a non-retiring engine.  Preserve the
-    * historical base-level allocation until its sampler-specific chain mode
-    * is recovered; lower-level transfer maps remain staging-only. */
-   mip_levels = 1;
+   /* P690 uses the common vendor chain geometry with a native 64x16 base,
+    * compact 32x32 child, and a shared <=16 native 64x16 tail.  The
+    * texture-only upload BO is required: an ordinary mapped render BO
+    * selects the wrong storage class for mip sampling. */
+   mip_levels = p690_native_texture32 && templ->width0 >= 64 &&
+                !(templ->width0 & (templ->width0 - 1)) &&
+                !(templ->height0 & (templ->height0 - 1)) ?
+                   templ->last_level + 1 : 1;
    if (!ph_mip_layout_init(&r->mip, templ->width0, templ->height0,
                            mip_levels, true))
       goto fail;
    if (p690_native_texture32) {
-      /* Live unit-1 spatial readback proves that SUN90 layout code 2 uses
-       * its native 64x16 address permutation for 32-bit texels.  The current
-       * P690 path exposes base level only, so widen its single tile row here
-       * without changing older chips or the vendor 16-bit texture layout. */
+      /* Live spatial sampling proves the hybrid address permutations used
+       * for this vendor chain; ph_mip_physical_coords() selects each one. */
       r->mip.native_64x16_32 = true;
       r->mip.level[0].pitch = MAX2(r->mip.level[0].pitch, 64u);
-      r->mip.size = ph_mip_align(r->mip.level[0].pitch *
-                                ph_mip_align(templ->height0, 32) * 4,
-                                0x2000);
+      if (mip_levels == 1)
+         r->mip.size = ph_mip_align(r->mip.level[0].pitch *
+                                   ph_mip_align(templ->height0, 32) * 4,
+                                   0x2000);
    }
    /* CREATE_RENDER has a bounded height.  Retain the historical level-zero
     * allocation for an unusually large chain rather than rejecting an
     * otherwise usable texture; transfer maps for its lower levels become
     * harmless staging-only fallbacks. */
    if (mip_levels > 1 &&
-       (r->mip.size + (size_t)ALIGN_POT(templ->width0, 64) * 4 - 1) /
-       ((size_t)ALIGN_POT(templ->width0, 64) * 4) > 768) {
+       (r->mip.size + (size_t)r->mip.level[0].pitch * 4 - 1) /
+       ((size_t)r->mip.level[0].pitch * 4) > 768) {
       mip_levels = 1;
       if (!ph_mip_layout_init(&r->mip, templ->width0, templ->height0,
                               mip_levels, true))
          goto fail;
+      if (p690_native_texture32) {
+         r->mip.native_64x16_32 = true;
+         r->mip.level[0].pitch = MAX2(r->mip.level[0].pitch, 64u);
+         r->mip.size = ph_mip_align(r->mip.level[0].pitch *
+                                   ph_mip_align(templ->height0, 32) * 4,
+                                   0x2000);
+      }
    }
    struct drm_parhelia_create_render create = {
       .width = p690_native_texture32 ? MAX2(templ->width0, 64u) :
                                       templ->width0,
       .height = mip_levels > 1 ?
-         (r->mip.size + (size_t)ALIGN_POT(templ->width0, 64) * 4 - 1) /
-         ((size_t)ALIGN_POT(templ->width0, 64) * 4) :
+         (r->mip.size + (size_t)r->mip.level[0].pitch * 4 - 1) /
+         ((size_t)r->mip.level[0].pitch * 4) :
          templ->height0,
    };
    /* A tiled sampler uses the texture-unit address path.  Keeping the 32 MiB
@@ -464,8 +477,8 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
          .width = ALIGN_POT(templ->width0, 32),
          .height = mip_levels > 1 ?
             (r->linear_mip.size +
-             (size_t)ALIGN_POT(templ->width0, 32) * 4 - 1) /
-            ((size_t)ALIGN_POT(templ->width0, 32) * 4) :
+             (size_t)r->linear_mip.level[0].pitch * 4 - 1) /
+            ((size_t)r->linear_mip.level[0].pitch * 4) :
             templ->height0,
          .flags = PARHELIA_CREATE_RENDER_LINEAR,
       };
@@ -913,8 +926,17 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->base.nir_options[MESA_SHADER_VERTEX] = &ph_vs_nir_options;
    s->base.nir_options[MESA_SHADER_FRAGMENT] = &ph_fs_nir_options;
    struct pipe_caps *caps = (struct pipe_caps *)&s->base.caps;
+   /* Both GEM handle import/export callbacks are implemented and the kernel
+    * reports the two PRIME directions.  Keep the DRI/GBM contract explicit:
+    * without this capability GBM falls back to CREATE_DUMB, which cannot
+    * create the ARGB rendering+scanout front buffer requested by glamor. */
+   caps->dmabuf = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
    caps->max_render_targets = 1;
-   caps->max_texture_2d_size = 1024;
+   /* Native shared render/scanout images support the chip's full 2048-pixel
+    * surface extent.  DRI rejects a GBM image before resource_create() when
+    * either dimension exceeds this cap, so reporting 1024 prevented glamor
+    * from creating a 1920x1200 front buffer despite that path being valid. */
+   caps->max_texture_2d_size = 2048;
    /* There is no pipe fence object yet.  Native window swaps are ordered by
     * the following Present blit, so the DRI frontend must not request a NULL
     * fence solely to throttle every swap in the client. */
@@ -924,6 +946,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    caps->npot_textures = true;
    caps->anisotropic_filter = true;
    caps->max_texture_anisotropy = 2.0f;
+   /* Match the vendor OpenGL driver's advertised limit; the register field
+    * itself remains safely clamped over its wider recovered +/-4 range. */
+   caps->max_texture_lod_bias = 2.0f;
    /* The back-end has separate RGB/alpha factors but one shared blend
     * equation, so Gallium must not expose the separate-equation extension. */
    caps->blend_equation_separate = false;

@@ -622,16 +622,21 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	rw[4].reg = P3D_R_TEX_ENABLE+12;rw[4].val = 0;
 	p3d_reglist(cs, rw, 5);
 
+	/* 0x11e8 is a global texture-cache partition latch, not a member of the
+	 * windowed per-unit state above.  Diagnostic and vendor-style clients can
+	 * program 0x00500000, while the hardware-proven production GL path uses
+	 * zero.  Every complete state image must therefore write the requested
+	 * value, including zero, so a later context cannot inherit another
+	 * client's cache mode. */
+	rw[0].reg = P3D_R_TEX_CACHE;
+	rw[0].val = st->texture_cache_probe;
+	p3d_reglist(cs, rw, 1);
+
 	/* -- texture ------------------------------------------------------- */
 	if (st->tex) {
 		const struct p3d_texture *t = st->tex;
 		unsigned nunit = st->tex1 ? 2u : 1u, u;
 
-		if (st->texture_cache_probe) {
-			rw[0].reg = P3D_R_TEX_CACHE;
-			rw[0].val = st->texture_cache_probe;
-			p3d_reglist(cs, rw, 1);
-		}
 		rw[0].reg = 0x121c; rw[0].val = 0;
 		p3d_reglist(cs, rw, 1);
 
