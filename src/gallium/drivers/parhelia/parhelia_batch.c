@@ -330,6 +330,28 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 	       (input->dw_per_vertex != 5u + !!input->has_depth +
 	        2 * (!!input->tex + !!input->tex1 +
 	             !!input->second_texcoord_probe) + !!input->vertex_alpha) ||
+	       (input->sampled_alpha_companion &&
+	        (!input->tex || !input->tex1 || input->single_texture_pipe != 1 ||
+	         input->vertex_alpha || input->transform || input->comb_op ||
+	         input->tex->env != P3D_TEXENV_MODULATE ||
+	         input->tex->fmt != 0x32 || input->tex->texelcode != 2 ||
+	         input->tex->mip_filter != P3D_MIP_NONE ||
+	         input->tex->max_level ||
+	         input->tex1->env != P3D_TEXENV_MODULATE ||
+	         input->tex1->fmt != 0x32 || input->tex1->texelcode != 2 ||
+	         input->tex1->width < 64 || input->tex1->height < 64 ||
+	         input->tex1->mip_filter != P3D_MIP_NONE ||
+	         input->tex1->max_level ||
+	         !((input->alpha_test && !input->blend &&
+	            input->alpha_func == P3D_CMP_GEQUAL &&
+	            input->alpha_ref == 0x80) ||
+	           (!input->alpha_test && input->blend &&
+	            input->blend_src.rgb == P3D_BF_SRC_ALPHA.rgb &&
+	            input->blend_src.a == P3D_BF_SRC_ALPHA.a &&
+	            input->blend_dst.rgb ==
+	               P3D_BF_ONE_MINUS_SRC_ALPHA.rgb &&
+	            input->blend_dst.a == P3D_BF_ONE_MINUS_SRC_ALPHA.a &&
+	            input->blend_eq == P3D_BEQ_ADD)))) ||
 	       /* RGBA fetch is restricted to the verified one-texture MODULATE
 	        * source-alpha ADD form.  The depth+RGBA alpha-test combination is
 	        * deliberately test-only: it proves the descriptor and texture-alpha

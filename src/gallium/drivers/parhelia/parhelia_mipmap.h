@@ -13,6 +13,34 @@
 
 #define PH_MAX_MIP_LEVELS 12
 
+/* P690's second texture-address unit corrupts images below 64 pixels in
+ * either dimension.  Repeat padding must end on a whole logical period so
+ * scaled, unbounded GL_REPEAT coordinates remain exact across the physical
+ * texture boundary.  Clamp padding repeats the edge texel over the same
+ * extent. */
+static inline unsigned
+ph_alpha_companion_extent(unsigned logical)
+{
+   if (!logical || logical >= 64)
+      return logical;
+   return ((64 + logical - 1) / logical) * logical;
+}
+
+static inline unsigned
+ph_alpha_companion_texel(unsigned physical, unsigned logical, bool repeat)
+{
+   if (!logical)
+      return 0;
+   return repeat ? physical % logical :
+                   (physical < logical ? physical : logical - 1);
+}
+
+static inline float
+ph_alpha_companion_scale(unsigned logical, unsigned physical)
+{
+   return physical ? (float)logical / (float)physical : 0.0f;
+}
+
 struct ph_mip_level {
    size_t offset;
    unsigned width, height, pitch;

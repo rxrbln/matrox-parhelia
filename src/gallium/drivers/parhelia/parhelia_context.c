@@ -74,7 +74,8 @@ static unsigned ph_texture_cpp(enum pipe_format format);
 static bool ph_prepare_rgb5a1(struct parhelia_resource *texture);
 static void ph_restore_rgba_tiled(struct parhelia_resource *texture);
 static int ph_prepare_alpha_companions(struct ph_context *ctx,
-                                       struct parhelia_resource *texture);
+                                       struct parhelia_resource *texture,
+                                       const struct pipe_sampler_state *sampler);
 static uint64_t ph_texture_base_hash(const struct parhelia_resource *texture,
                                      bool tiled, unsigned *alpha_zero,
                                      unsigned *alpha_nonzero);
@@ -203,6 +204,9 @@ struct ph_context {
 	 * companions and two native draws.  Its ten-float staging stream retains
 	 * RGBA so each hardware pass can be packed exactly. */
 	bool rgb_alpha_two_pass;
+	/* One-draw P690 route: unit 0 supplies RGB and the alpha companion on
+	 * unit 1 supplies fragment alpha for blending or the comparator. */
+	bool native_sampled_alpha;
    /* Hashing a tiled RGBA base level is O(texture pixels).  The draw frontend
     * calls the state predicate per triangle, so retain the result until this
     * texture receives a new linear upload. */
@@ -217,6 +221,7 @@ struct ph_context {
 	const struct parhelia_resource *trace_cpu_alpha_stage_resource;
 	const struct parhelia_resource *trace_alpha_cutout_resource;
 	const struct parhelia_resource *trace_alpha_source_resource;
+	const struct parhelia_resource *trace_native_alpha_resource;
 	const struct parhelia_resource *alpha_micro_hash_resource;
 	uint64_t alpha_micro_hash_generation;
 	uint64_t alpha_micro_hash;
@@ -619,24 +624,26 @@ static int
 ph_drain_batch(struct ph_context *ctx)
 {
    unsigned packed_calls = 0;
+   bool packed_calls_valid;
    int ret;
 
    if (!ctx->pending_batch.packet_count)
       return 0;
+   packed_calls_valid = !parhelia_batch_packed_call_count(
+      &ctx->pending_batch, 0, ctx->pending_batch.packet_count, &packed_calls);
    if (getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
-              "parhelia: aggregate submits=%u commands=%u packets=%u stages=%u relocs=%u vertices=%u resources=%u\n",
+              "parhelia: aggregate submits=%u commands=%u packets=%u stages=%u relocs=%u vertices=%u resources=%u estimated_calls=%u\n",
               ctx->pending_submit_count,
               ctx->pending_batch.command_count,
               ctx->pending_batch.packet_count,
               ctx->pending_stage_calls,
               ctx->pending_batch.reloc_count,
               ctx->pending_vertex_dwords,
-              ctx->pending_resource_count);
+              ctx->pending_resource_count,
+              packed_calls_valid ? packed_calls : 0);
    if (ctx->aggregate_state_stream && ctx->pending_mark_count > 1 &&
-       !parhelia_batch_packed_call_count(&ctx->pending_batch, 0,
-                                         ctx->pending_batch.packet_count,
-                                         &packed_calls) &&
+       packed_calls_valid &&
        packed_calls > PH_BATCH_HW_CALLS)
       ret = ph_submit_state_stream_groups(ctx);
    else
@@ -1187,6 +1194,95 @@ ph_auto_tiled_texture(const struct ph_context *ctx,
                                PIPE_BIND_SHARED));
 }
 
+/* P690 can recover RGBA sampled alpha in one draw by binding the original
+ * image on unit 0 and an opaque (A,A,A,1) companion on unit 1.  The final
+ * combiner moves unit-0 RGB and takes fragment alpha from unit-1 red.  Keep
+ * this to the two live Q3 fixed-function equations and base-level sampling;
+ * the companion does not carry a mip chain. */
+static bool
+ph_use_native_sampled_alpha(struct ph_context *ctx, bool textured,
+                            bool multitextured, bool depth)
+{
+   const struct pipe_rt_blend_state *blend =
+      ctx->blend ? &ctx->blend->rt[0] : NULL;
+   const struct pipe_sampler_state *sampler;
+   const struct parhelia_resource *texture, *color, *zs = NULL;
+   bool source_over, cutout;
+
+   if (!textured || multitextured || !ctx->p690_multitexture ||
+       !ctx->warp_textured_multitex || !ctx->fs || !ctx->dsa || !blend ||
+       ctx->fs->sampler_mask != BITFIELD_BIT(0) ||
+       ctx->fs->texenv != P3D_TEXENV_MODULATE ||
+       !ctx->num_sampler_views || !ctx->sampler_views[0] ||
+       !ctx->sampler_views[0]->texture || !ctx->num_samplers ||
+       !(sampler = ctx->samplers[0]) || !ctx->fb.nr_cbufs ||
+       !ctx->fb.cbufs[0].texture)
+      return false;
+
+   texture = ph_resource(ctx->sampler_views[0]->texture);
+   color = ph_resource(ctx->fb.cbufs[0].texture);
+   if (depth) {
+      if (!ctx->fb.zsbuf.texture)
+         return false;
+      zs = ph_resource(ctx->fb.zsbuf.texture);
+   }
+   if (texture->base.target != PIPE_TEXTURE_2D ||
+       texture->base.format != PIPE_FORMAT_R8G8B8A8_UNORM ||
+       !texture->upload_texture || !texture->handle || !texture->map ||
+       !texture->mip.levels ||
+       (texture->mip_defined & ~BITFIELD_BIT(0)) ||
+       ph_use_mips(texture, sampler) ||
+       ph_alpha_companion_extent(texture->base.width0) > 0x3fff ||
+       ph_alpha_companion_extent(texture->base.height0) > 0x3fff ||
+       !color->handle ||
+       (color->base.format != PIPE_FORMAT_B8G8R8A8_UNORM &&
+        color->base.format != PIPE_FORMAT_B8G8R8X8_UNORM) ||
+       (depth && (!zs->handle ||
+                  ctx->fb.zsbuf.format != PIPE_FORMAT_Z24_UNORM_S8_UINT)) ||
+       !((sampler->min_img_filter == PIPE_TEX_FILTER_NEAREST ||
+          sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR) &&
+         (sampler->mag_img_filter == PIPE_TEX_FILTER_NEAREST ||
+          sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR)) ||
+       !((sampler->wrap_s == PIPE_TEX_WRAP_REPEAT ||
+          sampler->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE) &&
+         (sampler->wrap_t == PIPE_TEX_WRAP_REPEAT ||
+          sampler->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE)) ||
+       ctx->dsa->stencil[0].enabled || ctx->dsa->stencil[1].enabled ||
+       blend->colormask != PIPE_MASK_RGBA ||
+       (ctx->rasterizer && (ctx->rasterizer->flatshade ||
+                            ctx->rasterizer->poly_stipple_enable)))
+      return false;
+
+   source_over = !ctx->dsa->alpha_enabled && blend->blend_enable &&
+      blend->rgb_func == PIPE_BLEND_ADD &&
+      blend->alpha_func == PIPE_BLEND_ADD &&
+      blend->rgb_src_factor == PIPE_BLENDFACTOR_SRC_ALPHA &&
+      blend->rgb_dst_factor == PIPE_BLENDFACTOR_INV_SRC_ALPHA &&
+      blend->alpha_src_factor == PIPE_BLENDFACTOR_SRC_ALPHA &&
+      blend->alpha_dst_factor == PIPE_BLENDFACTOR_INV_SRC_ALPHA;
+   /* Both live cutout images (8x16 mixed alpha and 32x64 opaque) report only
+    * BITFIELD_BIT(0).  Accept that correct bookkeeping value, while the mask
+    * above rejects every populated child level. */
+   cutout = texture->mip_defined == BITFIELD_BIT(0) &&
+      ctx->dsa->alpha_enabled &&
+      ctx->dsa->alpha_func == PIPE_FUNC_GEQUAL &&
+      fabsf(ctx->dsa->alpha_ref_value - 0.5f) <= 0.0001f &&
+      depth && ctx->dsa->depth_enabled && ctx->dsa->depth_writemask &&
+      ctx->dsa->depth_func == PIPE_FUNC_LEQUAL && !blend->blend_enable;
+   return source_over || cutout;
+}
+
+static bool
+ph_native_sampled_alpha_primitive(const struct prim_header *prim, int col)
+{
+   if (col < 0)
+      return true;
+   for (unsigned i = 0; i < 3; i++)
+      if (fabsf(prim->v[i]->data[col][3] - 1.0f) > 0.0001f)
+         return false;
+   return true;
+}
+
 /* Small texture dimensions recur throughout Q3.  The alpha-cutout trace must
  * therefore record an image identity before a fallback can be gated safely.
  * This hashes the GPU-order base level as sampled, without changing resource
@@ -1243,17 +1339,25 @@ ph_texture_base_hash(const struct parhelia_resource *texture, bool tiled,
    return hash;
 }
 
-/* Build the two ordinary 0x32 images consumed by the hardware source-over
- * fallback.  The source stays in its normal RGBA allocation; companion BOs
- * are refreshed only when a transfer changes level zero. */
+/* Build the ordinary 0x32 images consumed by the native one-pass and older
+ * two-pass sampled-alpha routes.  The source stays in its normal RGBA
+ * allocation; companion BOs are refreshed only when level zero or padding
+ * wrap semantics change. */
 static int
 ph_prepare_alpha_companions(struct ph_context *ctx,
-                            struct parhelia_resource *texture)
+                            struct parhelia_resource *texture,
+                            const struct pipe_sampler_state *sampler)
 {
    struct parhelia_screen *screen = ph_screen(ctx->base.screen);
+   const unsigned companion_width =
+      ph_alpha_companion_extent(texture->base.width0);
+   const unsigned companion_height =
+      ph_alpha_companion_extent(texture->base.height0);
+   const bool repeat_s = sampler->wrap_s == PIPE_TEX_WRAP_REPEAT;
+   const bool repeat_t = sampler->wrap_t == PIPE_TEX_WRAP_REPEAT;
    struct drm_parhelia_create_render alpha = {
-      .width = texture->base.width0,
-      .height = texture->base.height0,
+      .width = companion_width,
+      .height = companion_height,
       .flags = PARHELIA_CREATE_RENDER_TEXTURE,
    };
    struct drm_parhelia_create_render premul = alpha;
@@ -1262,7 +1366,11 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
    int ret = 0;
 
    if (texture->alpha_rgb_handle && texture->premul_rgb_handle &&
-       texture->alpha_companion_generation == texture->content_generation)
+       texture->alpha_companion_generation == texture->content_generation &&
+       texture->alpha_companion_width == companion_width &&
+       texture->alpha_companion_height == companion_height &&
+       texture->alpha_companion_repeat_s == repeat_s &&
+       texture->alpha_companion_repeat_t == repeat_t)
       return 0;
    if (!texture->map || !texture->mip.levels)
       return -EINVAL;
@@ -1272,7 +1380,9 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
       return ret;
    texture->alpha_companion_generation = UINT64_MAX;
 
-   if (!texture->alpha_rgb_handle || !texture->premul_rgb_handle) {
+   if (!texture->alpha_rgb_handle || !texture->premul_rgb_handle ||
+       texture->alpha_companion_width != companion_width ||
+       texture->alpha_companion_height != companion_height) {
       if (texture->alpha_rgb_handle) {
          struct drm_gem_close close = {.handle = texture->alpha_rgb_handle};
          ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
@@ -1282,6 +1392,8 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
          ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
       }
       texture->alpha_rgb_handle = texture->premul_rgb_handle = 0;
+      texture->alpha_companion_width = 0;
+      texture->alpha_companion_height = 0;
       if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &alpha)) {
          ret = -errno;
          goto out;
@@ -1294,7 +1406,8 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
       }
       if (!alpha.handle || !premul.handle || alpha.pitch != premul.pitch ||
           alpha.size != premul.size || (alpha.pitch & 3) ||
-          alpha.size < texture->mip.size) {
+          alpha.pitch / 4 != ph_sampler_tiled_pitch(companion_width) ||
+          alpha.size < (uint64_t)alpha.pitch * companion_height) {
          struct drm_gem_close close = {.handle = alpha.handle};
          ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
          close.handle = premul.handle;
@@ -1305,9 +1418,9 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
       texture->alpha_rgb_handle = alpha.handle;
       texture->premul_rgb_handle = premul.handle;
       texture->alpha_companion_size = alpha.size;
-      /* The texture unit derives its pitch from width; the allocation ABI's
-       * reported pitch may retain the render-target 64-pixel minimum. */
-      texture->alpha_companion_stride = texture->mip.level[0].pitch;
+      texture->alpha_companion_stride = alpha.pitch / 4;
+      texture->alpha_companion_width = companion_width;
+      texture->alpha_companion_height = companion_height;
    }
 
    alpha_image = calloc(1, texture->alpha_companion_size);
@@ -1316,9 +1429,15 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
       ret = -ENOMEM;
       goto out;
    }
-   for (unsigned y = 0; y < texture->base.height0; y++) {
-      for (unsigned x = 0; x < texture->base.width0; x++) {
-         size_t src_off = ph_mip_texel_offset(&texture->mip, 0, x, y, false);
+   for (unsigned y = 0; y < companion_height; y++) {
+      unsigned src_y = ph_alpha_companion_texel(y, texture->base.height0,
+                                                repeat_t);
+
+      for (unsigned x = 0; x < companion_width; x++) {
+         unsigned src_x = ph_alpha_companion_texel(x, texture->base.width0,
+                                                   repeat_s);
+         size_t src_off = ph_mip_texel_offset(&texture->mip, 0, src_x,
+                                              src_y, false);
          size_t dst_off = p3d_texture_tile_offset(x, y,
                                                    texture->alpha_companion_stride);
          const uint8_t *src;
@@ -1342,6 +1461,8 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
          rgb[3] = 255;
       }
    }
+   texture->alpha_companion_repeat_s = repeat_s;
+   texture->alpha_companion_repeat_t = repeat_t;
    upload = (struct drm_parhelia_upload_render) {
       .data = (uintptr_t)alpha_image,
       .size = texture->alpha_companion_size,
@@ -1360,9 +1481,11 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
    texture->alpha_companion_generation = texture->content_generation;
    if (getenv("PARHELIA_TRACE"))
       fprintf(stderr,
-              "parhelia: RGB-alpha companions texture=%u alpha=%u premul=%u generation=%llu\n",
+              "parhelia: RGB-alpha companions texture=%u alpha=%u premul=%u physical=%ux%u repeat=%u/%u generation=%llu\n",
               texture->handle, texture->alpha_rgb_handle,
               texture->premul_rgb_handle,
+              texture->alpha_companion_width,
+              texture->alpha_companion_height, repeat_s, repeat_t,
               (unsigned long long)texture->content_generation);
 out:
    free(premul_image);
@@ -2164,7 +2287,8 @@ ph_cpu_alpha_cutout(struct ph_context *ctx, struct parhelia_resource *color,
 }
 
 static void
-ph_pack_rgb_alpha_pass(struct ph_context *ctx, bool depth, bool attenuation)
+ph_pack_rgb_alpha_pass(struct ph_context *ctx, bool depth, bool attenuation,
+                       float scale_s, float scale_t)
 {
    float *dst = ctx->packed_vertices;
 
@@ -2185,8 +2309,8 @@ ph_pack_rgb_alpha_pass(struct ph_context *ctx, bool depth, bool attenuation)
          *dst++ = src[5] * a;
          *dst++ = src[6] * a;
       }
-      *dst++ = src[8];
-      *dst++ = src[9];
+      *dst++ = src[8] * scale_s;
+      *dst++ = src[9] * scale_t;
    }
 }
 
@@ -2195,6 +2319,7 @@ ph_submit_rgb_alpha_two_pass(struct ph_context *ctx,
                              struct parhelia_resource *color,
                              struct parhelia_resource *depth,
                              struct parhelia_resource *texture,
+                             const struct pipe_sampler_state *sampler,
                              const struct p3d_texture *texture_state,
                              const struct p3d_state *base_state)
 {
@@ -2202,11 +2327,18 @@ ph_submit_rgb_alpha_two_pass(struct ph_context *ctx,
    struct p3d_texture companion_tex = *texture_state;
    struct p3d_state attenuation = *base_state, additive;
    const unsigned dpv = depth ? 8 : 7;
+   float scale_s, scale_t;
    int ret;
 
-   ret = ph_prepare_alpha_companions(ctx, texture);
+   ret = ph_prepare_alpha_companions(ctx, texture, sampler);
    if (ret)
       return ret;
+   scale_s = ph_alpha_companion_scale(texture->base.width0,
+                                      texture->alpha_companion_width);
+   scale_t = ph_alpha_companion_scale(texture->base.height0,
+                                      texture->alpha_companion_height);
+   companion_tex.width = texture->alpha_companion_width;
+   companion_tex.height = texture->alpha_companion_height;
    companion_tex.fmt = 0x32;
    companion_tex.texelcode = 2;
    companion_tex.mip_filter = P3D_MIP_NONE;
@@ -2247,13 +2379,13 @@ ph_submit_rgb_alpha_two_pass(struct ph_context *ctx,
    if (ret)
       return ret;
 
-   ph_pack_rgb_alpha_pass(ctx, depth != NULL, true);
+   ph_pack_rgb_alpha_pass(ctx, depth != NULL, true, scale_s, scale_t);
    ret = ph_submit_batch(ctx, &attenuation_batch, ctx->packed_vertices,
                          ctx->triangles * 3 * dpv,
                          color, depth, texture, NULL);
    if (ret)
       return ret;
-   ph_pack_rgb_alpha_pass(ctx, depth != NULL, false);
+   ph_pack_rgb_alpha_pass(ctx, depth != NULL, false, scale_s, scale_t);
    ret = ph_submit_batch(ctx, &additive_batch, ctx->packed_vertices,
                          ctx->triangles * 3 * dpv,
                          color, depth, texture, NULL);
@@ -2373,7 +2505,8 @@ ph_submit_vertices(struct ph_context *ctx)
    if (texture1 && !texture1_tiled)
       ph_resource_resolve_linear(texture1);
 
-   if (!ctx->rgb_alpha_two_pass && texture && texture_tiled && !texture1 && blend &&
+   if (!ctx->rgb_alpha_two_pass && !ctx->native_sampled_alpha &&
+       texture && texture_tiled && !texture1 && blend &&
        blend->blend_enable && blend->rgb_func == PIPE_BLEND_ADD &&
        blend->alpha_func == PIPE_BLEND_ADD &&
        blend->rgb_src_factor == PIPE_BLENDFACTOR_SRC_ALPHA &&
@@ -2406,6 +2539,22 @@ ph_submit_vertices(struct ph_context *ctx)
       ctx->submit_error = ret;
       goto out;
    }
+   if (ctx->native_sampled_alpha &&
+       (ret = ph_prepare_alpha_companions(ctx, texture, sampler))) {
+      ctx->submit_error = ret;
+      goto out;
+   }
+   if (ctx->native_sampled_alpha && getenv("PARHELIA_TRACE_NATIVE_ALPHA") &&
+       ctx->trace_native_alpha_resource != texture) {
+      ctx->trace_native_alpha_resource = texture;
+      fprintf(stderr,
+              "parhelia: native sampled alpha texture=%u logical=%ux%u companion=%u/%ux%u blend=%u alpha-test=%u depth=%u/%u\n",
+              texture->handle, texture->base.width0, texture->base.height0,
+              texture->alpha_rgb_handle, texture->alpha_companion_width,
+              texture->alpha_companion_height, blend->blend_enable,
+              ctx->dsa->alpha_enabled, ctx->dsa->depth_enabled,
+              ctx->dsa->depth_writemask);
+   }
    if (texture && !texture1 && !depth && ph_copy_present_quad(ctx, color, texture))
       goto out;
    if (ctx->cpu_alpha_cutout) {
@@ -2434,7 +2583,9 @@ ph_submit_vertices(struct ph_context *ctx)
    state.dither = !ctx->blend || ctx->blend->dither;
    state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
 	state.has_depth = depth != NULL;
-	state.dw_per_vertex = texture ? (texture1 ? (depth ? 10 : 9) :
+	state.dw_per_vertex = texture ?
+	                              ((texture1 || ctx->native_sampled_alpha) ?
+	                               (depth ? 10 : 9) :
 	                               (depth ? 8 : 7)) :
 	                               (depth ? 6 : 5);
 	/* ph_stage_tri selected the exact one-texture MODULATE source-alpha
@@ -2482,10 +2633,24 @@ ph_submit_vertices(struct ph_context *ctx)
                              ph_resource_mip_levels(texture)) - 1 : 0;
       tex.env = ctx->fs->texenv;
       state.tex = &tex;
-      state.warp_entry = texture1 ? ctx->warp_textured_multitex :
+      state.warp_entry = (texture1 || ctx->native_sampled_alpha) ?
+                         ctx->warp_textured_multitex :
                          ((ctx->fs->uses_color || ctx->alpha_micro) ? ctx->warp_textured :
                                                 ctx->warp_replace);
-      if (texture1) {
+      if (ctx->native_sampled_alpha) {
+         tex1 = tex;
+         tex1.width = texture->alpha_companion_width;
+         tex1.height = texture->alpha_companion_height;
+         tex1.fmt = 0x32;
+         tex1.texelcode = 2;
+         tex1.mip_filter = P3D_MIP_NONE;
+         tex1.max_level = 0;
+         tex1.env = P3D_TEXENV_MODULATE;
+         state.tex1 = &tex1;
+         state.sampled_alpha_companion = true;
+         texture1_handle = texture->alpha_rgb_handle;
+         texture1_tiled = true;
+      } else if (texture1) {
          tex1.width = texture1->base.width0;
          tex1.height = texture1->base.height0;
          tex1.fmt = texture1->base.format == PIPE_FORMAT_B5G5R5A1_UNORM ? 0x26 :
@@ -2554,6 +2719,7 @@ ph_submit_vertices(struct ph_context *ctx)
 	      ret = -EINVAL;
 	   } else {
 	      ret = ph_submit_rgb_alpha_two_pass(ctx, color, depth, texture,
+	                                          sampler,
 	                                          &tex, &state);
 	   }
 	   submitted = true;
@@ -2563,7 +2729,8 @@ ph_submit_vertices(struct ph_context *ctx)
 
    dpv = state.dw_per_vertex;
 	ph_trace_blend_alpha(ctx, &state, texture, sampler, texture_tiled);
-	one_pass_multitexture = texture1 && ctx->p690_multitexture && ctx->fs &&
+	one_pass_multitexture = (texture1 || ctx->native_sampled_alpha) &&
+	                        ctx->p690_multitexture && ctx->fs &&
 	                        ctx->fs->serial_op == PH_SERIAL_MODULATE;
 	if (texture && getenv("PARHELIA_TRACE") && ctx->triangles) {
 		const float *v0 = &ctx->vertices[0];
@@ -2577,7 +2744,13 @@ ph_submit_vertices(struct ph_context *ctx)
 		      v1[0], v1[1], v1[st], v1[st + 1],
 		      v2[0], v2[1], v2[st], v2[st + 1]);
    }
-   if (texture1 && ph_screen(ctx->base.screen)->single_texture_pipe &&
+   if (ctx->native_sampled_alpha) {
+      ret = parhelia_batch_state_multitextured(batch, color->handle,
+                                                depth ? depth->handle : 0,
+                                                texture_handle,
+                                                texture1_handle, &state,
+                                                ctx->triangles);
+   } else if (texture1 && ph_screen(ctx->base.screen)->single_texture_pipe &&
        !one_pass_multitexture) {
       struct p3d_state lightmap = state;
       struct p3d_texture lightmap_tex = tex1;
@@ -2704,6 +2877,7 @@ out:
 	ctx->alpha_micro_cutout = false;
 	ctx->cpu_alpha_cutout = false;
 	ctx->rgb_alpha_two_pass = false;
+	ctx->native_sampled_alpha = false;
 }
 
 static float
@@ -2908,26 +3082,35 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	bool alpha_micro_depth;
 	bool cpu_alpha_cutout;
 	bool rgb_alpha_two_pass;
+	bool native_sampled_alpha;
 	unsigned dpv;
    float *dst;
 
 	vertex_alpha = ph_use_vertex_alpha(ctx, textured, multitextured, depth,
 				  col >= 0);
-	rgb_alpha_two_pass = ph_use_rgb_alpha_two_pass(ctx, textured,
+	native_sampled_alpha =
+	   ph_use_native_sampled_alpha(ctx, textured, multitextured, depth) &&
+	   ph_native_sampled_alpha_primitive(prim, col);
+	if (native_sampled_alpha)
+	   vertex_alpha = false;
+	rgb_alpha_two_pass = !native_sampled_alpha &&
+	                     ph_use_rgb_alpha_two_pass(ctx, textured,
 	                                               multitextured, col >= 0) &&
 		  ph_rgb_alpha_primitive(ctx, prim, pos, col);
-	alpha_micro = !rgb_alpha_two_pass &&
+	alpha_micro = !native_sampled_alpha && !rgb_alpha_two_pass &&
 	              ph_use_alpha_micro(ctx, textured, multitextured, depth,
 	                                 col >= 0);
-	alpha_micro_cutout = ph_use_alpha_micro_cutout(ctx, textured,
+	alpha_micro_cutout = !native_sampled_alpha &&
+	                     ph_use_alpha_micro_cutout(ctx, textured,
 	                                                multitextured, depth,
 	                                                col >= 0);
 	if (alpha_micro)
 	   vertex_alpha = true;
 	if (alpha_micro_cutout)
 	   vertex_alpha = false;
-	cpu_alpha_cutout = ph_use_cpu_alpha_cutout(ctx, textured, multitextured,
-								 depth, col >= 0);
+	cpu_alpha_cutout = !native_sampled_alpha &&
+	                   ph_use_cpu_alpha_cutout(ctx, textured, multitextured,
+	                                            depth, col >= 0);
 	if (alpha_micro || alpha_micro_cutout)
 	   cpu_alpha_cutout = rgb_alpha_two_pass = false;
 	alpha_micro_depth = depth && ctx->dsa && ctx->dsa->depth_enabled;
@@ -2978,7 +3161,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 				ctx->dsa ? ctx->dsa->depth_writemask : 0);
 		}
 	}
-	dpv = textured ? (multitextured ? (depth ? 10 : 9) :
+	dpv = textured ? ((multitextured || native_sampled_alpha) ?
+	                                 (depth ? 10 : 9) :
 	                                  (depth ? 8 : 7)) :
 	                                  (depth ? 6 : 5);
 	if (vertex_alpha)
@@ -2992,7 +3176,9 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	                       ctx->alpha_micro != alpha_micro ||
 	                       ctx->alpha_micro_cutout != alpha_micro_cutout ||
 	                       ctx->cpu_alpha_cutout != cpu_alpha_cutout ||
-	                       ctx->rgb_alpha_two_pass != rgb_alpha_two_pass))
+	                       ctx->rgb_alpha_two_pass != rgb_alpha_two_pass ||
+	                       ctx->native_sampled_alpha !=
+	                          native_sampled_alpha))
 	   ph_submit_vertices(ctx);
 
    /* Bound the complete logical stream to one negotiated CREATE_VERTEX slot.
@@ -3035,6 +3221,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	ctx->alpha_micro_cutout = alpha_micro_cutout;
 	ctx->cpu_alpha_cutout = cpu_alpha_cutout;
 	ctx->rgb_alpha_two_pass = rgb_alpha_two_pass;
+	ctx->native_sampled_alpha = native_sampled_alpha;
 	if (alpha_micro || alpha_micro_cutout) {
 	   ph_stage_alpha_micro(ctx, prim, pos, col, texcoord, depth,
 	                        alpha_micro_cutout);
@@ -3066,6 +3253,30 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 			*dst++ = c[3];
 			*dst++ = tc[0];
 			*dst++ = tc[1];
+			continue;
+		}
+		if (native_sampled_alpha) {
+			const struct parhelia_resource *texture =
+			   ph_resource(ctx->sampler_views[0]->texture);
+			const float *tc = prim->v[v]->data[texcoord];
+			float scale_s = ph_alpha_companion_scale(
+			   texture->base.width0,
+			   ph_alpha_companion_extent(texture->base.width0));
+			float scale_t = ph_alpha_companion_scale(
+			   texture->base.height0,
+			   ph_alpha_companion_extent(texture->base.height0));
+
+			*dst++ = p[0];
+			*dst++ = p[1];
+			if (depth)
+				*dst++ = CLAMP(p[2], 0.0f, 1.0f);
+			*dst++ = c[0];
+			*dst++ = c[1];
+			*dst++ = c[2];
+			*dst++ = tc[0];
+			*dst++ = tc[1];
+			*dst++ = tc[0] * scale_s;
+			*dst++ = tc[1] * scale_t;
 			continue;
 		}
       *dst++ = p[0];

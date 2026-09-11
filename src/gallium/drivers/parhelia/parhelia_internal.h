@@ -65,12 +65,16 @@ struct parhelia_resource {
    uint64_t content_generation;
    /* P690 does not expose sampled alpha from its four-byte texture decoder.
     * These texture-layout BOs are generated lazily from level zero: one
-    * carries A replicated into RGB, the other carries RGB premultiplied by A.
-    * They implement exact source-over RGB with two hardware draws. */
+    * carries A replicated into RGB for the native unit-1 alpha route, the
+    * other carries RGB premultiplied by A for its older two-pass fallback. */
    uint32_t alpha_rgb_handle;
    uint32_t premul_rgb_handle;
    uint64_t alpha_companion_size;
    unsigned alpha_companion_stride;
+   unsigned alpha_companion_width;
+   unsigned alpha_companion_height;
+   bool alpha_companion_repeat_s;
+   bool alpha_companion_repeat_t;
    uint64_t alpha_companion_generation;
    /* The texture unit walks this contiguous chain itself.  `mip_defined`
     * records levels initialized by either transfer upload or rendering, so

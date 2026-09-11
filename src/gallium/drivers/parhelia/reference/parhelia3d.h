@@ -359,6 +359,9 @@ struct p3d_state {
 	unsigned	   dw_per_vertex;
 	const struct p3d_texture *tex;	/* unit 0 */
 	const struct p3d_texture *tex1;	/* unit 1; NULL = single unit */	/* NULL = untextured */
+	/* P690 workaround proven by the RGB-companion cutout probe: preserve
+	 * unit-0 RGB and replicate unit-1 red into fragment alpha. */
+	int		   sampled_alpha_companion;
 	/* Diagnostic only: fetch a second two-component coordinate into v8 and
 	 * advertise sets 0/1 while keeping a single sampler/combiner stage.  This
 	 * separates the multitexture WARP program's o4 output from unit-1 texture

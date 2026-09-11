@@ -701,7 +701,24 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 				st->comb_op);
 
 		if (nunit > 1) {
-			p3d_emit_texenv(cs, 8, 1, 0, st->tex1, st->comb_op);
+			if (st->sampled_alpha_companion) {
+				/* Co-issued MOVs: rgb = r0.rgb, alpha = t1.r.  The
+				 * alpha opcode's scalar-select value 3 replicates red;
+				 * live P690 testing proved this feeds both alpha test
+				 * and SRC_ALPHA blending. */
+				rw[0].reg = P3D_R_COMB_RGB;
+				rw[0].val = 0x00000088u;
+				rw[1].reg = P3D_R_COMB_ALPHA;
+				rw[1].val = 0x00000020u;
+				rw[2].reg = 0x126c;
+				rw[2].val = 0x01400400u;
+				rw[3].reg = 0x1268;
+				rw[3].val = 0x01400403u;
+				p3d_reglist(cs, rw, 4);
+			} else {
+				p3d_emit_texenv(cs, 8, 1, 0, st->tex1,
+						st->comb_op);
+			}
 			/* one pad to reach the five-instruction quantum */
 			rw[0].reg = P3D_R_COMB_RGB; rw[0].val = 0x8a;
 			rw[1].reg = 0x126c;         rw[1].val = 0x00400400u;
