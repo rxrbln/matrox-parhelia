@@ -371,6 +371,11 @@ module_param(trace_vram_reloc, bool, 0400);
 MODULE_PARM_DESC(trace_vram_reloc,
 		 "Trace physical and engine addresses patched into render relocations");
 
+static unsigned int async_file_quantum_ms = 16;
+module_param(async_file_quantum_ms, uint, 0400);
+MODULE_PARM_DESC(async_file_quantum_ms,
+		 "Async render queue ownership timeslice in milliseconds (default 16)");
+
 /* Permit one ioctl to carry two complete logical state batches.  The kernel
  * retains each batch's opening/EOB/DWGSYNC bracket and coalesces only the final
  * primary producer update. */
@@ -1603,50 +1608,161 @@ static void parhelia_slot_release_locked(struct parhelia_device *pdev,
 		pdev->queued_slots--;
 	if (!pdev->queued_slots) {
 		pdev->primary_get = pdev->primary_put;
-		pdev->queue_owner = NULL;
 	}
 	wake_up_all(&pdev->submit_waitq);
 }
 
-/* Native targets use a small set of hardware-proven placements.  Do not hold
- * one client's placements pinned while accepting another client's queue: the
- * first contender requests a handoff, which stops the current owner appending
- * and lets DWGSYNC retirement drain the queue.  TTM can then preserve and
+struct parhelia_file_waiter {
+	struct list_head link;
+	struct drm_file *file;
+	bool queued;
+};
+
+static struct parhelia_file_waiter *
+parhelia_async_first_waiter(struct parhelia_device *pdev)
+{
+	if (list_empty(&pdev->queue_waiters))
+		return NULL;
+	return list_first_entry(&pdev->queue_waiters,
+		struct parhelia_file_waiter, link);
+}
+
+static void parhelia_async_refresh_next(struct parhelia_device *pdev)
+{
+	struct parhelia_file_waiter *first = parhelia_async_first_waiter(pdev);
+
+	pdev->queue_next = first ? first->file : NULL;
+}
+
+static void parhelia_async_waiter_add(struct parhelia_device *pdev,
+				       struct parhelia_file_waiter *waiter)
+{
+	if (waiter->queued)
+		return;
+	list_add_tail(&waiter->link, &pdev->queue_waiters);
+	waiter->queued = true;
+	parhelia_async_refresh_next(pdev);
+}
+
+static void parhelia_async_waiter_del(struct parhelia_device *pdev,
+				       struct parhelia_file_waiter *waiter)
+{
+	if (!waiter->queued)
+		return;
+	list_del_init(&waiter->link);
+	waiter->queued = false;
+	parhelia_async_refresh_next(pdev);
+}
+
+static void parhelia_async_waiters_del_file(struct parhelia_device *pdev,
+					     struct drm_file *file)
+{
+	struct parhelia_file_waiter *waiter, *tmp;
+
+	list_for_each_entry_safe(waiter, tmp, &pdev->queue_waiters, link) {
+		if (waiter->file != file)
+			continue;
+		list_del_init(&waiter->link);
+		waiter->queued = false;
+	}
+	parhelia_async_refresh_next(pdev);
+}
+
+static void parhelia_async_file_claim(struct parhelia_device *pdev,
+				       struct drm_file *file)
+{
+	unsigned int quantum = clamp_val(async_file_quantum_ms, 1, 1000);
+
+	pdev->queue_owner = file;
+	pdev->queue_owner_deadline = jiffies + msecs_to_jiffies(quantum);
+	pdev->queue_handoff = false;
+	/* Wake every submit already queued by this DRM file.  It shares the new
+	 * owner's complete state stream and does not need another file switch. */
+	parhelia_async_waiters_del_file(pdev, file);
+	wake_up_all(&pdev->submit_waitq);
+}
+
+/* Native targets use a small set of hardware-proven placements.  Give one DRM
+ * file a short FIFO lease so a frame-sized burst does not migrate its targets
+ * at every ioctl.  Once the lease expires, the oldest contender stops owner
+ * appends and DWGSYNC retirement drains the queue.  TTM can then preserve and
  * evict the old targets before pinning the new file's surfaces. */
 static bool parhelia_async_file_turn(struct parhelia_device *pdev,
-				     struct drm_file *file)
+				     struct drm_file *file,
+				     struct parhelia_file_waiter *waiter)
 {
-	if (!pdev->queued_slots) {
-		if (pdev->queue_next && pdev->queue_next != file)
+	struct parhelia_file_waiter *first;
+
+	if (!pdev->queue_owner) {
+		first = parhelia_async_first_waiter(pdev);
+		if (first && first != waiter) {
+			parhelia_async_waiter_add(pdev, waiter);
 			return false;
-		pdev->queue_owner = file;
-		if (pdev->queue_next == file)
-			pdev->queue_next = NULL;
+		}
+		parhelia_async_file_claim(pdev, file);
 		return true;
 	}
-	if (pdev->queue_owner == file && !pdev->queue_next)
+	if (pdev->queue_owner == file) {
+		if (pdev->queue_next == file) {
+			parhelia_async_waiters_del_file(pdev, file);
+			pdev->queue_handoff = false;
+		}
+		if (pdev->queue_handoff) {
+			parhelia_async_waiter_add(pdev, waiter);
+			return false;
+		}
+		if (pdev->queue_next &&
+		    time_after_eq(jiffies, pdev->queue_owner_deadline)) {
+			pdev->queue_handoff = true;
+			parhelia_async_waiter_add(pdev, waiter);
+			return false;
+		}
+		parhelia_async_waiter_del(pdev, waiter);
 		return true;
-	if (pdev->queue_owner != file && !pdev->queue_next)
-		pdev->queue_next = file;
-	return false;
+	}
+
+	parhelia_async_waiter_add(pdev, waiter);
+	first = parhelia_async_first_waiter(pdev);
+	if (first == waiter &&
+	    time_after_eq(jiffies, pdev->queue_owner_deadline))
+		pdev->queue_handoff = true;
+	if (!pdev->queue_handoff || pdev->queued_slots || first != waiter)
+		return false;
+
+	parhelia_async_file_claim(pdev, file);
+	return true;
 }
 
 static bool parhelia_async_file_turn_ready(struct parhelia_device *pdev,
 					    struct drm_file *file)
 {
-	return !READ_ONCE(pdev->queued_slots) &&
-	       (!READ_ONCE(pdev->queue_next) ||
-		READ_ONCE(pdev->queue_next) == file);
+	struct drm_file *owner = READ_ONCE(pdev->queue_owner);
+
+	if (!owner)
+		return true;
+	if (owner == file)
+		return !READ_ONCE(pdev->queue_handoff);
+	if (READ_ONCE(pdev->queue_next) != file)
+		return false;
+	if (!READ_ONCE(pdev->queue_handoff))
+		return time_after_eq(jiffies,
+			READ_ONCE(pdev->queue_owner_deadline));
+	return !READ_ONCE(pdev->queued_slots);
 }
 
 static void parhelia_async_file_turn_cancel(struct parhelia_device *pdev,
-					     struct drm_file *file)
+					     struct parhelia_file_waiter *waiter)
 {
+	bool was_first;
+
 	mutex_lock(&pdev->submit_lock);
-	if (pdev->queue_next == file) {
-		pdev->queue_next = NULL;
-		wake_up_all(&pdev->submit_waitq);
+	was_first = parhelia_async_first_waiter(pdev) == waiter;
+	parhelia_async_waiter_del(pdev, waiter);
+	if (was_first && pdev->queue_handoff) {
+		pdev->queue_handoff = pdev->queue_next &&
+			time_after_eq(jiffies, pdev->queue_owner_deadline);
 	}
+	wake_up_all(&pdev->submit_waitq);
 	mutex_unlock(&pdev->submit_lock);
 }
 
@@ -1656,27 +1772,36 @@ static int parhelia_async_file_turn_static_selftest(void)
 	struct drm_file *a = (struct drm_file *)1UL;
 	struct drm_file *b = (struct drm_file *)2UL;
 	struct drm_file *c = (struct drm_file *)3UL;
+	struct parhelia_file_waiter wa = { .file = a };
+	struct parhelia_file_waiter wb = { .file = b };
+	struct parhelia_file_waiter wc = { .file = c };
 	int ret = -EINVAL;
 
 	pdev = kzalloc(sizeof(*pdev), GFP_KERNEL);
 	if (!pdev)
 		return -ENOMEM;
-	/* A owns live work; B requests the first handoff.  A must then stop
-	 * appending, and a later C may not displace B. */
-	pdev->queued_slots = 2;
-	pdev->queue_owner = a;
-	if (!parhelia_async_file_turn(pdev, a) ||
-	    parhelia_async_file_turn(pdev, b) || pdev->queue_next != b ||
-	    parhelia_async_file_turn(pdev, a) ||
-	    parhelia_async_file_turn(pdev, c) || pdev->queue_next != b)
+	init_waitqueue_head(&pdev->submit_waitq);
+	INIT_LIST_HEAD(&pdev->queue_waiters);
+	INIT_LIST_HEAD(&wa.link);
+	INIT_LIST_HEAD(&wb.link);
+	INIT_LIST_HEAD(&wc.link);
+	if (!parhelia_async_file_turn(pdev, a, &wa) || pdev->queue_owner != a)
 		goto out;
-	/* Once A drains, only B can claim the empty queue. */
+	/* B and C wait in arrival order while A appends through its lease. */
+	pdev->queued_slots = 2;
+	if (parhelia_async_file_turn(pdev, b, &wb) ||
+	    parhelia_async_file_turn(pdev, c, &wc) || pdev->queue_next != b ||
+	    !parhelia_async_file_turn(pdev, a, &wa))
+		goto out;
+	/* At expiry A stops appending.  Only FIFO head B can claim after drain. */
+	pdev->queue_owner_deadline = jiffies - 1;
+	if (parhelia_async_file_turn(pdev, a, &wa) || !pdev->queue_handoff ||
+	    parhelia_async_file_turn(pdev, b, &wb))
+		goto out;
 	pdev->queued_slots = 0;
-	pdev->queue_owner = NULL;
-	if (parhelia_async_file_turn(pdev, a) ||
-	    parhelia_async_file_turn(pdev, c) ||
-	    !parhelia_async_file_turn(pdev, b) || pdev->queue_next ||
-	    pdev->queue_owner != b)
+	if (parhelia_async_file_turn(pdev, c, &wc) ||
+	    !parhelia_async_file_turn(pdev, b, &wb) ||
+	    pdev->queue_owner != b || pdev->queue_next != c || wb.queued)
 		goto out;
 	ret = 0;
 out:
@@ -1856,6 +1981,7 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 	}
 
 	init_waitqueue_head(&pdev->submit_waitq);
+	INIT_LIST_HEAD(&pdev->queue_waiters);
 	INIT_DELAYED_WORK(&pdev->retire_work, parhelia_retire_work);
 	atomic64_set(&pdev->submit_stats.async_submits, 0);
 	atomic64_set(&pdev->submit_stats.slot_waits, 0);
@@ -2988,6 +3114,7 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	struct parhelia_bound_range_submit bound_range = { };
 	struct parhelia_shadow_txn *shadow_txn = NULL;
 	struct parhelia_root_probe_trace *root_probe = NULL;
+	struct parhelia_file_waiter file_waiter = { .file = file };
 	u32 *commands, *primary;
 	void *vertex_cpu = pdev->vertex_cpu;
 	dma_addr_t vertex_bus = pdev->vertex_bus;
@@ -3015,6 +3142,7 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	static_assert(PARHELIA_PLAN_CAPACITY >=
 		      2u * PARHELIA_MAX_USER_PACKETS + 6u);
 	static_assert(PARHELIA_MAX_DRAW_DWORDS <= PARHELIA_DMA_BLOCK_DWORDS);
+	INIT_LIST_HEAD(&file_waiter.link);
 	generic_packet_packing = async && boundary_aware && pack_adjacent_packets &&
 		coalesce_primary && !trace_submit && !full_sync && !post_draw_wb &&
 		!state_shadow_cache;
@@ -3160,13 +3288,12 @@ retry_slot:
 		ret = -EIO;
 		goto out_unlock;
 	}
-	if (async && !parhelia_async_file_turn(pdev, file)) {
+	if (async && !parhelia_async_file_turn(pdev, file, &file_waiter)) {
 		mutex_unlock(&pdev->submit_lock);
 		ret = wait_event_interruptible_timeout(pdev->submit_waitq,
 			pdev->wedged || parhelia_async_file_turn_ready(pdev, file),
 			msecs_to_jiffies(10));
 		if (ret < 0) {
-			parhelia_async_file_turn_cancel(pdev, file);
 			goto out_relocs;
 		}
 		goto retry_slot;
@@ -4131,6 +4258,7 @@ out_unpin:
 out_unlock:
 	mutex_unlock(&pdev->submit_lock);
 out_relocs:
+	parhelia_async_file_turn_cancel(pdev, &file_waiter);
 	kfree(objects);
 	kfree(pinned);
 	kfree(call_boundaries);
@@ -4260,12 +4388,10 @@ void parhelia_submit_postclose(struct parhelia_device *pdev,
 retry:
 	mutex_lock(&pdev->submit_lock);
 	parhelia_retire_locked(pdev);
-	if (pdev->queue_next == file) {
-		pdev->queue_next = NULL;
-		wake_up_all(&pdev->submit_waitq);
-	}
 	if (!pdev->queued_slots && pdev->queue_owner == file)
 		pdev->queue_owner = NULL;
+	if (!pdev->queue_owner)
+		wake_up_all(&pdev->submit_waitq);
 	if (!pdev->wedged) {
 		for (i = 0; i < PARHELIA_ASYNC_SLOTS; i++) {
 			struct parhelia_submit_slot *slot = &pdev->slots[i];

@@ -437,6 +437,9 @@ struct parhelia_device {
 	 * unpinned targets before the next client consumes those anchors. */
 	struct drm_file *queue_owner;
 	struct drm_file *queue_next;
+	struct list_head queue_waiters;
+	unsigned long queue_owner_deadline;
+	bool queue_handoff;
 	u32 next_fence;
 	u32 first_fence;
 	bool primary_armed;
