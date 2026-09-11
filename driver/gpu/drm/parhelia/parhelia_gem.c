@@ -705,6 +705,43 @@ static const struct drm_gem_object_funcs parhelia_host_object_funcs = {
 	.print_info = drm_gem_ttm_print_info,
 };
 
+/* Zero a newly placed, pinned object through a kernel aperture window. */
+int parhelia_vram_clear(struct parhelia_device *pdev,
+			struct drm_gem_vram_object *gbo)
+{
+	struct parhelia_aperture_mapping mapping = { };
+	u64 size = gbo->bo.base.size, done;
+	int ret;
+
+	mutex_lock(&pdev->aperture_lock);
+	ret = parhelia_aperture_alloc_locked(pdev, &mapping, SZ_8K);
+	for (done = 0; !ret && done < size; done += SZ_8K) {
+		u32 bytes = min_t(u64, size - done, SZ_8K);
+		u32 surface_address;
+
+		ret = parhelia_vram_gpu_addr(pdev, gbo, done, bytes,
+					     &surface_address);
+		if (ret)
+			break;
+		if (!mapping.active)
+			parhelia_aperture_publish_locked(pdev, &mapping,
+				surface_address, 0x10000020, 0x00010001, NULL);
+		else
+			parhelia_aperture_retarget_locked(pdev, &mapping,
+				surface_address, 0x10000020, 0x00010001);
+		memset_io((u8 __iomem *)pdev->vram + mapping.node.start, 0,
+			  bytes);
+		wmb();
+		parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(mapping.slot));
+	}
+	if (mapping.active)
+		parhelia_aperture_release_locked(pdev, &mapping);
+	else
+		parhelia_aperture_free_unpublished_locked(&mapping);
+	mutex_unlock(&pdev->aperture_lock);
+	return ret;
+}
+
 int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 			 struct drm_mode_create_dumb *args)
 {
@@ -771,6 +808,11 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	parhelia_aperture_publish_locked(pdev, &bo->aperture, surface_address,
 		(PARHELIA_HOST_FORMAT_XRGB8888 << 24) | (3u << 16) |
 		(bo->gpu_pitch / 4), BIT(16) | bo->alloc_height, bo);
+	/* TTM no longer clears new P690 objects; use the object's own view. */
+	memset_io((u8 __iomem *)pdev->vram + bo->aperture.node.start, 0,
+		  host_size);
+	wmb();
+	parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(bo->aperture.slot));
 	mutex_unlock(&pdev->aperture_lock);
 
 	ret = drm_gem_handle_create(file, &gbo->bo.base, &handle);

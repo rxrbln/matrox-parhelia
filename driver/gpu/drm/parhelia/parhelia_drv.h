@@ -410,6 +410,12 @@ static inline struct parhelia_bo *to_parhelia_bo(struct drm_gem_object *gem)
 
 struct parhelia_device {
 	struct drm_device drm;
+	/* VRAM helper TTM callbacks with the P690 move override */
+	struct ttm_device_funcs ttm_funcs;
+	int (*ttm_helper_move)(struct ttm_buffer_object *bo, bool evict,
+			       struct ttm_operation_ctx *ctx,
+			       struct ttm_resource *new_mem,
+			       struct ttm_place *hop);
 	struct pci_dev *pdev;
 	const struct parhelia_chip_info *chip;
 	void __iomem *vram;
@@ -591,6 +597,8 @@ void parhelia_vram_unpin(struct drm_gem_vram_object *bo);
 int parhelia_vram_bar_addr(struct parhelia_device *pdev,
 			   struct drm_gem_vram_object *bo, u64 offset,
 			   u64 length, u32 *bar_addr);
+int parhelia_vram_clear(struct parhelia_device *pdev,
+			struct drm_gem_vram_object *gbo);
 int parhelia_vram_gpu_addr(struct parhelia_device *pdev,
 			   struct drm_gem_vram_object *bo, u64 offset,
 			   u64 length, u32 *gpu_addr);

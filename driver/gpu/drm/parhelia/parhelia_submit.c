@@ -3085,10 +3085,16 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 			return ret;
 		}
 		to_parhelia_bo(&bo->bo.base)->resident = true;
+		ret = parhelia_vram_clear(pdev, bo);
+		if (ret) {
+			drm_gem_object_put(&bo->bo.base);
+			return ret;
+		}
 	}
 	ret = drm_gem_handle_create(file, &bo->bo.base, &handle);
 	if (!ret && !(args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
-				  PARHELIA_CREATE_RENDER_NATIVE_DEPTH)) &&
+				  PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
+				  PARHELIA_CREATE_RENDER_NATIVE_SCANOUT)) &&
 	    (layout != PARHELIA_BO_LAYOUT_TEXTURE ||
 		     !parhelia_texture_upload_enabled()))
 		args->mmap_offset = drm_vma_node_offset_addr(&bo->bo.base.vma_node);

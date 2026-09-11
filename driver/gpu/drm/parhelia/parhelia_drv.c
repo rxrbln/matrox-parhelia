@@ -12,8 +12,30 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_vblank.h>
+#include <drm/ttm/ttm_tt.h>
 
 #include "parhelia_drv.h"
+
+/* P690 BAR0 is a translated host aperture, not a linear view of VRAM: TTM's
+ * CPU clear of a newly placed object lands wherever the aperture currently
+ * translates and zeroed other objects (a new 512x512 target wiped 77% of a
+ * resident texture).  Place new objects without CPU access; the driver
+ * clears them through its own aperture window. */
+static int parhelia_ttm_move(struct ttm_buffer_object *bo, bool evict,
+			     struct ttm_operation_ctx *ctx,
+			     struct ttm_resource *new_mem,
+			     struct ttm_place *hop)
+{
+	struct parhelia_device *pdev = to_parhelia(bo->base.dev);
+
+	if (bo->resource && bo->resource->mem_type == TTM_PL_SYSTEM &&
+	    new_mem->mem_type == TTM_PL_VRAM &&
+	    (!bo->ttm || !ttm_tt_is_populated(bo->ttm))) {
+		ttm_bo_move_null(bo, new_mem);
+		return 0;
+	}
+	return pdev->ttm_helper_move(bo, evict, ctx, new_mem, hop);
+}
 
 #define DRIVER_NAME "parhelia"
 #define DRIVER_DESC "Matrox Parhelia"
@@ -322,6 +344,12 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 				   pdev->vram_size);
 	if (ret)
 		return ret;
+	if (pci->device == PARHELIA_P690) {
+		pdev->ttm_funcs = *drm->vram_mm->bdev.funcs;
+		pdev->ttm_helper_move = pdev->ttm_funcs.move;
+		pdev->ttm_funcs.move = parhelia_ttm_move;
+		drm->vram_mm->bdev.funcs = &pdev->ttm_funcs;
+	}
 
 	ret = drmm_mutex_init(drm, &pdev->submit_lock);
 	if (ret)
