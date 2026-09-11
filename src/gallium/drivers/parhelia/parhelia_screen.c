@@ -187,7 +187,7 @@ ph_resource_resolve_linear(struct parhelia_resource *r)
    uint32_t fence;
    int ret = -EINVAL;
 
-   if (!r || !r->tiled_dirty || !r->map || !r->linear_map)
+   if (!r || !r->tiled_dirty || !r->linear_map)
       return;
    if (!getenv("PARHELIA_CPU_BLIT") &&
        r->handle && r->linear_handle && !(r->linear_stride & 3) &&
@@ -215,6 +215,8 @@ ph_resource_resolve_linear(struct parhelia_resource *r)
       }
       free(batch);
    }
+   if (!r->map || (r->transfer_shadow && ph_resource_download_shadow(r)))
+      return;
    if (getenv("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: CPU resolve resource=%p tiled=%u linear=%u %ux%u gpu_error=%d\n",
@@ -236,8 +238,7 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
    uint32_t fence;
    int ret = -EINVAL;
 
-   if (!r || !r->linear_dirty || r->tiled_dirty ||
-       !r->map || !r->linear_map)
+   if (!r || !r->linear_dirty || r->tiled_dirty || !r->linear_map)
       return;
    if (!getenv("PARHELIA_CPU_BLIT") &&
        r->handle && r->linear_handle && !(r->linear_stride & 3) &&
@@ -262,6 +263,8 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
       }
       free(batch);
    }
+   if (!r->map)
+      return;
    if (getenv("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: CPU upload resource=%p linear=%u tiled=%u %ux%u layout=%u gpu_error=%d\n",
@@ -279,6 +282,8 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
                     p3d_tile_offset_layout(x, y, r->stride, r->tile_layout)),
                 (uint8_t *)r->linear_map +
                    (size_t)y * r->linear_stride + x * 4, 4);
+   if (r->transfer_shadow && ph_resource_upload_shadow(r))
+      return;
    r->upload_dirty |= r->upload_texture;
    r->linear_dirty = false;
    r->rgb5a1_packed = false;
@@ -314,6 +319,47 @@ ph_resource_upload_texture(struct parhelia_resource *r)
    return 0;
 }
 
+static int
+ph_resource_shadow_transfer(struct parhelia_resource *r, unsigned long request,
+                            const char *operation)
+{
+   struct drm_parhelia_upload_render transfer;
+
+   if (!r || !r->transfer_shadow || !r->handle || !r->map || !r->size)
+      return -EINVAL;
+   transfer = (struct drm_parhelia_upload_render) {
+      .data = (uintptr_t)r->map,
+      .size = r->size,
+      .handle = r->handle,
+   };
+   if (ioctl(ph_screen(r->base.screen)->fd, request, &transfer)) {
+      int ret = -errno;
+
+      fprintf(stderr, "parhelia: %s handle=%u size=%llu failed: %s\n",
+              operation, r->handle, (unsigned long long)r->size,
+              strerror(errno));
+      return ret;
+   }
+   if (getenv("PARHELIA_TRACE"))
+      fprintf(stderr, "parhelia: %s handle=%u size=%llu\n", operation,
+              r->handle, (unsigned long long)r->size);
+   return 0;
+}
+
+int
+ph_resource_upload_shadow(struct parhelia_resource *r)
+{
+   return ph_resource_shadow_transfer(r, DRM_IOCTL_PARHELIA_UPLOAD_RENDER,
+                                      "render-shadow upload");
+}
+
+int
+ph_resource_download_shadow(struct parhelia_resource *r)
+{
+   return ph_resource_shadow_transfer(r, DRM_IOCTL_PARHELIA_DOWNLOAD_RENDER,
+                                      "render-shadow download");
+}
+
 static struct pipe_resource *
 ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *templ)
 {
@@ -329,6 +375,10 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    const bool p690_native_texture32 = sampler_storage &&
       p3d_texture_uses_native_64x16(screen->chip_id, screen->tile_layout,
                                     util_format_get_blocksize(templ->format));
+   const bool native_depth = screen->native_rt_classes &&
+      (templ->bind & PIPE_BIND_DEPTH_STENCIL);
+   const bool native_color = screen->native_rt_classes && !sampler_storage &&
+      (templ->bind & PIPE_BIND_RENDER_TARGET);
    /* CREATE_RENDER and the surface/texture descriptors all accept 2048 in
     * either dimension.  Keep resource creation consistent with the advertised
     * GL/DRI limit; the old 1024x768 userspace guard was a bring-up limit and
@@ -425,6 +475,10 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    }
    if (sampler_storage)
       create.flags = PARHELIA_CREATE_RENDER_TEXTURE;
+   else if (native_depth)
+      create.flags = PARHELIA_CREATE_RENDER_NATIVE_DEPTH;
+   else if (native_color)
+      create.flags = PARHELIA_CREATE_RENDER_NATIVE_COLOR;
    if (ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &create)) {
       fprintf(stderr, "parhelia: create render %ux%u failed: %s\n",
               templ->width0, templ->height0, strerror(errno));
@@ -455,7 +509,23 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
          goto fail;
       memset(r->map, 0, r->size);
       r->upload_dirty = true;
+   } else if (native_depth || native_color) {
+      /* Compact P690 target classes live above the raw 16-MiB host window.
+       * Their zero mmap offset is intentional.  Imported/present resources
+       * which already have a CPU-visible linear companion use GPU BITBLT;
+       * direct CPU transfers on a private class target remain unavailable. */
+      if (create.mmap_offset)
+         goto fail;
+      if (screen->render_transfer) {
+         r->map = align_malloc(r->size, 64);
+         if (!r->map)
+            goto fail;
+         memset(r->map, 0, r->size);
+         r->transfer_shadow = true;
+      }
    } else {
+      if (!r->mmap_offset)
+         goto fail;
       r->map = mmap(NULL, r->size, PROT_READ | PROT_WRITE, MAP_SHARED,
                     ph_screen(pscreen)->fd, r->mmap_offset);
       if (r->map == MAP_FAILED) {
@@ -542,7 +612,7 @@ fail:
       struct drm_gem_close close = {.handle = r->handle};
       ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &close);
    }
-   if (r->upload_texture)
+   if (r->upload_texture || r->transfer_shadow)
       align_free(r->map);
    align_free(r->malloc_data);
    FREE(r);
@@ -717,7 +787,7 @@ ph_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *pres)
          ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &close);
       }
    }
-   if (r->upload_texture)
+   if (r->upload_texture || r->transfer_shadow)
       align_free(r->map);
    else if (r->map)
       munmap(r->map, r->size);
@@ -852,6 +922,12 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param texture_upload = {
       .param = PARHELIA_PARAM_TEXTURE_UPLOAD,
    };
+   struct drm_parhelia_get_param native_rt_classes = {
+      .param = PARHELIA_PARAM_NATIVE_RT_CLASSES,
+   };
+   struct drm_parhelia_get_param render_transfer = {
+      .param = PARHELIA_PARAM_RENDER_TRANSFER,
+   };
    struct drm_parhelia_get_param max_packets = {
       .param = PARHELIA_PARAM_MAX_PACKETS,
    };
@@ -915,6 +991,12 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->texture_upload =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &texture_upload) &&
       texture_upload.value == 1;
+   s->native_rt_classes =
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &native_rt_classes) &&
+      native_rt_classes.value == 1;
+   s->render_transfer =
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &render_transfer) &&
+      render_transfer.value == 1;
    if (!ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &max_packets) &&
        max_packets.value && max_packets.value <= PH_BATCH_PACKETS)
       s->kernel_max_packets = max_packets.value;

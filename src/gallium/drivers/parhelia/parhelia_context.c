@@ -4382,7 +4382,7 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
       ctx->submit_error = -EOPNOTSUPP;
       return;
    }
-   if (getenv("PARHELIA_CPU_CLEAR")) {
+   if (getenv("PARHELIA_CPU_CLEAR") && r->map && !r->transfer_shadow) {
       /* The normal path queues this packet behind previous 3D work.  A CPU
        * diagnostic must establish the same ordering before touching the
        * tiled mapping directly. */
@@ -4542,6 +4542,8 @@ ph_copy_texture_box(struct ph_context *ctx,
     * required before either its linear shadow or its tiled map is sampled. */
    if (ph_wait_async(ctx) || ctx->submit_error)
       return false;
+   if (sr->transfer_shadow && ph_resource_download_shadow(sr))
+      return false;
 
    /* Imported drawable/renderbuffer resources have a linear companion.
     * Use the recovered type-2-to-type-1 hardware BITBLT to detile them once;
@@ -4615,8 +4617,19 @@ ph_copy_texture_box(struct ph_context *ctx,
          }
       }
    }
-   dr->tiled_dirty = !dr->linear_map;
-   dr->linear_dirty = false;
+   dr->tiled_dirty = dr->map && !dr->linear_map;
+   dr->linear_dirty = dr->linear_map && !dr->map;
+   if (dr->transfer_shadow) {
+      int ret = ph_resource_upload_shadow(dr);
+
+      if (ret) {
+         ctx->submit_error = ret;
+         FREE(staging);
+         return false;
+      }
+      dr->tiled_dirty = false;
+      dr->linear_dirty = false;
+   }
    dr->upload_dirty |= dr->upload_texture;
    dr->mip_defined |= BITFIELD_BIT(0);
    dr->content_generation++;
@@ -4884,6 +4897,13 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
          return NULL;
       }
    }
+   if ((usage & (PIPE_MAP_READ | PIPE_MAP_WRITE)) && r->transfer_shadow &&
+       (r->mip_defined & BITFIELD_BIT(level)) &&
+       ph_resource_download_shadow(r)) {
+      FREE(t->staging);
+      FREE(t);
+      return NULL;
+   }
    if ((usage & PIPE_MAP_READ) && level < ph_resource_mip_levels(r) &&
        (r->mip_defined & BITFIELD_BIT(level))) {
       if (r->linear_map) {
@@ -4941,7 +4961,6 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
    struct parhelia_resource *r = ph_resource(transfer->resource);
    unsigned cpp = util_format_get_blocksize(transfer->resource->format);
    bool swap_rb = ph_format_needs_rb_swap(transfer->resource->format);
-   (void)p;
    if (texture && t->base.level < ph_resource_mip_levels(r) && t->staging &&
        (transfer->usage & PIPE_MAP_WRITE)) {
       /* Do not apply a partial RGBA update over the temporary 16-bit packed
@@ -4989,8 +5008,8 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
       /* Both representations were updated when a presentation/sampler
        * backing exists; otherwise the tiled render image is authoritative.
        */
-      r->tiled_dirty = !r->linear_map;
-      r->linear_dirty = false;
+      r->tiled_dirty = r->map && !r->linear_map;
+      r->linear_dirty = r->linear_map && !r->map;
       /* The write replaced the native A1R5G5B5 scratch representation with
        * the resource's ordinary RGBA pixels.  A later binary-alpha draw may
        * reclassify/repack it under the new content generation. */
@@ -4998,6 +5017,16 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
       r->upload_dirty |= r->upload_texture;
       r->content_generation++;
       r->mip_defined |= BITFIELD_BIT(transfer->level);
+      if (r->transfer_shadow) {
+         int ret = ph_resource_upload_shadow(r);
+
+         if (ret)
+            ph_context(p)->submit_error = ret;
+         else {
+            r->tiled_dirty = false;
+            r->linear_dirty = false;
+         }
+      }
       /* Upload now to keep ordinary texture creation eager.  A temporary
        * aperture allocation failure leaves upload_dirty set; sampler bind
        * retries it before allowing a draw to reference this BO. */

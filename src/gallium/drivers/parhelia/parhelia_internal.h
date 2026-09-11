@@ -25,6 +25,8 @@ struct parhelia_screen {
    bool stateful_submit;
    bool native_share;
    bool texture_upload;
+   bool native_rt_classes;
+   bool render_transfer;
    /* Zero means GET_PARAM was unavailable or returned an invalid value. */
    uint32_t kernel_max_packets;
    uint64_t vram_size;
@@ -48,6 +50,10 @@ struct parhelia_resource {
     * software-swizzled malloc shadow copied through UPLOAD_RENDER. */
    bool upload_texture;
    bool upload_dirty;
+   /* Compact P690 colour/depth BOs are not raw-mappable.  This byte-exact
+    * native-layout shadow crosses the transient host aperture only through
+    * UPLOAD_RENDER/DOWNLOAD_RENDER. */
+   bool transfer_shadow;
 
    uint32_t linear_handle;
    uint64_t linear_size;
@@ -105,6 +111,8 @@ ph_resource(struct pipe_resource *r)
 void ph_resource_resolve_linear(struct parhelia_resource *r);
 void ph_resource_upload_tiled(struct parhelia_resource *r);
 int ph_resource_upload_texture(struct parhelia_resource *r);
+int ph_resource_upload_shadow(struct parhelia_resource *r);
+int ph_resource_download_shadow(struct parhelia_resource *r);
 struct pipe_context *ph_context_create(struct pipe_screen *screen, void *priv,
                                        unsigned flags);
 

@@ -23,6 +23,7 @@
 #define DRM_PARHELIA_WAIT_FENCE		0x04
 #define DRM_PARHELIA_GET_BO_INFO	0x05
 #define DRM_PARHELIA_UPLOAD_RENDER	0x06
+#define DRM_PARHELIA_DOWNLOAD_RENDER	0x07
 
 #define DRM_IOCTL_PARHELIA_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_PARHELIA_GET_PARAM, \
@@ -45,6 +46,9 @@
 #define DRM_IOCTL_PARHELIA_UPLOAD_RENDER \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_PARHELIA_UPLOAD_RENDER, \
 		struct drm_parhelia_upload_render)
+#define DRM_IOCTL_PARHELIA_DOWNLOAD_RENDER \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_PARHELIA_DOWNLOAD_RENDER, \
+		struct drm_parhelia_upload_render)
 
 /* Linear storage does not use the tiled render-target address decoder and
  * therefore needs only the native surface alignment, not a 32 MiB SUN90
@@ -54,6 +58,10 @@
  * the SUN90 render-target path.  It needs tiled storage, but not the 32 MiB
  * render-target bank separation. */
 #define PARHELIA_CREATE_RENDER_TEXTURE	(1u << 1)
+/* P690 native render-target classes.  These compact 8-KiB-aligned objects
+ * are GPU-only; CPU access must use a separate linear staging object. */
+#define PARHELIA_CREATE_RENDER_NATIVE_COLOR	(1u << 3)
+#define PARHELIA_CREATE_RENDER_NATIVE_DEPTH	(1u << 4)
 
 /* Bring-up tiled render allocation, deliberately separate from linear dumb
  * scanout. Both 32-bit colour and S8Z24 use this storage. The kernel reserves
@@ -151,6 +159,10 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_NATIVE_SHARE	21
 /* Guarded opaque type-0 host-aperture texture upload probe. */
 #define PARHELIA_PARAM_TEXTURE_UPLOAD	22
+/* P690 exposes separate packed native colour/depth allocation classes. */
+#define PARHELIA_PARAM_NATIVE_RT_CLASSES	27
+/* Kernel transient-aperture upload/download for opaque render storage. */
+#define PARHELIA_PARAM_RENDER_TRANSFER	28
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
 /* Retired unsafe generic packing capability; kernels report zero. */
