@@ -566,7 +566,11 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	if (st->fence)
 		p3d_fence_block(cs, st->fence);
 
-	rw[0].reg = P3D_R_WATERMARK; rw[0].val = 0x3fff8842u;
+	/* Both vendor drivers raise MemLevels for targets above 250,000 pixels.
+	 * Q3's 640x480 buffer crosses that exact threshold. */
+	rw[0].reg = P3D_R_WATERMARK;
+	rw[0].val = (uint64_t)st->screen_w * st->screen_h > 250000u ?
+		    0x3fff9084u : 0x3fff8842u;
 	p3d_reglist(cs, rw, 1);
 	rw[0].reg = P3D_R_DWGCTL; rw[0].val = dwgctl;
 	p3d_reglist(cs, rw, 1);

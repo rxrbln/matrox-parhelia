@@ -58,7 +58,7 @@ static bool
 batch_packet_is_opening_watermark(const uint32_t *cmd, unsigned length)
 {
    return length == 3 && cmd[0] == 1 && cmd[1] == 0x212121acu &&
-          cmd[2] == 0x3fff8842u;
+          (cmd[2] == 0x3fff8842u || cmd[2] == 0x3fff9084u);
 }
 
 int
