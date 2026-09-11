@@ -398,11 +398,22 @@ ph_create_vertex_ring(struct ph_context *ctx)
               screen->async_slots);
 }
 
+static bool
+ph_batch_has_full_boundary(const struct parhelia_batch *batch)
+{
+   for (unsigned i = 0; i < batch->reloc_count; i++)
+      if (batch->relocs[i].type == PARHELIA_RELOC_BATCH_BOUNDARY)
+         return true;
+   return false;
+}
+
 static int
 ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
                     const void *vertices, unsigned vertex_dwords)
 {
    struct parhelia_screen *screen = ph_screen(ctx->base.screen);
+   bool boundary_aware = screen->pack_adjacent_packets &&
+                         !ph_batch_has_full_boundary(batch);
    int ret;
    uint64_t bytes = (uint64_t)vertex_dwords * sizeof(uint32_t);
 
@@ -422,9 +433,13 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
       }
       memcpy((uint8_t *)ctx->vram_vertices + offset, vertices, bytes);
       __sync_synchronize();
-      ret = parhelia_batch_submit_vram_async(screen->fd, batch,
-                                              ctx->vram_vertex_handle, offset,
-                                              vertex_dwords, &ctx->fence);
+      ret = boundary_aware ?
+         parhelia_batch_submit_vram_async_bounded(
+            screen->fd, batch, ctx->vram_vertex_handle, offset,
+            vertex_dwords, &ctx->fence) :
+         parhelia_batch_submit_vram_async(
+            screen->fd, batch, ctx->vram_vertex_handle, offset,
+            vertex_dwords, &ctx->fence);
       if (!ret) {
          ctx->vram_vertex_fence[slot] = ctx->fence;
          ctx->vram_vertex_slot = (slot + 1) % ctx->vram_vertex_slot_count;
@@ -481,8 +496,11 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
    /* Copy-submit fallback requests retain their own kernel vertex snapshot.
     * CREATE_VERTEX submissions above use three fenced class-3 DMA subranges. */
    if (screen->async_submit) {
-      ret = parhelia_batch_submit_async(screen->fd, batch, vertices,
-                                        vertex_dwords, &ctx->fence);
+      ret = boundary_aware ?
+         parhelia_batch_submit_async_bounded(
+            screen->fd, batch, vertices, vertex_dwords, &ctx->fence) :
+         parhelia_batch_submit_async(
+            screen->fd, batch, vertices, vertex_dwords, &ctx->fence);
       if (!ret) {
          ctx->async_pending = true;
          return 0;
@@ -734,6 +752,22 @@ ph_reference_pending_resources(struct ph_context *ctx,
 }
 
 static int
+ph_append_state_stream(struct ph_context *ctx,
+                       const struct parhelia_batch *batch,
+                       const void *vertices, unsigned vertex_dwords)
+{
+   if (ph_screen(ctx->base.screen)->pack_adjacent_packets)
+      return parhelia_batch_append_call_bounded_limited(
+         &ctx->pending_batch, ctx->pending_vertices,
+         &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
+         &ctx->batch_limits);
+   return parhelia_batch_append_limited(
+      &ctx->pending_batch, ctx->pending_vertices,
+      &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
+      &ctx->batch_limits);
+}
+
+static int
 ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
                 const void *vertices, unsigned vertex_dwords,
                 struct parhelia_resource *r0, struct parhelia_resource *r1,
@@ -796,10 +830,7 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
          return ret;
    }
    ret = ctx->aggregate_state_stream ?
-      parhelia_batch_append_limited(
-         &ctx->pending_batch, ctx->pending_vertices,
-         &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
-         &ctx->batch_limits) :
+      ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
       ctx->aggregate_state_batches ?
       parhelia_batch_append_stateful_limited(
          &ctx->pending_batch, ctx->pending_vertices,
@@ -815,10 +846,7 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
       if (ret)
          return ret;
       ret = ctx->aggregate_state_stream ?
-         parhelia_batch_append_limited(
-            &ctx->pending_batch, ctx->pending_vertices,
-            &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
-            &ctx->batch_limits) :
+         ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
          ctx->aggregate_state_batches ?
          parhelia_batch_append_stateful_limited(
             &ctx->pending_batch, ctx->pending_vertices,

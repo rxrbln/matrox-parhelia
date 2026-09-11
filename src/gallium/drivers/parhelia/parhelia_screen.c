@@ -825,7 +825,7 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
       .param = PARHELIA_PARAM_ASYNC_SLOTS,
    };
    struct drm_parhelia_get_param pack_adjacent = {
-      .param = PARHELIA_PARAM_PACK_ADJACENT,
+      .param = PARHELIA_PARAM_PACK_ADJACENT_BOUNDARIES,
    };
    struct drm_parhelia_get_param bound_range = {
       .param = PARHELIA_PARAM_BOUND_RANGE,

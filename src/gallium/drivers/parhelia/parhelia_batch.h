@@ -120,6 +120,9 @@ int parhelia_batch_submit(int fd, const struct parhelia_batch *batch,
 int parhelia_batch_submit_async(int fd, const struct parhelia_batch *batch,
                                 const void *vertices, unsigned vertex_dwords,
                                 uint32_t *fence);
+int parhelia_batch_submit_async_bounded(
+   int fd, const struct parhelia_batch *batch, const void *vertices,
+   unsigned vertex_dwords, uint32_t *fence);
 /* Append one independently validated batch to another submit.  Packet command
  * offsets, packet-indexed relocations and byte-addressed DRAW relocations are
  * rebased while preserving the original packet order. */
@@ -136,6 +139,18 @@ int parhelia_batch_append_limited(struct parhelia_batch *dst,
                                   const void *src_vertices,
                                   unsigned src_vertex_dwords,
                                   const struct parhelia_batch_limits *limits);
+/* Append a complete logical state section and insert a metadata-only CALL
+ * boundary before it.  Boundary-aware kernels use the marker only to split
+ * adjacent-packet secondary spans; it emits no GPU synchronization. */
+int parhelia_batch_append_call_bounded(
+   struct parhelia_batch *dst, uint32_t *dst_vertices,
+   unsigned *dst_vertex_dwords, const struct parhelia_batch *src,
+   const void *src_vertices, unsigned src_vertex_dwords);
+int parhelia_batch_append_call_bounded_limited(
+   struct parhelia_batch *dst, uint32_t *dst_vertices,
+   unsigned *dst_vertex_dwords, const struct parhelia_batch *src,
+   const void *src_vertices, unsigned src_vertex_dwords,
+   const struct parhelia_batch_limits *limits);
 /* Extend an already queued state batch with only the DRAW tail of a second,
  * byte-identical state batch.  This retains one hardware state/fence cadence
  * and is equivalent to p3d_emit_draws() producing more consecutive draws. */
@@ -200,6 +215,9 @@ int parhelia_batch_submit_vram_async(int fd, const struct parhelia_batch *batch,
                                      uint32_t vertex_offset,
                                      unsigned vertex_dwords,
                                      uint32_t *fence);
+int parhelia_batch_submit_vram_async_bounded(
+   int fd, const struct parhelia_batch *batch, uint32_t vertex_handle,
+   uint32_t vertex_offset, unsigned vertex_dwords, uint32_t *fence);
 
 /* Deliberately narrow P690 mode-7 exercise builder.  It is for the DRM
  * screen test only: one untextured interleaved class-3 stream and one u32

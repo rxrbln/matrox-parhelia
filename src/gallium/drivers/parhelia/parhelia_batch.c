@@ -70,7 +70,10 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
 {
    enum { PACK_NONE, PACK_DRAW, PACK_RANGE } run = PACK_NONE;
    bool draw_packets[PH_BATCH_PACKETS] = {false};
+   bool call_boundaries[PH_BATCH_PACKETS] = {false};
    unsigned opening = first_packet, run_words = 0, count = 3;
+   unsigned last_call_boundary = 0;
+   bool call_boundary_seen = false;
 
    if (!batch || !calls || first_packet >= end_packet ||
        end_packet > batch->packet_count ||
@@ -83,6 +86,16 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
          return -EINVAL;
       if (reloc->type == PARHELIA_RELOC_BATCH_BOUNDARY)
          return -EINVAL;
+      if (reloc->type == PARHELIA_RELOC_CALL_BOUNDARY) {
+         if (!reloc->packet ||
+             (call_boundary_seen && reloc->packet <= last_call_boundary) ||
+             reloc->dword || reloc->handle || reloc->delta ||
+             reloc->pad[0] || reloc->pad[1] || reloc->pad[2])
+            return -EINVAL;
+         call_boundaries[reloc->packet] = true;
+         last_call_boundary = reloc->packet;
+         call_boundary_seen = true;
+      }
       if (reloc->type == PARHELIA_RELOC_DRAW)
          draw_packets[reloc->packet] = true;
    }
@@ -113,6 +126,11 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
              packet->length > batch->command_count - packet->offset)
             return -EINVAL;
          cmd = batch->commands + packet->offset;
+         if (i != first_packet && call_boundaries[i]) {
+            count += active;
+            active = false;
+            run_words = 0;
+         }
          if (i == opening) {
             count += active;
             active = false;
@@ -203,7 +221,7 @@ parhelia_batch_slice(struct parhelia_batch *dst,
    memset(dst, 0, sizeof(*dst));
    dst->command_count = end->command_dwords - begin->command_dwords;
    dst->packet_count = end->packets - begin->packets;
-   dst->reloc_count = end->relocs - begin->relocs;
+   dst->reloc_count = 0;
    memcpy(dst->commands, src->commands + begin->command_dwords,
           dst->command_count * sizeof(dst->commands[0]));
    for (unsigned i = 0; i < dst->packet_count; i++) {
@@ -217,20 +235,27 @@ parhelia_batch_slice(struct parhelia_batch *dst,
       dst->packets[i] = *packet;
       dst->packets[i].offset -= begin->command_dwords;
    }
-   for (unsigned i = 0; i < dst->reloc_count; i++) {
+   for (unsigned i = begin->relocs; i < end->relocs; i++) {
       const struct drm_parhelia_reloc *reloc =
-         &src->relocs[begin->relocs + i];
+         &src->relocs[i];
       uint64_t range_end = (uint64_t)reloc->dword + reloc->delta;
 
       if (reloc->packet < begin->packets || reloc->packet >= end->packets)
          return -EINVAL;
-      dst->relocs[i] = *reloc;
-      dst->relocs[i].packet -= begin->packets;
+      /* A group sliced at an original state mark starts a fresh submit.  Its
+       * leading CALL boundary has no preceding section and must not become
+       * the kernel-invalid packet-zero marker. */
+      if (reloc->type == PARHELIA_RELOC_CALL_BOUNDARY &&
+          reloc->packet == begin->packets)
+         continue;
+      dst->relocs[dst->reloc_count] = *reloc;
+      dst->relocs[dst->reloc_count].packet -= begin->packets;
       if (reloc->type == PARHELIA_RELOC_DRAW) {
          if (reloc->dword < vertex_begin || range_end > vertex_end)
             return -EINVAL;
-         dst->relocs[i].dword -= vertex_begin;
+         dst->relocs[dst->reloc_count].dword -= vertex_begin;
       }
+      dst->reloc_count++;
    }
    return 0;
 }
@@ -630,24 +655,49 @@ parhelia_batch_submit_flags(int fd, const struct parhelia_batch *batch,
                             const void *vertices, unsigned vertex_dwords,
                             unsigned flags, uint32_t *fence)
 {
+   struct drm_parhelia_reloc *filtered = NULL;
+   const struct drm_parhelia_reloc *relocs;
+   unsigned reloc_count;
+   int saved_errno;
+
    if (!batch || (!vertices && vertex_dwords) || !fence || vertex_dwords > 4096)
       return -EINVAL;
+   relocs = batch->relocs;
+   reloc_count = batch->reloc_count;
+   if (!(flags & PARHELIA_SUBMIT_CALL_BOUNDARIES)) {
+      for (unsigned i = 0; i < batch->reloc_count; i++)
+         if (batch->relocs[i].type == PARHELIA_RELOC_CALL_BOUNDARY) {
+            filtered = malloc(batch->reloc_count * sizeof(*filtered));
+            if (!filtered)
+               return -ENOMEM;
+            reloc_count = 0;
+            for (unsigned j = 0; j < batch->reloc_count; j++)
+               if (batch->relocs[j].type != PARHELIA_RELOC_CALL_BOUNDARY)
+                  filtered[reloc_count++] = batch->relocs[j];
+            relocs = filtered;
+            break;
+         }
+   }
    struct drm_parhelia_submit submit = {
       .commands = (uintptr_t)batch->commands,
       .packets = (uintptr_t)batch->packets,
-      .relocs = (uintptr_t)batch->relocs,
+      .relocs = (uintptr_t)relocs,
       .vertices = (uintptr_t)vertices,
       .command_dwords = batch->command_count,
       .packet_count = batch->packet_count,
-      .reloc_count = batch->reloc_count,
+      .reloc_count = reloc_count,
       .vertex_dwords = vertex_dwords,
       .flags = flags,
    };
    /* Do not blindly retry an interrupted submission: replaying rendering
     * can have side effects. Let the caller handle failures explicitly.
     */
-   if (ioctl(fd, DRM_IOCTL_PARHELIA_SUBMIT, &submit))
-      return -errno;
+   if (ioctl(fd, DRM_IOCTL_PARHELIA_SUBMIT, &submit)) {
+      saved_errno = errno;
+      free(filtered);
+      return -saved_errno;
+   }
+   free(filtered);
    *fence = submit.fence;
    return 0;
 }
@@ -669,6 +719,19 @@ parhelia_batch_submit_async(int fd, const struct parhelia_batch *batch,
    return parhelia_batch_submit_flags(fd, batch, vertices, vertex_dwords,
                                       PARHELIA_SUBMIT_FENCE |
                                       PARHELIA_SUBMIT_ASYNC, fence);
+}
+
+int
+parhelia_batch_submit_async_bounded(int fd,
+                                    const struct parhelia_batch *batch,
+                                    const void *vertices,
+                                    unsigned vertex_dwords,
+                                    uint32_t *fence)
+{
+   return parhelia_batch_submit_flags(
+      fd, batch, vertices, vertex_dwords,
+      PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC |
+      PARHELIA_SUBMIT_CALL_BOUNDARIES, fence);
 }
 
 int
@@ -766,6 +829,57 @@ parhelia_batch_append(struct parhelia_batch *dst, uint32_t *dst_vertices,
    return parhelia_batch_append_limited(dst, dst_vertices, dst_vertex_dwords,
                                         src, src_vertices, src_vertex_dwords,
                                         &maximum_batch_limits);
+}
+
+int
+parhelia_batch_append_call_bounded_limited(
+   struct parhelia_batch *dst, uint32_t *dst_vertices,
+   unsigned *dst_vertex_dwords, const struct parhelia_batch *src,
+   const void *src_vertices, unsigned src_vertex_dwords,
+   const struct parhelia_batch_limits *limits)
+{
+   unsigned boundary_reloc, first_packet;
+   int ret;
+
+   if (!dst || !src)
+      return -EINVAL;
+   if (!dst->packet_count)
+      return parhelia_batch_append_limited(dst, dst_vertices,
+                                           dst_vertex_dwords, src,
+                                           src_vertices, src_vertex_dwords,
+                                           limits);
+   if (!limits || !limits->relocs || limits->relocs > PH_BATCH_RELOCS ||
+       dst->reloc_count >= limits->relocs ||
+       src->reloc_count >= limits->relocs - dst->reloc_count)
+      return -E2BIG;
+
+   boundary_reloc = dst->reloc_count;
+   first_packet = dst->packet_count;
+   ret = parhelia_batch_append_limited(dst, dst_vertices, dst_vertex_dwords,
+                                       src, src_vertices,
+                                       src_vertex_dwords, limits);
+   if (ret)
+      return ret;
+   memmove(&dst->relocs[boundary_reloc + 1],
+           &dst->relocs[boundary_reloc],
+           (dst->reloc_count - boundary_reloc) * sizeof(dst->relocs[0]));
+   dst->relocs[boundary_reloc] = (struct drm_parhelia_reloc) {
+      .packet = first_packet,
+      .type = PARHELIA_RELOC_CALL_BOUNDARY,
+   };
+   dst->reloc_count++;
+   return 0;
+}
+
+int
+parhelia_batch_append_call_bounded(
+   struct parhelia_batch *dst, uint32_t *dst_vertices,
+   unsigned *dst_vertex_dwords, const struct parhelia_batch *src,
+   const void *src_vertices, unsigned src_vertex_dwords)
+{
+   return parhelia_batch_append_call_bounded_limited(
+      dst, dst_vertices, dst_vertex_dwords, src, src_vertices,
+      src_vertex_dwords, &maximum_batch_limits);
 }
 
 int
@@ -1197,6 +1311,7 @@ parhelia_batch_submit_vram(int fd, const struct parhelia_batch *batch,
                            unsigned vertex_dwords, uint32_t *fence)
 {
    struct drm_parhelia_reloc relocs[PH_BATCH_RELOCS];
+   unsigned reloc_count = 0;
    int ret;
 
    if (!batch || !fence || batch->reloc_count > PH_BATCH_RELOCS)
@@ -1206,13 +1321,16 @@ parhelia_batch_submit_vram(int fd, const struct parhelia_batch *batch,
                                     PH_BATCH_RELOCS);
    if (ret)
       return ret;
+   for (unsigned i = 0; i < batch->reloc_count; i++)
+      if (relocs[i].type != PARHELIA_RELOC_CALL_BOUNDARY)
+         relocs[reloc_count++] = relocs[i];
    struct drm_parhelia_submit submit = {
       .commands = (uintptr_t)batch->commands,
       .packets = (uintptr_t)batch->packets,
       .relocs = (uintptr_t)relocs,
       .command_dwords = batch->command_count,
       .packet_count = batch->packet_count,
-      .reloc_count = batch->reloc_count,
+      .reloc_count = reloc_count,
       .flags = PARHELIA_SUBMIT_FENCE,
    };
    if (ioctl(fd, DRM_IOCTL_PARHELIA_SUBMIT, &submit))
@@ -1226,6 +1344,41 @@ parhelia_batch_submit_vram_async(int fd, const struct parhelia_batch *batch,
                                  uint32_t vertex_handle,
                                  uint32_t vertex_offset,
                                  unsigned vertex_dwords, uint32_t *fence)
+{
+   struct drm_parhelia_reloc relocs[PH_BATCH_RELOCS];
+   struct drm_parhelia_submit submit;
+   unsigned reloc_count = 0;
+   int ret;
+
+   if (!batch || !fence || batch->reloc_count > PH_BATCH_RELOCS)
+      return -EINVAL;
+   ret = parhelia_batch_vram_relocs(batch, vertex_handle, vertex_offset,
+                                    vertex_dwords, relocs,
+                                    PH_BATCH_RELOCS);
+   if (ret)
+      return ret;
+   for (unsigned i = 0; i < batch->reloc_count; i++)
+      if (relocs[i].type != PARHELIA_RELOC_CALL_BOUNDARY)
+         relocs[reloc_count++] = relocs[i];
+   submit = (struct drm_parhelia_submit) {
+      .commands = (uintptr_t)batch->commands,
+      .packets = (uintptr_t)batch->packets,
+      .relocs = (uintptr_t)relocs,
+      .command_dwords = batch->command_count,
+      .packet_count = batch->packet_count,
+      .reloc_count = reloc_count,
+      .flags = PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC,
+   };
+   if (ioctl(fd, DRM_IOCTL_PARHELIA_SUBMIT, &submit))
+      return -errno;
+   *fence = submit.fence;
+   return 0;
+}
+
+int
+parhelia_batch_submit_vram_async_bounded(
+   int fd, const struct parhelia_batch *batch, uint32_t vertex_handle,
+   uint32_t vertex_offset, unsigned vertex_dwords, uint32_t *fence)
 {
    struct drm_parhelia_reloc relocs[PH_BATCH_RELOCS];
    struct drm_parhelia_submit submit;
@@ -1245,7 +1398,8 @@ parhelia_batch_submit_vram_async(int fd, const struct parhelia_batch *batch,
       .command_dwords = batch->command_count,
       .packet_count = batch->packet_count,
       .reloc_count = batch->reloc_count,
-      .flags = PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC,
+      .flags = PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC |
+               PARHELIA_SUBMIT_CALL_BOUNDARIES,
    };
    if (ioctl(fd, DRM_IOCTL_PARHELIA_SUBMIT, &submit))
       return -errno;
