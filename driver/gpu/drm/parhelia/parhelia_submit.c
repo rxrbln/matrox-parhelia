@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 /* Validated submission for the Parhelia WARP DMA engine.
  *
  * The primary ring, section packets and vertex fetch buffer are DMA32 memory
@@ -193,9 +194,9 @@ static bool parhelia_root_probe_read(struct parhelia_device *pdev, u32 value[3])
 
 		/* P690 64x16/4 KiB native swizzle.  in_tile is a dword index. */
 		in_tile = (ix & 1) | (((ix >> 1) & 1) << 1) |
-			  (((ix >> 2) & 1) << 2) | (((iy >> 1) & 1) << 3) |
+			  (((ix >> 2) & 1) << 2) | ((iy & 1) << 3) |
 			  (((ix >> 3) & 1) << 4) | (((ix >> 4) & 1) << 5) |
-			  ((iy & 1) << 6) | (x5 << 7) |
+			  (((iy >> 1) & 1) << 6) | (x5 << 7) |
 			  (((iy >> 2) & 1) << 8) | (((iy >> 3) & 1) << 9);
 		offset = physical_base +
 			 ((u64)trow * tpr + tcol) * SZ_4K + in_tile * sizeof(u32);

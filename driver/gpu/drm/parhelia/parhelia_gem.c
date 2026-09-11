@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -80,9 +81,9 @@ static bool parhelia_read_root_samples(struct parhelia_device *pdev, u32 value[3
 		u64 offset;
 
 		in_tile = (ix & 1) | (((ix >> 1) & 1) << 1) |
-			  (((ix >> 2) & 1) << 2) | (((iy >> 1) & 1) << 3) |
+			  (((ix >> 2) & 1) << 2) | ((iy & 1) << 3) |
 			  (((ix >> 3) & 1) << 4) | (((ix >> 4) & 1) << 5) |
-			  ((iy & 1) << 6) | (x5 << 7) |
+			  (((iy >> 1) & 1) << 6) | (x5 << 7) |
 			  (((iy >> 2) & 1) << 8) | (((iy >> 3) & 1) << 9);
 		offset = physical_base +
 			 ((u64)trow * tpr + tcol) * SZ_4K +
