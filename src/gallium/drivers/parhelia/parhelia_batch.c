@@ -10,6 +10,95 @@
 
 #include "parhelia_batch.h"
 
+static const struct parhelia_batch_limits maximum_batch_limits = {
+   .command_dwords = PH_BATCH_DWORDS,
+   .packets = PH_BATCH_PACKETS,
+   .relocs = PH_BATCH_RELOCS,
+   .vertex_dwords = PH_BATCH_VERTEX_DWORDS,
+};
+
+void
+parhelia_batch_negotiate_limits(uint64_t reported_packets,
+                                bool vertex_buffer_mapped,
+                                struct parhelia_batch_limits *limits)
+{
+   unsigned packets = PH_BATCH_LEGACY_PACKETS;
+
+   if (!limits)
+      return;
+   /* Values beyond our allocation ceiling are rejected rather than silently
+    * truncated.  A smaller valid report is honored for compatibility with a
+    * kernel whose descriptor validator is tighter than the legacy ABI. */
+   if (reported_packets && reported_packets <= PH_BATCH_PACKETS)
+      packets = reported_packets;
+   if (packets > PH_BATCH_LEGACY_PACKETS && !vertex_buffer_mapped)
+      packets = PH_BATCH_LEGACY_PACKETS;
+   *limits = (struct parhelia_batch_limits) {
+      .command_dwords = packets > PH_BATCH_LEGACY_PACKETS ?
+                          PH_BATCH_DWORDS : PH_BATCH_LEGACY_DWORDS,
+      .packets = packets,
+      .relocs = packets + 4,
+      .vertex_dwords = vertex_buffer_mapped ? packets * 3 * 10 :
+                                               PH_BATCH_LEGACY_DWORDS,
+   };
+}
+
+int
+parhelia_batch_slice(struct parhelia_batch *dst,
+                     const struct parhelia_batch *src,
+                     const struct parhelia_batch_mark *begin,
+                     const struct parhelia_batch_mark *end)
+{
+   uint64_t vertex_begin, vertex_end;
+
+   if (!dst || !src || !begin || !end ||
+       begin->command_dwords > end->command_dwords ||
+       begin->packets > end->packets || begin->relocs > end->relocs ||
+       begin->vertex_dwords > end->vertex_dwords ||
+       end->command_dwords > src->command_count ||
+       end->packets > src->packet_count || end->relocs > src->reloc_count ||
+       end->vertex_dwords > PH_BATCH_VERTEX_DWORDS ||
+       end->command_dwords - begin->command_dwords > PH_BATCH_DWORDS ||
+       end->packets - begin->packets > PH_BATCH_PACKETS ||
+       end->relocs - begin->relocs > PH_BATCH_RELOCS)
+      return -EINVAL;
+   vertex_begin = (uint64_t)begin->vertex_dwords * sizeof(uint32_t);
+   vertex_end = (uint64_t)end->vertex_dwords * sizeof(uint32_t);
+   memset(dst, 0, sizeof(*dst));
+   dst->command_count = end->command_dwords - begin->command_dwords;
+   dst->packet_count = end->packets - begin->packets;
+   dst->reloc_count = end->relocs - begin->relocs;
+   memcpy(dst->commands, src->commands + begin->command_dwords,
+          dst->command_count * sizeof(dst->commands[0]));
+   for (unsigned i = 0; i < dst->packet_count; i++) {
+      const struct drm_parhelia_packet *packet =
+         &src->packets[begin->packets + i];
+
+      if (packet->offset < begin->command_dwords ||
+          packet->offset > end->command_dwords ||
+          packet->length > end->command_dwords - packet->offset)
+         return -EINVAL;
+      dst->packets[i] = *packet;
+      dst->packets[i].offset -= begin->command_dwords;
+   }
+   for (unsigned i = 0; i < dst->reloc_count; i++) {
+      const struct drm_parhelia_reloc *reloc =
+         &src->relocs[begin->relocs + i];
+      uint64_t range_end = (uint64_t)reloc->dword + reloc->delta;
+
+      if (reloc->packet < begin->packets || reloc->packet >= end->packets)
+         return -EINVAL;
+      dst->relocs[i] = *reloc;
+      dst->relocs[i].packet -= begin->packets;
+      if (reloc->type == PARHELIA_RELOC_DRAW) {
+         if (reloc->dword < vertex_begin || range_end > vertex_end)
+            return -EINVAL;
+         dst->relocs[i].dword -= vertex_begin;
+      }
+   }
+   return 0;
+}
+
 static bool
 compact_state_packets_enabled(void)
 {
@@ -70,8 +159,10 @@ parhelia_batch_clear_surface(struct parhelia_batch *batch, uint32_t handle,
       return -EINVAL;
    if (format != 0x32 && format != 0x36)
       return -EINVAL;
-   memset(batch, 0, sizeof(*batch));
-   p3d_cs_init(&cs, batch->commands, PH_BATCH_DWORDS, ring,
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_clear(&cs, &surface, value, 0, 0, width, height);
    return batch_finish(batch, &cs, calls, handle, 0, 0, 0, 0, 0, 0, false);
@@ -100,8 +191,10 @@ parhelia_batch_blit(struct parhelia_batch *batch,
        dst_y > 0xffff || src_y > 0xffff ||
        height > 0xffff - dst_y || height > 0xffff - src_y)
       return -EINVAL;
-   memset(batch, 0, sizeof(*batch));
-   p3d_cs_init(&cs, batch->commands, PH_BATCH_DWORDS, ring,
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_blit(&cs, &dst, dst_type, dst_x, dst_y,
                  &src, src_type, src_x, src_y, width, height);
@@ -202,8 +295,10 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
       return -EINVAL;
    state = *input;
    state.fence = 0; /* global counter and final drain remain kernel-owned */
-   memset(batch, 0, sizeof(*batch));
-   p3d_cs_init(&cs, batch->commands, PH_BATCH_DWORDS, ring,
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_state(&cs, &state);
    if (state.bound_ranges)
@@ -419,28 +514,36 @@ parhelia_batch_submit_async(int fd, const struct parhelia_batch *batch,
 }
 
 int
-parhelia_batch_append(struct parhelia_batch *dst, uint32_t *dst_vertices,
-                      unsigned *dst_vertex_dwords,
-                      const struct parhelia_batch *src,
-                      const void *src_vertices, unsigned src_vertex_dwords)
+parhelia_batch_append_limited(struct parhelia_batch *dst,
+                              uint32_t *dst_vertices,
+                              unsigned *dst_vertex_dwords,
+                              const struct parhelia_batch *src,
+                              const void *src_vertices,
+                              unsigned src_vertex_dwords,
+                              const struct parhelia_batch_limits *limits)
 {
    unsigned command_base, packet_base, vertex_base;
 
-   if (!dst || !dst_vertices || !dst_vertex_dwords || !src ||
+   if (!dst || !dst_vertices || !dst_vertex_dwords || !src || !limits ||
        (!src_vertices && src_vertex_dwords) ||
-       dst->command_count > PH_BATCH_DWORDS ||
-       dst->packet_count > PH_BATCH_PACKETS ||
-       dst->reloc_count > PH_BATCH_RELOCS ||
-       *dst_vertex_dwords > PH_BATCH_VERTEX_DWORDS ||
-       src->command_count > PH_BATCH_DWORDS ||
-       src->packet_count > PH_BATCH_PACKETS ||
-       src->reloc_count > PH_BATCH_RELOCS ||
-       src_vertex_dwords > PH_BATCH_VERTEX_DWORDS)
+       !limits->command_dwords || limits->command_dwords > PH_BATCH_DWORDS ||
+       !limits->packets || limits->packets > PH_BATCH_PACKETS ||
+       limits->relocs < limits->packets || limits->relocs > PH_BATCH_RELOCS ||
+       !limits->vertex_dwords ||
+       limits->vertex_dwords > PH_BATCH_VERTEX_DWORDS ||
+       dst->command_count > limits->command_dwords ||
+       dst->packet_count > limits->packets ||
+       dst->reloc_count > limits->relocs ||
+       *dst_vertex_dwords > limits->vertex_dwords ||
+       src->command_count > limits->command_dwords ||
+       src->packet_count > limits->packets ||
+       src->reloc_count > limits->relocs ||
+       src_vertex_dwords > limits->vertex_dwords)
       return -EINVAL;
-   if (src->command_count > PH_BATCH_DWORDS - dst->command_count ||
-       src->packet_count > PH_BATCH_PACKETS - dst->packet_count ||
-       src->reloc_count > PH_BATCH_RELOCS - dst->reloc_count ||
-       src_vertex_dwords > PH_BATCH_VERTEX_DWORDS - *dst_vertex_dwords)
+   if (src->command_count > limits->command_dwords - dst->command_count ||
+       src->packet_count > limits->packets - dst->packet_count ||
+       src->reloc_count > limits->relocs - dst->reloc_count ||
+       src_vertex_dwords > limits->vertex_dwords - *dst_vertex_dwords)
       return -E2BIG;
 
    for (unsigned i = 0; i < src->packet_count; i++) {
@@ -464,7 +567,9 @@ parhelia_batch_append(struct parhelia_batch *dst, uint32_t *dst_vertices,
          uint64_t end = (uint64_t)reloc->dword + reloc->delta;
 
          if (reloc->handle || (reloc->dword & 3) || !reloc->delta ||
-             (reloc->delta & 3) || end > (uint64_t)src_vertex_dwords * 4)
+             (reloc->delta & 3) ||
+             reloc->delta > PH_BATCH_MAX_DRAW_DWORDS * sizeof(uint32_t) ||
+             end > (uint64_t)src_vertex_dwords * 4)
             return -EINVAL;
       }
    }
@@ -495,24 +600,37 @@ parhelia_batch_append(struct parhelia_batch *dst, uint32_t *dst_vertices,
 }
 
 int
-parhelia_batch_append_same_state(struct parhelia_batch *dst,
-                                 uint32_t *dst_vertices,
-                                 unsigned *dst_vertex_dwords,
-                                 const struct parhelia_batch *src,
-                                 const void *src_vertices,
-                                 unsigned src_vertex_dwords)
+parhelia_batch_append(struct parhelia_batch *dst, uint32_t *dst_vertices,
+                      unsigned *dst_vertex_dwords,
+                      const struct parhelia_batch *src,
+                      const void *src_vertices, unsigned src_vertex_dwords)
 {
-   struct parhelia_batch tail = {0};
+   return parhelia_batch_append_limited(dst, dst_vertices, dst_vertex_dwords,
+                                        src, src_vertices, src_vertex_dwords,
+                                        &maximum_batch_limits);
+}
+
+int
+parhelia_batch_append_same_state_limited(
+   struct parhelia_batch *dst, uint32_t *dst_vertices,
+   unsigned *dst_vertex_dwords, const struct parhelia_batch *src,
+   const void *src_vertices, unsigned src_vertex_dwords,
+   const struct parhelia_batch_limits *limits)
+{
+   struct parhelia_batch *tail;
    unsigned dst_draw = dst ? dst->packet_count : 0;
    unsigned src_draw = src ? src->packet_count : 0;
    unsigned dst_state_relocs = 0, src_state_relocs = 0;
    uint32_t draw_delta = 0;
+   int ret;
 
    if (!dst || !src)
       return -EINVAL;
    if (!dst->packet_count)
-      return parhelia_batch_append(dst, dst_vertices, dst_vertex_dwords,
-                                   src, src_vertices, src_vertex_dwords);
+      return parhelia_batch_append_limited(dst, dst_vertices,
+                                           dst_vertex_dwords, src,
+                                           src_vertices, src_vertex_dwords,
+                                           limits);
    for (unsigned i = 0; i < dst->packet_count; i++)
       if ((dst->commands[dst->packets[i].offset] >> 24) == 0x97) {
          dst_draw = i;
@@ -577,41 +695,69 @@ parhelia_batch_append_same_state(struct parhelia_batch *dst,
          return -EAGAIN;
    }
 
+   tail = malloc(sizeof(*tail));
+   if (!tail)
+      return -ENOMEM;
+   tail->command_count = 0;
+   tail->packet_count = 0;
+   tail->reloc_count = 0;
    for (unsigned i = src_draw; i < src->packet_count; i++) {
       const struct drm_parhelia_packet *packet = &src->packets[i];
 
-      if (packet->length > PH_BATCH_DWORDS - tail.command_count)
-         return -E2BIG;
-      tail.packets[tail.packet_count++] = (struct drm_parhelia_packet) {
-         .offset = tail.command_count,
+      if (packet->length > PH_BATCH_DWORDS - tail->command_count) {
+         ret = -E2BIG;
+         goto out;
+      }
+      tail->packets[tail->packet_count++] = (struct drm_parhelia_packet) {
+         .offset = tail->command_count,
          .length = packet->length,
       };
-      memcpy(tail.commands + tail.command_count,
+      memcpy(tail->commands + tail->command_count,
              src->commands + packet->offset,
              packet->length * sizeof(src->commands[0]));
-      tail.command_count += packet->length;
+      tail->command_count += packet->length;
       for (unsigned r = 0; r < src->reloc_count; r++)
          if (src->relocs[r].packet == i) {
             if (src->relocs[r].type != PARHELIA_RELOC_DRAW ||
-                tail.reloc_count == PH_BATCH_RELOCS)
-               return -EAGAIN;
-            tail.relocs[tail.reloc_count] = src->relocs[r];
-            tail.relocs[tail.reloc_count++].packet = tail.packet_count - 1;
+                tail->reloc_count == PH_BATCH_RELOCS) {
+               ret = -EAGAIN;
+               goto out;
+            }
+            tail->relocs[tail->reloc_count] = src->relocs[r];
+            tail->relocs[tail->reloc_count++].packet = tail->packet_count - 1;
          }
    }
-   if (tail.reloc_count != tail.packet_count)
-      return -EAGAIN;
-   return parhelia_batch_append(dst, dst_vertices, dst_vertex_dwords,
-                                &tail, src_vertices, src_vertex_dwords);
+   if (tail->reloc_count != tail->packet_count) {
+      ret = -EAGAIN;
+      goto out;
+   }
+   ret = parhelia_batch_append_limited(dst, dst_vertices, dst_vertex_dwords,
+                                       tail, src_vertices,
+                                       src_vertex_dwords, limits);
+out:
+   free(tail);
+   return ret;
 }
 
 int
-parhelia_batch_append_stateful(struct parhelia_batch *dst,
-                               uint32_t *dst_vertices,
-                               unsigned *dst_vertex_dwords,
-                               const struct parhelia_batch *src,
-                               const void *src_vertices,
-                               unsigned src_vertex_dwords)
+parhelia_batch_append_same_state(struct parhelia_batch *dst,
+                                 uint32_t *dst_vertices,
+                                 unsigned *dst_vertex_dwords,
+                                 const struct parhelia_batch *src,
+                                 const void *src_vertices,
+                                 unsigned src_vertex_dwords)
+{
+   return parhelia_batch_append_same_state_limited(
+      dst, dst_vertices, dst_vertex_dwords, src, src_vertices,
+      src_vertex_dwords, &maximum_batch_limits);
+}
+
+int
+parhelia_batch_append_stateful_limited(
+   struct parhelia_batch *dst, uint32_t *dst_vertices,
+   unsigned *dst_vertex_dwords, const struct parhelia_batch *src,
+   const void *src_vertices, unsigned src_vertex_dwords,
+   const struct parhelia_batch_limits *limits)
 {
    unsigned boundary_reloc;
    int ret;
@@ -619,21 +765,25 @@ parhelia_batch_append_stateful(struct parhelia_batch *dst,
    if (!dst || !src)
       return -EINVAL;
    if (!dst->packet_count)
-      return parhelia_batch_append(dst, dst_vertices, dst_vertex_dwords,
-                                   src, src_vertices, src_vertex_dwords);
+      return parhelia_batch_append_limited(dst, dst_vertices,
+                                           dst_vertex_dwords, src,
+                                           src_vertices, src_vertex_dwords,
+                                           limits);
    for (unsigned i = 0; i < dst->reloc_count; i++)
       if (dst->relocs[i].type == PARHELIA_RELOC_BATCH_BOUNDARY)
          return -E2BIG;
-   if (dst->reloc_count >= PH_BATCH_RELOCS ||
-       src->reloc_count >= PH_BATCH_RELOCS - dst->reloc_count)
+   if (!limits || !limits->relocs || limits->relocs > PH_BATCH_RELOCS ||
+       dst->reloc_count >= limits->relocs ||
+       src->reloc_count >= limits->relocs - dst->reloc_count)
       return -E2BIG;
 
    /* parhelia_batch_append() validates all source ranges and capacity before
     * changing dst.  Reserve the boundary only after that validation succeeds,
     * then move it ahead of the newly appended relocations. */
    boundary_reloc = dst->reloc_count;
-   ret = parhelia_batch_append(dst, dst_vertices, dst_vertex_dwords,
-                               src, src_vertices, src_vertex_dwords);
+   ret = parhelia_batch_append_limited(dst, dst_vertices, dst_vertex_dwords,
+                                       src, src_vertices,
+                                       src_vertex_dwords, limits);
    if (ret)
       return ret;
    memmove(&dst->relocs[boundary_reloc + 1],
@@ -645,6 +795,19 @@ parhelia_batch_append_stateful(struct parhelia_batch *dst,
    };
    dst->reloc_count++;
    return 0;
+}
+
+int
+parhelia_batch_append_stateful(struct parhelia_batch *dst,
+                               uint32_t *dst_vertices,
+                               unsigned *dst_vertex_dwords,
+                               const struct parhelia_batch *src,
+                               const void *src_vertices,
+                               unsigned src_vertex_dwords)
+{
+   return parhelia_batch_append_stateful_limited(
+      dst, dst_vertices, dst_vertex_dwords, src, src_vertices,
+      src_vertex_dwords, &maximum_batch_limits);
 }
 
 #define PH_COMPACT_REGLIST_DWORDS 64
@@ -712,9 +875,10 @@ int
 parhelia_batch_compact_reglists(struct parhelia_batch *dst,
                                 const struct parhelia_batch *src)
 {
-   struct parhelia_batch out = {0};
+   struct parhelia_batch *out;
    unsigned packet_map[PH_BATCH_PACKETS];
    bool previous_compactable = false;
+   int ret = 0;
 
    if (!dst || !src || src->command_count > PH_BATCH_DWORDS ||
        src->packet_count > PH_BATCH_PACKETS ||
@@ -723,6 +887,12 @@ parhelia_batch_compact_reglists(struct parhelia_batch *dst,
    for (unsigned r = 0; r < src->reloc_count; r++)
       if (src->relocs[r].packet >= src->packet_count)
          return -EINVAL;
+   out = malloc(sizeof(*out));
+   if (!out)
+      return -ENOMEM;
+   out->command_count = 0;
+   out->packet_count = 0;
+   out->reloc_count = 0;
 
    /* A range-stream relocation owns the first packet of an exact direct-fetch
     * tail.  That packet and every packet after it are already barriers (stream,
@@ -736,53 +906,67 @@ parhelia_batch_compact_reglists(struct parhelia_batch *dst,
       bool has_reloc = false, compactable, merge;
 
       if (packet->offset > src->command_count ||
-          packet->length > src->command_count - packet->offset)
-         return -EINVAL;
+          packet->length > src->command_count - packet->offset) {
+         ret = -EINVAL;
+         goto out_free;
+      }
       cmd = src->commands + packet->offset;
       for (unsigned r = 0; r < src->reloc_count; r++)
          has_reloc |= src->relocs[r].packet == i;
       compactable = !has_reloc && compact_reglist_packet(cmd, packet->length);
-      merge = compactable && previous_compactable && out.packet_count &&
-              out.packets[out.packet_count - 1].length <=
+      merge = compactable && previous_compactable && out->packet_count &&
+              out->packets[out->packet_count - 1].length <=
                  PH_COMPACT_REGLIST_DWORDS &&
               packet->length - 1 <= PH_COMPACT_REGLIST_DWORDS -
-                                     out.packets[out.packet_count - 1].length;
+                                     out->packets[out->packet_count - 1].length;
 
       if (merge) {
          struct drm_parhelia_packet *previous =
-            &out.packets[out.packet_count - 1];
-         uint32_t *previous_cmd = out.commands + previous->offset;
+            &out->packets[out->packet_count - 1];
+         uint32_t *previous_cmd = out->commands + previous->offset;
 
-         memcpy(out.commands + out.command_count, cmd + 1,
+         memcpy(out->commands + out->command_count, cmd + 1,
                 (packet->length - 1) * sizeof(cmd[0]));
-         out.command_count += packet->length - 1;
+         out->command_count += packet->length - 1;
          previous->length += packet->length - 1;
          previous_cmd[0] = (previous_cmd[0] & 0xffff0000u) |
                            (previous->length - 2);
-         packet_map[i] = out.packet_count - 1;
+         packet_map[i] = out->packet_count - 1;
       } else {
-         if (out.packet_count == PH_BATCH_PACKETS ||
-             packet->length > PH_BATCH_DWORDS - out.command_count)
-            return -E2BIG;
-         packet_map[i] = out.packet_count;
-         out.packets[out.packet_count++] = (struct drm_parhelia_packet) {
-            .offset = out.command_count,
+         if (out->packet_count == PH_BATCH_PACKETS ||
+             packet->length > PH_BATCH_DWORDS - out->command_count) {
+            ret = -E2BIG;
+            goto out_free;
+         }
+         packet_map[i] = out->packet_count;
+         out->packets[out->packet_count++] = (struct drm_parhelia_packet) {
+            .offset = out->command_count,
             .length = packet->length,
          };
-         memcpy(out.commands + out.command_count, cmd,
+         memcpy(out->commands + out->command_count, cmd,
                 packet->length * sizeof(cmd[0]));
-         out.command_count += packet->length;
+         out->command_count += packet->length;
       }
       previous_compactable = compactable;
    }
 
    for (unsigned r = 0; r < src->reloc_count; r++) {
-      out.relocs[r] = src->relocs[r];
-      out.relocs[r].packet = packet_map[src->relocs[r].packet];
+      out->relocs[r] = src->relocs[r];
+      out->relocs[r].packet = packet_map[src->relocs[r].packet];
    }
-   out.reloc_count = src->reloc_count;
-   *dst = out;
-   return 0;
+   out->reloc_count = src->reloc_count;
+   memcpy(dst->commands, out->commands,
+          out->command_count * sizeof(out->commands[0]));
+   memcpy(dst->packets, out->packets,
+          out->packet_count * sizeof(out->packets[0]));
+   memcpy(dst->relocs, out->relocs,
+          out->reloc_count * sizeof(out->relocs[0]));
+   dst->command_count = out->command_count;
+   dst->packet_count = out->packet_count;
+   dst->reloc_count = out->reloc_count;
+out_free:
+   free(out);
+   return ret;
 }
 
 int
@@ -835,7 +1019,8 @@ parhelia_batch_vram_relocs(const struct parhelia_batch *batch,
       if (src->type != PARHELIA_RELOC_DRAW)
          continue;
       if (saw_range || src->handle || (src->dword & 3) || !src->delta ||
-          (src->delta & 3))
+          (src->delta & 3) ||
+          src->delta > PH_BATCH_MAX_DRAW_DWORDS * sizeof(uint32_t))
          return -EINVAL;
       end = (uint64_t)src->dword + src->delta;
       if (end > bytes)
@@ -990,8 +1175,10 @@ parhelia_batch_mode7_screen_test(struct parhelia_batch *batch,
        index_offset < vertex_offset + vertex_count * vertex_dwords * 4)
       return -EINVAL;
 
-   memset(batch, 0, sizeof(*batch));
-   p3d_cs_init(&cs, batch->commands, PH_BATCH_DWORDS, ring,
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_state(&cs, &state);
    stream_packet = cs.rel_len;
@@ -1134,8 +1321,10 @@ parhelia_batch_mode3_screen_test(struct parhelia_batch *batch,
        range_case > PARHELIA_MODE3_TWO_PACKETS ||
        (!depth_handle && range_case != PARHELIA_MODE3_ONE_RANGE))
       return -EINVAL;
-   memset(batch, 0, sizeof(*batch));
-   p3d_cs_init(&cs, batch->commands, PH_BATCH_DWORDS, ring,
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_state(&cs, &state);
    stream_packet = cs.rel_len;

@@ -20,6 +20,8 @@ struct parhelia_screen {
    bool stateful_submit;
    bool native_share;
    bool texture_upload;
+   /* Zero means GET_PARAM was unavailable or returned an invalid value. */
+   uint32_t kernel_max_packets;
    uint64_t vram_size;
 };
 

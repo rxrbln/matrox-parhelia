@@ -183,7 +183,7 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
 void
 ph_resource_resolve_linear(struct parhelia_resource *r)
 {
-   struct parhelia_batch batch;
+   struct parhelia_batch *batch = NULL;
    uint32_t fence;
    int ret = -EINVAL;
 
@@ -192,15 +192,18 @@ ph_resource_resolve_linear(struct parhelia_resource *r)
    if (!getenv("PARHELIA_CPU_BLIT") &&
        r->handle && r->linear_handle && !(r->linear_stride & 3) &&
        r->linear_stride / 4 <= 0x3fff) {
-      ret = parhelia_batch_blit(&batch,
+      batch = calloc(1, sizeof(*batch));
+      if (batch)
+         ret = parhelia_batch_blit(batch,
                                 r->linear_handle, r->linear_stride / 4,
                                 1, 0, 0,
                                 r->handle, r->stride, 2, 0, 0,
                                 r->base.width0, r->base.height0);
       if (!ret)
-         ret = parhelia_batch_submit(ph_screen(r->base.screen)->fd, &batch,
+         ret = parhelia_batch_submit(ph_screen(r->base.screen)->fd, batch,
                                      NULL, 0, &fence);
       if (!ret) {
+         free(batch);
          r->tiled_dirty = false;
          r->linear_dirty = false;
          if (getenv("PARHELIA_TRACE"))
@@ -210,6 +213,7 @@ ph_resource_resolve_linear(struct parhelia_resource *r)
                     r->base.width0, r->base.height0);
          return;
       }
+      free(batch);
    }
    if (getenv("PARHELIA_TRACE"))
       fprintf(stderr,
@@ -228,7 +232,7 @@ ph_resource_resolve_linear(struct parhelia_resource *r)
 void
 ph_resource_upload_tiled(struct parhelia_resource *r)
 {
-   struct parhelia_batch batch;
+   struct parhelia_batch *batch = NULL;
    uint32_t fence;
    int ret = -EINVAL;
 
@@ -238,13 +242,16 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
    if (!getenv("PARHELIA_CPU_BLIT") &&
        r->handle && r->linear_handle && !(r->linear_stride & 3) &&
        r->linear_stride / 4 <= 0x3fff) {
-      ret = parhelia_batch_blit(&batch, r->handle, r->stride, 2, 0, 0,
+      batch = calloc(1, sizeof(*batch));
+      if (batch)
+         ret = parhelia_batch_blit(batch, r->handle, r->stride, 2, 0, 0,
                                 r->linear_handle, r->linear_stride / 4,
                                 1, 0, 0, r->base.width0, r->base.height0);
       if (!ret)
-         ret = parhelia_batch_submit(ph_screen(r->base.screen)->fd, &batch,
+         ret = parhelia_batch_submit(ph_screen(r->base.screen)->fd, batch,
                                      NULL, 0, &fence);
       if (!ret) {
+         free(batch);
          r->linear_dirty = false;
          if (getenv("PARHELIA_TRACE"))
             fprintf(stderr,
@@ -253,6 +260,7 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
                     r->base.width0, r->base.height0);
          return;
       }
+      free(batch);
    }
    if (getenv("PARHELIA_TRACE"))
       fprintf(stderr,
@@ -798,6 +806,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param texture_upload = {
       .param = PARHELIA_PARAM_TEXTURE_UPLOAD,
    };
+   struct drm_parhelia_get_param max_packets = {
+      .param = PARHELIA_PARAM_MAX_PACKETS,
+   };
    (void)config;
    if (!s)
       return NULL;
@@ -830,8 +841,8 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
       pipe_mode.value == PARHELIA_TEXTURE_PIPES_SINGLE;
    s->vram_size = vram.value;
    /* This optional parameter lets new Mesa retain the coherent-DMA path on
-    * older kernels. The P690-only class-0 path is never inferred from a PCI
-    * id alone. */
+    * older kernels. The P690-only CREATE_VERTEX path is never inferred from
+    * a PCI id alone. */
    s->vram_vertex = !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &vertex) &&
                     vertex.value == 1;
    s->bound_range = s->vram_vertex &&
@@ -851,6 +862,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->texture_upload =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &texture_upload) &&
       texture_upload.value == 1;
+   if (!ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &max_packets) &&
+       max_packets.value && max_packets.value <= PH_BATCH_PACKETS)
+      s->kernel_max_packets = max_packets.value;
    /* u_init_pipe_screen_caps() queries DRM_CAP_PRIME through this callback.
     * Install it first so GBM uses the DRI image path for ARGB scanout rather
     * than its restricted dumb-buffer fallback. */

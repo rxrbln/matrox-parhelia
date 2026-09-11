@@ -141,10 +141,16 @@ struct ph_context {
     * visibility boundary is reached.  Resource references keep every GEM
     * handle alive until the kernel has copied and pinned the aggregate. */
    struct parhelia_batch pending_batch;
+   /* Reused per-draw builder storage keeps the expanded aggregate command
+    * allocation off the hot draw-call stack. */
+   struct parhelia_batch build_batch;
    uint32_t pending_vertices[PH_BATCH_VERTEX_DWORDS];
    unsigned pending_vertex_dwords;
+   struct parhelia_batch_limits batch_limits;
    unsigned pending_submit_count;
    unsigned pending_stage_calls;
+   struct parhelia_batch_mark pending_marks[PH_BATCH_PACKETS];
+   unsigned pending_mark_count;
    struct pipe_resource *pending_resources[PH_BATCH_RELOCS];
    unsigned pending_resource_count;
    bool aggregate_batches;
@@ -211,13 +217,14 @@ struct ph_context {
    /* The fallback P690 path packs each logical texture stage for its serial
     * draw.  Proven one-pass MODULATE uses vertices[] directly. */
    float packed_vertices[PH_BATCH_MAX_DRAWS * 3 * 8];
-	/* P690-only persistent class-0 vertex ring. The pointer is a GEM mmap,
+	/* P690-only persistent class-3 vertex ring. The pointer is a GEM mmap,
 	 * never a GPU address; all draw ranges remain kernel relocations. */
 	float *vram_vertices;
 	uint64_t vram_vertex_size;
 	uint32_t vram_vertex_handle;
 	uint32_t vram_vertex_fence[PH_VRAM_VERTEX_SLOTS];
 	unsigned vram_vertex_slot;
+	unsigned vram_vertex_slot_dwords;
 	bool vram_vertex_enabled;
    unsigned triangles;
 };
@@ -246,12 +253,7 @@ ph_triangle_batch_limit(const struct ph_context *ctx)
 static inline unsigned
 ph_pending_vertex_limit(const struct ph_context *ctx)
 {
-   /* Class-3 submits copy vertices through the kernel's 4096-dword coherent
-    * slot.  CREATE_VERTEX relocations name the bounded local-VRAM ring and
-    * carry no submit vertex payload, so their aggregate can instead use all
-    * storage addressable by the 221 one-triangle DRAW packets. */
-   return ctx->vram_vertex_enabled ? PH_BATCH_VERTEX_DWORDS :
-                                     PH_BATCH_DWORDS;
+   return ctx->batch_limits.vertex_dwords;
 }
 
 static int ph_drain_batch(struct ph_context *ctx);
@@ -293,6 +295,7 @@ ph_destroy_vertex_ring(struct ph_context *ctx)
    ctx->vram_vertices = NULL;
    ctx->vram_vertex_size = 0;
    ctx->vram_vertex_handle = 0;
+   ctx->vram_vertex_slot_dwords = 0;
    ctx->vram_vertex_enabled = false;
 }
 
@@ -302,17 +305,23 @@ ph_destroy_vertex_ring(struct ph_context *ctx)
 static void
 ph_create_vertex_ring(struct ph_context *ctx)
 {
-   struct drm_parhelia_create_vertex create = {
-      .size = PH_VRAM_VERTEX_SLOTS * sizeof(ctx->pending_vertices),
-   };
+   struct parhelia_batch_limits mapped_limits;
    struct parhelia_screen *screen = ph_screen(ctx->base.screen);
+   uint64_t slot_bytes;
+   struct drm_parhelia_create_vertex create = {
+      .size = 0,
+   };
    void *map;
 
+   parhelia_batch_negotiate_limits(screen->kernel_max_packets, true,
+                                   &mapped_limits);
+   slot_bytes = (uint64_t)mapped_limits.vertex_dwords * sizeof(uint32_t);
+   create.size = PH_VRAM_VERTEX_SLOTS * slot_bytes;
    if (!screen->vram_vertex ||
        ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_VERTEX, &create))
       return;
    if (!create.handle ||
-       create.size < PH_VRAM_VERTEX_SLOTS * sizeof(ctx->pending_vertices)) {
+       create.size < PH_VRAM_VERTEX_SLOTS * slot_bytes) {
       if (create.handle) {
          struct drm_gem_close close = {.handle = create.handle};
          ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
@@ -329,10 +338,14 @@ ph_create_vertex_ring(struct ph_context *ctx)
    ctx->vram_vertices = map;
    ctx->vram_vertex_size = create.size;
    ctx->vram_vertex_handle = create.handle;
+   ctx->vram_vertex_slot_dwords = mapped_limits.vertex_dwords;
    ctx->vram_vertex_enabled = true;
+   ctx->batch_limits = mapped_limits;
    if (getenv("PARHELIA_TRACE"))
-      fprintf(stderr, "parhelia: enabled P690 class-0 vertex ring handle=%u bytes=%llu\n",
-              create.handle, (unsigned long long)create.size);
+      fprintf(stderr,
+              "parhelia: enabled P690 class-3 DMA vertex ring handle=%u bytes=%llu slot_dwords=%u\n",
+              create.handle, (unsigned long long)create.size,
+              ctx->vram_vertex_slot_dwords);
 }
 
 static int
@@ -344,9 +357,11 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
    uint64_t bytes = (uint64_t)vertex_dwords * sizeof(uint32_t);
 
    if (vertices && vertex_dwords && screen->async_submit &&
-       ctx->vram_vertex_enabled && bytes <= sizeof(ctx->pending_vertices)) {
+       ctx->vram_vertex_enabled &&
+       bytes <= (uint64_t)ctx->vram_vertex_slot_dwords * sizeof(uint32_t)) {
       unsigned slot = ctx->vram_vertex_slot;
-      uint64_t offset = (uint64_t)slot * sizeof(ctx->pending_vertices);
+      uint64_t offset = (uint64_t)slot * ctx->vram_vertex_slot_dwords *
+                        sizeof(uint32_t);
 
       if (ctx->vram_vertex_fence[slot]) {
          ret = parhelia_wait_fence(screen->fd, ctx->vram_vertex_fence[slot],
@@ -382,7 +397,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
    }
    if (vertices && vertex_dwords && !screen->async_submit &&
        ctx->vram_vertex_enabled &&
-       bytes <= sizeof(ctx->pending_vertices)) {
+       bytes <= (uint64_t)ctx->vram_vertex_slot_dwords * sizeof(uint32_t)) {
       /* Async submission can be disabled after a pre-doorbell allocation
        * failure.  Slot zero may still belong to an earlier queued draw at
        * that point, so retire its fence before reusing the synchronous
@@ -482,6 +497,34 @@ ph_batch_has_draw(const struct parhelia_batch *batch)
 }
 
 static int
+ph_submit_state_stream_slices(struct ph_context *ctx)
+{
+   struct parhelia_batch *slice = CALLOC_STRUCT(parhelia_batch);
+   struct parhelia_batch_mark begin = {0};
+   int ret = -ENOMEM;
+
+   if (!slice)
+      return ret;
+   for (unsigned i = 0; i < ctx->pending_mark_count; i++) {
+      const struct parhelia_batch_mark *end = &ctx->pending_marks[i];
+      unsigned vertex_dwords = end->vertex_dwords - begin.vertex_dwords;
+
+      ret = parhelia_batch_slice(slice, &ctx->pending_batch, &begin, end);
+      if (ret)
+         break;
+      ret = ph_submit_batch_now(
+         ctx, slice,
+         vertex_dwords ? ctx->pending_vertices + begin.vertex_dwords : NULL,
+         vertex_dwords);
+      if (ret)
+         break;
+      begin = *end;
+   }
+   FREE(slice);
+   return ret;
+}
+
+static int
 ph_drain_batch(struct ph_context *ctx)
 {
    int ret;
@@ -502,11 +545,22 @@ ph_drain_batch(struct ph_context *ctx)
                              ctx->pending_vertex_dwords ?
                                 ctx->pending_vertices : NULL,
                              ctx->pending_vertex_dwords);
+   /* The kernel returns E2BIG before publishing a primary producer update.
+    * A state-stream aggregate retains every complete original batch, so retry
+    * its recorded slices without dropping commands or reusing a live ring
+    * range.  This also keeps Mesa usable while packet-packing support is being
+    * staged independently from the 1024-descriptor validator. */
+   if (ret == -E2BIG && ctx->aggregate_state_stream &&
+       ctx->pending_mark_count > 1)
+      ret = ph_submit_state_stream_slices(ctx);
    ph_release_pending_resources(ctx);
-   memset(&ctx->pending_batch, 0, sizeof(ctx->pending_batch));
+   ctx->pending_batch.command_count = 0;
+   ctx->pending_batch.packet_count = 0;
+   ctx->pending_batch.reloc_count = 0;
    ctx->pending_vertex_dwords = 0;
    ctx->pending_submit_count = 0;
    ctx->pending_stage_calls = 0;
+   ctx->pending_mark_count = 0;
    if (ret)
       ctx->submit_error = ret;
    return ret;
@@ -564,6 +618,13 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
    if (!ctx->aggregate_batches)
       return ph_submit_batch_now(ctx, batch, vertices, vertex_dwords);
 
+   if (ctx->aggregate_state_stream &&
+       ctx->pending_mark_count >= ctx->batch_limits.packets) {
+      ret = ph_drain_batch(ctx);
+      if (ret)
+         return ret;
+   }
+
    stage_calls = ph_batch_stage_calls(batch);
    draw_batch = ph_batch_has_draw(batch);
    if (ctx->aggregate_state_stream && ctx->pending_batch.packet_count &&
@@ -577,11 +638,11 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
          return ret;
    }
    if (ctx->aggregate_state_stream &&
-       batch->packet_count + stage_calls > PH_BATCH_PACKETS)
+       batch->packet_count + stage_calls > ctx->batch_limits.packets)
       return -E2BIG;
    if (ctx->aggregate_state_stream && ctx->pending_batch.packet_count &&
        ctx->pending_batch.packet_count + ctx->pending_stage_calls +
-          batch->packet_count + stage_calls > PH_BATCH_PACKETS) {
+          batch->packet_count + stage_calls > ctx->batch_limits.packets) {
       ret = ph_drain_batch(ctx);
       if (ret)
          return ret;
@@ -596,43 +657,58 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
          return ret;
    }
    if (ctx->pending_resource_count +
-       ph_pending_new_resources(ctx, resources) > PH_BATCH_RELOCS) {
+       ph_pending_new_resources(ctx, resources) > ctx->batch_limits.relocs) {
       ret = ph_drain_batch(ctx);
       if (ret)
          return ret;
    }
    ret = ctx->aggregate_state_stream ?
-      parhelia_batch_append(
+      parhelia_batch_append_limited(
          &ctx->pending_batch, ctx->pending_vertices,
-         &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords) :
+         &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
+         &ctx->batch_limits) :
       ctx->aggregate_state_batches ?
-      parhelia_batch_append_stateful(
+      parhelia_batch_append_stateful_limited(
          &ctx->pending_batch, ctx->pending_vertices,
-         &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords) :
-      parhelia_batch_append_same_state(
+         &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
+         &ctx->batch_limits) :
+      parhelia_batch_append_same_state_limited(
          &ctx->pending_batch, ctx->pending_vertices,
-         &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords);
+         &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
+         &ctx->batch_limits);
    if ((ret == -E2BIG || ret == -EAGAIN) &&
        ctx->pending_batch.packet_count) {
       ret = ph_drain_batch(ctx);
       if (ret)
          return ret;
       ret = ctx->aggregate_state_stream ?
-         parhelia_batch_append(
+         parhelia_batch_append_limited(
             &ctx->pending_batch, ctx->pending_vertices,
-            &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords) :
+            &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
+            &ctx->batch_limits) :
          ctx->aggregate_state_batches ?
-         parhelia_batch_append_stateful(
+         parhelia_batch_append_stateful_limited(
             &ctx->pending_batch, ctx->pending_vertices,
-            &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords) :
-         parhelia_batch_append_same_state(
+            &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
+            &ctx->batch_limits) :
+         parhelia_batch_append_same_state_limited(
             &ctx->pending_batch, ctx->pending_vertices,
-            &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords);
+            &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
+            &ctx->batch_limits);
    }
    if (ret)
       return ret;
    ctx->pending_submit_count++;
    ctx->pending_stage_calls += stage_calls;
+   if (ctx->aggregate_state_stream) {
+      ctx->pending_marks[ctx->pending_mark_count++] =
+         (struct parhelia_batch_mark) {
+            .command_dwords = ctx->pending_batch.command_count,
+            .packets = ctx->pending_batch.packet_count,
+            .relocs = ctx->pending_batch.reloc_count,
+            .vertex_dwords = ctx->pending_vertex_dwords,
+         };
+   }
    ph_reference_pending_resources(ctx, resources);
    return 0;
 }
@@ -884,12 +960,12 @@ ph_copy_present_quad(struct ph_context *ctx,
    if (!getenv("PARHELIA_CPU_BLIT") &&
        src->linear_handle && !(src->linear_stride & 3) &&
        src->linear_stride / 4 <= 0x3fff) {
-      struct parhelia_batch batch;
+      struct parhelia_batch *batch = &ctx->build_batch;
       int ret = -EINVAL;
 
       if (dst->linear_handle && !(dst->linear_stride & 3) &&
           dst->linear_stride / 4 <= 0x3fff) {
-         ret = parhelia_batch_blit(&batch,
+         ret = parhelia_batch_blit(batch,
                                    dst->linear_handle,
                                    dst->linear_stride / 4,
                                    1, x0, y0,
@@ -898,7 +974,7 @@ ph_copy_present_quad(struct ph_context *ctx,
                                    1, 0, 0, width, height);
          if (!ret)
             ret = parhelia_batch_submit(ph_screen(ctx->base.screen)->fd,
-                                        &batch, NULL, 0, &ctx->fence);
+                                        batch, NULL, 0, &ctx->fence);
       }
       if (!ret) {
          dst->tiled_dirty = false;
@@ -1828,7 +1904,7 @@ ph_cpu_alpha_cutout(struct ph_context *ctx, struct parhelia_resource *color,
 static void
 ph_submit_vertices(struct ph_context *ctx)
 {
-   struct parhelia_batch batch;
+   struct parhelia_batch *batch = &ctx->build_batch;
    struct p3d_state state = {0};
    struct parhelia_resource *color, *depth = NULL;
    struct parhelia_resource *texture = NULL, *texture1 = NULL;
@@ -2162,12 +2238,12 @@ ph_submit_vertices(struct ph_context *ctx)
          lightmap.dw_per_vertex = packed_dpv;
          lightmap.warp_entry = ctx->warp_replace;
          ph_pack_multitex_vertices(ctx, true, depth != NULL);
-         ret = parhelia_batch_state_textured(&batch, color->handle,
+         ret = parhelia_batch_state_textured(batch, color->handle,
                                              depth ? depth->handle : 0,
                                              texture1_handle, &lightmap,
                                              ctx->triangles);
          if (!ret)
-            ret = ph_submit_batch(ctx, &batch, ctx->packed_vertices,
+            ret = ph_submit_batch(ctx, batch, ctx->packed_vertices,
                                   ctx->triangles * 3 * packed_dpv,
                                   color, depth, texture1, NULL);
       } else {
@@ -2176,12 +2252,12 @@ ph_submit_vertices(struct ph_context *ctx)
          state.warp_entry = ctx->fs->uses_color ? ctx->warp_textured :
                             ctx->warp_replace;
          ph_pack_multitex_vertices(ctx, false, depth != NULL);
-         ret = parhelia_batch_state_textured(&batch, color->handle,
+         ret = parhelia_batch_state_textured(batch, color->handle,
                                              depth ? depth->handle : 0,
                                              texture_handle, &state,
                                              ctx->triangles);
          if (!ret)
-            ret = ph_submit_batch(ctx, &batch, ctx->packed_vertices,
+            ret = ph_submit_batch(ctx, batch, ctx->packed_vertices,
                                   ctx->triangles * 3 * packed_dpv,
                                   color, depth, texture, NULL);
       }
@@ -2211,32 +2287,32 @@ ph_submit_vertices(struct ph_context *ctx)
             lightmap.depth_func = P3D_CMP_EQUAL;
          }
          ph_pack_multitex_vertices(ctx, true, depth != NULL);
-         ret = parhelia_batch_state_textured(&batch, color->handle,
+         ret = parhelia_batch_state_textured(batch, color->handle,
                                              depth ? depth->handle : 0,
                                              texture1_handle,
                                              &lightmap, ctx->triangles);
          if (!ret)
-            ret = ph_submit_batch(ctx, &batch, ctx->packed_vertices,
+            ret = ph_submit_batch(ctx, batch, ctx->packed_vertices,
                                   ctx->triangles * 3 * packed_dpv,
                                   color, depth, texture1, NULL);
       }
    } else if (texture1)
-      ret = parhelia_batch_state_multitextured(&batch, color->handle,
+      ret = parhelia_batch_state_multitextured(batch, color->handle,
                                                depth ? depth->handle : 0,
                                                texture_handle,
                                                texture1_handle, &state,
                                                ctx->triangles);
    else if (texture)
-      ret = parhelia_batch_state_textured(&batch, color->handle,
+      ret = parhelia_batch_state_textured(batch, color->handle,
                                           depth ? depth->handle : 0,
                                           texture_handle, &state,
                                           ctx->triangles);
    else
-      ret = parhelia_batch_state(&batch, color->handle,
+      ret = parhelia_batch_state(batch, color->handle,
                                  depth ? depth->handle : 0, &state,
                                  ctx->triangles);
    if (!ret && !submitted)
-      ret = ph_submit_batch(ctx, &batch, ctx->vertices,
+      ret = ph_submit_batch(ctx, batch, ctx->vertices,
                             ctx->triangles * 3 * dpv,
                             color, depth, texture, texture1);
    if (ret)
@@ -3206,7 +3282,7 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
                  unsigned format, uint32_t value, unsigned width,
                  unsigned height)
 {
-   struct parhelia_batch batch;
+   struct parhelia_batch *batch = &ctx->build_batch;
    int ret;
    if (!r || !r->handle || ctx->submit_error)
       return;
@@ -3236,14 +3312,14 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
                  r->tile_layout);
       return;
    }
-   ret = parhelia_batch_clear_surface(&batch, r->handle, width,
+   ret = parhelia_batch_clear_surface(batch, r->handle, width,
                                       ALIGN_POT(height, 32), r->stride,
                                       format, value);
    if (!ret)
       /* A clear has no CPU consumer before the next ordered 3D batch.  Use
        * the same fenced async queue as draws so Q3 does not retire colour and
        * depth clears on the CPU before it can queue world rendering. */
-      ret = ph_submit_batch(ctx, &batch, NULL, 0, r, NULL, NULL, NULL);
+      ret = ph_submit_batch(ctx, batch, NULL, 0, r, NULL, NULL, NULL);
    if (ret)
       ctx->submit_error = ret;
    else
@@ -3853,6 +3929,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       return NULL;
    ctx->base.screen = screen;
    ctx->base.priv = priv;
+   parhelia_batch_negotiate_limits(ph_screen(screen)->kernel_max_packets,
+                                   false, &ctx->batch_limits);
    if (ioctl(ph_screen(screen)->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &warp) ||
        !warp.value || warp.value > UINT32_MAX)
       goto fail;
@@ -3872,11 +3950,6 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->aggregate_batches = ctx->aggregate_state_stream ||
                             ctx->aggregate_state_batches ||
                             getenv("PARHELIA_BATCH_AGGREGATE") != NULL;
-   if (ctx->aggregate_batches && getenv("PARHELIA_TRACE_BATCH"))
-      fprintf(stderr,
-              "parhelia: experimental aggregation enabled: up to %u command dwords, %u class-3/%u class-0 vertex dwords, %u packets, %u relocs\n",
-              PH_BATCH_DWORDS, PH_BATCH_DWORDS, PH_BATCH_VERTEX_DWORDS,
-              PH_BATCH_PACKETS, PH_BATCH_RELOCS);
    if (ctx->aggregate_state_batches && getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: preserving per-state EOB/DWGSYNC boundaries inside aggregate submits\n");
@@ -3960,9 +4033,17 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.sampler_view_release = u_default_sampler_view_release;
    ctx->base.stream_uploader = u_upload_create_default(&ctx->base);
    ctx->base.const_uploader = ctx->base.stream_uploader;
-   if (!ctx->base.stream_uploader)
-      goto fail;
+	if (!ctx->base.stream_uploader)
+	   goto fail;
 	ph_create_vertex_ring(ctx);
+   if (ctx->aggregate_batches && getenv("PARHELIA_TRACE_BATCH"))
+      fprintf(stderr,
+              "parhelia: aggregation limits commands=%u vertices=%u packets=%u relocs=%u kernel_packets=%u dma_ring=%u\n",
+              ctx->batch_limits.command_dwords,
+              ctx->batch_limits.vertex_dwords,
+              ctx->batch_limits.packets, ctx->batch_limits.relocs,
+              ph_screen(screen)->kernel_max_packets,
+              ctx->vram_vertex_enabled);
    return &ctx->base;
 fail:
 	ph_destroy_vertex_ring(ctx);

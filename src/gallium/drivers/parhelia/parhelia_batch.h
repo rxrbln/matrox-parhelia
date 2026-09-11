@@ -2,16 +2,48 @@
 #ifndef PARHELIA_BATCH_H
 #define PARHELIA_BATCH_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "parhelia_drm.h"
 #include "reference/parhelia3d.h"
 
-#define PH_BATCH_PACKETS 221
-#define PH_BATCH_DWORDS 4096
+#define PH_BATCH_LEGACY_PACKETS 221
+#define PH_BATCH_PACKETS 1024
+#define PH_BATCH_LEGACY_DWORDS 4096
+#define PH_BATCH_DWORDS 16384
 #define PH_BATCH_VERTEX_DWORDS (PH_BATCH_PACKETS * 3 * 10)
+#define PH_BATCH_LEGACY_VERTEX_DWORDS (PH_BATCH_LEGACY_PACKETS * 3 * 10)
+#define PH_BATCH_MAX_DRAW_DWORDS 4096
 #define PH_BATCH_MAX_DRAWS 180
 #define PH_BATCH_RELOCS (PH_BATCH_PACKETS + 4)
+
+struct parhelia_batch_limits {
+   unsigned command_dwords;
+   unsigned packets;
+   unsigned relocs;
+   unsigned vertex_dwords;
+};
+
+struct parhelia_batch_mark {
+   unsigned command_dwords;
+   unsigned packets;
+   unsigned relocs;
+   unsigned vertex_dwords;
+};
+
+struct parhelia_batch;
+
+/* A report of zero represents an unavailable or invalid GET_PARAM result.
+ * Capacities above the legacy ABI are enabled only after CREATE_VERTEX has
+ * produced a mapped buffer on the new dedicated-DMA kernel path. */
+void parhelia_batch_negotiate_limits(uint64_t reported_packets,
+                                     bool vertex_buffer_mapped,
+                                     struct parhelia_batch_limits *limits);
+int parhelia_batch_slice(struct parhelia_batch *dst,
+                         const struct parhelia_batch *src,
+                         const struct parhelia_batch_mark *begin,
+                         const struct parhelia_batch_mark *end);
 
 /* No physical addresses or MMIO callbacks cross this interface. */
 struct parhelia_batch {
@@ -85,6 +117,13 @@ int parhelia_batch_append(struct parhelia_batch *dst,
                           const struct parhelia_batch *src,
                           const void *src_vertices,
                           unsigned src_vertex_dwords);
+int parhelia_batch_append_limited(struct parhelia_batch *dst,
+                                  uint32_t *dst_vertices,
+                                  unsigned *dst_vertex_dwords,
+                                  const struct parhelia_batch *src,
+                                  const void *src_vertices,
+                                  unsigned src_vertex_dwords,
+                                  const struct parhelia_batch_limits *limits);
 /* Extend an already queued state batch with only the DRAW tail of a second,
  * byte-identical state batch.  This retains one hardware state/fence cadence
  * and is equivalent to p3d_emit_draws() producing more consecutive draws. */
@@ -94,6 +133,11 @@ int parhelia_batch_append_same_state(struct parhelia_batch *dst,
                                      const struct parhelia_batch *src,
                                      const void *src_vertices,
                                      unsigned src_vertex_dwords);
+int parhelia_batch_append_same_state_limited(
+   struct parhelia_batch *dst, uint32_t *dst_vertices,
+   unsigned *dst_vertex_dwords, const struct parhelia_batch *src,
+   const void *src_vertices, unsigned src_vertex_dwords,
+   const struct parhelia_batch_limits *limits);
 /* Append a complete, possibly different state batch.  Starting with the
  * second batch, a kernel-only logical boundary asks submit to retain the
  * recovered EOB/DWGSYNC/opening cadence between the two packet sequences.
@@ -104,6 +148,11 @@ int parhelia_batch_append_stateful(struct parhelia_batch *dst,
                                    const struct parhelia_batch *src,
                                    const void *src_vertices,
                                    unsigned src_vertex_dwords);
+int parhelia_batch_append_stateful_limited(
+   struct parhelia_batch *dst, uint32_t *dst_vertices,
+   unsigned *dst_vertex_dwords, const struct parhelia_batch *src,
+   const void *src_vertices, unsigned src_vertex_dwords,
+   const struct parhelia_batch_limits *limits);
 /* Coalesce adjacent, ordinary register-list packets while preserving their
  * register-write order.  Packets which carry a relocation or touch a fetch,
  * WARP, surface, texture-bank, draw-arm, fence, or strobe register are hard
@@ -116,7 +165,7 @@ int parhelia_batch_compact_reglists(struct parhelia_batch *dst,
                                     const struct parhelia_batch *src);
 int parhelia_wait_fence(int fd, uint32_t fence, int64_t timeout_ns,
                         uint32_t *completed);
-/* Convert normal kernel-DMA draw relocations to a bounded class-0 P690 VRAM
+/* Convert normal draw relocations to a bounded CREATE_VERTEX class-3 DMA
  * ring range. This has no side effects and is also used by the packet test. */
 int parhelia_batch_vram_relocs(const struct parhelia_batch *batch,
                                uint32_t vertex_handle,
@@ -124,14 +173,15 @@ int parhelia_batch_vram_relocs(const struct parhelia_batch *batch,
                                unsigned vertex_dwords,
                                struct drm_parhelia_reloc *out,
                                unsigned out_count);
-/* The persistent ring is mmaped local VRAM. The kernel verifies the object,
- * pin and every range; callers retain parhelia_batch_submit() as fallback. */
+/* The persistent ring is mapped dedicated DMA32 memory. The kernel verifies
+ * the object and every range; callers retain parhelia_batch_submit() as
+ * fallback. */
 int parhelia_batch_submit_vram(int fd, const struct parhelia_batch *batch,
                                uint32_t vertex_handle,
                                uint32_t vertex_offset,
                                unsigned vertex_dwords,
                                uint32_t *fence);
-/* Async form of the same bounded class-0 relocation.  The caller owns the
+/* Async form of the same bounded class-3 relocation.  The caller owns the
  * mapped subrange until the returned terminal fence has retired. */
 int parhelia_batch_submit_vram_async(int fd, const struct parhelia_batch *batch,
                                      uint32_t vertex_handle,
@@ -140,7 +190,7 @@ int parhelia_batch_submit_vram_async(int fd, const struct parhelia_batch *batch,
                                      uint32_t *fence);
 
 /* Deliberately narrow P690 mode-7 exercise builder.  It is for the DRM
- * screen test only: one untextured interleaved class-0 stream and one u32
+ * screen test only: one untextured interleaved class-3 stream and one u32
  * triangle index list.  Production Gallium submission continues to use the
  * independently proven 0x97 paths until this ABI has hardware evidence. */
 int parhelia_batch_mode7_screen_test(struct parhelia_batch *batch,
