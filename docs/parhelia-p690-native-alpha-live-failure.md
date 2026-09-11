@@ -1,0 +1,100 @@
+# P690 native sampled-alpha live failure
+
+Copyright 2026 Rene Rebe <rene@exactco.de>
+SPDX-License-Identifier: GPL-2.0
+
+## Scope
+
+This note diagnoses the first ioquake3 run with Mesa commit `55fd4aa`, which
+binds the application RGBA texture on unit 0, a padded RGB alpha companion on
+unit 1, and moves `t1.r` into fragment alpha.  The target was the P690 at
+`192.168.1.111`.  The implementation was rolled back after the test; this note
+does not change production code.
+
+## Whole-frame degradation coincides with VRAM placement failure
+
+The first capture, `/tmp/q3-native-alpha.png`, still contains the normal world
+image plus the known patterned HUD.  Later captures progressively lose passes
+and end with large white, black and overexposed areas.  This is not evidence of
+a persistent combiner or depth register leaking into later draws.
+
+The kernel recorded an asynchronous placement failure during the native run at
+01:39:51:
+
+```
+parhelia 0000:01:00.0: async VRAM pin failed: relocation=2 handle=3
+size=1228800 pin_count=0 ret=-12
+parhelia 0000:01:00.0: async submit allocation failed in VRAM relocation pin
+(packets=21 commands=166 relocs=6)
+```
+
+The failed 1,228,800-byte object is a 640 by 480 32-bpp render surface.  This
+proves severe VRAM placement pressure and matches the time of the degraded
+capture.  It does not by itself prove that Mesa lost the draw: the asynchronous
+path handles `-ENOMEM` by disabling async/packet packing and retrying the same
+batch synchronously after the kernel drains its queue.  If that synchronous
+retry also returns `-ENOMEM`, `ph_drain_batch()` copies the error to the
+persistent `ctx->submit_error`; draw, clear, transfer and flush then omit all
+later work.  That behavior exactly explains successive partially drawn frames,
+but a repeat with `PARHELIA_TRACE=1` must record the final submit return to make
+the causal chain conclusive.  Either way, the unnecessary companion footprint
+is a demonstrated placement regression which must be removed.
+
+The live trace contains 344 unique state lines and 312 unique texture handles.
+Counting each handle once, their padded physical dimensions give 7.578125 MiB
+for one 32-bpp companion.
+`ph_prepare_alpha_companions()` currently allocates both `alpha_rgb_handle`
+and `premul_rgb_handle`, even though the one-pass native route binds only the
+former.  The unused premultiplied set doubles the derived texture footprint to
+15.15625 MiB.  Minimum 64 by 64 padding also makes every 2x2, 4x4, 8x8, 16x16
+and 32x32 source consume at least 16 KiB per companion.
+
+The first production correction should therefore make companion preparation
+explicit about which derived images are needed.  The native one-pass route
+must allocate and upload only `alpha_rgb_handle`; the legacy two-pass route is
+the only consumer of `premul_rgb_handle`.  The existing asynchronous
+wait-and-synchronous-retry path should be retained.  If the drained synchronous
+retry still cannot place one request, emit a diagnostic before setting
+`ctx->submit_error`; retrying it indefinitely cannot create another aligned
+VRAM slot.  Removing the unused companion set is the first correction to test
+against that condition.
+
+## The HUD failure is still a spatial unit-1 sampling problem
+
+The 64 by 64 padding experiment did not remove the horizontal HUD pattern.
+The native trace confirms that the affected 32 by 32 resources received 64 by
+64 companions and selected the one-pass route, so a missing selector or an
+unselected companion does not explain the retained artifact.
+
+The passing `--p690-rgb-companion-cutout-probe` is narrower than its summary
+line suggests.  Its mask is cleared uniformly to all-zero or all-one and all
+three vertices use `(s1,t1) = (0,0)`.  It proves all of the following:
+
+* physical-pipe-2 unit 1 can supply `t1.r`;
+* the separate-alpha replicate encoding is correct;
+* alpha rejection precedes colour and depth writes; and
+* accepted fragments write depth.
+
+It does not test coordinate variation, filtering, wrapping, tiled texel
+addressing, or any texel beyond the sample at the origin.  The multitexture
+WARP probe likewise keeps the fragment sampler on unit 0 when it tests the
+second coordinate attribute.  No retained probe currently verifies a spatial
+image fetched through unit 1.
+
+That missing test is the smallest next step.  Extend the offscreen companion
+probe with a 64 by 64 asymmetric mask whose expected output identifies both
+axes, for example:
+
+* red increases with X and green increases with Y, with a unique corner tag;
+* draw two triangles covering a known rectangle with unit-1 coordinates
+  spanning `(0,0)` through `(1,1)`;
+* select `t1.r` into RGB for direct readback, or use alpha test at several
+  thresholds and compare the complete binary silhouette; and
+* run nearest first, then linear and repeat/clamp boundary cases.
+
+Keep unit 0 constant during this test.  If the spatial result fails, vary the
+second-coordinate descriptor/output routing independently of the already
+proved physical-pipe-2 TA source.  Only after that test passes should Q3 use
+the native route.  Changing padding again or changing the alpha comparator
+cannot discriminate the remaining fault because the present uniform probe
+already proves those parts while bypassing the failing spatial behavior.
