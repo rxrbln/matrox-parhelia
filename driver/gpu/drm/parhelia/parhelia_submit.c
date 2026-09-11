@@ -1382,10 +1382,65 @@ static bool parhelia_is_vram_operand(const u32 *cmd, u32 length, u32 dword)
 	return false;
 }
 
+/* Keep one engine-visible allocation wholly inside either physical VRAM bank.
+ * SUN90 encodes bank B at 128 MiB, so a linear surface may not cross the
+ * half-VRAM discontinuity.  Two bounded placements let TTM pack many small
+ * clients into each bank instead of forcing every surface onto a 32 MiB base.
+ */
+static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
+				    u64 vram_size, bool split_banks)
+{
+	u64 vram_pages = vram_size >> PAGE_SHIFT;
+	u64 bank_pages = vram_pages >> 1;
+	u64 bo_pages = PFN_UP(bo->bo.base.size);
+
+	bo->placement.placement = bo->placements;
+	bo->placements[0].mem_type = TTM_PL_VRAM;
+	bo->placements[0].flags = 0;
+	bo->placements[0].fpfn = 0;
+	bo->placements[0].lpfn = split_banks ? bank_pages : 0;
+	bo->placement.num_placement = 1;
+
+	if (!split_banks)
+		return 0;
+	if (!bank_pages || bo_pages > bank_pages)
+		return -E2BIG;
+	bo->placements[1].mem_type = TTM_PL_VRAM;
+	bo->placements[1].flags = 0;
+	bo->placements[1].fpfn = bank_pages;
+	bo->placements[1].lpfn = vram_pages;
+	bo->placement.num_placement = 2;
+	return 0;
+}
+
+static int parhelia_vram_placement_static_selftest(void)
+{
+	struct drm_gem_vram_object bo = { };
+	u64 bank_pages = SZ_64M >> PAGE_SHIFT;
+
+	bo.bo.base.size = SZ_2M;
+	if (parhelia_vram_placement(&bo, SZ_128M, true) ||
+	    bo.placement.placement != bo.placements ||
+	    bo.placement.num_placement != 2 || bo.placements[0].fpfn ||
+	    bo.placements[0].lpfn != bank_pages ||
+	    bo.placements[1].fpfn != bank_pages ||
+	    bo.placements[1].lpfn != 2 * bank_pages)
+		return -EINVAL;
+	bo.bo.base.size = SZ_64M + PAGE_SIZE;
+	if (parhelia_vram_placement(&bo, SZ_128M, true) != -E2BIG)
+		return -EINVAL;
+	bo.bo.base.size = SZ_2M;
+	if (parhelia_vram_placement(&bo, SZ_128M, false) ||
+	    bo.placement.num_placement != 1 || bo.placements[0].lpfn)
+		return -EINVAL;
+	return 0;
+}
+
 /* The public helper only pins plane framebuffers. Render relocations need
  * the same TTM operation, held until the synchronous batch fence retires. */
 int parhelia_vram_pin(struct drm_gem_vram_object *bo)
 {
+	struct parhelia_device *pdev = to_parhelia(bo->bo.base.dev);
 	struct ttm_operation_ctx ctx = { false, false };
 	int ret;
 
@@ -1393,12 +1448,10 @@ int parhelia_vram_pin(struct drm_gem_vram_object *bo)
 	if (ret)
 		return ret;
 	if (!bo->bo.pin_count) {
-		bo->placement.placement = bo->placements;
-		bo->placements[0].mem_type = TTM_PL_VRAM;
-		bo->placements[0].flags = 0;
-		bo->placement.num_placement = 1;
-		bo->placements[0].fpfn = 0;
-		bo->placements[0].lpfn = 0;
+		ret = parhelia_vram_placement(bo, pdev->vram_size,
+			pdev->pdev->device == PARHELIA_P690);
+		if (ret)
+			goto out;
 		ret = ttm_bo_validate(&bo->bo, &bo->placement, &ctx);
 		if (ret)
 			goto out;
@@ -1692,7 +1745,9 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 	u32 i;
 	int ret;
 
-	ret = parhelia_shadow_static_selftest();
+	ret = parhelia_vram_placement_static_selftest();
+	if (!ret)
+		ret = parhelia_shadow_static_selftest();
 	if (!ret)
 		ret = parhelia_shadow_plan_static_selftest();
 	if (!ret)
@@ -2598,18 +2653,11 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 		return -EINVAL;
 	if (!to_parhelia(drm)->raw_aperture_owned)
 		return -EOPNOTSUPP;
-	/* SUN90's two local-memory banks are discontinuous in engine address
-	 * space.  A 640x480 type-2 surface placed at 63 MiB was reproducibly split
-	 * at the physical half-VRAM boundary.  Align each P690 surface base to
-	 * 32 MiB so ordinary render targets cannot straddle that boundary while
-	 * charging TTM only for the tiled extent actually addressed.  Earlier
-	 * silicon retains its hardware-proven 8 KiB surface alignment.
-	 */
-	align_pages = pdev->pdev->device == 0x2539 &&
-		      !(args->flags & (PARHELIA_CREATE_RENDER_LINEAR |
-				       PARHELIA_CREATE_RENDER_TEXTURE)) ?
-			      (32u << 20) / PAGE_SIZE :
-			      max_t(unsigned long, 1, 8192 / PAGE_SIZE);
+	/* parhelia_vram_pin() supplies separate placements for P690's two physical
+	 * banks.  Surface alignment therefore describes the native tile only; a
+	 * 32 MiB object alignment left just three usable anchors and made several
+	 * independent GL clients exhaust VRAM with one-megabyte render targets. */
+	align_pages = max_t(unsigned long, 1, 8192 / PAGE_SIZE);
 	/* Tiled surfaces occupy complete hardware tile rows.  Rounding only the
 	 * final byte count underallocates a partial row whenever pitch spans more
 	 * than one tile (300x300 on P690 was one 4 KiB tile short). */
