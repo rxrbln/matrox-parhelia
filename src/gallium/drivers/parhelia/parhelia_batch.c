@@ -404,7 +404,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 
    if (!batch || !input || !colour_handle || !triangle_count ||
        triangle_count > PH_BATCH_MAX_DRAWS ||
-       (input->prim != P3D_TRIANGLES && input->prim != P3D_LINES) ||
+       (input->prim != P3D_TRIANGLES && input->prim != P3D_LINES &&
+        input->prim != P3D_POINTS) ||
        !input->screen_w || !input->screen_h || input->screen_h > 0xffff ||
        input->screen_w > input->colour.pitch || (input->colour.pitch & 63) ||
        input->colour.pitch > 0x3fff || input->colour.base ||

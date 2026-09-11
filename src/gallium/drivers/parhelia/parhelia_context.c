@@ -258,6 +258,7 @@ struct ph_context {
 	bool vram_vertex_enabled;
    unsigned triangles;
    unsigned lines;
+   unsigned points;
 };
 
 struct ph_stage {
@@ -2578,23 +2579,21 @@ ph_submit_rgb_alpha_two_pass(struct ph_context *ctx,
    return ret;
 }
 
-/* Lines use the ordinary transformed-vertex path, but carry two vertices per
- * relocated DRAW packet.  Keep consecutive compatible callbacks in the same
- * state batch: Q3 issues enough small line lists that rebuilding and appending
- * a complete state stream per segment is measurable even when the eventual
- * kernel submission is aggregated. */
+/* Unit points and lines use the ordinary transformed-vertex path, carrying
+ * one or two vertices per relocated DRAW packet.  Keep consecutive compatible
+ * callbacks in one state batch: rebuilding a complete state stream for each
+ * primitive is measurable even when the kernel submission is aggregated. */
 static void
-ph_submit_lines(struct ph_context *ctx)
+ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
 {
    struct parhelia_batch *batch = &ctx->build_batch;
    struct parhelia_resource *color, *depth = NULL;
-   const struct pipe_rt_blend_state *blend =
-      ctx->blend ? &ctx->blend->rt[0] : NULL;
    struct p3d_state state = {0};
-   unsigned count = ctx->lines;
+   unsigned vertices_per_primitive = p3d_vertices_per_primitive(prim);
+   unsigned count = prim == P3D_POINTS ? ctx->points : ctx->lines;
    int ret;
 
-   if (!count || ctx->submit_error)
+   if (!count || !vertices_per_primitive || ctx->submit_error)
       goto out;
    if (!ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture) {
       ctx->submit_error = -EINVAL;
@@ -2617,7 +2616,7 @@ ph_submit_lines(struct ph_context *ctx)
    state.colour.fmt = 0x32;
    state.screen_w = ctx->fb.width;
    state.screen_h = ctx->fb.height;
-   state.prim = P3D_LINES;
+   state.prim = prim;
    state.warp_entry = ctx->warp_passthrough;
    state.dither = !ctx->blend || ctx->blend->dither;
    state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
@@ -2627,25 +2626,6 @@ ph_submit_lines(struct ph_context *ctx)
       state.depth.pitch = depth->stride;
       state.depth.fmt = 0x36;
       state.depth_slot = 1;
-      state.depth_test = ctx->dsa && ctx->dsa->depth_enabled;
-      state.depth_write = ctx->dsa && ctx->dsa->depth_writemask;
-      state.depth_func = ph_compare(ctx->dsa ? ctx->dsa->depth_func :
-                                               PIPE_FUNC_LESS);
-   }
-   if (ctx->dsa) {
-      state.alpha_test = ctx->dsa->alpha_enabled;
-      state.alpha_func = ph_compare(ctx->dsa->alpha_func);
-      state.alpha_ref = CLAMP((int)lrintf(ctx->dsa->alpha_ref_value * 255.0f),
-                              0, 255);
-   }
-   if (blend) {
-      state.blend = blend->blend_enable;
-      state.blend_src = ph_blend_factor(blend->rgb_src_factor);
-      state.blend_dst = ph_blend_factor(blend->rgb_dst_factor);
-      state.mask_r = !!(blend->colormask & PIPE_MASK_R);
-      state.mask_g = !!(blend->colormask & PIPE_MASK_G);
-      state.mask_b = !!(blend->colormask & PIPE_MASK_B);
-      state.mask_a = !!(blend->colormask & PIPE_MASK_A);
    }
    ph_apply_fragment_state(ctx, &state, depth != NULL);
 
@@ -2653,7 +2633,8 @@ ph_submit_lines(struct ph_context *ctx)
                               depth ? depth->handle : 0, &state, count);
    if (!ret)
       ret = ph_submit_batch(ctx, batch, ctx->vertices,
-                            count * 2 * state.dw_per_vertex,
+                            count * vertices_per_primitive *
+                               state.dw_per_vertex,
                             color, depth, NULL, NULL);
    if (ret) {
       ctx->submit_error = ret;
@@ -2670,10 +2651,14 @@ ph_submit_lines(struct ph_context *ctx)
    }
    if (getenv("PARHELIA_TRACE"))
       fprintf(stderr,
-              "parhelia: submit lines=%u color=%u depth=%u ret=0\n",
-              count, color->handle, depth ? depth->handle : 0);
+              "parhelia: submit %s=%u color=%u depth=%u ret=0\n",
+              prim == P3D_POINTS ? "points" : "lines", count,
+              color->handle, depth ? depth->handle : 0);
 out:
-   ctx->lines = 0;
+   if (prim == P3D_POINTS)
+      ctx->points = 0;
+   else
+      ctx->lines = 0;
 }
 
 static void
@@ -2697,9 +2682,13 @@ ph_submit_vertices(struct ph_context *ctx)
    bool one_pass_multitexture = false;
    int ret;
 
-   assert(!ctx->lines || !ctx->triangles);
+   assert((!!ctx->points + !!ctx->lines + !!ctx->triangles) <= 1);
+   if (ctx->points) {
+      ph_submit_simple_primitives(ctx, P3D_POINTS);
+      return;
+   }
    if (ctx->lines) {
-      ph_submit_lines(ctx);
+      ph_submit_simple_primitives(ctx, P3D_LINES);
       return;
    }
    if (!ctx->triangles || ctx->submit_error)
@@ -3376,7 +3365,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 
    /* Preserve mixed-primitive ordering while allowing every run of compatible
     * line callbacks to share one state block. */
-   if (ctx->lines) {
+   if (ctx->points || ctx->lines) {
       ph_submit_vertices(ctx);
       if (ctx->submit_error)
          return;
@@ -3598,8 +3587,69 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
    ctx->triangles++;
 }
 
-static void ph_stage_point(struct draw_stage *s, struct prim_header *p)
-{ (void)s; (void)p; }
+/* The vendor's GL capture proves the complete unit-point draw delta from a
+ * triangle: class 0, primitive word 0x00060020, raster image 0x04000024 and a
+ * one-vertex byte range.  Its own client produces exactly one covered pixel.
+ * Wider, smoothed, sprite and per-vertex-size points need additional WARP and
+ * coverage state and deliberately remain outside this exact native subset. */
+static void
+ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
+{
+   struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   float *dst;
+   int pos, col;
+   bool has_texture;
+   bool depth;
+   unsigned dpv;
+
+   if (ctx->submit_error || !ctx->fb.nr_cbufs ||
+       !ctx->fb.cbufs[0].texture)
+      return;
+
+   has_texture = ctx->num_sampler_views && ctx->sampler_views[0] &&
+                 ctx->sampler_views[0]->texture;
+   if (has_texture ||
+       (ctx->rasterizer &&
+        (ctx->rasterizer->point_smooth ||
+         ctx->rasterizer->point_quad_rasterization ||
+         ctx->rasterizer->point_size_per_vertex ||
+         ctx->rasterizer->sprite_coord_enable ||
+         fabsf(ctx->rasterizer->point_size - 1.0f) > 0.0001f)))
+      return;
+
+   pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
+   col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
+   if (pos < 0)
+      return;
+
+   if (ctx->triangles || ctx->lines) {
+      ph_submit_vertices(ctx);
+      if (ctx->submit_error)
+         return;
+   }
+   depth = ctx->fb.zsbuf.texture != NULL;
+   dpv = depth ? 6 : 5;
+   if (ctx->points == ph_triangle_batch_limit(ctx) ||
+       (ctx->points + 1) * dpv > ph_logical_vertex_limit(ctx)) {
+      ph_submit_vertices(ctx);
+      if (ctx->submit_error)
+         return;
+   }
+   dst = &ctx->vertices[ctx->points * dpv];
+
+   const float *p = prim->v[0]->data[pos];
+   const float white[4] = {1, 1, 1, 1};
+   const float *c = col < 0 ? white : prim->v[0]->data[col];
+
+   *dst++ = p[0];
+   *dst++ = p[1];
+   if (depth)
+      *dst++ = CLAMP(p[2], 0.0f, 1.0f);
+   *dst++ = c[0];
+   *dst++ = c[1];
+   *dst++ = c[2];
+   ctx->points++;
+}
 
 /* The draw module has already transformed and clipped both endpoints when it
  * reaches this stage.  A unit-width line therefore uses the same window-space
@@ -3639,7 +3689,7 @@ ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
 
    /* A pending triangle batch owns the shared staging array.  Publish it once
     * at the primitive-class transition, then retain following line segments. */
-   if (ctx->triangles) {
+   if (ctx->points || ctx->triangles) {
       ph_submit_vertices(ctx);
       if (ctx->submit_error)
          return;

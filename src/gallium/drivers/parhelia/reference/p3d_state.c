@@ -411,7 +411,11 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	rw[1].val = st->scissor ? ((uint32_t)st->scissor_maxy << 16) |
 	                            st->scissor_maxx :
 	                            (st->screen_h << 16) | st->screen_w;
-	rw[2].reg = P3D_R_RASTERMODE;  rw[2].val = 0x0bb80024u;	/* measured */
+	rw[2].reg = P3D_R_RASTERMODE;
+	/* The vendor's own unit-point draw uses the class-0 raster image.  The
+	 * ordinary triangle/line surface image is different even though the
+	 * decoded low control bits agree. */
+	rw[2].val = st->prim == P3D_POINTS ? 0x04000024u : 0x0bb80024u;
 	rw[3].reg = 0x12f8;            rw[3].val = 0x007fe000u;	/* AA threshold */
 	p3d_reglist(cs, rw, 4);
 
