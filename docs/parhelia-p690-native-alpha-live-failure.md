@@ -66,6 +66,14 @@ The native trace confirms that the affected 32 by 32 resources received 64 by
 64 companions and selected the one-pass route, so a missing selector or an
 unselected companion does not explain the retained artifact.
 
+The target's `pak0.pk3` also resolves two previously anonymous live hashes.
+Computing the driver's FNV-1a value over the decoded BGRA upload bytes gives
+`0xba1b38b73dc17fdd` for `gfx/2d/numbers/one_32b.tga` and
+`0x822adefe62cfcfde` for `gfx/2d/numbers/zero_32b.tga`.  These are the first two
+resources at X positions 2 and 34 in the visibly banded `100` HUD counter.
+The corruption therefore changes the spatial silhouette of known source
+alpha; it is not an unknown animated resource or an incorrect draw selector.
+
 The passing `--p690-rgb-companion-cutout-probe` is narrower than its summary
 line suggests.  Its mask is cleared uniformly to all-zero or all-one and all
 three vertices use `(s1,t1) = (0,0)`.  It proves all of the following:
