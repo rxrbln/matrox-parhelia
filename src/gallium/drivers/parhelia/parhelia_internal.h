@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 #ifndef PARHELIA_INTERNAL_H
 #define PARHELIA_INTERNAL_H
 
@@ -113,6 +114,11 @@ void ph_resource_upload_tiled(struct parhelia_resource *r);
 int ph_resource_upload_texture(struct parhelia_resource *r);
 int ph_resource_upload_shadow(struct parhelia_resource *r);
 int ph_resource_download_shadow(struct parhelia_resource *r);
+/* Transfer only the tile rows holding image rows [y0, y1). */
+int ph_resource_upload_shadow_rows(struct parhelia_resource *r, unsigned y0,
+                                   unsigned y1);
+int ph_resource_download_shadow_rows(struct parhelia_resource *r, unsigned y0,
+                                     unsigned y1);
 struct pipe_context *ph_context_create(struct pipe_screen *screen, void *priv,
                                        unsigned flags);
 

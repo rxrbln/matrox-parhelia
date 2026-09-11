@@ -4724,7 +4724,17 @@ ph_copy_texture_box(struct ph_context *ctx,
     * required before either its linear shadow or its tiled map is sampled. */
    if (ph_wait_async(ctx) || ctx->submit_error)
       return false;
-   if (sr->transfer_shadow && ph_resource_download_shadow(sr))
+   if (sr->transfer_shadow &&
+       ph_resource_download_shadow_rows(sr,
+          src_box->height < 0 ? src_box->y - height : src_box->y,
+          src_box->height < 0 ? src_box->y : src_box->y + height))
+      return false;
+   /* The destination upload publishes whole tile rows; the pixels beside
+    * the copied box must be current in its shadow first. */
+   if (dr->transfer_shadow && (dr->mip_defined & BITFIELD_BIT(0)) &&
+       ph_resource_download_shadow_rows(dr,
+          dst_height < 0 ? dsty - height : dsty,
+          dst_height < 0 ? dsty : dsty + height))
       return false;
 
    /* Imported drawable/renderbuffer resources have a linear companion.
@@ -4802,7 +4812,9 @@ ph_copy_texture_box(struct ph_context *ctx,
    dr->tiled_dirty = dr->map && !dr->linear_map;
    dr->linear_dirty = dr->linear_map && !dr->map;
    if (dr->transfer_shadow) {
-      int ret = ph_resource_upload_shadow(dr);
+      int ret = ph_resource_upload_shadow_rows(dr,
+         dst_height < 0 ? dsty - height : dsty,
+         dst_height < 0 ? dsty : dsty + height);
 
       if (ret) {
          ctx->submit_error = ret;
@@ -5081,7 +5093,9 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
    }
    if ((usage & (PIPE_MAP_READ | PIPE_MAP_WRITE)) && r->transfer_shadow &&
        (r->mip_defined & BITFIELD_BIT(level)) &&
-       ph_resource_download_shadow(r)) {
+       (level ? ph_resource_download_shadow(r) :
+                ph_resource_download_shadow_rows(r, box->y,
+                                                 box->y + box->height))) {
       FREE(t->staging);
       FREE(t);
       return NULL;
@@ -5200,7 +5214,10 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
       r->content_generation++;
       r->mip_defined |= BITFIELD_BIT(transfer->level);
       if (r->transfer_shadow) {
-         int ret = ph_resource_upload_shadow(r);
+         int ret = transfer->level ? ph_resource_upload_shadow(r) :
+                   ph_resource_upload_shadow_rows(r, transfer->box.y,
+                                                  transfer->box.y +
+                                                     transfer->box.height);
 
          if (ret)
             ph_context(p)->submit_error = ret;

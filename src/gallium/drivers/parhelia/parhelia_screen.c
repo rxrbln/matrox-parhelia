@@ -327,43 +327,87 @@ ph_resource_upload_texture(struct parhelia_resource *r)
 
 static int
 ph_resource_shadow_transfer(struct parhelia_resource *r, unsigned long request,
-                            const char *operation)
+                            const char *operation, uint64_t offset,
+                            uint64_t size)
 {
    struct drm_parhelia_upload_render transfer;
 
-   if (!r || !r->transfer_shadow || !r->handle || !r->map || !r->size)
+   if (!r || !r->transfer_shadow || !r->handle || !r->map || !r->size ||
+       offset > r->size || size > r->size - offset)
       return -EINVAL;
+   if (!size)
+      return 0;
    transfer = (struct drm_parhelia_upload_render) {
-      .data = (uintptr_t)r->map,
-      .size = r->size,
+      .data = (uintptr_t)r->map + offset,
+      .offset = offset,
+      .size = size,
       .handle = r->handle,
    };
    if (ioctl(ph_screen(r->base.screen)->fd, request, &transfer)) {
       int ret = -errno;
 
-      fprintf(stderr, "parhelia: %s handle=%u size=%llu failed: %s\n",
-              operation, r->handle, (unsigned long long)r->size,
-              strerror(errno));
+      fprintf(stderr, "parhelia: %s handle=%u offset=%llu size=%llu failed: %s\n",
+              operation, r->handle, (unsigned long long)offset,
+              (unsigned long long)size, strerror(errno));
       return ret;
    }
    if (getenv("PARHELIA_TRACE"))
-      fprintf(stderr, "parhelia: %s handle=%u size=%llu\n", operation,
-              r->handle, (unsigned long long)r->size);
+      fprintf(stderr, "parhelia: %s handle=%u offset=%llu size=%llu\n",
+              operation, r->handle, (unsigned long long)offset,
+              (unsigned long long)size);
    return 0;
+}
+
+/* Image rows [y0, y1) of a render-target BO live in one contiguous byte
+ * range: their whole tile rows. */
+static void
+ph_shadow_row_range(const struct parhelia_resource *r, unsigned y0,
+                    unsigned y1, uint64_t *offset, uint64_t *size)
+{
+   const unsigned th = r->tile_layout == PARHELIA_TILE_64X16_4K ? 16 : 32;
+   const uint64_t tile_row = (uint64_t)r->stride * th * 4;
+   uint64_t end = MIN2(((uint64_t)y1 + th - 1) / th * tile_row, r->size);
+
+   *offset = MIN2((uint64_t)(y0 / th) * tile_row, end);
+   *size = end - *offset;
 }
 
 int
 ph_resource_upload_shadow(struct parhelia_resource *r)
 {
    return ph_resource_shadow_transfer(r, DRM_IOCTL_PARHELIA_UPLOAD_RENDER,
-                                      "render-shadow upload");
+                                      "render-shadow upload", 0,
+                                      r ? r->size : 0);
 }
 
 int
 ph_resource_download_shadow(struct parhelia_resource *r)
 {
    return ph_resource_shadow_transfer(r, DRM_IOCTL_PARHELIA_DOWNLOAD_RENDER,
-                                      "render-shadow download");
+                                      "render-shadow download", 0,
+                                      r ? r->size : 0);
+}
+
+int
+ph_resource_upload_shadow_rows(struct parhelia_resource *r, unsigned y0,
+                               unsigned y1)
+{
+   uint64_t offset, size;
+
+   ph_shadow_row_range(r, y0, y1, &offset, &size);
+   return ph_resource_shadow_transfer(r, DRM_IOCTL_PARHELIA_UPLOAD_RENDER,
+                                      "render-shadow upload", offset, size);
+}
+
+int
+ph_resource_download_shadow_rows(struct parhelia_resource *r, unsigned y0,
+                                 unsigned y1)
+{
+   uint64_t offset, size;
+
+   ph_shadow_row_range(r, y0, y1, &offset, &size);
+   return ph_resource_shadow_transfer(r, DRM_IOCTL_PARHELIA_DOWNLOAD_RENDER,
+                                      "render-shadow download", offset, size);
 }
 
 static struct pipe_resource *
