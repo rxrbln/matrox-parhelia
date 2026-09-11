@@ -404,6 +404,10 @@ struct p3d_state {
 	 * hardware testing proved that the packet boundary supplies the depth
 	 * interlock which a second range in the same packet does not. */
 	int		   bound_ranges;
+	/* Vertices consumed by one draw packet.  Zero keeps one primitive per
+	 * packet (three vertices for a triangle list).  A larger count draws
+	 * several primitives, or a strip, fan or quad run, from one packet. */
+	unsigned	   vertices_per_packet;
 	uint32_t	   fence;	/* first fence tag; steps by 8 per draw */
 };
 
@@ -439,6 +443,8 @@ void	 p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 uint32_t p3d_primword(enum p3d_prim prim);
 uint32_t p3d_prim_class(enum p3d_prim prim);
 unsigned p3d_vertices_per_primitive(enum p3d_prim prim);
+/* Smallest vertex count that draws one primitive of this kind. */
+unsigned p3d_minimum_vertices(enum p3d_prim prim);
 uint32_t p3d_surface_cfg(const struct p3d_surface *s);
 uint32_t p3d_blendctl(const struct p3d_state *st);
 uint32_t p3d_dwgctl(const struct p3d_state *st);

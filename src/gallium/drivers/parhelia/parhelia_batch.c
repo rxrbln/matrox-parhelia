@@ -424,8 +424,16 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 
    if (!batch || !input || !colour_handle || !triangle_count ||
        triangle_count > PH_BATCH_MAX_DRAWS ||
-       (input->prim != P3D_TRIANGLES && input->prim != P3D_LINES &&
-        input->prim != P3D_POINTS) ||
+       input->prim >= P3D_PRIM_COUNT ||
+       ((input->prim != P3D_TRIANGLES && input->prim != P3D_LINES &&
+         input->prim != P3D_POINTS) && !input->vertices_per_packet) ||
+       (input->vertices_per_packet &&
+        (input->vertices_per_packet > PH_BATCH_MAX_PACKET_VERTICES ||
+         input->vertices_per_packet <
+            p3d_minimum_vertices(input->prim) ||
+         (p3d_vertices_per_primitive(input->prim) &&
+          input->vertices_per_packet %
+             p3d_vertices_per_primitive(input->prim)))) ||
        !input->screen_w || !input->screen_h || input->screen_h > 0xffff ||
        input->screen_w > input->colour.pitch || (input->colour.pitch & 63) ||
        input->colour.pitch > 0x3fff || input->colour.base ||
@@ -522,6 +530,7 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
                       state.has_depth ? depth_handle : 0,
                       texture0_handle, texture1_handle, texture_offsets, 0,
                       triangle_count, state.dw_per_vertex,
+                      state.vertices_per_packet ? state.vertices_per_packet :
                       p3d_vertices_per_primitive(state.prim),
                       !!state.bound_ranges);
    /* Q3 reaches this builder with already transformed window-space vertices.

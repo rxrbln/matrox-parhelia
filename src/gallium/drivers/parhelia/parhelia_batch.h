@@ -18,6 +18,8 @@
 #define PH_BATCH_MAX_DRAW_DWORDS 4096
 #define PH_BATCH_STATE_PACKET_RESERVE 64
 #define PH_BATCH_MAX_DRAWS (PH_BATCH_PACKETS - PH_BATCH_STATE_PACKET_RESERVE)
+/* Vertices one draw packet may consume; the vendor's own packets hold 24. */
+#define PH_BATCH_MAX_PACKET_VERTICES 64u
 #define PH_BATCH_RELOCS (PH_BATCH_PACKETS + 4)
 /* The P690 primary ring has 224 CALL slots.  A normal submission consumes
  * three of them for its opening, EOB and terminal drain blocks. */

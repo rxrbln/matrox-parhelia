@@ -69,6 +69,22 @@ p3d_vertices_per_primitive(enum p3d_prim prim)
 	}
 }
 
+unsigned
+p3d_minimum_vertices(enum p3d_prim prim)
+{
+	switch (prim) {
+	case P3D_POINTS:
+		return 1;
+	case P3D_LINES:
+	case P3D_LINESTRIP:
+		return 2;
+	case P3D_QUADS:
+		return 4;
+	default:
+		return 3;
+	}
+}
+
 /* The vendor turns the blender off when src=ONE, dst=ZERO on both pipes, which
  * is a no-op; that is an optimisation, so it is reproduced here only in that it
  * gives byte-identity with the capture's disabled state. */
