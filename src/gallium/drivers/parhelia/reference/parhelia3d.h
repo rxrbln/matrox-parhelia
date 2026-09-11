@@ -60,6 +60,7 @@
 #define P3D_R_TEX_CACHE		0x11e8
 #define P3D_R_DEPTH_STATE	0x11f4
 #define P3D_R_ZFUNC		0x12c8	/* [0] test enable, [3:1] compare func */
+#define P3D_R_STENCIL_REF	0x12cc	/* compare mask [7:0], reference [15:8] */
 #define P3D_R_ZWRITE		0x12d0	/* bit 8 = depth write enable */
 #define P3D_R_ALPHATEST		0x12e4	/* [0] enable, [3:1] compare, [15:8] ref */
 #define P3D_R_COLMASK		0x1324	/* colour write mask, byte per channel */
@@ -263,6 +264,18 @@ enum p3d_cmp {
 	P3D_CMP_NOTEQUAL = 6,
 	P3D_CMP_ALWAYS	 = 7,
 };
+
+/* Packed 0x12c8 stencil operations recovered from the Windows ICD. */
+enum p3d_stencil_op {
+	P3D_STENCIL_KEEP = 0,
+	P3D_STENCIL_REPLACE = 1,
+	P3D_STENCIL_INVERT = 2,
+	P3D_STENCIL_ZERO = 3,
+	P3D_STENCIL_INCR_WRAP = 4,
+	P3D_STENCIL_DECR_WRAP = 5,
+	P3D_STENCIL_INCR_SAT = 6,
+	P3D_STENCIL_DECR_SAT = 7,
+};
 #define P3D_Z_LESS	P3D_CMP_LESS
 #define P3D_Z_GEQUAL	P3D_CMP_GEQUAL
 typedef enum p3d_cmp p3d_zfunc_t;
@@ -276,6 +289,10 @@ struct p3d_state {
 	uint32_t	   depth_raw;	/* whole 0x12c8 value; overrides the above */
 	uint32_t	   comb_op;	/* probe: opcode base OR'd into 0x126c/0x1268 */
 	int		   depth_write;	/* 0x12d0 bit 8 */
+	int		   stencil_test;
+	enum p3d_cmp	   stencil_func;
+	enum p3d_stencil_op stencil_fail, stencil_zfail, stencil_zpass;
+	uint8_t		   stencil_ref, stencil_value_mask, stencil_write_mask;
 	/* alpha test, 0x12e4: [0] enable, [3:1] compare, [15:8] reference.
 	 * GL's 0..1 reference scales to 0..255 (0.5 was captured as 0x80). */
 	int		   alpha_test;
@@ -353,6 +370,9 @@ struct p3d_state {
 	uint32_t	   texture_cache_probe;
 	unsigned	   depth_slot;	/* surface slot for Z; 1 = 0x1228 */
 	uint32_t	   screen_w, screen_h;
+	int		   scissor;
+	uint16_t	   scissor_minx, scissor_miny;
+	uint16_t	   scissor_maxx, scissor_maxy;
 	enum p3d_prim	   prim;
 	int		   flat;
 	int		   cull;	/* 0x1130[1:0]: 0 none, 1 cull CW, 2 cull CCW */

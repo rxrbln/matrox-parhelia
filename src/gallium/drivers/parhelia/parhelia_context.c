@@ -133,6 +133,9 @@ struct ph_context {
    struct pipe_rasterizer_state *rasterizer;
    struct pipe_depth_stencil_alpha_state *dsa;
    struct pipe_blend_state *blend;
+   struct pipe_blend_color blend_color;
+   struct pipe_stencil_ref stencil_ref;
+   struct pipe_scissor_state scissor;
    struct ph_velems *velems;
    struct ph_fs *fs;
    struct pipe_sampler_state *samplers[PIPE_MAX_SAMPLERS];
@@ -902,7 +905,101 @@ ph_blend_factor(unsigned factor)
    case PIPE_BLENDFACTOR_DST_COLOR: return P3D_BF_DST_COLOR;
    case PIPE_BLENDFACTOR_INV_DST_COLOR: return P3D_BF_ONE_MINUS_DST_COLOR;
    case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE: return P3D_BF_SRC_ALPHA_SATURATE;
+   case PIPE_BLENDFACTOR_CONST_COLOR: return P3D_BF_CONST_COLOR;
+   case PIPE_BLENDFACTOR_INV_CONST_COLOR: return P3D_BF_ONE_MINUS_CONST_COLOR;
+   case PIPE_BLENDFACTOR_CONST_ALPHA: return P3D_BF_CONST_ALPHA;
+   case PIPE_BLENDFACTOR_INV_CONST_ALPHA: return P3D_BF_ONE_MINUS_CONST_ALPHA;
    default: return P3D_BF_ONE;
+   }
+}
+
+static enum p3d_blend_eq
+ph_blend_equation(unsigned equation)
+{
+   switch (equation) {
+   case PIPE_BLEND_SUBTRACT: return P3D_BEQ_SUBTRACT;
+   case PIPE_BLEND_REVERSE_SUBTRACT: return P3D_BEQ_REVERSE_SUBTRACT;
+   case PIPE_BLEND_MIN: return P3D_BEQ_MIN;
+   case PIPE_BLEND_MAX: return P3D_BEQ_MAX;
+   default: return P3D_BEQ_ADD;
+   }
+}
+
+static enum p3d_stencil_op
+ph_stencil_op(unsigned op)
+{
+   switch (op) {
+   case PIPE_STENCIL_OP_ZERO: return P3D_STENCIL_ZERO;
+   case PIPE_STENCIL_OP_REPLACE: return P3D_STENCIL_REPLACE;
+   case PIPE_STENCIL_OP_INCR: return P3D_STENCIL_INCR_SAT;
+   case PIPE_STENCIL_OP_DECR: return P3D_STENCIL_DECR_SAT;
+   case PIPE_STENCIL_OP_INCR_WRAP: return P3D_STENCIL_INCR_WRAP;
+   case PIPE_STENCIL_OP_DECR_WRAP: return P3D_STENCIL_DECR_WRAP;
+   case PIPE_STENCIL_OP_INVERT: return P3D_STENCIL_INVERT;
+   default: return P3D_STENCIL_KEEP;
+   }
+}
+
+static uint32_t
+ph_pack_2x10(float lo, float hi)
+{
+   unsigned a = (unsigned)(CLAMP(lo, 0.0f, 1.0f) * 1023.0f);
+   unsigned b = (unsigned)(CLAMP(hi, 0.0f, 1.0f) * 1023.0f);
+   return a | (b << 16);
+}
+
+static void
+ph_apply_fragment_state(struct ph_context *ctx, struct p3d_state *state,
+                        bool has_depth)
+{
+   const struct pipe_rt_blend_state *blend =
+      ctx->blend ? &ctx->blend->rt[0] : NULL;
+
+   if (ctx->dsa) {
+      state->alpha_test = ctx->dsa->alpha_enabled;
+      state->alpha_func = ph_compare(ctx->dsa->alpha_func);
+      state->alpha_ref = CLAMP((int)lrintf(ctx->dsa->alpha_ref_value * 255.0f),
+                               0, 255);
+      if (has_depth) {
+         const struct pipe_stencil_state *s = &ctx->dsa->stencil[0];
+         state->depth_test = ctx->dsa->depth_enabled;
+         state->depth_write = ctx->dsa->depth_writemask;
+         state->depth_func = ph_compare(ctx->dsa->depth_func);
+         state->stencil_test = s->enabled;
+         state->stencil_func = ph_compare(s->func);
+         state->stencil_fail = ph_stencil_op(s->fail_op);
+         state->stencil_zfail = ph_stencil_op(s->zfail_op);
+         state->stencil_zpass = ph_stencil_op(s->zpass_op);
+         state->stencil_ref = ctx->stencil_ref.ref_value[0];
+         state->stencil_value_mask = s->valuemask;
+         state->stencil_write_mask = s->writemask;
+      }
+   }
+   if (blend) {
+      struct p3d_blend_factor rgb_src = ph_blend_factor(blend->rgb_src_factor);
+      struct p3d_blend_factor rgb_dst = ph_blend_factor(blend->rgb_dst_factor);
+      struct p3d_blend_factor a_src = ph_blend_factor(blend->alpha_src_factor);
+      struct p3d_blend_factor a_dst = ph_blend_factor(blend->alpha_dst_factor);
+
+      state->blend = blend->blend_enable;
+      state->blend_src = (struct p3d_blend_factor){rgb_src.rgb, a_src.a};
+      state->blend_dst = (struct p3d_blend_factor){rgb_dst.rgb, a_dst.a};
+      state->blend_eq = ph_blend_equation(blend->rgb_func);
+      state->blend_const_rg = ph_pack_2x10(ctx->blend_color.color[0],
+                                           ctx->blend_color.color[1]);
+      state->blend_const_ba = ph_pack_2x10(ctx->blend_color.color[2],
+                                           ctx->blend_color.color[3]);
+      state->mask_r = !!(blend->colormask & PIPE_MASK_R);
+      state->mask_g = !!(blend->colormask & PIPE_MASK_G);
+      state->mask_b = !!(blend->colormask & PIPE_MASK_B);
+      state->mask_a = !!(blend->colormask & PIPE_MASK_A);
+   }
+   if (ctx->rasterizer && ctx->rasterizer->scissor) {
+      state->scissor = true;
+      state->scissor_minx = MIN2(ctx->scissor.minx, state->screen_w);
+      state->scissor_miny = MIN2(ctx->scissor.miny, state->screen_h);
+      state->scissor_maxx = MIN2(ctx->scissor.maxx, state->screen_w);
+      state->scissor_maxy = MIN2(ctx->scissor.maxy, state->screen_h);
    }
 }
 
@@ -2794,6 +2891,7 @@ ph_submit_vertices(struct ph_context *ctx)
       state.mask_b = !!(blend->colormask & PIPE_MASK_B);
       state.mask_a = !!(blend->colormask & PIPE_MASK_A);
    }
+   ph_apply_fragment_state(ctx, &state, depth != NULL);
    if (ctx->alpha_micro_cutout) {
       /* Alpha was classified before splitting.  The surviving cells are
        * opaque, so suppress the broken sampled-alpha comparator. */
@@ -3483,6 +3581,7 @@ ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
       state.mask_b = !!(blend->colormask & PIPE_MASK_B);
       state.mask_a = !!(blend->colormask & PIPE_MASK_A);
    }
+   ph_apply_fragment_state(ctx, &state, depth != NULL);
 
    for (unsigned v = 0; v < 2; v++) {
       const float *p = prim->v[v]->data[pos];
@@ -4029,13 +4128,34 @@ static void ph_set_clip(struct pipe_context *p, const struct pipe_clip_state *cl
 { draw_set_clip_state(ph_context(p)->draw, clip); }
 static void ph_set_scissor(struct pipe_context *p, unsigned start, unsigned count,
                            const struct pipe_scissor_state *s)
-{ (void)p; (void)start; (void)count; (void)s; }
-static void ph_noop_blend_color(struct pipe_context *p,
-                                const struct pipe_blend_color *c)
-{ (void)p; (void)c; }
-static void ph_noop_stencil_ref(struct pipe_context *p,
-                                const struct pipe_stencil_ref r)
-{ (void)p; (void)r; }
+{
+   struct ph_context *ctx = ph_context(p);
+
+   if (!count || start || !s || !memcmp(&ctx->scissor, s, sizeof(*s)))
+      return;
+   ph_submit_vertices(ctx);
+   ctx->scissor = *s;
+}
+static void ph_set_blend_color(struct pipe_context *p,
+                               const struct pipe_blend_color *c)
+{
+   struct ph_context *ctx = ph_context(p);
+
+   if (!c || !memcmp(&ctx->blend_color, c, sizeof(*c)))
+      return;
+   ph_submit_vertices(ctx);
+   ctx->blend_color = *c;
+}
+static void ph_set_stencil_ref(struct pipe_context *p,
+                               const struct pipe_stencil_ref r)
+{
+   struct ph_context *ctx = ph_context(p);
+
+   if (!memcmp(&ctx->stencil_ref, &r, sizeof(r)))
+      return;
+   ph_submit_vertices(ctx);
+   ctx->stencil_ref = r;
+}
 static void ph_noop_sample_mask(struct pipe_context *p, unsigned m)
 { (void)p; (void)m; }
 static void ph_noop_stipple(struct pipe_context *p,
@@ -4735,6 +4855,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    (void)flags;
    if (!ctx)
       return NULL;
+   ctx->scissor.maxx = UINT16_MAX;
+   ctx->scissor.maxy = UINT16_MAX;
    ctx->base.screen = screen;
    ctx->base.priv = priv;
    if (native_alpha_mode) {
@@ -4832,8 +4954,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.set_viewport_states = ph_set_viewport;
    ctx->base.set_clip_state = ph_set_clip;
    ctx->base.set_scissor_states = ph_set_scissor;
-   ctx->base.set_blend_color = ph_noop_blend_color;
-   ctx->base.set_stencil_ref = ph_noop_stencil_ref;
+   ctx->base.set_blend_color = ph_set_blend_color;
+   ctx->base.set_stencil_ref = ph_set_stencil_ref;
    ctx->base.set_sample_mask = ph_noop_sample_mask;
    ctx->base.set_polygon_stipple = ph_noop_stipple;
    ctx->base.buffer_map = ph_buffer_map;

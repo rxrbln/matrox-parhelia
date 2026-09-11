@@ -404,8 +404,13 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	dwgctl  = p3d_dwgctl(st);
 
 	/* -- raster / ROP ------------------------------------------------- */
-	rw[0].reg = P3D_R_SCISSOR_MIN; rw[0].val = 0;
-	rw[1].reg = P3D_R_SCISSOR_MAX; rw[1].val = (st->screen_h << 16) | st->screen_w;
+	rw[0].reg = P3D_R_SCISSOR_MIN;
+	rw[0].val = st->scissor ? ((uint32_t)st->scissor_miny << 16) |
+	                            st->scissor_minx : 0;
+	rw[1].reg = P3D_R_SCISSOR_MAX;
+	rw[1].val = st->scissor ? ((uint32_t)st->scissor_maxy << 16) |
+	                            st->scissor_maxx :
+	                            (st->screen_h << 16) | st->screen_w;
 	rw[2].reg = P3D_R_RASTERMODE;  rw[2].val = 0x0bb80024u;	/* measured */
 	rw[3].reg = 0x12f8;            rw[3].val = 0x007fe000u;	/* AA threshold */
 	p3d_reglist(cs, rw, 4);
@@ -422,17 +427,29 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	rw[3].reg = 0x12ec; rw[3].val = st->blend_const_rg;
 	p3d_reglist(cs, rw, 4);
 
-	/* 0x12c8 [0] enables the depth compare and [3:1] selects it; 0x12d0
-	 * bit 8 is the depth WRITE enable - the depthmask capture leaves that
-	 * bit clear and changes nothing else. */
+	/* Depth and stencil share the 0x12c8 control word and S8Z24 surface.
+	 * The stencil masks/reference occupy 0x12cc/0x12d0; depth write remains
+	 * independent in 0x12d0 bit 8. */
 	rw[0].reg = P3D_R_ZFUNC;
-	rw[0].val  = st->depth_raw ? st->depth_raw : 0x001000e0u |
+	rw[0].val  = st->depth_raw ? st->depth_raw : 0x00100000u |
 		     ((uint32_t)(st->depth_test ? st->depth_func
 					        : P3D_CMP_LESS) << 1) |
-		     (st->depth_test ? 1u : 0u);
-	rw[1].reg = 0x12cc; rw[1].val = 0x000000ffu;
+		     (st->depth_test ? 1u : 0u) |
+		     (st->stencil_test ? 1u << 4 : 0u) |
+		     ((uint32_t)(st->stencil_test ? st->stencil_func :
+		                                      P3D_CMP_ALWAYS) << 5) |
+		     ((uint32_t)(st->stencil_test ? st->stencil_fail :
+		                                      P3D_STENCIL_KEEP) << 8) |
+		     ((uint32_t)(st->stencil_test ? st->stencil_zfail :
+		                                      P3D_STENCIL_KEEP) << 11) |
+		     ((uint32_t)(st->stencil_test ? st->stencil_zpass :
+		                                      P3D_STENCIL_KEEP) << 14);
+	rw[1].reg = P3D_R_STENCIL_REF;
+	rw[1].val = (st->stencil_test ? st->stencil_value_mask : 0xffu) |
+		    ((uint32_t)(st->stencil_test ? st->stencil_ref : 0u) << 8);
 	rw[2].reg = P3D_R_ZWRITE;
-	rw[2].val  = 0x000000ffu | (st->depth_write ? 0x100u : 0u);
+	rw[2].val  = (st->stencil_test ? st->stencil_write_mask : 0xffu) |
+		     (st->depth_write ? 0x100u : 0u);
 	rw[3].reg = 0x12c0; rw[3].val = 0x80000000u;
 	rw[4].reg = 0x12c4; rw[4].val = 0x7fffffffu;
 	p3d_reglist(cs, rw, 5);
