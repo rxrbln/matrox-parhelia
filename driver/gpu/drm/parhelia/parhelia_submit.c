@@ -2622,6 +2622,11 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		args->value = pdev->async_primary_cpu && !trace_submit &&
 			!full_sync && !post_draw_wb && coalesce_primary;
 		break;
+	case PARHELIA_PARAM_ASYNC_SLOTS:
+		args->value = pdev->async_primary_cpu && !trace_submit &&
+			!full_sync && !post_draw_wb && coalesce_primary ?
+			PARHELIA_ASYNC_SLOTS : 0;
+		break;
 	case PARHELIA_PARAM_STATEFUL_SUBMIT:
 		args->value = stateful_submit && pdev->async_primary_cpu &&
 			!trace_submit && !full_sync && !post_draw_wb &&
