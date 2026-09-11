@@ -68,6 +68,8 @@ struct ph_transfer {
 
 struct ph_context;
 static unsigned ph_sampler_tiled_pitch(unsigned width);
+static unsigned ph_sampler_storage_pitch(struct pipe_screen *screen,
+                                         unsigned width, unsigned cpp);
 static unsigned ph_texture_cpp(enum pipe_format format);
 static bool ph_prepare_rgb5a1(struct parhelia_resource *texture);
 static void ph_restore_rgba_tiled(struct parhelia_resource *texture);
@@ -89,7 +91,10 @@ ph_mip_texel_offset(const struct ph_mip_layout *mip, unsigned level,
    y += image->tail_y;
    return image->offset + (linear ?
           ((size_t)y * image->pitch + x) * 4 :
-          p3d_texture_tile_offset(x, y, image->pitch));
+          (mip->native_64x16_32 ?
+           p3d_tile_offset_layout(x, y, image->pitch,
+                                  PARHELIA_TILE_64X16_4K) :
+           p3d_texture_tile_offset(x, y, image->pitch)));
 }
 
 static size_t
@@ -102,7 +107,10 @@ ph_mip_texel_offset_cpp(const struct ph_mip_layout *mip, unsigned level,
    y += image->tail_y;
    return image->offset + (linear ?
           ((size_t)y * image->pitch + x) * cpp :
-          p3d_texture_tile_offset_cpp(x, y, image->pitch, cpp));
+          (mip->native_64x16_32 && cpp == 4 ?
+           p3d_tile_offset_layout(x, y, image->pitch,
+                                  PARHELIA_TILE_64X16_4K) :
+           p3d_texture_tile_offset_cpp(x, y, image->pitch, cpp)));
 }
 
 static unsigned
@@ -1337,8 +1345,11 @@ ph_texture_base_hash(const struct parhelia_resource *texture, bool tiled,
          if (use_tiled) {
             off = texture->mip.levels ?
                   ph_mip_texel_offset(&texture->mip, 0, x, y, false) :
-                  p3d_texture_tile_offset(x, y,
-                                          ph_sampler_tiled_pitch(texture->base.width0));
+                  p3d_texture_tile_offset_chip(
+                     x, y, ph_sampler_storage_pitch(texture->base.screen,
+                                                    texture->base.width0, 4), 4,
+                     ph_screen(texture->base.screen)->chip_id,
+                     texture->tile_layout);
          } else if (texture->linear_map) {
             off = texture->linear_mip.levels ?
                ph_mip_texel_offset(&texture->linear_mip, 0, x, y, true) :
@@ -1382,7 +1393,9 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
    const bool repeat_s = sampler->wrap_s == PIPE_TEX_WRAP_REPEAT;
    const bool repeat_t = sampler->wrap_t == PIPE_TEX_WRAP_REPEAT;
    struct drm_parhelia_create_render alpha = {
-      .width = companion_width,
+      .width = p3d_texture_uses_native_64x16(screen->chip_id,
+                                             screen->tile_layout, 4) ?
+                  MAX2(companion_width, 64u) : companion_width,
       .height = companion_height,
       .flags = PARHELIA_CREATE_RENDER_TEXTURE,
    };
@@ -1427,7 +1440,8 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
          goto out;
       }
       if (!alpha.handle || (alpha.pitch & 3) ||
-          alpha.pitch / 4 != ph_sampler_tiled_pitch(companion_width) ||
+          alpha.pitch / 4 != ph_sampler_storage_pitch(&screen->base,
+                                                       companion_width, 4) ||
           alpha.size < (uint64_t)alpha.pitch * companion_height) {
          struct drm_gem_close close = {.handle = alpha.handle};
          ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
@@ -1472,8 +1486,9 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
                                                    repeat_s);
          size_t src_off = ph_mip_texel_offset(&texture->mip, 0, src_x,
                                               src_y, false);
-         size_t dst_off = p3d_texture_tile_offset(x, y,
-                                                   texture->alpha_companion_stride);
+         size_t dst_off = p3d_texture_tile_offset_chip(
+            x, y, texture->alpha_companion_stride, 4, screen->chip_id,
+            screen->tile_layout);
          const uint8_t *src;
          uint8_t *mask, *rgb;
          unsigned a;
@@ -4126,8 +4141,8 @@ ph_copy_texture_box(struct ph_context *ctx,
                         !(dr->base.bind & (PIPE_BIND_RENDER_TARGET |
                                            PIPE_BIND_DISPLAY_TARGET |
                                            PIPE_BIND_SCANOUT)))) ?
-                       p3d_texture_tile_offset(dx, dy,
-                                               ph_sampler_tiled_pitch(dr->base.width0)) :
+                       ph_mip_texel_offset_cpp(&dr->mip, 0, dx, dy,
+                                               false, cpp) :
                        p3d_tile_offset_layout(dx, dy, dr->stride,
                                               dr->tile_layout)), in, cpp);
          if (!dr->linear_map && !dr->map) {
@@ -4239,6 +4254,19 @@ ph_sampler_tiled_pitch(unsigned width)
    return MAX2(32u, util_next_power_of_two(width));
 }
 
+static unsigned
+ph_sampler_storage_pitch(struct pipe_screen *pscreen, unsigned width,
+                         unsigned cpp)
+{
+   struct parhelia_screen *screen = ph_screen(pscreen);
+   unsigned pitch = ph_sampler_tiled_pitch(width);
+
+   if (p3d_texture_uses_native_64x16(screen->chip_id, screen->tile_layout,
+                                     cpp))
+      pitch = MAX2(pitch, 64u);
+   return pitch;
+}
+
 /* Q3's retained vendor path deliberately changes its binary-alpha atlas from
  * RGBA client pixels into A1R5G5B5 storage for SRC_ALPHA source-over.  Keep a
  * four-byte linear shadow for all ordinary uses and build the native sampler
@@ -4295,8 +4323,6 @@ ph_prepare_rgb5a1(struct parhelia_resource *texture)
 static void
 ph_restore_rgba_tiled(struct parhelia_resource *texture)
 {
-   const unsigned pitch = ph_sampler_tiled_pitch(texture->base.width0);
-
    if (!texture || !texture->rgb5a1_packed || !texture->map ||
        !texture->linear_map)
       return;
@@ -4309,7 +4335,8 @@ ph_restore_rgba_tiled(struct parhelia_resource *texture)
    for (unsigned y = 0; y < texture->base.height0; y++)
       for (unsigned x = 0; x < texture->base.width0; x++)
          memcpy((uint8_t *)texture->map +
-                   p3d_texture_tile_offset_cpp(x, y, pitch, 4),
+                   ph_mip_texel_offset_cpp(&texture->mip, 0, x, y,
+                                           false, 4),
                 (uint8_t *)texture->linear_map +
                    (size_t)y * texture->linear_stride + x * 4, 4);
    __sync_synchronize();
@@ -4407,10 +4434,14 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
                                        ph_mip_texel_offset_cpp(&r->mip, level,
                                                            box->x + x, box->y + y,
                                                            false, cpp) :
-                                       p3d_texture_tile_offset_cpp(box->x + x,
-                                          box->y + y,
-                                          ph_sampler_tiled_pitch(r->base.width0),
-                                          cpp)), swap_rb, cpp);
+                                       p3d_texture_tile_offset_chip(
+                                          box->x + x, box->y + y,
+                                          ph_sampler_storage_pitch(
+                                             r->base.screen,
+                                             r->base.width0, cpp),
+                                          cpp,
+                                          ph_screen(r->base.screen)->chip_id,
+                                          r->tile_layout)), swap_rb, cpp);
       }
    } else if (usage & PIPE_MAP_READ) {
       /* A lower level outside the P690-supported backing remains a valid
@@ -4458,9 +4489,14 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
                                     ph_mip_texel_offset_cpp(&r->mip, transfer->level,
                                                         transfer->box.x + x,
                                                         transfer->box.y + y, false, cpp) :
-                                    p3d_texture_tile_offset_cpp(transfer->box.x + x,
-                                                            transfer->box.y + y,
-                                                            ph_sampler_tiled_pitch(r->base.width0), cpp)) :
+                                    p3d_texture_tile_offset_chip(
+                                       transfer->box.x + x,
+                                       transfer->box.y + y,
+                                       ph_sampler_storage_pitch(
+                                          r->base.screen,
+                                          r->base.width0, cpp), cpp,
+                                       ph_screen(r->base.screen)->chip_id,
+                                       r->tile_layout)) :
                                    p3d_tile_offset_layout(transfer->box.x + x,
                                                           transfer->box.y + y,
                                                           r->stride,

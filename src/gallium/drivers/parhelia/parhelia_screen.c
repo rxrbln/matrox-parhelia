@@ -271,7 +271,11 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
       for (unsigned x = 0; x < r->base.width0; x++)
          memcpy((uint8_t *)r->map +
                    (r->upload_texture ?
-                    p3d_texture_tile_offset(x, y, r->mip.level[0].pitch) :
+                    (r->mip.native_64x16_32 ?
+                     p3d_tile_offset_layout(x, y, r->mip.level[0].pitch,
+                                            PARHELIA_TILE_64X16_4K) :
+                     p3d_texture_tile_offset(x, y,
+                                             r->mip.level[0].pitch)) :
                     p3d_tile_offset_layout(x, y, r->stride, r->tile_layout)),
                 (uint8_t *)r->linear_map +
                    (size_t)y * r->linear_stride + x * 4, 4);
@@ -322,6 +326,9 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
       templ->width0 <= 512 && templ->height0 <= 512 &&
       !(templ->bind & PIPE_BIND_DEPTH_STENCIL);
+   const bool p690_native_texture32 = sampler_storage &&
+      p3d_texture_uses_native_64x16(screen->chip_id, screen->tile_layout,
+                                    util_format_get_blocksize(templ->format));
    const unsigned max_width = share_native ? 4096 : 1024;
    const unsigned max_height = share_native ? 4096 : 768;
    unsigned mip_levels;
@@ -358,6 +365,17 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    if (!ph_mip_layout_init(&r->mip, templ->width0, templ->height0,
                            mip_levels, true))
       goto fail;
+   if (p690_native_texture32) {
+      /* Live unit-1 spatial readback proves that SUN90 layout code 2 uses
+       * its native 64x16 address permutation for 32-bit texels.  The current
+       * P690 path exposes base level only, so widen its single tile row here
+       * without changing older chips or the vendor 16-bit texture layout. */
+      r->mip.native_64x16_32 = true;
+      r->mip.level[0].pitch = MAX2(r->mip.level[0].pitch, 64u);
+      r->mip.size = ph_mip_align(r->mip.level[0].pitch *
+                                ph_mip_align(templ->height0, 32) * 4,
+                                0x2000);
+   }
    /* CREATE_RENDER has a bounded height.  Retain the historical level-zero
     * allocation for an unusually large chain rather than rejecting an
     * otherwise usable texture; transfer maps for its lower levels become
@@ -371,7 +389,8 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
          goto fail;
    }
    struct drm_parhelia_create_render create = {
-      .width = templ->width0,
+      .width = p690_native_texture32 ? MAX2(templ->width0, 64u) :
+                                      templ->width0,
       .height = mip_levels > 1 ?
          (r->mip.size + (size_t)ALIGN_POT(templ->width0, 64) * 4 - 1) /
          ((size_t)ALIGN_POT(templ->width0, 64) * 4) :
