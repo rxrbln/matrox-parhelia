@@ -112,6 +112,7 @@ static int parhelia_submit_stats_show(struct seq_file *m, void *data)
 		   atomic64_read(&stats->ring_end_writes));
 	seq_printf(m, "queue_high_water %lld\n",
 		   atomic64_read(&stats->queue_high_water));
+	seq_printf(m, "async_flips %lld\n", atomic64_read(&stats->async_flips));
 	seq_printf(m, "engine_irqs %lld\n", atomic64_read(&stats->engine_irqs));
 	seq_printf(m, "fence_waits %lld\n", atomic64_read(&stats->fence_waits));
 	seq_printf(m, "gpu_busy_ns %lld\n", atomic64_read(&stats->gpu_busy_ns));

@@ -3,6 +3,7 @@
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 
+#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_color_mgmt.h>
 #include <drm/drm_connector.h>
@@ -790,6 +791,97 @@ static void parhelia_pipe_end_fb_access(struct drm_simple_display_pipe *pipe,
 	drm_gem_vram_plane_helper_cleanup_fb(&pipe->plane, plane_state);
 }
 
+/* An asynchronous flip only reprograms the surface address.  The P690 latches
+ * DC_START at the next retrace, so the image never changes mid-scanline; the
+ * tearing an asynchronous flip permits comes from releasing the old buffer to
+ * the client at once.  Everything else must already match the committed state. */
+static int parhelia_plane_async_check(struct drm_plane *plane,
+				      struct drm_atomic_commit *state,
+				      bool flip)
+{
+	struct drm_plane_state *new_state =
+		drm_atomic_get_new_plane_state(state, plane);
+	struct parhelia_device *pdev = to_parhelia(plane->dev);
+	struct drm_gem_object *gem, *old_gem;
+	u32 address;
+
+	if (!new_state->fb || !plane->state->fb || !plane->state->crtc ||
+	    new_state->crtc != plane->state->crtc ||
+	    !plane->state->crtc->state->active ||
+	    new_state->crtc_x != plane->state->crtc_x ||
+	    new_state->crtc_y != plane->state->crtc_y ||
+	    new_state->crtc_w != plane->state->crtc_w ||
+	    new_state->crtc_h != plane->state->crtc_h ||
+	    new_state->src_x != plane->state->src_x ||
+	    new_state->src_y != plane->state->src_y ||
+	    new_state->src_w != plane->state->src_w ||
+	    new_state->src_h != plane->state->src_h ||
+	    new_state->rotation != plane->state->rotation ||
+	    new_state->fb->format != plane->state->fb->format ||
+	    new_state->fb->pitches[0] != plane->state->fb->pitches[0])
+		return -EINVAL;
+	gem = drm_gem_fb_get_obj(new_state->fb, 0);
+	old_gem = drm_gem_fb_get_obj(plane->state->fb, 0);
+	if (!gem || !old_gem ||
+	    to_parhelia_bo(gem)->gpu_pitch != to_parhelia_bo(old_gem)->gpu_pitch)
+		return -EINVAL;
+	return parhelia_scanout_address(pdev, gem, &address);
+}
+
+static void parhelia_plane_async_update(struct drm_plane *plane,
+					struct drm_atomic_commit *state)
+{
+	struct drm_plane_state *new_state =
+		drm_atomic_get_new_plane_state(state, plane);
+	struct parhelia_device *pdev = to_parhelia(plane->dev);
+	struct drm_crtc *crtc = plane->state->crtc;
+	struct drm_crtc_state *crtc_state =
+		drm_atomic_get_new_crtc_state(state, crtc);
+	struct drm_gem_object *gem = drm_gem_fb_get_obj(new_state->fb, 0);
+	u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
+	u32 address;
+
+	swap(plane->state->fb, new_state->fb);
+	if (gem && !parhelia_scanout_address(pdev, gem, &address)) {
+		wmb();
+		parhelia_write(pdev, dc + PARHELIA_DC_START,
+			       address & 0x0ffffc00);
+		atomic64_inc(&pdev->submit_stats.async_flips);
+	}
+	/* The asynchronous helper does not process events.  Report completion as
+	 * soon as the address is programmed: that is what the caller asked for by
+	 * setting DRM_MODE_PAGE_FLIP_ASYNC, and it is what releases the old buffer
+	 * to the client.  The visible change still happens at the next retrace. */
+	if (crtc_state && crtc_state->event) {
+		spin_lock_irq(&plane->dev->event_lock);
+		drm_crtc_send_vblank_event(crtc, crtc_state->event);
+		crtc_state->event = NULL;
+		spin_unlock_irq(&plane->dev->event_lock);
+	}
+}
+
+/* drm_atomic_helper_page_flip() and the atomic ioctl only record
+ * drm_crtc_state.async_flip; without a driver commit tail that acts on it an
+ * asynchronous flip would be committed like any other one and completed at the
+ * next vblank.  Promote such a commit to the helper's asynchronous path when
+ * the plane accepts it, so the flip is programmed and reported immediately. */
+static int parhelia_atomic_commit(struct drm_device *drm,
+				  struct drm_atomic_commit *state, bool nonblock)
+{
+	struct drm_crtc_state *crtc_state;
+	struct drm_crtc *crtc;
+	int i;
+
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		if (!crtc_state->async_flip)
+			continue;
+		if (!drm_atomic_helper_async_check(drm, state))
+			state->async_update = true;
+		break;
+	}
+	return drm_atomic_helper_commit(drm, state, nonblock);
+}
+
 static const struct drm_simple_display_pipe_funcs parhelia_pipe_funcs = {
 	.mode_valid = parhelia_mode_valid,
 	.check = parhelia_pipe_check,
@@ -861,7 +953,7 @@ out_put:
 static const struct drm_mode_config_funcs parhelia_mode_config_funcs = {
 	.fb_create = parhelia_fb_create,
 	.atomic_check = drm_atomic_helper_check,
-	.atomic_commit = drm_atomic_helper_commit,
+	.atomic_commit = parhelia_atomic_commit,
 };
 
 /* P690 and LX boards use the first low-byte GPIO pair for their primary
@@ -1031,6 +1123,12 @@ int parhelia_modeset_init(struct parhelia_device *pdev)
 	if (ret)
 		return ret;
 	drm_plane_enable_fb_damage_clips(&pdev->pipe.plane);
+	/* Asynchronous flips: the simple pipe has no such hooks of its own. */
+	pdev->plane_helper_funcs = *pdev->pipe.plane.helper_private;
+	pdev->plane_helper_funcs.atomic_async_check = parhelia_plane_async_check;
+	pdev->plane_helper_funcs.atomic_async_update = parhelia_plane_async_update;
+	drm_plane_helper_add(&pdev->pipe.plane, &pdev->plane_helper_funcs);
+	drm->mode_config.async_page_flip = true;
 	ret = parhelia_cursor_init(pdev);
 	if (ret)
 		return ret;

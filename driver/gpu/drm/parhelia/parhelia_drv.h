@@ -18,6 +18,7 @@
 #include <drm/drm_mm.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_gem_vram_helper.h>
+#include <drm/drm_modeset_helper_vtables.h>
 #include <linux/iosys-map.h>
 
 #include "parhelia_drm.h"
@@ -348,6 +349,7 @@ struct parhelia_reg_shadow {
  * without taking submit_lock or perturbing the producer critical section.
  */
 struct parhelia_submit_stats {
+	atomic64_t async_flips;
 	atomic64_t async_submits;
 	atomic64_t slot_waits;
 	atomic64_t slot_wait_ns;
@@ -434,6 +436,8 @@ struct parhelia_device {
 	resource_size_t vram_size;
 	struct parhelia_bios bios;
 	struct drm_simple_display_pipe pipe;
+	/* the simple pipe's plane helpers plus the asynchronous flip hooks */
+	struct drm_plane_helper_funcs plane_helper_funcs;
 	struct parhelia_output outputs[PARHELIA_MAX_OUTPUTS];
 	u8 num_outputs;
 	struct mutex ddc_lock;
