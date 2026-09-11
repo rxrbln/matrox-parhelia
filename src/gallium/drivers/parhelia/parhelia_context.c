@@ -281,6 +281,16 @@ ph_context(struct pipe_context *p)
    return (struct ph_context *)p;
 }
 
+/* Texture unit 0 is in use only when the fragment shader samples it; the
+ * state tracker may leave a view bound after texturing is disabled. */
+static bool
+ph_samples_unit0(const struct ph_context *ctx)
+{
+   return ctx->fs && (ctx->fs->sampler_mask & BITFIELD_BIT(0)) &&
+          ctx->num_sampler_views && ctx->sampler_views[0] &&
+          ctx->sampler_views[0]->texture;
+}
+
 static unsigned
 ph_hardware_cull(const struct pipe_rasterizer_state *rasterizer)
 {
@@ -2787,8 +2797,7 @@ ph_submit_vertices(struct ph_context *ctx)
    if (ctx->alpha_micro && (!ctx->dsa || !ctx->dsa->depth_enabled))
       depth = NULL;
    blend = ctx->blend ? &ctx->blend->rt[0] : NULL;
-   if (ctx->num_sampler_views && ctx->sampler_views[0] &&
-       ctx->sampler_views[0]->texture) {
+   if (ph_samples_unit0(ctx)) {
       texture = ph_resource(ctx->sampler_views[0]->texture);
       if (ctx->num_samplers)
          sampler = ctx->samplers[0];
@@ -3422,8 +3431,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
    int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
    int col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
    int texcoord = -1, texcoord1 = -1;
-   bool textured = ctx->num_sampler_views && ctx->sampler_views[0] &&
-                   ctx->sampler_views[0]->texture;
+   bool textured = ph_samples_unit0(ctx);
 	bool multitextured = textured && ctx->fs &&
                         (ctx->fs->sampler_mask & BITFIELD_BIT(1)) &&
                         (!ph_screen(ctx->base.screen)->single_texture_pipe ||
