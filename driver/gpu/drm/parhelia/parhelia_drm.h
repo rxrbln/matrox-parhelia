@@ -154,8 +154,10 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_TEXTURE_UPLOAD	22
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
-/* Validated generic adjacent-packet secondary-CALL packing is active. */
+/* Retired unsafe generic packing capability; kernels report zero. */
 #define PARHELIA_PARAM_PACK_ADJACENT	24
+/* Boundary-aware adjacent-packet packing and CALL_BOUNDARY relocations. */
+#define PARHELIA_PARAM_PACK_ADJACENT_BOUNDARIES	25
 
 #define PARHELIA_TEXTURE_PIPES_PAIRED	0
 #define PARHELIA_TEXTURE_PIPES_SINGLE	1
@@ -226,6 +228,12 @@ struct drm_parhelia_packet {
  * EOB/DWGSYNC drain followed by the next opening bracket.  This preserves the
  * vendor's per-state-validate ordering while allowing one ioctl and one final
  * primary producer update to carry two different consecutive states.
+ *
+ * PARHELIA_RELOC_CALL_BOUNDARY also carries no address.  @packet names the
+ * first packet of a later logical state section; all other fields must be
+ * zero.  Unlike BATCH_BOUNDARY, it emits no EOB, DWGSYNC or opening bracket.
+ * It only prevents boundary-aware adjacent-packet packing from placing
+ * packets on opposite sides in the same secondary CALL.
  */
 struct drm_parhelia_reloc {
 	__u32 packet;
@@ -246,6 +254,7 @@ struct drm_parhelia_reloc {
 #define PARHELIA_RELOC_RANGE_STREAM_DMA	7u
 #define PARHELIA_RELOC_RANGE_STREAM_VRAM	8u
 #define PARHELIA_RELOC_BATCH_BOUNDARY	9u
+#define PARHELIA_RELOC_CALL_BOUNDARY	10u
 
 /*
  * Submit a sequence of header-ful secondary packets.
@@ -276,6 +285,8 @@ struct drm_parhelia_submit {
 #define PARHELIA_SUBMIT_FENCE	(1u << 0)
 /* Return after the producer doorbell. PARHELIA_SUBMIT_FENCE is mandatory. */
 #define PARHELIA_SUBMIT_ASYNC	(1u << 1)
+/* CALL_BOUNDARY markers completely describe this submit's logical sections. */
+#define PARHELIA_SUBMIT_CALL_BOUNDARIES	0x4u
 
 /* Wait for a terminal submit fence. timeout_ns is relative: zero polls and
  * -1 requests an interruptible unbounded wait. completed always reports the
