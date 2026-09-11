@@ -34,6 +34,14 @@
 #define PARHELIA_FENCE_TIMEOUT_US	50000u
 #define PARHELIA_R_DWGCTL		0x1300
 
+/* A single textured full-screen draw can take well over 50 ms (minified
+ * without mipmaps); only a request without fence progress for this long is
+ * treated as an engine hang. */
+static unsigned int hang_timeout_ms = 2000;
+module_param(hang_timeout_ms, uint, 0600);
+MODULE_PARM_DESC(hang_timeout_ms,
+		 "Asynchronous request time without fence progress before the engine is declared hung (per fence section)");
+
 static bool trace_submit;
 module_param(trace_submit, bool, 0400);
 MODULE_PARM_DESC(trace_submit, "Trace coherent retirement of each pre-draw state packet");
@@ -4229,7 +4237,7 @@ retry_slot:
 		async_slot->submitted = jiffies;
 		async_slot->submit_ns = ktime_get_ns();
 		async_slot->budget =
-			usecs_to_jiffies(PARHELIA_FENCE_TIMEOUT_US *
+			msecs_to_jiffies(max(hang_timeout_ms, 50u) *
 				plan->sync_sections) + 1;
 		async_slot->reloc_count = args->reloc_count;
 		if (args->reloc_count) {
