@@ -422,6 +422,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
             fprintf(stderr,
                     "parhelia: async vertex slot exhausted; retrying synchronously\n");
          screen->async_submit = false;
+         screen->pack_adjacent_packets = false;
       }
    }
    if (vertices && vertex_dwords && !screen->async_submit &&
@@ -474,6 +475,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
       if (ret == -ENOMEM && getenv("PARHELIA_TRACE"))
          fprintf(stderr, "parhelia: async DMA32 slot exhausted; falling back to synchronous submits\n");
       screen->async_submit = false;
+      screen->pack_adjacent_packets = false;
    }
    return parhelia_batch_submit(screen->fd, batch, vertices, vertex_dwords,
                                 &ctx->fence);
@@ -588,20 +590,23 @@ ph_submit_state_stream_groups(struct ph_context *ctx)
    if (!slice)
       return ret;
    while (first < ctx->pending_mark_count) {
-      unsigned end = first, calls = 3;
+      const bool pack_adjacent =
+         ph_screen(ctx->base.screen)->pack_adjacent_packets;
+      unsigned first_packet = first ? ctx->pending_marks[first - 1].packets : 0;
+      unsigned end = first, calls = 0;
 
       while (end < ctx->pending_mark_count) {
-         unsigned first_packet = end ? ctx->pending_marks[end - 1].packets : 0;
-         unsigned mark_calls;
+         unsigned candidate_calls;
 
          ret = parhelia_batch_packed_call_count(
             &ctx->pending_batch, first_packet,
-            ctx->pending_marks[end].packets, &mark_calls);
+            ctx->pending_marks[end].packets, pack_adjacent,
+            &candidate_calls);
          if (ret)
             goto out;
-         if (end > first && mark_calls - 3 > PH_BATCH_HW_CALLS - calls)
+         if (end > first && candidate_calls > PH_BATCH_HW_CALLS)
             break;
-         calls += mark_calls - 3;
+         calls = candidate_calls;
          end++;
          if (calls >= PH_BATCH_HW_CALLS)
             break;
@@ -630,7 +635,8 @@ ph_drain_batch(struct ph_context *ctx)
    if (!ctx->pending_batch.packet_count)
       return 0;
    packed_calls_valid = !parhelia_batch_packed_call_count(
-      &ctx->pending_batch, 0, ctx->pending_batch.packet_count, &packed_calls);
+      &ctx->pending_batch, 0, ctx->pending_batch.packet_count,
+      ph_screen(ctx->base.screen)->pack_adjacent_packets, &packed_calls);
    if (getenv("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: aggregate submits=%u commands=%u packets=%u stages=%u relocs=%u vertices=%u resources=%u estimated_calls=%u\n",

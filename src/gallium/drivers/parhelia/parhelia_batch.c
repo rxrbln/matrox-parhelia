@@ -54,15 +54,23 @@ batch_packet_adds_stage_call(const uint32_t *cmd, unsigned length)
             cmd[6] == cmd[7] && cmd[8] == 0x2121213eu && cmd[9] == 2));
 }
 
+static bool
+batch_packet_is_opening_watermark(const uint32_t *cmd, unsigned length)
+{
+   return length == 3 && cmd[0] == 1 && cmd[1] == 0x212121acu &&
+          cmd[2] == 0x3fff8842u;
+}
+
 int
 parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
                                  unsigned first_packet,
                                  unsigned end_packet,
+                                 bool pack_adjacent_packets,
                                  unsigned *calls)
 {
    enum { PACK_NONE, PACK_DRAW, PACK_RANGE } run = PACK_NONE;
    bool draw_packets[PH_BATCH_PACKETS] = {false};
-   unsigned run_words = 0, count = 3;
+   unsigned opening = first_packet, run_words = 0, count = 3;
 
    if (!batch || !calls || first_packet >= end_packet ||
        end_packet > batch->packet_count ||
@@ -77,6 +85,60 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
          return -EINVAL;
       if (reloc->type == PARHELIA_RELOC_DRAW)
          draw_packets[reloc->packet] = true;
+   }
+   for (unsigned i = first_packet; i < end_packet; i++) {
+      const struct drm_parhelia_packet *packet = &batch->packets[i];
+
+      if (packet->offset > batch->command_count || !packet->length ||
+          packet->length > PH_BATCH_MAX_DRAW_DWORDS ||
+          packet->length > batch->command_count - packet->offset)
+         return -EINVAL;
+      if (batch_packet_is_opening_watermark(batch->commands + packet->offset,
+                                            packet->length)) {
+         opening = i;
+         break;
+      }
+   }
+   if (pack_adjacent_packets) {
+      bool active = false;
+      unsigned previous = 0;
+
+      count = 0;
+      for (unsigned i = first_packet; i < end_packet; i++) {
+         const struct drm_parhelia_packet *packet = &batch->packets[i];
+         const uint32_t *cmd;
+
+         if (packet->offset > batch->command_count || !packet->length ||
+             packet->length > PH_BATCH_MAX_DRAW_DWORDS ||
+             packet->length > batch->command_count - packet->offset)
+            return -EINVAL;
+         cmd = batch->commands + packet->offset;
+         if (i == opening) {
+            count += active;
+            active = false;
+            run_words = 0;
+            count++; /* Kernel-owned opening fence CALL. */
+         }
+         if (active && batch->packets[previous].offset +
+                          batch->packets[previous].length == packet->offset &&
+             packet->length <= PH_BATCH_MAX_DRAW_DWORDS - run_words) {
+            run_words += packet->length;
+         } else {
+            count += active;
+            active = true;
+            run_words = packet->length;
+         }
+         previous = i;
+         if (batch_packet_adds_stage_call(cmd, packet->length)) {
+            count++; /* Flush the run ending in its parent bind. */
+            count++; /* Synthetic WARP-stage CALL. */
+            active = false;
+            run_words = 0;
+         }
+      }
+      count += active;
+      *calls = count + 2; /* EOB and terminal drain. */
+      return 0;
    }
    for (unsigned i = first_packet; i < end_packet; i++) {
       const struct drm_parhelia_packet *packet = &batch->packets[i];

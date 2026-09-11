@@ -48,12 +48,13 @@ int parhelia_batch_slice(struct parhelia_batch *dst,
                          const struct parhelia_batch *src,
                          const struct parhelia_batch_mark *begin,
                          const struct parhelia_batch_mark *end);
-/* Conservatively predict the kernel execution-plan size after its proven
- * adjacent 0x97/0x8f packet packing.  The half-open packet range is treated
- * as one normal submit and therefore includes its three synthetic CALLs. */
+/* Predict the kernel execution-plan size after either its proven 0x97/0x8f
+ * packing or capability-gated generic adjacent-packet packing.  The half-open
+ * packet range is treated as one normal submit, including synthetic CALLs. */
 int parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
                                      unsigned first_packet,
                                      unsigned end_packet,
+                                     bool pack_adjacent_packets,
                                      unsigned *calls);
 
 /* No physical addresses or MMIO callbacks cross this interface. */

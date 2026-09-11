@@ -17,6 +17,7 @@ struct parhelia_screen {
    bool vram_vertex;
    bool bound_range;
    bool async_submit;
+   bool pack_adjacent_packets;
    bool stateful_submit;
    bool native_share;
    bool texture_upload;

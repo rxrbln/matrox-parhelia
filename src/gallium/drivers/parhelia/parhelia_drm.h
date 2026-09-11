@@ -151,6 +151,8 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_NATIVE_SHARE	21
 /* Guarded opaque type-0 host-aperture texture upload probe. */
 #define PARHELIA_PARAM_TEXTURE_UPLOAD	22
+/* Validated generic adjacent-packet secondary-CALL packing is active. */
+#define PARHELIA_PARAM_PACK_ADJACENT	24
 
 #define PARHELIA_TEXTURE_PIPES_PAIRED	0
 #define PARHELIA_TEXTURE_PIPES_SINGLE	1

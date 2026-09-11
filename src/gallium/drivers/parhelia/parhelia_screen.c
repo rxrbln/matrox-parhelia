@@ -802,6 +802,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param async = {
       .param = PARHELIA_PARAM_ASYNC_SUBMIT,
    };
+   struct drm_parhelia_get_param pack_adjacent = {
+      .param = PARHELIA_PARAM_PACK_ADJACENT,
+   };
    struct drm_parhelia_get_param bound_range = {
       .param = PARHELIA_PARAM_BOUND_RANGE,
    };
@@ -861,6 +864,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * complete synchronous path. */
    s->async_submit = !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &async) &&
                      async.value == 1;
+   s->pack_adjacent_packets = s->async_submit &&
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &pack_adjacent) &&
+      pack_adjacent.value == 1;
    s->stateful_submit = s->async_submit &&
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &stateful) &&
       stateful.value == 1;
