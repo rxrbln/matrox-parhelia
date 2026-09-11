@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /* Software vertex processing followed by native Parhelia raster submission. */
+#include <assert.h>
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
@@ -156,6 +157,11 @@ struct ph_context {
    unsigned pending_mark_count;
    struct pipe_resource *pending_resources[PH_BATCH_RELOCS];
    unsigned pending_resource_count;
+   /* Raw aliases into pending_resources.  They identify colour/depth writes
+    * so a CPU/GPU resolve of an unrelated sampled texture need not publish
+    * the whole userspace aggregate first. */
+   struct pipe_resource *pending_writes[PH_BATCH_RELOCS];
+   unsigned pending_write_count;
    bool aggregate_batches;
    bool aggregate_state_batches;
    bool aggregate_state_stream;
@@ -247,17 +253,31 @@ ph_context(struct pipe_context *p)
 static inline unsigned
 ph_triangle_batch_limit(const struct ph_context *ctx)
 {
-   /* The proven mode-3 tail has three more state packets than 0x97.  Leave
-    * those CALL slots available without reducing the default frontend cap. */
-   return ph_screen(ctx->base.screen)->bound_range &&
-          ctx->vram_vertex_enabled && !ctx->aggregate_batches ?
-             PH_BATCH_MAX_DRAWS - 3 : PH_BATCH_MAX_DRAWS;
+   unsigned packets = ctx->batch_limits.packets;
+
+   /* Each triangle is one independently relocated 0x97/0x8f descriptor.
+    * Reserve room for the complete recovered state sequence; the builder's
+    * own bounds remain the final guard if a future state grows. */
+   if (packets <= PH_BATCH_STATE_PACKET_RESERVE)
+      return 1;
+   return MIN2(PH_BATCH_MAX_DRAWS,
+               packets - PH_BATCH_STATE_PACKET_RESERVE);
 }
 
 static inline unsigned
 ph_pending_vertex_limit(const struct ph_context *ctx)
 {
    return ctx->batch_limits.vertex_dwords;
+}
+
+static inline unsigned
+ph_logical_vertex_limit(const struct ph_context *ctx)
+{
+   /* CREATE_VERTEX relocates every triangle range independently, so the
+    * logical stream may fill one negotiated ring slot while every hardware
+    * fetch remains only 3 * dwords-per-vertex. */
+   return ctx->vram_vertex_enabled ? ctx->batch_limits.vertex_dwords :
+                                     PH_BATCH_LEGACY_DWORDS;
 }
 
 static int ph_drain_batch(struct ph_context *ctx);
@@ -460,6 +480,28 @@ ph_release_pending_resources(struct ph_context *ctx)
    for (unsigned i = 0; i < ctx->pending_resource_count; i++)
       pipe_resource_reference(&ctx->pending_resources[i], NULL);
    ctx->pending_resource_count = 0;
+   ctx->pending_write_count = 0;
+}
+
+static bool
+ph_pending_writes_resource(const struct ph_context *ctx,
+                           const struct parhelia_resource *resource)
+{
+   for (unsigned i = 0; resource && i < ctx->pending_write_count; i++)
+      if (ctx->pending_writes[i] == &resource->base)
+         return true;
+   return false;
+}
+
+static void
+ph_record_pending_write(struct ph_context *ctx,
+                        struct parhelia_resource *resource)
+{
+   if (!resource || ph_pending_writes_resource(ctx, resource))
+      return;
+   /* Every written resource is also retained in pending_resources. */
+   assert(ctx->pending_write_count < PH_BATCH_RELOCS);
+   ctx->pending_writes[ctx->pending_write_count++] = &resource->base;
 }
 
 /* parhelia_vertex_bind_mode() in the kernel turns this exact vertex-program
@@ -713,6 +755,8 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
             .vertex_dwords = ctx->pending_vertex_dwords,
          };
    }
+   ph_record_pending_write(ctx, r0);
+   ph_record_pending_write(ctx, r1);
    ph_reference_pending_resources(ctx, resources);
    return 0;
 }
@@ -2246,13 +2290,13 @@ ph_submit_vertices(struct ph_context *ctx)
    /* Layout 0 samples the CPU-visible shadow allocation.  Make a render
     * result authoritative there before it is rebound as a texture. */
    if (ctx->aggregate_batches && texture && !texture_tiled &&
-       texture->tiled_dirty &&
+       texture->tiled_dirty && ph_pending_writes_resource(ctx, texture) &&
        ph_drain_batch(ctx))
       goto out;
    if (texture && !texture_tiled)
       ph_resource_resolve_linear(texture);
    if (ctx->aggregate_batches && texture1 && !texture1_tiled &&
-       texture1->tiled_dirty &&
+       texture1->tiled_dirty && ph_pending_writes_resource(ctx, texture1) &&
        ph_drain_batch(ctx))
       goto out;
    if (texture1 && !texture1_tiled)
@@ -2645,7 +2689,7 @@ ph_alpha_micro_emit(struct ph_context *ctx, const float vertices[3][9],
    const unsigned dpv = 5 + !!depth + 2 + !!vertex_alpha;
 
    if (ctx->triangles == ph_triangle_batch_limit(ctx) ||
-       (ctx->triangles + 1) * 3 * dpv > 4096)
+       (ctx->triangles + 1) * 3 * dpv > ph_logical_vertex_limit(ctx))
       ph_submit_vertices(ctx);
    /* ph_submit_vertices clears the batch tag.  Every split primitive has the
     * same narrow state, so restore it before continuing the packet. */
@@ -2701,7 +2745,8 @@ ph_stage_alpha_micro(struct ph_context *ctx, struct prim_header *prim,
    unsigned samples = 0, accepted = 0;
    float amin = 1.0f, amax = 0.0f;
 
-   if (ctx->aggregate_batches && texture->tiled_dirty && ph_drain_batch(ctx))
+   if (ctx->aggregate_batches && texture->tiled_dirty &&
+       ph_pending_writes_resource(ctx, texture) && ph_drain_batch(ctx))
       return;
    ph_resource_resolve_linear((struct parhelia_resource *)texture);
    for (unsigned i = 0; i < n; i++) {
@@ -2879,11 +2924,11 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	                       ctx->rgb_alpha_two_pass != rgb_alpha_two_pass))
 	   ph_submit_vertices(ctx);
 
-   /* The kernel-owned vertex DMA area is 4096 dwords.  A fixed draw cap is
-    * insufficient because the descriptor layout changes with depth and
-    * texturing: a depth-textured triangle consumes 24 dwords. */
+   /* Bound the complete logical stream to one negotiated CREATE_VERTEX slot.
+    * The descriptor layout still matters: a depth-textured triangle consumes
+    * 24 dwords, while each individual fetch is checked independently. */
    if (ctx->triangles == ph_triangle_batch_limit(ctx) ||
-       (ctx->triangles + 1) * 3 * dpv > 4096)
+       (ctx->triangles + 1) * 3 * dpv > ph_logical_vertex_limit(ctx))
       ph_submit_vertices(ctx);
    if (textured) {
       /* The fixed-function vertex path exports the texture varyings directly.
@@ -2984,7 +3029,8 @@ static void ph_stage_flush(struct draw_stage *s, unsigned flags)
    /* draw_flush() ends the software frontend's draw, but each transformed
     * triangle is already copied into ctx->vertices by ph_stage_tri().  Keep
     * compatible DRAW packets together until a packet-state setter, resource
-    * operation, explicit pipe flush, or the 180-draw packet cap submits them.
+    * operation, explicit pipe flush, or the negotiated packet cap submits
+    * them.
     */
    (void)s;
    (void)flags;
