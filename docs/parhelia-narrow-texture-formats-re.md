@@ -195,16 +195,52 @@ under test and reports which address model each fetched texel matches.
 
 ## Measured on the P690 so far
 
-`--texture-format-probe` has not yet produced a format result.  What the first
-run did establish:
+`--texture-format-probe` has not yet produced a format result.  Two runs both
+wedged the engine on their textured draw:
 
-* **The first textured draw of a freshly loaded engine wedges it.**  A probe
-  that starts with a textured draw never retires its fence
-  (`asynchronous submit fence 00000030 made no progress for 2001 ms`,
-  `BM=03000000 status450=fbebdf0f`).  This is the WARP temporary T2 problem the
-  handover records for Mesa: T2 holds garbage until a program writes it.
-  `probe_prime_warp()` now issues one degenerate untextured passthrough draw
-  first, exactly like Mesa's `ph_prime_warp()`.
+```
+run 1, no WARP prime:  fence 00000030 made no progress for 2001 ms (done 00000028)
+run 2, WARP primed:    fence 00000048 made no progress for 2002 ms (done 00000040)
+```
+
+In run 2 the prime draw and the surface clear both retired (`done 00000040`),
+so the descriptor under test is what the engine stopped on.
+
+**This is not yet attributable to the format fields.**  The probe's command
+stream was compared against `--mip-address-probe`'s, which is the closest
+known-good textured draw, by building both on the host and decoding their
+register writes.  They are identical except for exactly the three registers
+under test:
+
+```
+  11e0 = 32020040   vs  26000040    format and texel layout
+  11e4 = 60010020   vs  00010020    max level
+  11c0 = 01c01040   vs  01c01000    mip filter
+```
+
+so the draw's shape, vertex descriptors, WARP bind, surfaces, combiner and
+packet framing are the same.  What the runs do **not** establish is that
+`--mip-address-probe` still passes on this tree: the shared kernel has grown
+userspace WARP program upload (`6b4237f`), page flips (`f6a3a14`) and
+uncommitted submit/WARP work since the handover's `43c0490`, and the loaded
+module defaults to `pack_draw_packets=Y`.  Another agent's own run wedged the
+same machine 60 seconds after the next reboot, with a different fence.
+
+**The next hardware session must run `--mip-address-probe /dev/dri/renderD128
+64 32` first.**  If that wedges too, the regression is in the shared tree and
+not in these descriptors; if it passes, the format fields are the cause and
+the sweep should continue one combination at a time.  Every wedge costs a
+reboot: a plain module reload afterwards fails in `warp_gate_ready()`
+(`parhelia_warp.c:193`) with `WARP store busy`, and the driver has no engine
+reset path.
+
+Two findings that hold regardless:
+
+* **A fresh engine needs an untextured draw before any textured one.**  WARP
+  temporary T2 holds garbage until a program writes it, which the handover
+  records for Mesa; it applies to every non-Mesa client too.
+  `probe_prime_warp()` now issues one degenerate untextured passthrough draw,
+  exactly like Mesa's `ph_prime_warp()`, and its fence does retire.
 * **`reset_on_probe=1` must not be used on the P690.**  After the engine is
   wedged, a plain module reload fails with `WARP store busy: BM=03020000` and
   `-ETIMEDOUT: cannot initialize WARP engine`.  Loading with
