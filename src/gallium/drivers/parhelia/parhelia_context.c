@@ -75,7 +75,8 @@ static bool ph_prepare_rgb5a1(struct parhelia_resource *texture);
 static void ph_restore_rgba_tiled(struct parhelia_resource *texture);
 static int ph_prepare_alpha_companions(struct ph_context *ctx,
                                        struct parhelia_resource *texture,
-                                       const struct pipe_sampler_state *sampler);
+                                       const struct pipe_sampler_state *sampler,
+                                       bool native_only);
 static uint64_t ph_texture_base_hash(const struct parhelia_resource *texture,
                                      bool tiled, unsigned *alpha_zero,
                                      unsigned *alpha_nonzero);
@@ -1362,13 +1363,15 @@ ph_texture_base_hash(const struct parhelia_resource *texture, bool tiled,
 static int
 ph_prepare_alpha_companions(struct ph_context *ctx,
                             struct parhelia_resource *texture,
-                            const struct pipe_sampler_state *sampler)
+                            const struct pipe_sampler_state *sampler,
+                            bool native_only)
 {
    struct parhelia_screen *screen = ph_screen(ctx->base.screen);
-   const unsigned companion_width =
-      ph_alpha_companion_extent(texture->base.width0);
-   const unsigned companion_height =
-      ph_alpha_companion_extent(texture->base.height0);
+   const unsigned companion_width = native_only ?
+      ph_alpha_companion_extent(texture->base.width0) : texture->base.width0;
+   const unsigned companion_height = native_only ?
+      ph_alpha_companion_extent(texture->base.height0) : texture->base.height0;
+   const bool need_premul = !native_only;
    const bool repeat_s = sampler->wrap_s == PIPE_TEX_WRAP_REPEAT;
    const bool repeat_t = sampler->wrap_t == PIPE_TEX_WRAP_REPEAT;
    struct drm_parhelia_create_render alpha = {
@@ -1381,7 +1384,8 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
    uint8_t *alpha_image = NULL, *premul_image = NULL;
    int ret = 0;
 
-   if (texture->alpha_rgb_handle && texture->premul_rgb_handle &&
+   if (texture->alpha_rgb_handle &&
+       (!need_premul || texture->premul_rgb_handle) &&
        texture->alpha_companion_generation == texture->content_generation &&
        texture->alpha_companion_width == companion_width &&
        texture->alpha_companion_height == companion_height &&
@@ -1396,8 +1400,7 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
       return ret;
    texture->alpha_companion_generation = UINT64_MAX;
 
-   if (!texture->alpha_rgb_handle || !texture->premul_rgb_handle ||
-       texture->alpha_companion_width != companion_width ||
+   if (texture->alpha_companion_width != companion_width ||
        texture->alpha_companion_height != companion_height) {
       if (texture->alpha_rgb_handle) {
          struct drm_gem_close close = {.handle = texture->alpha_rgb_handle};
@@ -1410,38 +1413,46 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
       texture->alpha_rgb_handle = texture->premul_rgb_handle = 0;
       texture->alpha_companion_width = 0;
       texture->alpha_companion_height = 0;
+   }
+   if (!texture->alpha_rgb_handle) {
       if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &alpha)) {
          ret = -errno;
          goto out;
       }
-      if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &premul)) {
-         ret = -errno;
-         struct drm_gem_close close = {.handle = alpha.handle};
-         ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
-         goto out;
-      }
-      if (!alpha.handle || !premul.handle || alpha.pitch != premul.pitch ||
-          alpha.size != premul.size || (alpha.pitch & 3) ||
+      if (!alpha.handle || (alpha.pitch & 3) ||
           alpha.pitch / 4 != ph_sampler_tiled_pitch(companion_width) ||
           alpha.size < (uint64_t)alpha.pitch * companion_height) {
          struct drm_gem_close close = {.handle = alpha.handle};
-         ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
-         close.handle = premul.handle;
          ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
          ret = -EINVAL;
          goto out;
       }
       texture->alpha_rgb_handle = alpha.handle;
-      texture->premul_rgb_handle = premul.handle;
       texture->alpha_companion_size = alpha.size;
       texture->alpha_companion_stride = alpha.pitch / 4;
       texture->alpha_companion_width = companion_width;
       texture->alpha_companion_height = companion_height;
    }
+   if (need_premul && !texture->premul_rgb_handle) {
+      if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &premul)) {
+         ret = -errno;
+         goto out;
+      }
+      if (!premul.handle || (premul.pitch & 3) ||
+          premul.pitch / 4 != texture->alpha_companion_stride ||
+          premul.size != texture->alpha_companion_size) {
+         struct drm_gem_close close = {.handle = premul.handle};
+         ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
+         ret = -EINVAL;
+         goto out;
+      }
+      texture->premul_rgb_handle = premul.handle;
+   }
 
    alpha_image = calloc(1, texture->alpha_companion_size);
-   premul_image = calloc(1, texture->alpha_companion_size);
-   if (!alpha_image || !premul_image) {
+   if (need_premul)
+      premul_image = calloc(1, texture->alpha_companion_size);
+   if (!alpha_image || (need_premul && !premul_image)) {
       ret = -ENOMEM;
       goto out;
    }
@@ -1467,14 +1478,16 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
          }
          src = (const uint8_t *)texture->map + src_off;
          mask = alpha_image + dst_off;
-         rgb = premul_image + dst_off;
+         rgb = need_premul ? premul_image + dst_off : NULL;
          a = src[3];
          mask[0] = mask[1] = mask[2] = a;
          mask[3] = 255;
-         rgb[0] = (src[0] * a + 127) / 255;
-         rgb[1] = (src[1] * a + 127) / 255;
-         rgb[2] = (src[2] * a + 127) / 255;
-         rgb[3] = 255;
+         if (rgb) {
+            rgb[0] = (src[0] * a + 127) / 255;
+            rgb[1] = (src[1] * a + 127) / 255;
+            rgb[2] = (src[2] * a + 127) / 255;
+            rgb[3] = 255;
+         }
       }
    }
    texture->alpha_companion_repeat_s = repeat_s;
@@ -1488,11 +1501,13 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
       ret = -errno;
       goto out;
    }
-   upload.data = (uintptr_t)premul_image;
-   upload.handle = texture->premul_rgb_handle;
-   if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_UPLOAD_RENDER, &upload)) {
-      ret = -errno;
-      goto out;
+   if (need_premul) {
+      upload.data = (uintptr_t)premul_image;
+      upload.handle = texture->premul_rgb_handle;
+      if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_UPLOAD_RENDER, &upload)) {
+         ret = -errno;
+         goto out;
+      }
    }
    texture->alpha_companion_generation = texture->content_generation;
    if (getenv("PARHELIA_TRACE"))
@@ -2346,7 +2361,7 @@ ph_submit_rgb_alpha_two_pass(struct ph_context *ctx,
    float scale_s, scale_t;
    int ret;
 
-   ret = ph_prepare_alpha_companions(ctx, texture, sampler);
+   ret = ph_prepare_alpha_companions(ctx, texture, sampler, false);
    if (ret)
       return ret;
    scale_s = ph_alpha_companion_scale(texture->base.width0,
@@ -2556,7 +2571,7 @@ ph_submit_vertices(struct ph_context *ctx)
       goto out;
    }
    if (ctx->native_sampled_alpha &&
-       (ret = ph_prepare_alpha_companions(ctx, texture, sampler))) {
+       (ret = ph_prepare_alpha_companions(ctx, texture, sampler, true))) {
       ctx->submit_error = ret;
       goto out;
    }
