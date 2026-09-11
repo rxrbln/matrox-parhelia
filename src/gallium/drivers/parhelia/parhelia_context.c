@@ -34,8 +34,6 @@
 #include "parhelia_batch.h"
 #include "parhelia_internal.h"
 
-#define PH_VRAM_VERTEX_SLOTS 3
-
 struct ph_velems {
    unsigned count;
    struct pipe_vertex_element elem[PIPE_MAX_ATTRIBS];
@@ -241,8 +239,9 @@ struct ph_context {
 	float *vram_vertices;
 	uint64_t vram_vertex_size;
 	uint32_t vram_vertex_handle;
-	uint32_t vram_vertex_fence[PH_VRAM_VERTEX_SLOTS];
+	uint32_t vram_vertex_fence[PH_VRAM_VERTEX_SLOTS_MAX];
 	unsigned vram_vertex_slot;
+	unsigned vram_vertex_slot_count;
 	unsigned vram_vertex_slot_dwords;
 	bool vram_vertex_enabled;
    unsigned triangles;
@@ -328,6 +327,7 @@ ph_destroy_vertex_ring(struct ph_context *ctx)
    ctx->vram_vertices = NULL;
    ctx->vram_vertex_size = 0;
    ctx->vram_vertex_handle = 0;
+   ctx->vram_vertex_slot_count = 0;
    ctx->vram_vertex_slot_dwords = 0;
    ctx->vram_vertex_enabled = false;
 }
@@ -341,6 +341,7 @@ ph_create_vertex_ring(struct ph_context *ctx)
    struct parhelia_batch_limits mapped_limits;
    struct parhelia_screen *screen = ph_screen(ctx->base.screen);
    uint64_t slot_bytes;
+   unsigned slot_count;
    struct drm_parhelia_create_vertex create = {
       .size = 0,
    };
@@ -349,12 +350,15 @@ ph_create_vertex_ring(struct ph_context *ctx)
    parhelia_batch_negotiate_limits(screen->kernel_max_packets, true,
                                    &mapped_limits);
    slot_bytes = (uint64_t)mapped_limits.vertex_dwords * sizeof(uint32_t);
-   create.size = PH_VRAM_VERTEX_SLOTS * slot_bytes;
+   slot_count = screen->async_slots &&
+                screen->async_slots + 1 <= PH_VRAM_VERTEX_SLOTS_MAX ?
+                screen->async_slots + 1 : PH_VRAM_VERTEX_LEGACY_SLOTS;
+   create.size = slot_count * slot_bytes;
    if (!screen->vram_vertex ||
        ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_VERTEX, &create))
       return;
    if (!create.handle ||
-       create.size < PH_VRAM_VERTEX_SLOTS * slot_bytes) {
+       create.size < slot_count * slot_bytes) {
       if (create.handle) {
          struct drm_gem_close close = {.handle = create.handle};
          ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
@@ -371,14 +375,16 @@ ph_create_vertex_ring(struct ph_context *ctx)
    ctx->vram_vertices = map;
    ctx->vram_vertex_size = create.size;
    ctx->vram_vertex_handle = create.handle;
+   ctx->vram_vertex_slot_count = slot_count;
    ctx->vram_vertex_slot_dwords = mapped_limits.vertex_dwords;
    ctx->vram_vertex_enabled = true;
    ctx->batch_limits = mapped_limits;
    if (getenv("PARHELIA_TRACE"))
       fprintf(stderr,
-              "parhelia: enabled P690 class-3 DMA vertex ring handle=%u bytes=%llu slot_dwords=%u\n",
+              "parhelia: enabled P690 class-3 DMA vertex ring handle=%u bytes=%llu slots=%u slot_dwords=%u queue-depth=%u\n",
               create.handle, (unsigned long long)create.size,
-              ctx->vram_vertex_slot_dwords);
+              ctx->vram_vertex_slot_count, ctx->vram_vertex_slot_dwords,
+              screen->async_slots);
 }
 
 static int
@@ -396,7 +402,10 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
       uint64_t offset = (uint64_t)slot * ctx->vram_vertex_slot_dwords *
                         sizeof(uint32_t);
 
-      if (ctx->vram_vertex_fence[slot]) {
+      /* With queue-depth+1 subranges, acceptance of the intervening queue
+       * depth submits proves this slot's earlier request has retired before
+       * wrap.  Older kernels expose no depth and retain explicit waits. */
+      if (!screen->async_slots && ctx->vram_vertex_fence[slot]) {
          ret = parhelia_wait_fence(screen->fd, ctx->vram_vertex_fence[slot],
                                    -1, NULL);
          if (ret)
@@ -410,7 +419,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
                                               vertex_dwords, &ctx->fence);
       if (!ret) {
          ctx->vram_vertex_fence[slot] = ctx->fence;
-         ctx->vram_vertex_slot = (slot + 1) % ARRAY_SIZE(ctx->vram_vertex_fence);
+         ctx->vram_vertex_slot = (slot + 1) % ctx->vram_vertex_slot_count;
          ctx->async_pending = true;
          return 0;
       }

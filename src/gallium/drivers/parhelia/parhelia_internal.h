@@ -8,6 +8,9 @@
 #include "pipe/p_screen.h"
 #include "parhelia_mipmap.h"
 
+#define PH_VRAM_VERTEX_LEGACY_SLOTS 3
+#define PH_VRAM_VERTEX_SLOTS_MAX 9
+
 struct parhelia_screen {
    struct pipe_screen base;
    int fd;
@@ -17,6 +20,7 @@ struct parhelia_screen {
    bool vram_vertex;
    bool bound_range;
    bool async_submit;
+   uint32_t async_slots;
    bool pack_adjacent_packets;
    bool stateful_submit;
    bool native_share;

@@ -140,7 +140,7 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_VRAM_VERTEX	15
 /* P690-only guarded mode-7 index/stream relocation contract. */
 #define PARHELIA_PARAM_NATIVE_INDEXED	16
-/* Non-zero only when the fenced three-slot producer queue is available. */
+/* Non-zero only when the fenced asynchronous producer queue is available. */
 #define PARHELIA_PARAM_ASYNC_SUBMIT	17
 /* P690-only guarded sequential bound-stream range diagnostic. */
 #define PARHELIA_PARAM_BOUND_RANGE_TEST	18
@@ -151,6 +151,8 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_NATIVE_SHARE	21
 /* Guarded opaque type-0 host-aperture texture upload probe. */
 #define PARHELIA_PARAM_TEXTURE_UPLOAD	22
+/* Number of requests the kernel can retain in its ordered async queue. */
+#define PARHELIA_PARAM_ASYNC_SLOTS	23
 /* Validated generic adjacent-packet secondary-CALL packing is active. */
 #define PARHELIA_PARAM_PACK_ADJACENT	24
 
