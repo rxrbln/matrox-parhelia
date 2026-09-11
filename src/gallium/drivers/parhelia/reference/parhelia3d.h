@@ -395,6 +395,11 @@ struct p3d_state {
 	 * only: it additionally retains the vendor's disabled unit-1 pipe mask
 	 * (0x0001000c), while issuing no second sampler descriptor. */
 	int		   single_texture_pipe;
+	/* Vendor LX-class pipe allocation (parhelia-p690-texture-pipes-re.md,
+	 * parhelia-p690-ganged-pipe-ta-re.md): one stage ganged on pipes 0+2
+	 * and merged in combiner slot 0, leftover pipes parked on the next
+	 * unit, 0x11e8 written per unit bank.  Needs single_texture_pipe. */
+	int		   lx_pipe_route;
 	/* Select the P690 mode-3 frontend.  It retains one packet per triangle;
 	 * hardware testing proved that the packet boundary supplies the depth
 	 * interlock which a second range in the same packet does not. */

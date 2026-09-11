@@ -397,6 +397,7 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	uint32_t cls = p3d_prim_class(st->prim);
 	uint32_t pipectl, dwgctl;
 	struct p3d_rw rw[10], desc[6];
+	const int lx = st->lx_pipe_route && st->single_texture_pipe == 1;
 	size_t nd;
 
 	/* 0x1130: set only the decoded fields and keep the captured remainder */
@@ -629,9 +630,11 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	 * zero.  Every complete state image must therefore write the requested
 	 * value, including zero, so a later context cannot inherit another
 	 * client's cache mode. */
-	rw[0].reg = P3D_R_TEX_CACHE;
-	rw[0].val = st->texture_cache_probe;
-	p3d_reglist(cs, rw, 1);
+	if (!(lx && st->tex)) {
+		rw[0].reg = P3D_R_TEX_CACHE;
+		rw[0].val = st->texture_cache_probe;
+		p3d_reglist(cs, rw, 1);
+	}
 
 	/* -- texture ------------------------------------------------------- */
 	if (st->tex) {
@@ -659,7 +662,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			rw[0].reg = P3D_R_TEX_ENABLE + 4 * u;
 			rw[0].val = 0x00040100u | pipe_mask[u];
 			if (st->single_texture_pipe && u == 0)
-				rw[0].val = 0x00040101u;
+				rw[0].val = lx && nunit == 1 ? 0x00040105u :
+					    0x00040101u;
 			else if (st->single_texture_pipe && u == 1)
 				/* SUN90/P690 allocates units 0/1 to pipes 0/2. */
 				rw[0].val = 0x00040104u;
@@ -681,10 +685,20 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			rw[0].reg = 0x11cc; rw[0].val = 0xffffffffu;
 			rw[1].reg = 0x11d0; rw[1].val = 0;
 			rw[2].reg = 0x11c8; rw[2].val = 0;
-			p3d_reglist(cs, rw, 3);
+			/* the vendor LX table value for one or two stages */
+			rw[3].reg = P3D_R_TEX_CACHE; rw[3].val = 0x00500000u;
+			p3d_reglist(cs, rw, lx ? 4 : 3);
 		}
 
-		if (nunit == 1) {
+		if (lx) {
+			/* park the pipes no stage owns on the first free unit */
+			for (u = nunit; u < 4; u++) {
+				rw[0].reg = P3D_R_TEX_ENABLE + 4 * u;
+				rw[0].val = u == nunit ? 0x0001000au : 0;
+				rw[1].reg = P3D_R_TEX_CACHE; rw[1].val = 0;
+				p3d_reglist(cs, rw, 2);
+			}
+		} else if (nunit == 1) {
 			rw[0].reg = P3D_R_TEX_ENABLE + 4;
 			/* The normal P690 one-pipe path leaves unit 1 clear.  The
 			 * vendor capture instead retains a disabled unit-1 descriptor
@@ -712,10 +726,13 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 		rw[1].reg = P3D_R_TEX_UNK1334; rw[1].val = 0x3f800000u;
 		p3d_reglist(cs, rw, 2);
 
-		/* MODULATE: the texture-address stage takes instruction 0, so
-		 * the ALU is instruction 1 = hardware slot 2 */
-		rw[0].reg = P3D_R_COMB_RGB;   rw[0].val = 0x00004000u;
-		rw[1].reg = P3D_R_COMB_ALPHA; rw[1].val = 0x00004000u;
+		/* Slot 0 is ADD t0, t0, t1: it merges the partial samples of a
+		 * stage ganged over two pipes (0528: pipes 0+1).  The P690 gang
+		 * is pipes 0+2, merged with ADD t0, t0, t2; each pipe returns
+		 * zero for the fragments it does not own. */
+		rw[0].reg = P3D_R_COMB_RGB;
+		rw[0].val = lx && nunit == 1 ? 0x00008000u : 0x00004000u;
+		rw[1].reg = P3D_R_COMB_ALPHA; rw[1].val = rw[0].val;
 		rw[2].reg = 0x126c;           rw[2].val = 0x00000c00u;
 		rw[3].reg = 0x1268;           rw[3].val = 0x00000c00u;
 		rw[4].reg = 0x1278; rw[4].val = 0;

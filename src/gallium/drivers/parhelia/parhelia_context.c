@@ -3325,6 +3325,9 @@ ph_submit_vertices(struct ph_context *ctx)
 		state.dw_per_vertex++;
 	}
    state.single_texture_pipe = ph_screen(ctx->base.screen)->single_texture_pipe;
+   /* One texture ganged on pipes 0+2: +25% on trilinear minification. */
+   state.lx_pipe_route = ph_screen(ctx->base.screen)->chip_id == 0x2539 &&
+                         !ph_env("PARHELIA_NO_LX_PIPES");
    /* The kernel advertises this only under its independent default-off
     * module gate.  CREATE_VERTEX mmap success is also required, keeping the
     * ordinary 0x97/class-3 builder as the fallback context path. */
