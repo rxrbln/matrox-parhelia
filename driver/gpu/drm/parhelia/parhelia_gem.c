@@ -396,6 +396,11 @@ void parhelia_bo_make_unmappable(struct drm_gem_vram_object *gbo)
 		gbo->bo.base.funcs = &parhelia_unmappable_object_funcs;
 }
 
+void parhelia_bo_force_unmappable(struct drm_gem_vram_object *gbo)
+{
+	gbo->bo.base.funcs = &parhelia_unmappable_object_funcs;
+}
+
 bool parhelia_texture_upload_enabled(void)
 {
 	return texture_upload_probe;
@@ -814,39 +819,48 @@ int parhelia_get_bo_info_ioctl(struct drm_device *drm, void *data,
 	return 0;
 }
 
-int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
-				 struct drm_file *file)
+static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
+					   struct drm_file *file,
+					   bool download)
 {
 	struct drm_parhelia_upload_render *args = data;
 	struct parhelia_device *pdev = to_parhelia(drm);
-	struct parhelia_aperture_mapping mapping;
+	struct parhelia_aperture_mapping mapping = { };
 	struct drm_gem_object *gem;
 	struct parhelia_bo *bo;
 	u32 surface_address;
 	u64 copied;
-	void *source;
+	void *buffer;
 	int ret;
 
-	if (!texture_upload_probe || pdev->pdev->device != 0x2539 ||
-	    !pdev->raw_aperture_owned)
+	if (pdev->pdev->device != 0x2539 || !pdev->raw_aperture_owned)
 		return -EOPNOTSUPP;
 	if (!args->data || !args->handle || !args->size || args->flags ||
 	    args->pad || !IS_ALIGNED(args->offset, 4) ||
-	    !IS_ALIGNED(args->size, 4) || args->size > SIZE_MAX)
+	    !IS_ALIGNED(args->size, 4) || args->size > SZ_16M ||
+	    args->size > SIZE_MAX)
 		return -EINVAL;
 
-	source = vmemdup_user(u64_to_user_ptr(args->data), args->size);
-	if (IS_ERR(source))
-		return PTR_ERR(source);
+	if (download) {
+		buffer = kvmalloc(args->size, GFP_KERNEL);
+		if (!buffer)
+			return -ENOMEM;
+	} else {
+		buffer = vmemdup_user(u64_to_user_ptr(args->data), args->size);
+		if (IS_ERR(buffer))
+			return PTR_ERR(buffer);
+	}
 
 	gem = drm_gem_object_lookup(file, args->handle);
 	if (!gem) {
 		ret = -ENOENT;
-		goto out_source;
+		goto out_buffer;
 	}
 	bo = to_parhelia_bo(gem);
-	if (gem->funcs != &parhelia_unmappable_object_funcs ||
-	    bo->layout != PARHELIA_BO_LAYOUT_TEXTURE ||
+	if (!parhelia_gem_is_owned(gem) ||
+	    !((bo->layout == PARHELIA_BO_LAYOUT_TEXTURE && texture_upload_probe) ||
+	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_COLOR ||
+	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_DEPTH) ||
 	    args->offset >= gem->size || args->size > gem->size - args->offset) {
 		ret = -EINVAL;
 		goto out_gem;
@@ -894,23 +908,31 @@ int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
 		if (texture_upload_trace &&
 		    atomic_inc_return(&texture_upload_trace_count) <= 4096)
 			dev_info(&pdev->pdev->dev,
-				 "texture upload slot=%u aperture=%#llx surface=%#x copied=%#llx total=%#llx bo_offset=%#llx bytes=%#x ctrl=%#x\n",
+				 "render %s slot=%u aperture=%#llx surface=%#x copied=%#llx total=%#llx bo_offset=%#llx bytes=%#x ctrl=%#x\n",
+				 download ? "download" : "upload",
 				 mapping.slot,
 				 (unsigned long long)mapping.node.start,
 				 surface_address, (unsigned long long)copied,
 				 (unsigned long long)args->size,
 				 (unsigned long long)args->offset, bytes,
 				 mapping.ctrl);
-		watch_root = texture_upload_trace &&
+		watch_root = !download && texture_upload_trace &&
 			parhelia_read_root_samples(pdev, root_before);
-		memcpy_toio((u8 __iomem *)pdev->vram + mapping.node.start,
-			    (u8 *)source + copied, bytes);
-		wmb();
-		parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(mapping.slot));
+		if (download) {
+			memcpy_fromio((u8 *)buffer + copied,
+				      (u8 __iomem *)pdev->vram + mapping.node.start,
+				      bytes);
+		} else {
+			memcpy_toio((u8 __iomem *)pdev->vram + mapping.node.start,
+				    (u8 *)buffer + copied, bytes);
+			wmb();
+			parhelia_read(pdev,
+				      PARHELIA_HOST_APERTURE_SLOT(mapping.slot));
+		}
 		if (watch_root && parhelia_read_root_samples(pdev, root_after) &&
 		    memcmp(root_before, root_after, sizeof(root_before)))
 			dev_err(&pdev->pdev->dev,
-				"texture upload changed root probes: handle=%u surface=%#x copied=%#llx bytes=%#x values=%08x/%08x/%08x -> %08x/%08x/%08x\n",
+				"render upload changed root probes: handle=%u surface=%#x copied=%#llx bytes=%#x values=%08x/%08x/%08x -> %08x/%08x/%08x\n",
 				args->handle, surface_address,
 				(unsigned long long)copied, bytes,
 				root_before[0], root_before[1], root_before[2],
@@ -931,7 +953,22 @@ out_submit_unlock:
 	mutex_unlock(&pdev->submit_lock);
 out_gem:
 	drm_gem_object_put(gem);
-out_source:
-	kvfree(source);
+out_buffer:
+	if (!ret && download && copy_to_user(u64_to_user_ptr(args->data),
+						 buffer, args->size))
+		ret = -EFAULT;
+	kvfree(buffer);
 	return ret;
+}
+
+int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
+				 struct drm_file *file)
+{
+	return parhelia_transfer_render_ioctl(drm, data, file, false);
+}
+
+int parhelia_download_render_ioctl(struct drm_device *drm, void *data,
+				   struct drm_file *file)
+{
+	return parhelia_transfer_render_ioctl(drm, data, file, true);
 }

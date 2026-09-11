@@ -3007,6 +3007,9 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 			PARHELIA_PLACEMENT_NATIVE_DEPTH);
 	if (layout == PARHELIA_BO_LAYOUT_TEXTURE)
 		parhelia_bo_make_unmappable(bo);
+	else if (args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
+				PARHELIA_CREATE_RENDER_NATIVE_DEPTH))
+		parhelia_bo_force_unmappable(bo);
 	ret = drm_gem_handle_create(file, &bo->bo.base, &handle);
 	if (!ret && !(args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 				  PARHELIA_CREATE_RENDER_NATIVE_DEPTH)) &&
@@ -3182,6 +3185,10 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 	case PARHELIA_PARAM_NATIVE_RT_CLASSES:
 		args->value = pdev->pdev->device == PARHELIA_P690 &&
 			pdev->raw_aperture_owned && pdev->vram_size >= SZ_128M;
+		break;
+	case PARHELIA_PARAM_RENDER_TRANSFER:
+		args->value = pdev->pdev->device == PARHELIA_P690 &&
+			pdev->raw_aperture_owned;
 		break;
 	default:
 		return -EINVAL;

@@ -64,6 +64,10 @@ PARHELIA_TRACED_IOCTL(parhelia_traced_upload_render, parhelia_upload_render_ioct
 	((struct drm_parhelia_upload_render *)data)->handle,
 	((struct drm_parhelia_upload_render *)data)->offset,
 	((struct drm_parhelia_upload_render *)data)->size)
+PARHELIA_TRACED_IOCTL(parhelia_traced_download_render, parhelia_download_render_ioctl,
+	((struct drm_parhelia_upload_render *)data)->handle,
+	((struct drm_parhelia_upload_render *)data)->offset,
+	((struct drm_parhelia_upload_render *)data)->size)
 
 static int parhelia_traced_dumb_create(struct drm_file *file,
 				       struct drm_device *drm,
@@ -112,6 +116,8 @@ static const struct drm_ioctl_desc parhelia_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(PARHELIA_GET_BO_INFO, parhelia_traced_get_bo_info,
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(PARHELIA_UPLOAD_RENDER, parhelia_traced_upload_render,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(PARHELIA_DOWNLOAD_RENDER, parhelia_traced_download_render,
 			  DRM_RENDER_ALLOW),
 };
 

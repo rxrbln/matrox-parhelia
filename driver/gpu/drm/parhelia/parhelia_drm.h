@@ -23,6 +23,7 @@
 #define DRM_PARHELIA_WAIT_FENCE		0x04
 #define DRM_PARHELIA_GET_BO_INFO	0x05
 #define DRM_PARHELIA_UPLOAD_RENDER	0x06
+#define DRM_PARHELIA_DOWNLOAD_RENDER	0x07
 
 #define DRM_IOCTL_PARHELIA_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_PARHELIA_GET_PARAM, \
@@ -44,6 +45,9 @@
 		 struct drm_parhelia_get_bo_info)
 #define DRM_IOCTL_PARHELIA_UPLOAD_RENDER \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_PARHELIA_UPLOAD_RENDER, \
+		struct drm_parhelia_upload_render)
+#define DRM_IOCTL_PARHELIA_DOWNLOAD_RENDER \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_PARHELIA_DOWNLOAD_RENDER, \
 		struct drm_parhelia_upload_render)
 
 /* Linear storage does not use the tiled render-target address decoder and
@@ -107,7 +111,9 @@ struct drm_parhelia_get_bo_info {
 	__u64 size;
 };
 
-/* Copy an already hardware-laid-out byte span into native sampler storage.
+/* Copy an already hardware-laid-out byte span between userspace and native
+ * storage.  UPLOAD reads from @data; DOWNLOAD writes to @data.  Both ioctls
+ * use this structure and require four-byte-aligned bounds.
  * The kernel creates a short-lived type-0 host-aperture view for the copy;
  * userspace never receives a raw BAR mapping of local memory. */
 struct drm_parhelia_upload_render {
@@ -165,6 +171,8 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_PACK_ADJACENT_BOUNDARIES	25
 /* P690 exposes separate packed native colour/depth allocation classes. */
 #define PARHELIA_PARAM_NATIVE_RT_CLASSES	27
+/* Safe bounded UPLOAD_RENDER and DOWNLOAD_RENDER through a kernel aperture. */
+#define PARHELIA_PARAM_RENDER_TRANSFER	28
 
 #define PARHELIA_TEXTURE_PIPES_PAIRED	0
 #define PARHELIA_TEXTURE_PIPES_SINGLE	1
