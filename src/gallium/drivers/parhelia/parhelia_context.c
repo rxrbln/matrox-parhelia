@@ -3929,11 +3929,12 @@ static void ph_bind_rasterizer(struct pipe_context *p, void *s)
    if (ctx->rasterizer == s)
       return;
    ph_submit_vertices(ctx);
-   ctx->rasterizer = s;
    /* Early software rejection avoids transforming and uploading backfaces;
     * the independently hardware-proven 0x1130 selector remains programmed as
-    * the final raster guard for every surviving batch. */
+    * the final raster guard for every surviving batch.  Assign afterwards:
+    * the draw flush lets wide-line/point stages re-bind their saved state. */
    draw_set_rasterizer_state(ctx->draw, s, s);
+   ctx->rasterizer = s;
 }
 static void ph_delete_state(struct pipe_context *p, void *s)
 { (void)p; FREE(s); }
