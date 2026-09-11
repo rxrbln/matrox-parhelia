@@ -220,7 +220,7 @@ struct parhelia_bios {
 #define PARHELIA_MAX_COMMAND_DWORDS	(64u * 1024u)
 /* Five-dword CALL plus optional three-dword diagnostic writeback marker. */
 #define PARHELIA_PRIMARY_DWORDS		(PARHELIA_MAX_PACKETS * 8u + 16u)
-#define PARHELIA_ASYNC_SLOTS		3u
+#define PARHELIA_ASYNC_SLOTS		8u
 /* A normal coalesced submit has one five-word CALL per packet plus its
  * opening/EOB/drain sections, optional stage calls, and one writeback. */
 #define PARHELIA_SLOT_PRIMARY_DWORDS	(PARHELIA_MAX_PACKETS * 5u + 16u)
@@ -322,6 +322,21 @@ struct parhelia_reg_shadow {
 	DECLARE_BITMAP(valid, PARHELIA_INDEXED_REGS);
 };
 
+/*
+ * Default-off submit telemetry. Atomic storage keeps debugfs reads coherent
+ * without taking submit_lock or perturbing the producer critical section.
+ */
+struct parhelia_submit_stats {
+	atomic64_t async_submits;
+	atomic64_t slot_waits;
+	atomic64_t slot_wait_ns;
+	atomic64_t tail_waits;
+	atomic64_t tail_wait_ns;
+	atomic64_t ring_start_writes;
+	atomic64_t ring_end_writes;
+	atomic64_t queue_high_water;
+};
+
 struct parhelia_bo;
 
 /* One entry in the P690's 24-bit class-0 virtual address space.  The drm_mm
@@ -418,6 +433,7 @@ struct parhelia_device {
 	bool primary_armed;
 	u64 fence_context;
 	u32 next_dma_tag;
+	struct parhelia_submit_stats submit_stats;
 	struct parhelia_reg_shadow reg_shadow;
 	u64 reg_shadow_submits;
 	u64 reg_shadow_packets;
@@ -498,6 +514,7 @@ int parhelia_get_bo_info_ioctl(struct drm_device *drm, void *data,
 int parhelia_upload_render_ioctl(struct drm_device *drm, void *data,
 				 struct drm_file *file);
 int parhelia_submit_idle_lock(struct parhelia_device *pdev);
+void parhelia_submit_debugfs_init(struct drm_minor *minor);
 struct drm_gem_object *parhelia_gem_create_object(struct drm_device *drm, size_t size);
 int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 			 struct drm_mode_create_dumb *args);

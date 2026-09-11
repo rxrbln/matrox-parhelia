@@ -24,6 +24,12 @@ MODULE_PARM_DESC(reset_on_probe, "Reset PCI function before initialization (brin
 
 DEFINE_DRM_GEM_FOPS(parhelia_fops);
 
+static void parhelia_debugfs_init(struct drm_minor *minor)
+{
+	drm_vram_mm_debugfs_init(minor);
+	parhelia_submit_debugfs_init(minor);
+}
+
 #define PARHELIA_TRACED_IOCTL(_name, _fn, _a0, _a1, _a2)                \
 static int _name(struct drm_device *drm, void *data, struct drm_file *file) \
 {                                                                       \
@@ -116,7 +122,7 @@ static const struct drm_driver parhelia_driver = {
 	.ioctls = parhelia_ioctls,
 	.num_ioctls = ARRAY_SIZE(parhelia_ioctls),
 	.gem_create_object = parhelia_gem_create_object,
-	.debugfs_init = drm_vram_mm_debugfs_init,
+	.debugfs_init = parhelia_debugfs_init,
 	.dumb_create = parhelia_traced_dumb_create,
 	.dumb_map_offset = parhelia_traced_dumb_map_offset,
 	.name = DRIVER_NAME,

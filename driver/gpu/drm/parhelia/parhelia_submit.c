@@ -10,6 +10,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
 #include <linux/slab.h>
@@ -17,6 +18,8 @@
 #include <linux/jiffies.h>
 
 #include <drm/drm_gem.h>
+#include <drm/drm_debugfs.h>
+#include <drm/drm_file.h>
 #include <drm/drm_gem_vram_helper.h>
 #include <drm/ttm/ttm_bo.h>
 
@@ -33,6 +36,86 @@
 static bool trace_submit;
 module_param(trace_submit, bool, 0400);
 MODULE_PARM_DESC(trace_submit, "Trace coherent retirement of each pre-draw state packet");
+
+static bool submit_stats;
+module_param(submit_stats, bool, 0400);
+MODULE_PARM_DESC(submit_stats,
+		 "Collect async queue and primary publication counters in debugfs");
+
+static u64 parhelia_submit_wait_begin(atomic64_t *waits)
+{
+	if (!submit_stats)
+		return 0;
+	atomic64_inc(waits);
+	return ktime_get_mono_fast_ns();
+}
+
+static void parhelia_submit_wait_end(atomic64_t *elapsed_ns, u64 begin)
+{
+	if (begin)
+		atomic64_add(ktime_get_mono_fast_ns() - begin, elapsed_ns);
+}
+
+static void parhelia_submit_high_water(struct parhelia_device *pdev, u32 depth)
+{
+	s64 old;
+
+	if (!submit_stats)
+		return;
+	old = atomic64_read(&pdev->submit_stats.queue_high_water);
+	while (depth > old) {
+		s64 seen = atomic64_cmpxchg(&pdev->submit_stats.queue_high_water,
+					old, depth);
+
+		if (seen == old)
+			break;
+		old = seen;
+	}
+}
+
+static int parhelia_submit_stats_show(struct seq_file *m, void *data)
+{
+	struct drm_info_node *node = m->private;
+	struct parhelia_device *pdev = to_parhelia(node->minor->dev);
+	struct parhelia_submit_stats *stats = &pdev->submit_stats;
+
+	seq_printf(m, "enabled %u\n", submit_stats);
+	seq_printf(m, "async_slots %u\n", PARHELIA_ASYNC_SLOTS);
+	seq_printf(m, "async_primary_dwords %u\n",
+		   PARHELIA_ASYNC_PRIMARY_DWORDS);
+	seq_printf(m, "queued_slots %u\n", READ_ONCE(pdev->queued_slots));
+	seq_printf(m, "primary_put_dwords %u\n", READ_ONCE(pdev->primary_put));
+	seq_printf(m, "primary_get_dwords %u\n", READ_ONCE(pdev->primary_get));
+	seq_printf(m, "primary_armed %u\n", READ_ONCE(pdev->primary_armed));
+	seq_printf(m, "async_submits %lld\n",
+		   atomic64_read(&stats->async_submits));
+	seq_printf(m, "async_slot_waits %lld\n",
+		   atomic64_read(&stats->slot_waits));
+	seq_printf(m, "async_slot_wait_ns %lld\n",
+		   atomic64_read(&stats->slot_wait_ns));
+	seq_printf(m, "primary_tail_waits %lld\n",
+		   atomic64_read(&stats->tail_waits));
+	seq_printf(m, "primary_tail_wait_ns %lld\n",
+		   atomic64_read(&stats->tail_wait_ns));
+	seq_printf(m, "async_ring_start_0x404_writes %lld\n",
+		   atomic64_read(&stats->ring_start_writes));
+	seq_printf(m, "async_ring_end_0x408_writes %lld\n",
+		   atomic64_read(&stats->ring_end_writes));
+	seq_printf(m, "queue_high_water %lld\n",
+		   atomic64_read(&stats->queue_high_water));
+	return 0;
+}
+
+static const struct drm_info_list parhelia_submit_debugfs_list[] = {
+	{ "parhelia_submit_stats", parhelia_submit_stats_show, 0 },
+};
+
+void parhelia_submit_debugfs_init(struct drm_minor *minor)
+{
+	drm_debugfs_create_files(parhelia_submit_debugfs_list,
+				 ARRAY_SIZE(parhelia_submit_debugfs_list),
+				 minor->debugfs_root, minor);
+}
 
 /* Diagnose writes to three pixels in the fixed Quake root-window corruption
  * band.  This is deliberately read-only and default-off.  While enabled,
@@ -1165,6 +1248,14 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 
 	init_waitqueue_head(&pdev->submit_waitq);
 	INIT_DELAYED_WORK(&pdev->retire_work, parhelia_retire_work);
+	atomic64_set(&pdev->submit_stats.async_submits, 0);
+	atomic64_set(&pdev->submit_stats.slot_waits, 0);
+	atomic64_set(&pdev->submit_stats.slot_wait_ns, 0);
+	atomic64_set(&pdev->submit_stats.tail_waits, 0);
+	atomic64_set(&pdev->submit_stats.tail_wait_ns, 0);
+	atomic64_set(&pdev->submit_stats.ring_start_writes, 0);
+	atomic64_set(&pdev->submit_stats.ring_end_writes, 0);
+	atomic64_set(&pdev->submit_stats.queue_high_water, 0);
 	pdev->fence_context = dma_fence_context_alloc(1);
 	pdev->async_primary_cpu = dmam_alloc_coherent(&pdev->pdev->dev,
 		PARHELIA_ASYNC_PRIMARY_DWORDS * sizeof(u32), &pdev->async_primary_bus,
@@ -2248,6 +2339,7 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 			  struct drm_file *file)
 {
 	struct parhelia_device *pdev = to_parhelia(drm);
+	struct parhelia_submit_stats *stats = &pdev->submit_stats;
 	struct drm_parhelia_submit *args = data;
 	struct drm_parhelia_packet *packets;
 	struct drm_parhelia_reloc *relocs;
@@ -2416,13 +2508,18 @@ retry_slot:
 			if (pdev->slots[slot_index].state == PARHELIA_SLOT_FREE)
 				break;
 		if (slot_index == PARHELIA_ASYNC_SLOTS || pdev->wedged) {
+			u64 wait_begin;
+
 			ret = pdev->wedged ? -EIO : 0;
+			wait_begin = ret ? 0 :
+				parhelia_submit_wait_begin(&stats->slot_waits);
 			mutex_unlock(&pdev->submit_lock);
 			if (ret)
 				goto out_relocs;
 			ret = wait_event_interruptible_timeout(pdev->submit_waitq,
 				pdev->wedged || pdev->queued_slots < PARHELIA_ASYNC_SLOTS,
 				msecs_to_jiffies(10));
+			parhelia_submit_wait_end(&stats->slot_wait_ns, wait_begin);
 			if (ret < 0)
 				goto out_relocs;
 			goto retry_slot;
@@ -2450,10 +2547,14 @@ retry_slot:
 			 * fetch is live.  A full span is back-pressure, not a malformed
 			 * request: retire its FIFO work, re-arm at zero, then retry. */
 			if (pdev->queued_slots) {
+				u64 wait_begin =
+					parhelia_submit_wait_begin(&stats->tail_waits);
+
 				mutex_unlock(&pdev->submit_lock);
 				ret = wait_event_interruptible_timeout(pdev->submit_waitq,
 					pdev->wedged || !pdev->queued_slots,
 					msecs_to_jiffies(10));
+				parhelia_submit_wait_end(&stats->tail_wait_ns, wait_begin);
 				if (ret < 0)
 					goto out_relocs;
 				goto retry_slot;
@@ -3089,12 +3190,16 @@ retry_slot:
 				goto out_unpin;
 			parhelia_write(pdev, PARHELIA_MMIO_RING_START,
 				       lower_32_bits(primary_bus));
+			if (submit_stats)
+				atomic64_inc(&stats->ring_start_writes);
 			pdev->primary_armed = true;
 		}
 		async_slot->root_probe = root_probe;
 		root_probe = NULL;
 		parhelia_write(pdev, PARHELIA_MMIO_RING_END,
 			lower_32_bits(primary_bus + primary_words * sizeof(u32)) | 3);
+		if (submit_stats)
+			atomic64_inc(&stats->ring_end_writes);
 		parhelia_write(pdev, 0x0314, 1);
 		parhelia_shadow_commit(pdev, shadow_txn);
 
@@ -3123,6 +3228,9 @@ retry_slot:
 			pdev->primary_get = pdev->primary_put;
 		pdev->primary_put = async_slot->primary_end;
 		pdev->queued_slots++;
+		if (submit_stats)
+			atomic64_inc(&stats->async_submits);
+		parhelia_submit_high_water(pdev, pdev->queued_slots);
 		pdev->next_fence = fence;
 		if (!pdev->first_fence)
 			pdev->first_fence = fence;
