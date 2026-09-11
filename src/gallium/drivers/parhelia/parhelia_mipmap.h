@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 /*
  * Layout of the hardware's contiguous 32-bit 2D mip chain.  This is kept
  * separate from the render-target layout: texture layout 2 has 32x16
@@ -98,13 +99,18 @@ ph_mip_tail_position(unsigned tail, unsigned *x, unsigned *y)
 
 /* Returns false for chains the fixed table cannot represent.  `tiled` is
  * hardware texture layout 2; it is intentionally not the display/RT tile
- * layout. */
+ * layout.  `p690` selects the chain geometry measured on the P690 texture
+ * unit (parhelia-drm-test --mip-address-probe): levels with a pitch of 64 or
+ * more reserve 16-row multiples, the tail starts at the first level no
+ * larger than 32x16, and a 32-wide tail level occupies the left half of the
+ * 64x16 tail block with the smaller levels' table shifted right by 32. */
 static inline bool
-ph_mip_layout_init(struct ph_mip_layout *out, unsigned width, unsigned height,
-                   unsigned requested_levels, bool tiled)
+ph_mip_layout_init_chip(struct ph_mip_layout *out, unsigned width,
+                        unsigned height, unsigned requested_levels, bool tiled,
+                        bool p690)
 {
    size_t next = 0, tail_base = 0;
-   unsigned tail = 0;
+   unsigned tail = 0, tail_shift = 0;
    bool tail_started = false;
 
    if (!out || !width || !height || !requested_levels ||
@@ -125,23 +131,29 @@ ph_mip_layout_init(struct ph_mip_layout *out, unsigned width, unsigned height,
       level->pitch = pitch;
       level_align = tiled ? 0x1000 : 0x40;
 
-      if (width <= 16 && height <= 16) {
-         unsigned x, y;
+      if ((width <= 16 || (p690 && tiled && width <= 32)) && height <= 16) {
+         unsigned x = 0, y = 0;
 
-         if (tail >= 5)
-            return false;
-         ph_mip_tail_position(tail++, &x, &y);
          if (!tail_started) {
             tail_base = ph_mip_align((unsigned)next, level_align);
             bytes = (size_t)32 * (tiled ? 32 : 16) * 4;
             next = tail_base + bytes;
             tail_started = true;
          }
+         if (width > 16) {
+            tail_shift = 32;
+         } else {
+            if (tail >= 5)
+               return false;
+            ph_mip_tail_position(tail++, &x, &y);
+         }
          level->offset = tail_base;
-         level->tail_x = x;
+         level->tail_x = width > 16 ? 0 : x + tail_shift;
          level->tail_y = y;
       } else {
-         rows = tiled ? ph_mip_align(height, 32) : height;
+         rows = !tiled ? height :
+                p690 && pitch >= 64 ? ph_mip_align(height, 16) :
+                ph_mip_align(height, 32);
          bytes = (size_t)pitch * rows * 4;
          level->offset = ph_mip_align((unsigned)next, level_align);
          next = level->offset + bytes;
@@ -152,6 +164,14 @@ ph_mip_layout_init(struct ph_mip_layout *out, unsigned width, unsigned height,
    }
    out->size = ph_mip_align((unsigned)next, tiled ? 0x2000 : 0x200);
    return out->size != 0;
+}
+
+static inline bool
+ph_mip_layout_init(struct ph_mip_layout *out, unsigned width, unsigned height,
+                   unsigned requested_levels, bool tiled)
+{
+   return ph_mip_layout_init_chip(out, width, height, requested_levels, tiled,
+                                  false);
 }
 
 static inline unsigned

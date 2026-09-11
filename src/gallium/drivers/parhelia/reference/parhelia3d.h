@@ -218,6 +218,7 @@ struct p3d_texture {
 	unsigned	max_level;	/* 0x11e4[31:28] */
 	enum p3d_texenv	env;
 	uint32_t	env_colour_rg, env_colour_ba;	/* P3D_COMBINER_CONST pairs */
+	uint32_t	reloc_offset;	/* base level byte offset, relocated */
 };
 
 uint32_t p3d_tex_filter(const struct p3d_texture *t);

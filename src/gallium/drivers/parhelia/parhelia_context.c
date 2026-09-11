@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "compiler/nir/nir.h"
@@ -70,6 +71,14 @@ struct ph_transfer {
    void *staging;
 };
 
+/* A sampler view plus, for a first level the hardware cannot use as its
+ * base, a private chain holding levels first..last. */
+struct ph_sampler_view {
+   struct pipe_sampler_view base;
+   struct pipe_sampler_view *shadow_view;
+   uint64_t shadow_generation;
+};
+
 struct ph_context;
 static unsigned ph_sampler_tiled_pitch(unsigned width);
 static unsigned ph_sampler_storage_pitch(struct pipe_screen *screen,
@@ -84,6 +93,12 @@ static int ph_prepare_alpha_companions(struct ph_context *ctx,
 static uint64_t ph_texture_base_hash(const struct parhelia_resource *texture,
                                      bool tiled, unsigned *alpha_zero,
                                      unsigned *alpha_nonzero);
+static bool ph_copy_texture_box(struct ph_context *ctx,
+                                struct pipe_resource *dst, unsigned dst_level,
+                                int dstx, int dsty,
+                                struct pipe_resource *src, unsigned src_level,
+                                const struct pipe_box *src_box,
+                                int dst_width, int dst_height);
 
 static size_t
 ph_mip_texel_offset(const struct ph_mip_layout *mip, unsigned level,
@@ -131,6 +146,17 @@ ph_resource_mip_levels(const struct parhelia_resource *r)
    return r->mip.levels ? r->mip.levels : 1;
 }
 
+enum ph_stat_kind {
+   PH_STAT_OTHER, PH_STAT_CLEAR, PH_STAT_COLOUR, PH_STAT_TEX_LINEAR,
+   PH_STAT_TEX_TILED, PH_STAT_TEX_MIP, PH_STAT_MULTITEX, PH_STAT_SERIAL,
+   PH_STAT_ALPHA_TWO_PASS, PH_STAT_ALPHA_MICRO, PH_STAT_KINDS,
+};
+
+static const char *const ph_stat_kind_names[PH_STAT_KINDS] = {
+   "other", "clear", "colour", "tex-linear", "tex-tiled", "tex-mip",
+   "multitex", "serial-lightmap", "alpha-two-pass", "alpha-micro",
+};
+
 struct ph_context {
    struct pipe_context base;
    struct draw_context *draw;
@@ -144,7 +170,10 @@ struct ph_context {
    struct ph_velems *velems;
    struct ph_fs *fs;
    struct pipe_sampler_state *samplers[PIPE_MAX_SAMPLERS];
+   /* Effective views: a bound view whose first level cannot be the texture
+    * unit's base is replaced by its shadow chain's view at draw time. */
    struct pipe_sampler_view *sampler_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
+   struct pipe_sampler_view *bound_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
    unsigned num_samplers;
    unsigned num_sampler_views;
    struct pipe_resource *constants[MESA_SHADER_STAGES];
@@ -274,6 +303,19 @@ struct ph_context {
    bool derived_triangles;
    /* Viewport 0 maps GL window y downwards (window-system framebuffer). */
    bool viewport_y_flip;
+   /* PARHELIA_STATS: submission counters averaged over 100 frames.
+    * PARHELIA_STATS=sync additionally times every submit to its fence. */
+   bool stats, stats_sync;
+   unsigned stat_kind;
+   double stat_pixels;
+   struct {
+      unsigned frames, batches, draw_batches, triangles, submits, clears;
+      unsigned waits;
+      uint64_t vertex_dwords, clear_pixels, wait_ns, start_ns;
+      unsigned kind_count[PH_STAT_KINDS];
+      uint64_t kind_ns[PH_STAT_KINDS];
+      double kind_pixels[PH_STAT_KINDS];
+   } stat;
 };
 
 struct ph_stage {
@@ -345,6 +387,59 @@ ph_logical_vertex_limit(const struct ph_context *ctx)
 
 static int ph_drain_batch(struct ph_context *ctx);
 
+static uint64_t
+ph_now_ns(void)
+{
+   struct timespec ts;
+
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+static int
+ph_wait_fence_counted(struct ph_context *ctx, uint32_t fence)
+{
+   uint64_t start = ctx->stats ? ph_now_ns() : 0;
+   int ret = parhelia_wait_fence(ph_screen(ctx->base.screen)->fd, fence, -1,
+                                 NULL);
+
+   if (ctx->stats) {
+      ctx->stat.waits++;
+      ctx->stat.wait_ns += ph_now_ns() - start;
+   }
+   return ret;
+}
+
+static void
+ph_stats_frame(struct ph_context *ctx)
+{
+   const double n = 100.0;
+   uint64_t now;
+
+   if (!ctx->stats || ++ctx->stat.frames < 100)
+      return;
+   now = ph_now_ns();
+   if (ctx->stat.start_ns)
+      fprintf(stderr,
+              "parhelia stats/frame: %.2f ms, %.0f batches (%.0f draw), %.0f triangles, %.0f submits, %.0f vertex dwords, %.1f clears (%.2f Mpixel), %.1f waits %.2f ms\n",
+              (now - ctx->stat.start_ns) / n / 1e6, ctx->stat.batches / n,
+              ctx->stat.draw_batches / n, ctx->stat.triangles / n,
+              ctx->stat.submits / n, ctx->stat.vertex_dwords / n,
+              ctx->stat.clears / n, ctx->stat.clear_pixels / n / 1e6,
+              ctx->stat.waits / n, ctx->stat.wait_ns / n / 1e6);
+   for (unsigned k = 0; ctx->stats_sync && k < PH_STAT_KINDS; k++)
+      if (ctx->stat.kind_count[k])
+         fprintf(stderr,
+                 "  %-15s %6.1f submits %7.3f ms %6.3f Mpixel (%.0f Mpixel/s)\n",
+                 ph_stat_kind_names[k], ctx->stat.kind_count[k] / n,
+                 ctx->stat.kind_ns[k] / n / 1e6,
+                 ctx->stat.kind_pixels[k] / n / 1e6,
+                 ctx->stat.kind_ns[k] ?
+                    ctx->stat.kind_pixels[k] * 1e3 / ctx->stat.kind_ns[k] : 0);
+   memset(&ctx->stat, 0, sizeof(ctx->stat));
+   ctx->stat.start_ns = now;
+}
+
 /* A queued class-3 submission owns its command and vertex copies in the
  * kernel, but a front-buffer handoff has to observe its terminal DWGSYNC tag.
  * Normal GPU-to-GPU resolves are ordered by the same kernel producer queue;
@@ -359,10 +454,9 @@ ph_wait_async(struct ph_context *ctx)
       return ret;
    if (!ctx->async_pending)
       return 0;
-   if (getenv("PARHELIA_TRACE_BATCH"))
+   if (ph_env("PARHELIA_TRACE_BATCH"))
       fprintf(stderr, "parhelia: aggregate wait fence=%u\n", ctx->fence);
-   ret = parhelia_wait_fence(ph_screen(ctx->base.screen)->fd, ctx->fence,
-                             -1, NULL);
+   ret = ph_wait_fence_counted(ctx, ctx->fence);
    if (ret)
       ctx->submit_error = ret;
    else
@@ -437,7 +531,7 @@ ph_create_vertex_ring(struct ph_context *ctx)
    ctx->vram_vertex_slot_dwords = mapped_limits.vertex_dwords;
    ctx->vram_vertex_enabled = true;
    ctx->batch_limits = mapped_limits;
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: enabled P690 class-3 DMA vertex ring handle=%u bytes=%llu slots=%u slot_dwords=%u queue-depth=%u\n",
               create.handle, (unsigned long long)create.size,
@@ -455,14 +549,73 @@ ph_batch_has_full_boundary(const struct parhelia_batch *batch)
 }
 
 static int
+ph_submit_batch_now_untimed(struct ph_context *ctx,
+                            const struct parhelia_batch *batch,
+                            const void *vertices, unsigned vertex_dwords);
+
+/* PARHELIA_DUMP_BATCHES=path appends every submitted batch's packets. */
+static void
+ph_dump_batch(const struct parhelia_batch *batch)
+{
+   static FILE *dump;
+   static unsigned serial;
+   const char *path = getenv("PARHELIA_DUMP_BATCHES");
+
+   if (!path)
+      return;
+   if (!dump && !(dump = fopen(path, "a")))
+      return;
+   fprintf(dump, "submit %u packets %u dwords %u relocs %u\n", serial++,
+           batch->packet_count, batch->command_count, batch->reloc_count);
+   for (unsigned i = 0; i < batch->packet_count; i++) {
+      const struct drm_parhelia_packet *packet = &batch->packets[i];
+
+      fprintf(dump, " p%u:", i);
+      for (unsigned w = 0; w < packet->length &&
+                           packet->offset + w < batch->command_count; w++)
+         fprintf(dump, " %08x", batch->commands[packet->offset + w]);
+      fprintf(dump, "\n");
+   }
+   fflush(dump);
+}
+
+static int
 ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
                     const void *vertices, unsigned vertex_dwords)
+{
+   uint64_t start;
+   int ret;
+
+   if (ph_env("PARHELIA_DUMP_BATCHES"))
+      ph_dump_batch(batch);
+
+   if (!ctx->stats_sync)
+      return ph_submit_batch_now_untimed(ctx, batch, vertices, vertex_dwords);
+   start = ph_now_ns();
+   ret = ph_submit_batch_now_untimed(ctx, batch, vertices, vertex_dwords);
+   if (!ret && ctx->async_pending) {
+      ret = parhelia_wait_fence(ph_screen(ctx->base.screen)->fd, ctx->fence,
+                                -1, NULL);
+      ctx->async_pending = ret != 0;
+   }
+   ctx->stat.kind_count[ctx->stat_kind]++;
+   ctx->stat.kind_ns[ctx->stat_kind] += ph_now_ns() - start;
+   ctx->stat.kind_pixels[ctx->stat_kind] += ctx->stat_pixels;
+   return ret;
+}
+
+static int
+ph_submit_batch_now_untimed(struct ph_context *ctx,
+                            const struct parhelia_batch *batch,
+                            const void *vertices, unsigned vertex_dwords)
 {
    struct parhelia_screen *screen = ph_screen(ctx->base.screen);
    bool boundary_aware = ctx->pack_adjacent_packets &&
                          !ph_batch_has_full_boundary(batch);
    int ret;
    uint64_t bytes = (uint64_t)vertex_dwords * sizeof(uint32_t);
+
+   ctx->stat.submits++;
 
    if (vertices && vertex_dwords && ctx->async_submit &&
        ctx->vram_vertex_enabled &&
@@ -472,8 +625,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
                         sizeof(uint32_t);
 
       if (ctx->vram_vertex_fence[slot]) {
-         ret = parhelia_wait_fence(screen->fd, ctx->vram_vertex_fence[slot],
-                                   -1, NULL);
+         ret = ph_wait_fence_counted(ctx, ctx->vram_vertex_fence[slot]);
          if (ret)
             return ret;
          ctx->vram_vertex_fence[slot] = 0;
@@ -501,7 +653,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
          /* The request has not reached the doorbell.  Retry through the
           * synchronous CREATE_VERTEX path below; a large local-VRAM batch
           * cannot fall back to the kernel's 4096-dword class-3 copy slot. */
-         if (getenv("PARHELIA_TRACE"))
+         if (ph_env("PARHELIA_TRACE"))
             fprintf(stderr,
                     "parhelia: async vertex slot exhausted; retrying synchronously\n");
          ctx->async_submit = false;
@@ -558,7 +710,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
        * screen to the proven fenced synchronous path. */
       if (ret != -EOPNOTSUPP && ret != -ENOMEM)
          return ret;
-      if (ret == -ENOMEM && getenv("PARHELIA_TRACE"))
+      if (ret == -ENOMEM && ph_env("PARHELIA_TRACE"))
          fprintf(stderr, "parhelia: async DMA32 slot exhausted; falling back to synchronous submits\n");
       ctx->async_submit = false;
       ctx->pack_adjacent_packets = false;
@@ -697,7 +849,7 @@ ph_submit_state_stream_groups(struct ph_context *ctx)
          if (calls >= PH_BATCH_HW_CALLS)
             break;
       }
-      if (getenv("PARHELIA_TRACE_BATCH"))
+      if (ph_env("PARHELIA_TRACE_BATCH"))
          fprintf(stderr,
                  "parhelia: aggregate group marks=%u..%u estimated_calls=%u\n",
                  first, end, calls);
@@ -723,7 +875,7 @@ ph_drain_batch(struct ph_context *ctx)
    packed_calls_valid = !parhelia_batch_packed_call_count(
       &ctx->pending_batch, 0, ctx->pending_batch.packet_count,
       ctx->pack_adjacent_packets, &packed_calls);
-   if (getenv("PARHELIA_TRACE_BATCH"))
+   if (ph_env("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: aggregate submits=%u commands=%u packets=%u stages=%u relocs=%u vertices=%u resources=%u estimated_calls=%u\n",
               ctx->pending_submit_count,
@@ -824,6 +976,10 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
    unsigned stage_calls;
    bool draw_batch;
    int ret;
+
+   ctx->stat.batches++;
+   ctx->stat.draw_batches += vertex_dwords != 0;
+   ctx->stat.vertex_dwords += vertex_dwords;
 
    /* Same-state aggregation extends only the draw tail.  State-stream mode
     * keeps every complete state and DRAW sequence while sharing one terminal
@@ -1102,7 +1258,7 @@ ph_use_vertex_alpha(struct ph_context *ctx, bool textured,
 	/* One concise line per distinct rejection reason makes a Q3 trace useful
 	 * without producing one line per triangle.  Depth-bound texture draws are
 	 * the only forms relevant to the new packet. */
-	if (depth && textured && getenv("PARHELIA_TRACE") &&
+	if (depth && textured && ph_env("PARHELIA_TRACE") &&
 	    !(ctx->trace_depth_alpha_seen & BITFIELD_BIT(reason_bit))) {
 		ctx->trace_depth_alpha_seen |= BITFIELD_BIT(reason_bit);
 		fprintf(stderr,
@@ -1287,7 +1443,7 @@ ph_copy_present_quad(struct ph_context *ctx,
       return false;
    ph_resource_resolve_linear(src);
    ph_resource_resolve_linear(dst);
-   if (!getenv("PARHELIA_CPU_BLIT") &&
+   if (!ph_env("PARHELIA_CPU_BLIT") &&
        src->linear_handle && !(src->linear_stride & 3) &&
        src->linear_stride / 4 <= 0x3fff) {
       struct parhelia_batch *batch = &ctx->build_batch;
@@ -1311,14 +1467,14 @@ ph_copy_present_quad(struct ph_context *ctx,
          dst->linear_dirty = true;
          dst->mip_defined |= BITFIELD_BIT(0);
          dst->content_generation++;
-         if (getenv("PARHELIA_TRACE"))
+         if (ph_env("PARHELIA_TRACE"))
             fprintf(stderr,
                     "parhelia: GPU present src=%u dst=%u/%u rect=%d,%d %dx%d\n",
                     src->linear_handle, dst->handle, dst->linear_handle,
                     x0, y0, width, height);
          return true;
       }
-      if (getenv("PARHELIA_TRACE"))
+      if (ph_env("PARHELIA_TRACE"))
          fprintf(stderr, "parhelia: GPU present failed: %d\n", ret);
    }
    for (int y = 0; y < height; y++) {
@@ -1339,7 +1495,7 @@ ph_copy_present_quad(struct ph_context *ctx,
    dst->linear_dirty = false;
    dst->mip_defined |= BITFIELD_BIT(0);
    dst->content_generation++;
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: CPU present fallback src=%u dst=%u rect=%d,%d %dx%d\n",
               src->linear_handle, dst->handle, x0, y0, width, height);
@@ -1383,15 +1539,58 @@ ph_sampler_mip_filter(const struct pipe_sampler_state *sampler)
    }
 }
 
+/* A view's first level can be the hardware base only when it is stored in
+ * the native base-level permutation; the texture unit derives the rest of the
+ * chain from that base exactly like the vendor layout does from level 0. */
+static unsigned
+ph_view_first_level(const struct parhelia_resource *texture,
+                    const struct pipe_sampler_view *view)
+{
+   unsigned first = view ? view->u.tex.first_level : 0;
+
+   if (!first || first >= ph_resource_mip_levels(texture) ||
+       texture->mip.level[first].pitch < 64 ||
+       !(texture->mip_defined & BITFIELD_BIT(first)))
+      return 0;
+   return first;
+}
+
 static unsigned
 ph_view_mip_levels(const struct parhelia_resource *texture,
                    const struct pipe_sampler_view *view)
 {
    unsigned levels = ph_resource_mip_levels(texture);
+   unsigned first = ph_view_first_level(texture, view), last;
 
-   if (!view || view->u.tex.first_level || !levels)
+   if (!view || !levels || view->u.tex.first_level != first)
       return 1;
-   return MIN2(levels, view->u.tex.last_level + 1);
+   last = MIN2(levels - 1, view->u.tex.last_level);
+   return last >= first ? last - first + 1 : 1;
+}
+
+static void
+ph_apply_view_base(const struct parhelia_resource *texture,
+                   const struct pipe_sampler_view *view, bool tiled,
+                   struct p3d_texture *tex)
+{
+   unsigned first = tiled ? ph_view_first_level(texture, view) : 0;
+
+   if (!first)
+      return;
+   tex->width = texture->mip.level[first].width;
+   tex->height = texture->mip.level[first].height;
+   tex->reloc_offset = texture->mip.level[first].offset;
+}
+
+/* PARHELIA_NO_MIPS=1 samples the base level only (diagnostic). */
+static bool
+ph_debug_no_mips(void)
+{
+   static int cached = -1;
+
+   if (cached < 0)
+      cached = debug_get_bool_option("PARHELIA_NO_MIPS", false);
+   return cached;
 }
 
 static bool
@@ -1402,11 +1601,13 @@ ph_use_mips(const struct parhelia_resource *texture,
    unsigned levels;
 
    if (!texture || !sampler ||
-       sampler->min_mip_filter == PIPE_TEX_MIPFILTER_NONE)
+       sampler->min_mip_filter == PIPE_TEX_MIPFILTER_NONE ||
+       ph_debug_no_mips())
       return false;
    levels = ph_view_mip_levels(texture, view);
    return levels > 1 &&
-      ph_mip_ready_levels(texture->mip_defined, levels) == levels;
+      ph_mip_ready_levels(texture->mip_defined >>
+                          ph_view_first_level(texture, view), levels) == levels;
 }
 
 static uint32_t
@@ -1774,7 +1975,7 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
       }
    }
    texture->alpha_companion_generation = texture->content_generation;
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: RGB-alpha companions texture=%u alpha=%u premul=%u physical=%ux%u repeat=%u/%u generation=%llu\n",
               texture->handle, texture->alpha_rgb_handle,
@@ -1905,7 +2106,7 @@ ph_use_rgb_alpha_two_pass(struct ph_context *ctx, bool textured,
       zs = ph_resource(ctx->fb.zsbuf.texture);
    }
    sampler = ctx->samplers[0];
-   trace_candidate = getenv("PARHELIA_TRACE_CPU_ALPHA") &&
+   trace_candidate = ph_env("PARHELIA_TRACE_CPU_ALPHA") &&
       texture->base.width0 <= 256 && texture->base.height0 <= 256 &&
       ctx->trace_cpu_alpha_resource != texture;
    if (trace_candidate) {
@@ -2078,7 +2279,7 @@ ph_trace_alpha_test(struct ph_context *ctx, const struct p3d_state *state,
    const struct pipe_rt_blend_state *blend =
       ctx->blend ? &ctx->blend->rt[0] : NULL;
 
-   if (!getenv("PARHELIA_TRACE_ALPHA_TEST") || !state->alpha_test ||
+   if (!ph_env("PARHELIA_TRACE_ALPHA_TEST") || !state->alpha_test ||
        !texture)
       return;
    texture_hash = ph_texture_base_hash(texture, texture_tiled, &alpha_zero,
@@ -2182,7 +2383,7 @@ ph_trace_blend_alpha(struct ph_context *ctx, const struct p3d_state *state,
    float maxx = -INFINITY, maxy = -INFINITY;
    uint32_t values[21];
 
-   if (!getenv("PARHELIA_TRACE_BLEND_ALPHA") || !texture || !blend ||
+   if (!ph_env("PARHELIA_TRACE_BLEND_ALPHA") || !texture || !blend ||
        !blend->blend_enable || !ctx->triangles)
       return;
    image = ph_texture_base_hash(texture, texture_tiled, &alpha_zero,
@@ -2528,7 +2729,7 @@ ph_cpu_alpha_blend(struct ph_context *ctx, struct parhelia_resource *color,
                    const struct parhelia_resource *texture,
                    const struct pipe_sampler_state *sampler)
 {
-   if (getenv("PARHELIA_TRACE_BLEND_ALPHA")) {
+   if (ph_env("PARHELIA_TRACE_BLEND_ALPHA")) {
       float xmin = FLT_MAX, ymin = FLT_MAX;
       float xmax = -FLT_MAX, ymax = -FLT_MAX;
       float oow_min = FLT_MAX, oow_max = -FLT_MAX;
@@ -2684,7 +2885,7 @@ ph_submit_rgb_alpha_two_pass(struct ph_context *ctx,
    ret = ph_submit_batch(ctx, &additive_batch, ctx->packed_vertices,
                          ctx->triangles * 3 * dpv,
                          color, depth, texture, NULL);
-   if (!ret && getenv("PARHELIA_TRACE"))
+   if (!ret && ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: GPU RGB-alpha two-pass triangles=%u texture=%u companions=%u/%u depth=%u/%u\n",
               ctx->triangles, texture->handle, texture->alpha_rgb_handle,
@@ -2763,7 +2964,7 @@ ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
       depth->content_generation++;
       depth->mip_defined |= BITFIELD_BIT(0);
    }
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: submit %s=%u color=%u depth=%u ret=0\n",
               prim == P3D_POINTS ? "points" : "lines", count,
@@ -2788,8 +2989,8 @@ ph_submit_vertices(struct ph_context *ctx)
    const struct pipe_rt_blend_state *blend;
    unsigned dpv;
    bool submitted = false;
-   bool tiled_textures = getenv("PARHELIA_TEXTURE_TILED") != NULL;
-   bool small_texture_linear = getenv("PARHELIA_SMALL_TEXTURE_LINEAR") != NULL;
+   bool tiled_textures = ph_env("PARHELIA_TEXTURE_TILED");
+   bool small_texture_linear = ph_env("PARHELIA_SMALL_TEXTURE_LINEAR");
    bool texture_tiled = false, texture1_tiled = false;
    bool texture_mipped = false, texture1_mipped = false;
    bool rgb5a1_texture = false;
@@ -2807,6 +3008,7 @@ ph_submit_vertices(struct ph_context *ctx)
    }
    if (!ctx->triangles || ctx->submit_error)
       goto out;
+   ctx->stat.triangles += ctx->triangles;
    if (!ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture) {
       ctx->submit_error = -EINVAL;
       goto out;
@@ -2858,6 +3060,17 @@ ph_submit_vertices(struct ph_context *ctx)
          ph_auto_tiled_texture(ctx, texture1, sampler1);
    texture_mipped = texture_tiled &&
       ph_use_mips(texture, sampler, ctx->sampler_views[0]);
+   if (texture && ph_env("PARHELIA_TRACE_MIPS") && !texture->trace_mips) {
+      texture->trace_mips = true;
+      fprintf(stderr,
+              "parhelia: mips tex=%u %ux%u last_level=%u levels=%u defined=%#x tiled=%u mipfilter=%u view=%u..%u used=%u\n",
+              texture->handle, texture->base.width0, texture->base.height0,
+              texture->base.last_level, texture->mip.levels,
+              texture->mip_defined, texture_tiled,
+              sampler ? sampler->min_mip_filter : 99,
+              ctx->sampler_views[0]->u.tex.first_level,
+              ctx->sampler_views[0]->u.tex.last_level, texture_mipped);
+   }
    texture1_mipped = texture1_tiled &&
       ph_use_mips(texture1, sampler1, ctx->sampler_views[1]);
    if (!color->handle || (depth && !depth->handle)) {
@@ -2931,7 +3144,7 @@ ph_submit_vertices(struct ph_context *ctx)
       ctx->submit_error = ret;
       goto out;
    }
-   if (ctx->native_sampled_alpha && getenv("PARHELIA_TRACE_NATIVE_ALPHA") &&
+   if (ctx->native_sampled_alpha && ph_env("PARHELIA_TRACE_NATIVE_ALPHA") &&
        ctx->trace_native_alpha_resource != texture) {
       ctx->trace_native_alpha_resource = texture;
       fprintf(stderr,
@@ -2950,7 +3163,7 @@ ph_submit_vertices(struct ph_context *ctx)
       ph_resource_resolve_linear(color);
       ph_resource_resolve_linear(depth);
       ph_cpu_alpha_cutout(ctx, color, depth, texture);
-      if (getenv("PARHELIA_TRACE"))
+      if (ph_env("PARHELIA_TRACE"))
          fprintf(stderr, "parhelia: CPU alpha cutout triangles=%u image=%#llx\n",
                  ctx->triangles,
                  (unsigned long long)ph_texture_base_hash(texture, true,
@@ -3021,6 +3234,7 @@ ph_submit_vertices(struct ph_context *ctx)
                       P3D_WRAP_CLAMP : P3D_WRAP_REPEAT;
       tex.max_level = texture_mipped ?
          ph_view_mip_levels(texture, ctx->sampler_views[0]) - 1 : 0;
+      ph_apply_view_base(texture, ctx->sampler_views[0], texture_tiled, &tex);
       tex.filter = ph_sampler_filter_word(&tex, sampler);
       tex.wrap = ph_sampler_wrap_word(&tex, sampler);
       tex.env = ctx->fs->texenv;
@@ -3031,6 +3245,7 @@ ph_submit_vertices(struct ph_context *ctx)
                                                 ctx->warp_replace);
       if (ctx->native_sampled_alpha) {
          tex1 = tex;
+         tex1.reloc_offset = 0;
          tex1.width = texture->alpha_companion_width;
          tex1.height = texture->alpha_companion_height;
          tex1.fmt = 0x32;
@@ -3065,6 +3280,8 @@ ph_submit_vertices(struct ph_context *ctx)
                          P3D_WRAP_CLAMP : P3D_WRAP_REPEAT;
          tex1.max_level = texture1_mipped ?
             ph_view_mip_levels(texture1, ctx->sampler_views[1]) - 1 : 0;
+         ph_apply_view_base(texture1, ctx->sampler_views[1], texture1_tiled,
+                            &tex1);
          tex1.filter = ph_sampler_filter_word(&tex1, sampler1);
          tex1.wrap = ph_sampler_wrap_word(&tex1, sampler1);
          /* Quake's base world pass is diffuse times lightmap. */
@@ -3111,6 +3328,30 @@ ph_submit_vertices(struct ph_context *ctx)
       state.alpha_test = false;
       state.blend = false;
    }
+	if (ctx->stats_sync) {
+		const unsigned stride = ctx->rgb_alpha_two_pass ? 10 :
+		                        state.dw_per_vertex;
+
+		ctx->stat_pixels = 0;
+		for (unsigned t = 0; t < ctx->triangles; t++) {
+			const float *v = ctx->vertices + t * 3 * stride;
+
+			ctx->stat_pixels += fabsf((v[stride] - v[0]) *
+			                          (v[2 * stride + 1] - v[1]) -
+			                          (v[2 * stride] - v[0]) *
+			                          (v[stride + 1] - v[1])) * 0.5f;
+		}
+		ctx->stat_kind = ctx->rgb_alpha_two_pass ? PH_STAT_ALPHA_TWO_PASS :
+		   (ctx->alpha_micro || ctx->alpha_micro_cutout) ?
+		      PH_STAT_ALPHA_MICRO :
+		   (texture1 && ph_screen(ctx->base.screen)->single_texture_pipe &&
+		    !(ctx->p690_multitexture && ctx->fs &&
+		      ctx->fs->serial_op == PH_SERIAL_MODULATE)) ? PH_STAT_SERIAL :
+		   (texture1 || ctx->native_sampled_alpha) ? PH_STAT_MULTITEX :
+		   !texture ? PH_STAT_COLOUR :
+		   texture_mipped ? PH_STAT_TEX_MIP :
+		   texture_tiled ? PH_STAT_TEX_TILED : PH_STAT_TEX_LINEAR;
+	}
 	if (ctx->rgb_alpha_two_pass) {
 	   if (!texture || texture1 || !texture_tiled) {
 	      ret = -EINVAL;
@@ -3129,7 +3370,7 @@ ph_submit_vertices(struct ph_context *ctx)
 	one_pass_multitexture = (texture1 || ctx->native_sampled_alpha) &&
 	                        ctx->p690_multitexture && ctx->fs &&
 	                        ctx->fs->serial_op == PH_SERIAL_MODULATE;
-	if (texture && getenv("PARHELIA_TRACE") && ctx->triangles) {
+	if (texture && ph_env("PARHELIA_TRACE") && ctx->triangles) {
 		const float *v0 = &ctx->vertices[0];
 		const float *v1 = &ctx->vertices[dpv];
 		const float *v2 = &ctx->vertices[2 * dpv];
@@ -3192,7 +3433,7 @@ ph_submit_vertices(struct ph_context *ctx)
                                   color, depth, texture, NULL);
       }
       if (ctx->fs->serial_op != PH_SERIAL_REPLACE1 &&
-          !ret && !getenv("PARHELIA_SKIP_LIGHTMAP")) {
+          !ret && !ph_env("PARHELIA_SKIP_LIGHTMAP")) {
          lightmap_tex.env = P3D_TEXENV_REPLACE;
          lightmap.tex = &lightmap_tex;
          lightmap.tex1 = NULL;
@@ -3206,7 +3447,7 @@ ph_submit_vertices(struct ph_context *ctx)
             lightmap.blend_src = P3D_BF_DST_COLOR;
             lightmap.blend_dst = P3D_BF_ZERO;
          }
-         if (getenv("PARHELIA_LIGHTMAP_RAW")) {
+         if (ph_env("PARHELIA_LIGHTMAP_RAW")) {
             lightmap.blend = false;
             lightmap.blend_src = P3D_BF_ONE;
             lightmap.blend_dst = P3D_BF_ZERO;
@@ -3258,7 +3499,7 @@ submission_done:
          depth->mip_defined |= BITFIELD_BIT(0);
       }
    }
-   if (ret || getenv("PARHELIA_TRACE"))
+   if (ret || ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: submit triangles=%u color=%u depth=%u texture=%u/%u fmt=%#x/%#x layout=%u/%u native1555=%u warp=%#x fs_tex=%u views=%u p690_multitex=%u ret=%d\n",
               ctx->triangles, color->handle, depth ? depth->handle : 0,
@@ -3269,6 +3510,8 @@ submission_done:
               one_pass_multitexture, ret);
 out:
    ctx->triangles = 0;
+   ctx->stat_kind = PH_STAT_OTHER;
+   ctx->stat_pixels = 0;
 	ctx->vertex_alpha = false;
 	ctx->alpha_micro = false;
 	ctx->alpha_micro_cutout = false;
@@ -3447,7 +3690,7 @@ ph_stage_alpha_micro(struct ph_context *ctx, struct prim_header *prim,
          }
       }
    }
-   if (cutout && getenv("PARHELIA_TRACE_ALPHA_CUTOUT") &&
+   if (cutout && ph_env("PARHELIA_TRACE_ALPHA_CUTOUT") &&
        ctx->trace_alpha_cutout_resource != texture) {
       ctx->trace_alpha_cutout_resource = texture;
       fprintf(stderr, "parhelia: alpha-cutout micro tex=%ux%u samples=%u accepted=%u range=%g..%g\\n",
@@ -3526,7 +3769,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	alpha_micro_depth = depth && ctx->dsa && ctx->dsa->depth_enabled;
 	if (alpha_micro)
 	   depth = alpha_micro_depth;
-	if (getenv("PARHELIA_TRACE_CPU_ALPHA") && textured && ctx->blend &&
+	if (ph_env("PARHELIA_TRACE_CPU_ALPHA") && textured && ctx->blend &&
 	    ctx->blend->rt[0].blend_enable && ctx->num_sampler_views &&
 	    ctx->sampler_views[0] && ctx->sampler_views[0]->texture) {
 		const struct parhelia_resource *trace_texture =
@@ -3550,7 +3793,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 				ctx->dsa ? ctx->dsa->alpha_enabled : 0);
 		}
 	}
-	if (getenv("PARHELIA_TRACE_ALPHA_SOURCE") && textured && ctx->blend &&
+	if (ph_env("PARHELIA_TRACE_ALPHA_SOURCE") && textured && ctx->blend &&
 	    ctx->blend->rt[0].blend_enable && ctx->blend->rt[0].rgb_func == PIPE_BLEND_ADD &&
 	    ctx->blend->rt[0].rgb_src_factor == PIPE_BLENDFACTOR_SRC_ALPHA &&
 	    ctx->blend->rt[0].rgb_dst_factor == PIPE_BLENDFACTOR_INV_SRC_ALPHA &&
@@ -3615,7 +3858,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
                                                  TGSI_SEMANTIC_TEXCOORD, 1);
       }
    }
-   if (textured && texcoord < 0 && getenv("PARHELIA_TRACE")) {
+   if (textured && texcoord < 0 && ph_env("PARHELIA_TRACE")) {
       const struct tgsi_shader_info *info = draw_get_shader_info(stage->draw);
       fprintf(stderr, "parhelia: no real texture varying; VS has %u outputs\\n",
               info->num_outputs);
@@ -3638,7 +3881,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	   return;
 	}
    if (multitextured && !ctx->trace_multitex_emitted &&
-       getenv("PARHELIA_TRACE")) {
+       ph_env("PARHELIA_TRACE")) {
       const float *st0 = prim->v[0]->data[texcoord];
       const float *st1 = prim->v[0]->data[texcoord1];
       fprintf(stderr,
@@ -3890,7 +4133,7 @@ ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
          size = prim->v[0]->data[psize][0];
    }
    has_texture = ph_samples_unit0(ctx);
-   if (getenv("PARHELIA_TRACE_PRIM"))
+   if (ph_env("PARHELIA_TRACE_PRIM"))
       fprintf(stderr, "parhelia: point %g,%g size=%g per-vertex=%u tex=%u smooth=%u cull=%u derived=%u\n",
               prim->v[0]->data[pos][0], prim->v[0]->data[pos][1], size,
               rast ? rast->point_size_per_vertex : 0, has_texture,
@@ -3960,7 +4203,7 @@ ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
    if (pos < 0)
       return;
    has_texture = ph_samples_unit0(ctx);
-   if (getenv("PARHELIA_TRACE_PRIM"))
+   if (ph_env("PARHELIA_TRACE_PRIM"))
       fprintf(stderr, "parhelia: line %g,%g-%g,%g width=%g tex=%u smooth=%u cull=%u derived=%u\n",
               prim->v[0]->data[pos][0], prim->v[0]->data[pos][1],
               prim->v[1]->data[pos][0], prim->v[1]->data[pos][1],
@@ -4046,6 +4289,75 @@ ph_create_stage(struct ph_context *ctx)
    return &s->base;
 }
 
+/* Levels first..last of @v's texture copied into a private chain whose
+ * level 0 is the view's first level; rebuilt when the texture changes. */
+static struct pipe_sampler_view *
+ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
+{
+   struct parhelia_resource *r = ph_resource(v->base.texture);
+   const unsigned first = v->base.u.tex.first_level;
+   const unsigned last = MIN2(v->base.u.tex.last_level, r->base.last_level);
+
+   if (util_format_get_blocksize(r->base.format) != 4)
+      return NULL;
+   if (!v->shadow_view) {
+      struct pipe_resource templ = r->base, *shadow;
+      struct pipe_sampler_view view = v->base;
+
+      templ.width0 = u_minify(r->base.width0, first);
+      templ.height0 = u_minify(r->base.height0, first);
+      templ.last_level = last - first;
+      templ.bind = PIPE_BIND_SAMPLER_VIEW;
+      shadow = ctx->base.screen->resource_create(ctx->base.screen, &templ);
+      if (!shadow)
+         return NULL;
+      view.u.tex.first_level = 0;
+      view.u.tex.last_level = last - first;
+      v->shadow_view = ctx->base.create_sampler_view(&ctx->base, shadow,
+                                                    &view);
+      pipe_resource_reference(&shadow, NULL);
+      if (!v->shadow_view)
+         return NULL;
+      v->shadow_generation = ~0ull;
+   }
+   if (v->shadow_generation != r->content_generation) {
+      for (unsigned l = first; l <= last; l++) {
+         const unsigned w = u_minify(r->base.width0, l);
+         const unsigned h = u_minify(r->base.height0, l);
+         const struct pipe_box box = {.width = w, .height = h, .depth = 1};
+
+         if ((r->mip_defined & BITFIELD_BIT(l)) &&
+             !ph_copy_texture_box(ctx, v->shadow_view->texture, l - first,
+                                  0, 0, &r->base, l, &box, w, h))
+            return NULL;
+      }
+      v->shadow_generation = r->content_generation;
+   }
+   return v->shadow_view;
+}
+
+/* Select the effective view for every bound sampler view before a draw. */
+static void
+ph_update_effective_views(struct ph_context *ctx)
+{
+   for (unsigned i = 0; i < ctx->num_sampler_views; i++) {
+      struct pipe_sampler_view *bound = ctx->bound_views[i], *use = bound;
+
+      if (bound && bound->u.tex.first_level &&
+          !ph_view_first_level(ph_resource(bound->texture), bound)) {
+         struct pipe_sampler_view *shadow =
+            ph_shadow_view(ctx, (struct ph_sampler_view *)bound);
+
+         if (shadow)
+            use = shadow;
+      }
+      if (ctx->sampler_views[i] != use) {
+         ph_submit_vertices(ctx);
+         pipe_sampler_view_reference(&ctx->sampler_views[i], use);
+      }
+   }
+}
+
 static void
 ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
             unsigned drawid_offset, const struct pipe_draw_indirect_info *indirect,
@@ -4061,6 +4373,7 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    if (!num_draws || indirect || ctx->submit_error)
       return;
+   ph_update_effective_views(ctx);
    for (unsigned i = 0; i < ctx->draw->pt.nr_vertex_buffers; i++) {
       const struct pipe_vertex_buffer *vb = &ctx->draw->pt.vertex_buffer[i];
       const void *map = vb->is_user_buffer ? vb->buffer.user :
@@ -4179,28 +4492,31 @@ static struct pipe_sampler_view *
 ph_create_sampler_view(struct pipe_context *p, struct pipe_resource *texture,
                        const struct pipe_sampler_view *templ)
 {
-   struct pipe_sampler_view *view;
+   struct ph_sampler_view *view;
    if (!templ || !texture || templ->target != PIPE_TEXTURE_2D ||
-       templ->u.tex.first_level ||
+       templ->u.tex.first_level > templ->u.tex.last_level ||
        templ->u.tex.last_level > texture->last_level)
       return NULL;
-   view = CALLOC_STRUCT(pipe_sampler_view);
+   view = CALLOC_STRUCT(ph_sampler_view);
    if (!view)
       return NULL;
-   *view = *templ;
-   view->reference.count = 1;
-   view->texture = NULL;
-   view->context = p;
-   pipe_resource_reference(&view->texture, texture);
-   return view;
+   view->base = *templ;
+   view->base.reference.count = 1;
+   view->base.texture = NULL;
+   view->base.context = p;
+   pipe_resource_reference(&view->base.texture, texture);
+   return &view->base;
 }
 
 static void
 ph_sampler_view_destroy(struct pipe_context *p, struct pipe_sampler_view *view)
 {
+   struct ph_sampler_view *v = (struct ph_sampler_view *)view;
+
    (void)p;
+   pipe_sampler_view_reference(&v->shadow_view, NULL);
    pipe_resource_reference(&view->texture, NULL);
-   FREE(view);
+   FREE(v);
 }
 
 static void ph_set_sampler_views(struct pipe_context *p, mesa_shader_stage sh,
@@ -4213,23 +4529,27 @@ static void ph_set_sampler_views(struct pipe_context *p, mesa_shader_stage sh,
    if (sh != MESA_SHADER_FRAGMENT || end > PIPE_MAX_SHADER_SAMPLER_VIEWS)
       return;
    for (unsigned i = 0; i < count; i++)
-      if (ctx->sampler_views[start + i] != views[i])
+      if (ctx->bound_views[start + i] != views[i])
          goto changed;
    for (unsigned i = start + count; i < end; i++)
-      if (ctx->sampler_views[i])
+      if (ctx->bound_views[i])
          goto changed;
    return;
 changed:
    ph_submit_vertices(ctx);
-   for (unsigned i = 0; i < count; i++)
+   for (unsigned i = 0; i < count; i++) {
+      pipe_sampler_view_reference(&ctx->bound_views[start + i], views[i]);
       pipe_sampler_view_reference(&ctx->sampler_views[start + i], views[i]);
-   for (unsigned i = start + count; i < end; i++)
+   }
+   for (unsigned i = start + count; i < end; i++) {
+      pipe_sampler_view_reference(&ctx->bound_views[i], NULL);
       pipe_sampler_view_reference(&ctx->sampler_views[i], NULL);
+   }
    ctx->num_sampler_views = MAX2(ctx->num_sampler_views, start + count);
    while (ctx->num_sampler_views &&
           !ctx->sampler_views[ctx->num_sampler_views - 1])
       ctx->num_sampler_views--;
-   if (getenv("PARHELIA_TRACE_VIEWS"))
+   if (ph_env("PARHELIA_TRACE_VIEWS"))
       fprintf(stderr,
               "parhelia: sampler views stage=%u start=%u count=%u trailing=%u active=%u view0=%p\n",
               sh, start, count, trailing, ctx->num_sampler_views,
@@ -4440,7 +4760,7 @@ static void *ph_create_fs(struct pipe_context *p,
                                       P3D_TEXENV_REPLACE;
          if (s->type == PIPE_SHADER_IR_NIR)
             fs->texenv = ph_nir_texenv(s->ir.nir, fs->texenv);
-         if (getenv("PARHELIA_TRACE")) {
+         if (ph_env("PARHELIA_TRACE")) {
             fprintf(stderr,
                     "parhelia: create fs=%p samplers=%#x serial=%u texenv=%u inputs=%u uses_color=%u coord=%u/%u\n",
                     (void *)fs, fs->sampler_mask, fs->serial_op, fs->texenv,
@@ -4527,7 +4847,7 @@ static void ph_set_viewport(struct pipe_context *p, unsigned start,
 {
    struct ph_context *ctx = ph_context(p);
 
-   if (getenv("PARHELIA_TRACE_VIEWPORT")) {
+   if (ph_env("PARHELIA_TRACE_VIEWPORT")) {
       for (unsigned i = 0; i < count; i++)
          fprintf(stderr,
                  "parhelia: viewport[%u] scale=%g,%g,%g translate=%g,%g,%g\\n",
@@ -4581,7 +4901,7 @@ ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *
 {
    struct ph_context *ctx = ph_context(p);
 
-   if (getenv("PARHELIA_TRACE_VIEWPORT"))
+   if (ph_env("PARHELIA_TRACE_VIEWPORT"))
       fprintf(stderr, "parhelia: framebuffer=%ux%u cbufs=%u zs=%u\\n",
               fb ? fb->width : 0, fb ? fb->height : 0,
               fb ? fb->nr_cbufs : 0, fb && fb->zsbuf.texture);
@@ -4657,7 +4977,7 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
          return;
       }
    }
-   if (getenv("PARHELIA_CPU_CLEAR") && r->map && !r->transfer_shadow) {
+   if (ph_env("PARHELIA_CPU_CLEAR") && r->map && !r->transfer_shadow) {
       /* The normal path queues this packet behind previous 3D work.  A CPU
        * diagnostic must establish the same ordering before touching the
        * tiled mapping directly. */
@@ -4677,13 +4997,17 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
       r->linear_dirty = false;
       r->mip_defined |= BITFIELD_BIT(0);
       r->content_generation++;
-      if (getenv("PARHELIA_TRACE"))
+      if (ph_env("PARHELIA_TRACE"))
          fprintf(stderr,
                  "parhelia: CPU clear resource=%u fmt=%#x value=%#x mask=%#x %u,%u %ux%u stride=%u layout=%u\n",
                  r->handle, format, value, write_mask, x, y, width, height,
                  r->stride, r->tile_layout);
       return;
    }
+   ctx->stat.clears++;
+   ctx->stat.clear_pixels += (uint64_t)width * height;
+   ctx->stat_kind = PH_STAT_CLEAR;
+   ctx->stat_pixels = (double)width * height;
    /* The kernel allocates whole tile rows: 16 on P690, 32 otherwise. */
    alloc_height = ALIGN_POT(r->base.height0,
                             r->tile_layout == PARHELIA_TILE_64X16_4K ? 16 : 32);
@@ -4694,7 +5018,7 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
                                            alloc_height, r->stride, format,
                                            value, write_mask, x, y, width,
                                            height);
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: GPU clear resource=%u fmt=%#x value=%#x mask=%#x %u,%u %ux%u ret=%d\n",
               r->handle, format, value, write_mask, x, y, width, height, ret);
@@ -4703,6 +5027,8 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
        * the same fenced async queue as draws so Q3 does not retire colour and
        * depth clears on the CPU before it can queue world rendering. */
       ret = ph_submit_batch(ctx, batch, NULL, 0, r, NULL, NULL, NULL);
+   ctx->stat_kind = PH_STAT_OTHER;
+   ctx->stat_pixels = 0;
    if (ret)
       ctx->submit_error = ret;
    else
@@ -4830,6 +5156,8 @@ ph_flush(struct pipe_context *p, struct pipe_fence_handle **fence,
    struct parhelia_resource *color = NULL;
 
    ph_submit_vertices(ctx);
+   if (flags & PIPE_FLUSH_END_OF_FRAME)
+      ph_stats_frame(ctx);
    /* The following X-server blit can order against an async kernel request,
     * but it cannot see an aggregate still owned by this userspace context. */
    if (ctx->aggregate_batches && ph_drain_batch(ctx)) {
@@ -4875,7 +5203,7 @@ ph_flush_resource(struct pipe_context *p, struct pipe_resource *resource)
    if (resource->target == PIPE_BUFFER ||
        !ph_resource(resource)->native_shared)
       ph_wait_async(ctx);
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: flush resource=%p target=%u dirty=%u error=%d\n",
               (void *)resource, resource->target,
@@ -4887,10 +5215,60 @@ ph_flush_resource(struct pipe_context *p, struct pipe_resource *resource)
       ph_resource_resolve_linear(ph_resource(resource));
 }
 
+static bool ph_resource_uses_sampler_layout(const struct parhelia_resource *r);
+
+/* Byte offset of texel (x,y) of @level in the linear or the native backing,
+ * using the same addressing as the transfer paths. */
+static size_t
+ph_texel_offset(const struct parhelia_resource *r, unsigned level,
+                unsigned x, unsigned y, unsigned cpp, bool linear)
+{
+   if (linear)
+      return r->linear_mip.levels ?
+         ph_mip_texel_offset_cpp(&r->linear_mip, level, x, y, true, cpp) :
+         (size_t)y * r->linear_stride + x * cpp;
+   if (ph_resource_uses_sampler_layout(r))
+      return r->mip.levels ?
+         ph_mip_texel_offset_cpp(&r->mip, level, x, y, false, cpp) :
+         p3d_texture_tile_offset_chip(
+            x, y, ph_sampler_storage_pitch(r->base.screen, r->base.width0,
+                                           cpp),
+            cpp, ph_screen(r->base.screen)->chip_id, r->tile_layout);
+   return p3d_tile_offset_layout(x, y, r->stride, r->tile_layout);
+}
+
+/* Levels above zero exist only in the sampler mip chain or a linear chain. */
+static bool
+ph_level_extent(const struct parhelia_resource *r, unsigned level,
+                unsigned *width, unsigned *height)
+{
+   if (!level) {
+      *width = r->base.width0;
+      *height = r->base.height0;
+      return true;
+   }
+   if (level >= ph_resource_mip_levels(r) ||
+       (r->map && !ph_resource_uses_sampler_layout(r)) ||
+       (r->linear_map && r->linear_mip.levels <= level))
+      return false;
+   *width = r->mip.level[level].width;
+   *height = r->mip.level[level].height;
+   return true;
+}
+
+static int
+ph_shadow_download_level(struct parhelia_resource *r, unsigned level,
+                         int y0, int y1)
+{
+   return level ? ph_resource_download_shadow(r) :
+                  ph_resource_download_shadow_rows(r, y0, y1);
+}
+
 static bool
 ph_copy_texture_box(struct ph_context *ctx,
-                    struct pipe_resource *dst, int dstx, int dsty,
-                    struct pipe_resource *src,
+                    struct pipe_resource *dst, unsigned dst_level,
+                    int dstx, int dsty,
+                    struct pipe_resource *src, unsigned src_level,
                     const struct pipe_box *src_box,
                     int dst_width, int dst_height)
 {
@@ -4901,12 +5279,16 @@ ph_copy_texture_box(struct ph_context *ctx,
    const int dwidth = abs(dst_width);
    const int dheight = abs(dst_height);
    const unsigned cpp = util_format_get_blocksize(src->format);
+   const int dst_y0 = dst_height < 0 ? dsty - height : dsty;
+   unsigned src_w, src_h, dst_w, dst_h;
    uint8_t *staging;
 
    ph_submit_vertices(ctx);
    if (!width || !height || width != dwidth || height != dheight ||
        src_box->depth != 1 || cpp != 4 ||
        util_format_get_blocksize(dst->format) != cpp ||
+       !ph_level_extent(sr, src_level, &src_w, &src_h) ||
+       !ph_level_extent(dr, dst_level, &dst_w, &dst_h) ||
        (uint64_t)width * height * cpp > SIZE_MAX)
       return false;
 
@@ -4917,16 +5299,14 @@ ph_copy_texture_box(struct ph_context *ctx,
    if (ph_wait_async(ctx) || ctx->submit_error)
       return false;
    if (sr->transfer_shadow &&
-       ph_resource_download_shadow_rows(sr,
+       ph_shadow_download_level(sr, src_level,
           src_box->height < 0 ? src_box->y - height : src_box->y,
           src_box->height < 0 ? src_box->y : src_box->y + height))
       return false;
    /* The destination upload publishes whole tile rows; the pixels beside
     * the copied box must be current in its shadow first. */
-   if (dr->transfer_shadow && (dr->mip_defined & BITFIELD_BIT(0)) &&
-       ph_resource_download_shadow_rows(dr,
-          dst_height < 0 ? dsty - height : dsty,
-          dst_height < 0 ? dsty : dsty + height))
+   if (dr->transfer_shadow && (dr->mip_defined & BITFIELD_BIT(dst_level)) &&
+       ph_shadow_download_level(dr, dst_level, dst_y0, dst_y0 + height))
       return false;
 
    /* Imported drawable/renderbuffer resources have a linear companion.
@@ -4950,23 +5330,16 @@ ph_copy_texture_box(struct ph_context *ctx,
       for (int x = 0; x < width; x++) {
          const int sx = src_box->x + (src_box->width < 0 ? -1 - x : x);
          uint8_t *out = staging + ((size_t)y * width + x) * cpp;
+         const bool linear = sr->linear_map && !sr->tiled_dirty;
 
-         if (sx < 0 || sy < 0 || sx >= (int)src->width0 ||
-             sy >= (int)src->height0) {
+         if (sx < 0 || sy < 0 || sx >= (int)src_w || sy >= (int)src_h ||
+             (!linear && !sr->map)) {
             FREE(staging);
             return false;
          }
-         if (sr->linear_map && !sr->tiled_dirty)
-            memcpy(out, (uint8_t *)sr->linear_map +
-                        (size_t)sy * sr->linear_stride + sx * cpp, cpp);
-         else if (sr->map)
-            memcpy(out, (uint8_t *)sr->map +
-                        p3d_tile_offset_layout(sx, sy, sr->stride,
-                                               sr->tile_layout), cpp);
-         else {
-            FREE(staging);
-            return false;
-         }
+         memcpy(out, (uint8_t *)(linear ? sr->linear_map : sr->map) +
+                     ph_texel_offset(sr, src_level, sx, sy, cpp, linear),
+                cpp);
       }
    }
 
@@ -4976,37 +5349,26 @@ ph_copy_texture_box(struct ph_context *ctx,
          const int dx = dstx + (dst_width < 0 ? -1 - x : x);
          const uint8_t *in = staging + ((size_t)y * width + x) * cpp;
 
-         if (dx < 0 || dy < 0 || dx >= (int)dst->width0 ||
-             dy >= (int)dst->height0) {
+         if (dx < 0 || dy < 0 || dx >= (int)dst_w || dy >= (int)dst_h ||
+             (!dr->linear_map && !dr->map)) {
             FREE(staging);
             return false;
          }
          if (dr->linear_map)
             memcpy((uint8_t *)dr->linear_map +
-                      (size_t)dy * dr->linear_stride + dx * cpp, in, cpp);
+                      ph_texel_offset(dr, dst_level, dx, dy, cpp, true),
+                   in, cpp);
          if (dr->map)
             memcpy((uint8_t *)dr->map +
-                      ((dr->upload_texture ||
-                        ((dr->base.bind & PIPE_BIND_SAMPLER_VIEW) &&
-                        !(dr->base.bind & (PIPE_BIND_RENDER_TARGET |
-                                           PIPE_BIND_DISPLAY_TARGET |
-                                           PIPE_BIND_SCANOUT)))) ?
-                       ph_mip_texel_offset_cpp(&dr->mip, 0, dx, dy,
-                                               false, cpp) :
-                       p3d_tile_offset_layout(dx, dy, dr->stride,
-                                              dr->tile_layout)), in, cpp);
-         if (!dr->linear_map && !dr->map) {
-            FREE(staging);
-            return false;
-         }
+                      ph_texel_offset(dr, dst_level, dx, dy, cpp, false),
+                   in, cpp);
       }
    }
    dr->tiled_dirty = dr->map && !dr->linear_map;
    dr->linear_dirty = dr->linear_map && !dr->map;
    if (dr->transfer_shadow) {
-      int ret = ph_resource_upload_shadow_rows(dr,
-         dst_height < 0 ? dsty - height : dsty,
-         dst_height < 0 ? dsty : dsty + height);
+      int ret = dst_level ? ph_resource_upload_shadow(dr) :
+         ph_resource_upload_shadow_rows(dr, dst_y0, dst_y0 + height);
 
       if (ret) {
          ctx->submit_error = ret;
@@ -5017,9 +5379,11 @@ ph_copy_texture_box(struct ph_context *ctx,
       dr->linear_dirty = false;
    }
    dr->upload_dirty |= dr->upload_texture;
-   dr->mip_defined |= BITFIELD_BIT(0);
+   dr->mip_defined |= BITFIELD_BIT(dst_level);
    dr->content_generation++;
    FREE(staging);
+   if (dr->upload_texture)
+      ph_resource_upload_texture(dr);
    return true;
 }
 
@@ -5032,7 +5396,7 @@ ph_resource_copy_region(struct pipe_context *p,
 {
    struct ph_context *ctx = ph_context(p);
 
-   if (dst_level || src_level || dstz || src_box->z)
+   if (dstz || src_box->z)
       return;
    if (dst->target == PIPE_BUFFER && src->target == PIPE_BUFFER) {
       struct parhelia_resource *dr = ph_resource(dst);
@@ -5048,31 +5412,174 @@ ph_resource_copy_region(struct pipe_context *p,
    }
    if (dst->target == PIPE_BUFFER || src->target == PIPE_BUFFER)
       return;
-   ph_copy_texture_box(ctx, dst, dstx, dsty, src, src_box,
-                       src_box->width, src_box->height);
+   ph_copy_texture_box(ctx, dst, dst_level, dstx, dsty, src, src_level,
+                       src_box, src_box->width, src_box->height);
+}
+
+static void
+ph_normalize_box(const struct pipe_box *in, struct pipe_box *out)
+{
+   *out = *in;
+   if (out->width < 0) {
+      out->x += out->width;
+      out->width = -out->width;
+   }
+   if (out->height < 0) {
+      out->y += out->height;
+      out->height = -out->height;
+   }
+}
+
+/* General 2-D blit through the CPU transfer paths: scaling with nearest or
+ * bilinear filtering, format conversion, flips, write masks and scissor. */
+static bool
+ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
+{
+   const enum pipe_format sf = info->src.format, df = info->dst.format;
+   const bool zs = util_format_is_depth_or_stencil(sf) ||
+                   util_format_is_depth_or_stencil(df);
+   const unsigned mask = info->mask & (zs ? PIPE_MASK_ZS : PIPE_MASK_RGBA);
+   const bool keep = (!zs && mask != PIPE_MASK_RGBA) || info->scissor_enable;
+   const bool flip_x = (info->src.box.width < 0) != (info->dst.box.width < 0);
+   const bool flip_y = (info->src.box.height < 0) != (info->dst.box.height < 0);
+   struct pipe_transfer *st = NULL, *dt = NULL;
+   struct pipe_box sb, db;
+   const uint8_t *src;
+   uint8_t *dst;
+   float *pixels = NULL, *row = NULL;
+   bool ok = false;
+
+   ph_normalize_box(&info->src.box, &sb);
+   ph_normalize_box(&info->dst.box, &db);
+   if (!mask || !sb.width || !sb.height || !db.width || !db.height ||
+       sb.depth != 1 || db.depth != 1 ||
+       (zs && (sf != df || util_format_get_blocksize(sf) != 4)))
+      return !mask;
+   src = p->texture_map(p, info->src.resource, info->src.level,
+                        PIPE_MAP_READ, &sb, &st);
+   dst = p->texture_map(p, info->dst.resource, info->dst.level,
+                        PIPE_MAP_WRITE | (keep ? PIPE_MAP_READ : 0), &db,
+                        &dt);
+   pixels = MALLOC((size_t)sb.width * sb.height * 4 * sizeof(float));
+   row = MALLOC((size_t)db.width * 4 * sizeof(float));
+   if (!src || !dst || !pixels || !row)
+      goto out;
+   if (!zs)
+      for (int y = 0; y < sb.height; y++)
+         util_format_unpack_rgba(sf, pixels + (size_t)y * sb.width * 4,
+                                 src + (size_t)y * st->stride, sb.width);
+   for (int y = 0; y < db.height; y++) {
+      const float fy = ((flip_y ? db.height - 1 - y : y) + 0.5f) *
+                       sb.height / db.height - 0.5f;
+      uint8_t *out = dst + (size_t)y * dt->stride;
+      const int wy = db.y + y;
+
+      if (zs) {
+         for (int x = 0; x < db.width; x++) {
+            const float fx = ((flip_x ? db.width - 1 - x : x) + 0.5f) *
+                             sb.width / db.width - 0.5f;
+            const int sx = CLAMP((int)lroundf(fx), 0, sb.width - 1);
+            const int sy = CLAMP((int)lroundf(fy), 0, sb.height - 1);
+            uint32_t in, old;
+
+            memcpy(&in, src + (size_t)sy * st->stride + sx * 4, 4);
+            memcpy(&old, out + x * 4, 4);
+            if (mask != PIPE_MASK_ZS)
+               in = (mask & PIPE_MASK_Z) ? (in & 0x00ffffffu) | (old & 0xff000000u) :
+                                           (in & 0xff000000u) | (old & 0x00ffffffu);
+            if (!info->scissor_enable ||
+                (db.x + x >= info->scissor.minx && db.x + x < info->scissor.maxx &&
+                 wy >= info->scissor.miny && wy < info->scissor.maxy))
+               memcpy(out + x * 4, &in, 4);
+         }
+         continue;
+      }
+      if (keep)
+         util_format_unpack_rgba(df, row, out, db.width);
+      for (int x = 0; x < db.width; x++) {
+         const float fx = ((flip_x ? db.width - 1 - x : x) + 0.5f) *
+                          sb.width / db.width - 0.5f;
+         const int wx = db.x + x;
+         float texel[4];
+
+         if (info->scissor_enable &&
+             (wx < info->scissor.minx || wx >= info->scissor.maxx ||
+              wy < info->scissor.miny || wy >= info->scissor.maxy))
+            continue;
+         if (info->filter == PIPE_TEX_FILTER_LINEAR &&
+             (sb.width != db.width || sb.height != db.height)) {
+            const float cx = CLAMP(fx, 0.0f, sb.width - 1.0f);
+            const float cy = CLAMP(fy, 0.0f, sb.height - 1.0f);
+            const int x0 = (int)cx, y0 = (int)cy;
+            const int x1 = MIN2(x0 + 1, sb.width - 1);
+            const int y1 = MIN2(y0 + 1, sb.height - 1);
+            const float ax = cx - x0, ay = cy - y0;
+
+            for (unsigned c = 0; c < 4; c++) {
+               const float *p00 = pixels + ((size_t)y0 * sb.width + x0) * 4;
+               const float *p10 = pixels + ((size_t)y0 * sb.width + x1) * 4;
+               const float *p01 = pixels + ((size_t)y1 * sb.width + x0) * 4;
+               const float *p11 = pixels + ((size_t)y1 * sb.width + x1) * 4;
+
+               texel[c] = (p00[c] * (1 - ax) + p10[c] * ax) * (1 - ay) +
+                          (p01[c] * (1 - ax) + p11[c] * ax) * ay;
+            }
+         } else {
+            const int sx = CLAMP((int)floorf(fx + 0.5f), 0, sb.width - 1);
+            const int sy = CLAMP((int)floorf(fy + 0.5f), 0, sb.height - 1);
+
+            memcpy(texel, pixels + ((size_t)sy * sb.width + sx) * 4,
+                   sizeof(texel));
+         }
+         for (unsigned c = 0; c < 4; c++)
+            if (mask & (PIPE_MASK_R << c))
+               row[x * 4 + c] = texel[c];
+      }
+      util_format_pack_rgba(df, out, row, db.width);
+   }
+   ok = true;
+out:
+   FREE(row);
+   FREE(pixels);
+   if (dt)
+      p->texture_unmap(p, dt);
+   if (st)
+      p->texture_unmap(p, st);
+   return ok;
 }
 
 static void
 ph_blit(struct pipe_context *p, const struct pipe_blit_info *info)
 {
    struct ph_context *ctx = ph_context(p);
+   bool copied = false;
 
    if (!info || !info->src.resource || !info->dst.resource ||
-       info->src.level || info->dst.level ||
        info->src.resource->nr_samples > 1 ||
        info->dst.resource->nr_samples > 1)
       return;
-   bool copied = ph_copy_texture_box(ctx, info->dst.resource,
-                                     info->dst.box.x, info->dst.box.y,
-                                     info->src.resource, &info->src.box,
-                                     info->dst.box.width,
-                                     info->dst.box.height);
-   if (getenv("PARHELIA_TRACE"))
+   if (info->src.format == info->dst.format &&
+       info->src.format == info->src.resource->format &&
+       info->dst.format == info->dst.resource->format &&
+       abs(info->src.box.width) == abs(info->dst.box.width) &&
+       abs(info->src.box.height) == abs(info->dst.box.height) &&
+       !info->scissor_enable &&
+       (info->mask & PIPE_MASK_RGBA) == PIPE_MASK_RGBA &&
+       !util_format_is_depth_or_stencil(info->src.format))
+      copied = ph_copy_texture_box(ctx, info->dst.resource, info->dst.level,
+                                   info->dst.box.x, info->dst.box.y,
+                                   info->src.resource, info->src.level,
+                                   &info->src.box, info->dst.box.width,
+                                   info->dst.box.height);
+   if (!copied)
+      copied = ph_blit_cpu(p, info);
+   if (!copied)
       fprintf(stderr,
-              "parhelia: blit src=%p dst=%p %dx%d -> %dx%d copied=%u\n",
-              (void *)info->src.resource, (void *)info->dst.resource,
+              "parhelia: unsupported blit %s -> %s %dx%d -> %dx%d\n",
+              util_format_short_name(info->src.format),
+              util_format_short_name(info->dst.format),
               info->src.box.width, info->src.box.height,
-              info->dst.box.width, info->dst.box.height, copied);
+              info->dst.box.width, info->dst.box.height);
 }
 
 /* P3D's 0x32/0x33 32-bit sampler formats are little-endian BGR(A/X).  Mesa
@@ -5446,8 +5953,10 @@ ph_destroy_context(struct pipe_context *p)
    struct ph_context *ctx = ph_context(p);
    ph_submit_vertices(ctx);
    ph_wait_async(ctx);
-   for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++)
+   for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++) {
       pipe_sampler_view_reference(&ctx->sampler_views[i], NULL);
+      pipe_sampler_view_reference(&ctx->bound_views[i], NULL);
+   }
    for (unsigned i = 0; i < MESA_SHADER_STAGES; i++)
       pipe_resource_reference(&ctx->constants[i], NULL);
    util_unreference_framebuffer_state(&ctx->fb);
@@ -5505,19 +6014,23 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->warp_textured = textured.value;
    ctx->warp_replace = replace.value;
    ctx->async_submit = ph_screen(screen)->async_submit;
+   ctx->stats_sync = getenv("PARHELIA_STATS") &&
+                     !strcmp(getenv("PARHELIA_STATS"), "sync");
+   ctx->stats = ctx->stats_sync ||
+                debug_get_bool_option("PARHELIA_STATS", false);
    ctx->pack_adjacent_packets = ph_screen(screen)->pack_adjacent_packets;
    ctx->aggregate_state_batches =
       ph_screen(screen)->stateful_submit &&
-      getenv("PARHELIA_BATCH_DIFFERENT_STATE") != NULL;
+      ph_env("PARHELIA_BATCH_DIFFERENT_STATE");
    ctx->aggregate_state_stream =
       debug_get_bool_option("PARHELIA_BATCH_STATE_STREAM", false);
    ctx->aggregate_batches = ctx->aggregate_state_stream ||
                             ctx->aggregate_state_batches ||
-                            getenv("PARHELIA_BATCH_AGGREGATE") != NULL;
-   if (ctx->aggregate_state_batches && getenv("PARHELIA_TRACE_BATCH"))
+                            ph_env("PARHELIA_BATCH_AGGREGATE");
+   if (ctx->aggregate_state_batches && ph_env("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: preserving per-state EOB/DWGSYNC boundaries inside aggregate submits\n");
-   if (ctx->aggregate_state_stream && getenv("PARHELIA_TRACE_BATCH"))
+   if (ctx->aggregate_state_stream && ph_env("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: complete ordered state streams share one terminal EOB/DWGSYNC\n");
    /* Older kernels remain usable for the single-texture renderer.  A bound
@@ -5529,7 +6042,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->p690_multitexture =
       ph_screen(screen)->chip_id == 0x2539 && ctx->warp_textured_multitex &&
       debug_get_bool_option("PARHELIA_P690_MULTITEXTURE", true);
-   if (ctx->p690_multitexture && getenv("PARHELIA_TRACE"))
+   if (ctx->p690_multitexture && ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: P690 one-pass two-texture MODULATE enabled\n");
    ctx->draw = draw_create(&ctx->base);
@@ -5605,7 +6118,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
 	if (!ctx->base.stream_uploader)
 	   goto fail;
 	ph_create_vertex_ring(ctx);
-   if (ctx->aggregate_batches && getenv("PARHELIA_TRACE_BATCH"))
+   if (ctx->aggregate_batches && ph_env("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: aggregation limits commands=%u vertices=%u packets=%u relocs=%u kernel_packets=%u dma_ring=%u\n",
               ctx->batch_limits.command_dwords,

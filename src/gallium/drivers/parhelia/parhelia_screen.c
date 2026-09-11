@@ -179,7 +179,7 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
          }
       }
    }
-   if (getenv("PARHELIA_DEBUG"))
+   if (ph_env("PARHELIA_DEBUG"))
       fprintf(stderr,
               "parhelia: format query format=%u target=%u samples=%u/%u bind=%#x -> %u\n",
               format, target, samples, storage_samples, bind, supported);
@@ -195,7 +195,7 @@ ph_resource_resolve_linear(struct parhelia_resource *r)
 
    if (!r || !r->tiled_dirty || !r->linear_map)
       return;
-   if (!getenv("PARHELIA_CPU_BLIT") &&
+   if (!ph_env("PARHELIA_CPU_BLIT") &&
        r->handle && r->linear_handle && !(r->linear_stride & 3) &&
        r->linear_stride / 4 <= 0x3fff) {
       batch = calloc(1, sizeof(*batch));
@@ -212,7 +212,7 @@ ph_resource_resolve_linear(struct parhelia_resource *r)
          free(batch);
          r->tiled_dirty = false;
          r->linear_dirty = false;
-         if (getenv("PARHELIA_TRACE"))
+         if (ph_env("PARHELIA_TRACE"))
             fprintf(stderr,
                     "parhelia: GPU resolve tiled=%u linear=%u %ux%u\n",
                     r->handle, r->linear_handle,
@@ -223,7 +223,7 @@ ph_resource_resolve_linear(struct parhelia_resource *r)
    }
    if (!r->map || (r->transfer_shadow && ph_resource_download_shadow(r)))
       return;
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: CPU resolve resource=%p tiled=%u linear=%u %ux%u gpu_error=%d\n",
               (void *)r, r->handle, r->linear_handle,
@@ -246,7 +246,7 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
 
    if (!r || !r->linear_dirty || r->tiled_dirty || !r->linear_map)
       return;
-   if (!getenv("PARHELIA_CPU_BLIT") &&
+   if (!ph_env("PARHELIA_CPU_BLIT") &&
        r->handle && r->linear_handle && !(r->linear_stride & 3) &&
        r->linear_stride / 4 <= 0x3fff) {
       batch = calloc(1, sizeof(*batch));
@@ -260,7 +260,7 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
       if (!ret) {
          free(batch);
          r->linear_dirty = false;
-         if (getenv("PARHELIA_TRACE"))
+         if (ph_env("PARHELIA_TRACE"))
             fprintf(stderr,
                     "parhelia: GPU upload linear=%u tiled=%u %ux%u\n",
                     r->linear_handle, r->handle,
@@ -271,7 +271,7 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
    }
    if (!r->map)
       return;
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: CPU upload resource=%p linear=%u tiled=%u %ux%u layout=%u gpu_error=%d\n",
               (void *)r, r->linear_handle, r->handle,
@@ -319,7 +319,7 @@ ph_resource_upload_texture(struct parhelia_resource *r)
       return ret;
    }
    r->upload_dirty = false;
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr, "parhelia: texture upload handle=%u size=%llu\n",
               r->handle, (unsigned long long)r->size);
    return 0;
@@ -351,7 +351,7 @@ ph_resource_shadow_transfer(struct parhelia_resource *r, unsigned long request,
               (unsigned long long)size, strerror(errno));
       return ret;
    }
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr, "parhelia: %s handle=%u offset=%llu size=%llu\n",
               operation, r->handle, (unsigned long long)offset,
               (unsigned long long)size);
@@ -465,18 +465,21 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * compact 32x32 child, and a shared <=16 native 64x16 tail.  The
     * texture-only upload BO is required: an ordinary mapped render BO
     * selects the wrong storage class for mip sampling. */
-   mip_levels = p690_native_texture32 && templ->width0 >= 64 &&
+   mip_levels = p690_native_texture32 &&
                 !(templ->width0 & (templ->width0 - 1)) &&
                 !(templ->height0 & (templ->height0 - 1)) ?
                    templ->last_level + 1 : 1;
-   if (!ph_mip_layout_init(&r->mip, templ->width0, templ->height0,
-                           mip_levels, true))
+   if (!ph_mip_layout_init_chip(&r->mip, templ->width0, templ->height0,
+                                mip_levels, true, p690_native_texture32))
       goto fail;
    if (p690_native_texture32) {
       /* Live spatial sampling proves the hybrid address permutations used
        * for this vendor chain; ph_mip_physical_coords() selects each one. */
       r->mip.native_64x16_32 = true;
-      r->mip.level[0].pitch = MAX2(r->mip.level[0].pitch, 64u);
+      /* A base up to 32 texels wide uses the compact 32-pitch permutation
+       * of a 32x32 child (--mip-address-probe 32 32, 16 32, 32 64). */
+      if (templ->width0 > 32)
+         r->mip.level[0].pitch = MAX2(r->mip.level[0].pitch, 64u);
       if (mip_levels == 1)
          r->mip.size = ph_mip_align(r->mip.level[0].pitch *
                                    ph_mip_align(templ->height0, 32) * 4,
@@ -490,12 +493,13 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
        (r->mip.size + (size_t)r->mip.level[0].pitch * 4 - 1) /
        ((size_t)r->mip.level[0].pitch * 4) > 768) {
       mip_levels = 1;
-      if (!ph_mip_layout_init(&r->mip, templ->width0, templ->height0,
-                              mip_levels, true))
+      if (!ph_mip_layout_init_chip(&r->mip, templ->width0, templ->height0,
+                                   mip_levels, true, p690_native_texture32))
          goto fail;
       if (p690_native_texture32) {
          r->mip.native_64x16_32 = true;
-         r->mip.level[0].pitch = MAX2(r->mip.level[0].pitch, 64u);
+         if (templ->width0 > 32)
+            r->mip.level[0].pitch = MAX2(r->mip.level[0].pitch, 64u);
          r->mip.size = ph_mip_align(r->mip.level[0].pitch *
                                    ph_mip_align(templ->height0, 32) * 4,
                                    0x2000);
@@ -504,9 +508,10 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    struct drm_parhelia_create_render create = {
       .width = p690_native_texture32 ? MAX2(templ->width0, 64u) :
                                       templ->width0,
+      /* Rows of the (possibly wider) allocation that hold the chain. */
       .height = mip_levels > 1 ?
-         (r->mip.size + (size_t)r->mip.level[0].pitch * 4 - 1) /
-         ((size_t)r->mip.level[0].pitch * 4) :
+         (r->mip.size + (size_t)MAX2(r->mip.level[0].pitch, 64u) * 4 - 1) /
+         ((size_t)MAX2(r->mip.level[0].pitch, 64u) * 4) :
          templ->height0,
    };
    /* A tiled sampler uses the texture-unit address path.  Keeping the 32 MiB
@@ -635,7 +640,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
          }
       }
    }
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: create resource=%p tiled=%u linear=%u %ux%u format=%u/%s bind=%#x create_flags=%#x tiled_pitch_px=%u linear_pitch_B=%u layout=%u\n",
               (void *)r, r->handle, r->linear_handle,
@@ -727,7 +732,7 @@ ph_resource_from_handle(struct pipe_screen *pscreen,
          r->tile_layout = screen->tile_layout;
          r->native_shared = true;
          pipe_reference_init(&r->base.reference, 1);
-         if (getenv("PARHELIA_TRACE"))
+         if (ph_env("PARHELIA_TRACE"))
             fprintf(stderr,
                     "parhelia: import native resource=%p handle=%u %ux%u bind=%#x pitch_B=%u layout=%u\n",
                     (void *)r, r->handle, templ->width0, templ->height0,
@@ -798,7 +803,7 @@ ph_resource_from_handle(struct pipe_screen *pscreen,
       goto fail;
    }
    r->linear_dirty = true;
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: import resource=%p tiled=%u linear=%u %ux%u bind=%#x type=%u tiled_pitch_px=%u linear_pitch_B=%u layout=%u\n",
               (void *)r, r->handle, r->linear_handle,
@@ -858,7 +863,7 @@ ph_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *ctx,
    if (r->native_shared) {
       int prime_fd;
 
-      if (getenv("PARHELIA_TRACE"))
+      if (ph_env("PARHELIA_TRACE"))
          fprintf(stderr,
                  "parhelia: export native resource=%p handle=%u type=%u pitch_B=%u\n",
                  (void *)r, r->handle, whandle->type, r->stride * 4);
@@ -890,7 +895,7 @@ ph_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *ctx,
    if (!r->linear_handle)
       return false;
    ph_resource_resolve_linear(r);
-   if (getenv("PARHELIA_TRACE"))
+   if (ph_env("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: export resource=%p tiled=%u linear=%u type=%u\n",
               (void *)r, r->handle, r->linear_handle, whandle->type);

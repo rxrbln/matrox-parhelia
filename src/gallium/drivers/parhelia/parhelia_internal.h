@@ -6,8 +6,18 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <stdlib.h>
+
 #include "pipe/p_screen.h"
 #include "parhelia_mipmap.h"
+
+/* Presence of a debug environment variable, looked up once per call site:
+ * several are tested for every staged triangle. */
+#define ph_env(name) ({ \
+   static int ph_env_cached_ = -1; \
+   if (ph_env_cached_ < 0) \
+      ph_env_cached_ = getenv(name) != NULL; \
+   ph_env_cached_ != 0; })
 
 #define PH_VRAM_VERTEX_LEGACY_SLOTS 3
 #define PH_VRAM_VERTEX_SLOTS_MAX 8
@@ -95,6 +105,7 @@ struct parhelia_resource {
    struct ph_mip_layout mip;
    struct ph_mip_layout linear_mip;
    uint16_t mip_defined;
+   bool trace_mips;
 };
 
 static inline struct parhelia_screen *
