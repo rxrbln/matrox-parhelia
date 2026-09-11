@@ -43,6 +43,78 @@ parhelia_batch_negotiate_limits(uint64_t reported_packets,
    };
 }
 
+static bool
+batch_packet_adds_stage_call(const uint32_t *cmd, unsigned length)
+{
+   return (length == 8 || length == 10) && cmd[0] == length - 2 &&
+          cmd[1] == 0x212121ddu && cmd[4] == 0x20000002u &&
+          cmd[5] == cmd[4] &&
+          ((length == 8 && cmd[3] == 0x3e403c3cu && cmd[7] == 2) ||
+           (length == 10 && cmd[3] == 0x41403c3cu &&
+            cmd[6] == cmd[7] && cmd[8] == 0x2121213eu && cmd[9] == 2));
+}
+
+int
+parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
+                                 unsigned first_packet,
+                                 unsigned end_packet,
+                                 unsigned *calls)
+{
+   enum { PACK_NONE, PACK_DRAW, PACK_RANGE } run = PACK_NONE;
+   bool draw_packets[PH_BATCH_PACKETS] = {false};
+   unsigned run_words = 0, count = 3;
+
+   if (!batch || !calls || first_packet >= end_packet ||
+       end_packet > batch->packet_count ||
+       batch->reloc_count > PH_BATCH_RELOCS)
+      return -EINVAL;
+   for (unsigned i = 0; i < batch->reloc_count; i++) {
+      const struct drm_parhelia_reloc *reloc = &batch->relocs[i];
+
+      if (reloc->packet >= batch->packet_count)
+         return -EINVAL;
+      if (reloc->type == PARHELIA_RELOC_DRAW)
+         draw_packets[reloc->packet] = true;
+   }
+   for (unsigned i = first_packet; i < end_packet; i++) {
+      const struct drm_parhelia_packet *packet = &batch->packets[i];
+      const uint32_t *cmd;
+      unsigned kind = PACK_NONE;
+
+      if (packet->offset > batch->command_count || !packet->length ||
+          packet->length > batch->command_count - packet->offset)
+         return -EINVAL;
+      cmd = batch->commands + packet->offset;
+      if (packet->length == 3 && (cmd[0] >> 24) == 0x97 &&
+          draw_packets[i])
+         kind = PACK_DRAW;
+      else if (packet->length == 3 && cmd[0] == 0x8f000001u)
+         kind = PACK_RANGE;
+
+      /* The kernel packs only consecutive packet storage and never crosses
+       * its 4096-dword secondary-fetch limit. */
+      if (kind != PACK_NONE && run == kind && i > first_packet &&
+          batch->packets[i - 1].offset +
+             batch->packets[i - 1].length == packet->offset &&
+          packet->length <= PH_BATCH_MAX_DRAW_DWORDS - run_words) {
+         run_words += packet->length;
+      } else {
+         count++;
+         run = kind;
+         run_words = packet->length;
+      }
+      /* Vertex-program binds acquire a separate synthetic stage CALL after
+       * their parent packet, which also terminates any packable run. */
+      if (batch_packet_adds_stage_call(cmd, packet->length)) {
+         count++;
+         run = PACK_NONE;
+         run_words = 0;
+      }
+   }
+   *calls = count;
+   return 0;
+}
+
 int
 parhelia_batch_slice(struct parhelia_batch *dst,
                      const struct parhelia_batch *src,

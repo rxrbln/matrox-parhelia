@@ -543,29 +543,74 @@ ph_batch_has_draw(const struct parhelia_batch *batch)
 }
 
 static int
-ph_submit_state_stream_slices(struct ph_context *ctx)
+ph_submit_state_stream_range(struct ph_context *ctx,
+                             struct parhelia_batch *slice,
+                             unsigned first_mark, unsigned end_mark)
+{
+   const struct parhelia_batch_mark begin = first_mark ?
+      ctx->pending_marks[first_mark - 1] : (struct parhelia_batch_mark) {0};
+   const struct parhelia_batch_mark *end = &ctx->pending_marks[end_mark - 1];
+   unsigned vertex_dwords = end->vertex_dwords - begin.vertex_dwords;
+   int ret;
+
+   ret = parhelia_batch_slice(slice, &ctx->pending_batch, &begin, end);
+   if (ret)
+      return ret;
+   ret = ph_submit_batch_now(
+      ctx, slice,
+      vertex_dwords ? ctx->pending_vertices + begin.vertex_dwords : NULL,
+      vertex_dwords);
+   if (ret != -E2BIG || end_mark - first_mark == 1)
+      return ret;
+
+   /* E2BIG is guaranteed to precede the producer update.  If a kernel lacks
+    * the draw packer assumed by the estimator, bisect this group while still
+    * preserving every original state-stream mark and its ordering. */
+   unsigned middle = first_mark + (end_mark - first_mark) / 2;
+   ret = ph_submit_state_stream_range(ctx, slice, first_mark, middle);
+   if (!ret)
+      ret = ph_submit_state_stream_range(ctx, slice, middle, end_mark);
+   return ret;
+}
+
+static int
+ph_submit_state_stream_groups(struct ph_context *ctx)
 {
    struct parhelia_batch *slice = CALLOC_STRUCT(parhelia_batch);
-   struct parhelia_batch_mark begin = {0};
+   unsigned first = 0;
    int ret = -ENOMEM;
 
    if (!slice)
       return ret;
-   for (unsigned i = 0; i < ctx->pending_mark_count; i++) {
-      const struct parhelia_batch_mark *end = &ctx->pending_marks[i];
-      unsigned vertex_dwords = end->vertex_dwords - begin.vertex_dwords;
+   while (first < ctx->pending_mark_count) {
+      unsigned end = first, calls = 3;
 
-      ret = parhelia_batch_slice(slice, &ctx->pending_batch, &begin, end);
+      while (end < ctx->pending_mark_count) {
+         unsigned first_packet = end ? ctx->pending_marks[end - 1].packets : 0;
+         unsigned mark_calls;
+
+         ret = parhelia_batch_packed_call_count(
+            &ctx->pending_batch, first_packet,
+            ctx->pending_marks[end].packets, &mark_calls);
+         if (ret)
+            goto out;
+         if (end > first && mark_calls - 3 > PH_BATCH_HW_CALLS - calls)
+            break;
+         calls += mark_calls - 3;
+         end++;
+         if (calls >= PH_BATCH_HW_CALLS)
+            break;
+      }
+      if (getenv("PARHELIA_TRACE_BATCH"))
+         fprintf(stderr,
+                 "parhelia: aggregate group marks=%u..%u estimated_calls=%u\n",
+                 first, end, calls);
+      ret = ph_submit_state_stream_range(ctx, slice, first, end);
       if (ret)
-         break;
-      ret = ph_submit_batch_now(
-         ctx, slice,
-         vertex_dwords ? ctx->pending_vertices + begin.vertex_dwords : NULL,
-         vertex_dwords);
-      if (ret)
-         break;
-      begin = *end;
+         goto out;
+      first = end;
    }
+out:
    FREE(slice);
    return ret;
 }
@@ -573,6 +618,7 @@ ph_submit_state_stream_slices(struct ph_context *ctx)
 static int
 ph_drain_batch(struct ph_context *ctx)
 {
+   unsigned packed_calls = 0;
    int ret;
 
    if (!ctx->pending_batch.packet_count)
@@ -587,18 +633,25 @@ ph_drain_batch(struct ph_context *ctx)
               ctx->pending_batch.reloc_count,
               ctx->pending_vertex_dwords,
               ctx->pending_resource_count);
-   ret = ph_submit_batch_now(ctx, &ctx->pending_batch,
-                             ctx->pending_vertex_dwords ?
-                                ctx->pending_vertices : NULL,
-                             ctx->pending_vertex_dwords);
+   if (ctx->aggregate_state_stream && ctx->pending_mark_count > 1 &&
+       !parhelia_batch_packed_call_count(&ctx->pending_batch, 0,
+                                         ctx->pending_batch.packet_count,
+                                         &packed_calls) &&
+       packed_calls > PH_BATCH_HW_CALLS)
+      ret = ph_submit_state_stream_groups(ctx);
+   else
+      ret = ph_submit_batch_now(ctx, &ctx->pending_batch,
+                                ctx->pending_vertex_dwords ?
+                                   ctx->pending_vertices : NULL,
+                                ctx->pending_vertex_dwords);
    /* The kernel returns E2BIG before publishing a primary producer update.
     * A state-stream aggregate retains every complete original batch, so retry
-    * its recorded slices without dropping commands or reusing a live ring
-    * range.  This also keeps Mesa usable while packet-packing support is being
-    * staged independently from the 1024-descriptor validator. */
+    * ordered groups within the hardware CALL bound.  The recursive range
+    * helper can still reach individual marks when userspace and kernel packet
+    * packing capabilities differ. */
    if (ret == -E2BIG && ctx->aggregate_state_stream &&
        ctx->pending_mark_count > 1)
-      ret = ph_submit_state_stream_slices(ctx);
+      ret = ph_submit_state_stream_groups(ctx);
    ph_release_pending_resources(ctx);
    ctx->pending_batch.command_count = 0;
    ctx->pending_batch.packet_count = 0;

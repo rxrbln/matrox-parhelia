@@ -18,6 +18,9 @@
 #define PH_BATCH_STATE_PACKET_RESERVE 64
 #define PH_BATCH_MAX_DRAWS (PH_BATCH_PACKETS - PH_BATCH_STATE_PACKET_RESERVE)
 #define PH_BATCH_RELOCS (PH_BATCH_PACKETS + 4)
+/* The P690 primary ring has 224 CALL slots.  A normal submission consumes
+ * three of them for its opening, EOB and terminal drain blocks. */
+#define PH_BATCH_HW_CALLS 224
 
 struct parhelia_batch_limits {
    unsigned command_dwords;
@@ -45,6 +48,13 @@ int parhelia_batch_slice(struct parhelia_batch *dst,
                          const struct parhelia_batch *src,
                          const struct parhelia_batch_mark *begin,
                          const struct parhelia_batch_mark *end);
+/* Conservatively predict the kernel execution-plan size after its proven
+ * adjacent 0x97/0x8f packet packing.  The half-open packet range is treated
+ * as one normal submit and therefore includes its three synthetic CALLs. */
+int parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
+                                     unsigned first_packet,
+                                     unsigned end_packet,
+                                     unsigned *calls);
 
 /* No physical addresses or MMIO callbacks cross this interface. */
 struct parhelia_batch {
