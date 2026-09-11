@@ -39,9 +39,13 @@ Environment: `LD_LIBRARY_PATH=/root/parhelia-mip/lib:/root/parhelia-mesa/lib64`,
 | T2 priming draw, resident BOs, measured mip geometry, deferred uploads, trilinear | 23.5 | 42.5 |
 | same, `GL_LINEAR_MIPMAP_NEAREST` | 26.4 | 37.9 |
 
-The last two rows are the committed state (kernel `0c28239` with
-`pack_adjacent_packets=1`, Mesa `4a8f9bc`): 791 frames in 30.0 s and 33.6 s,
-35-38 s wall time including the level load, no engine hangs.  The level load
+| allocation clobber fixed, display buffer in bank B, ganged pipes, mip-nearest | 30.6 | 32.6 |
+| same, trilinear | 28.1 | 35.5 |
+
+The 26.4/23.5 rows are kernel `0c28239` with `pack_adjacent_packets=1` and
+Mesa `4a8f9bc`; the 30.6/28.1 rows add kernel `43c0490` and Mesa `af4d810`
+with the patched X server (791 frames in 25.8 s and 28.1 s, 30-38 s wall
+time including the level load, no engine hangs).  The level load
 took 92-142 s before texture uploads were deferred to the first draw (each
 level copy re-uploaded the whole object).
 
@@ -164,6 +168,61 @@ Mpixel/s, which is why colour moved to bank A.  Any read-modify-write stream
   (0x0bc0, new `tedlf_counters=` module parameter) 0x4087 vs 0x1e4087 made no
   measurable difference.
 
+## Display refresh competes with rendering: give it its own bank
+
+Every fill-rate number above 230 Mpixel/s was measured with the CRTC off
+(stopping X disables it).  With a 1920x1200 refresh active, where the
+scanned-out image lives matters (textured 256x256 quads, depth test and
+write, Mpixel/s):
+
+| scanout location | 1:1 bilinear | 2:1 minified | 1.5:1 trilinear |
+|---|---:|---:|---:|
+| none (CRTC off) | 262 | 120 | 116.5 |
+| dumb buffer, bank A | 182 | 83.5 | 77.6 |
+| colour band, bank A (X before this change) | 179.5 | 91 | 85.7 |
+| depth band, bank B | 198.6 | 120.3 | 116.5 |
+
+Refresh out of bank B leaves the texture-bound cases untouched.  The kernel
+therefore has a display class in the third 32 MiB band (bank B, below the
+depth band), which Mesa requests for a resource that is both a scanout and a
+front-rendering target; the X modesetting driver passes
+`GBM_BO_USE_FRONT_RENDERING` for its front and rotation buffers, which is
+what separates the display image from a client's shared back buffer.  Q3
+gained 16% (26.4 to 30.6 fps, 23.5 to 28.1 trilinear).
+
+## Ganged texture pipes work with the right combiner merge
+
+The vendor places every single-stage draw of this chip family on pipe mask 5
+(pipes 0+2).  The first hardware test sampled correctly only in rows 0-3 of
+every 8-row band; the missing half came from combiner slot 0, which is not a
+texture-address instruction but an `ADD t0, t0, t1` that merges the partial
+samples of the two ganged pipes.  The P690 gang needs `ADD t0, t0, t2`
+(`0x1264 = 0x1260 = 0x00008000`); each pipe returns zero for the fragments it
+does not own.  With that merge every chain of `--mip-address-probe` samples
+exactly (`PROBE_LX_PIPES=1`), and:
+
+| case (1280x1024, depth write, scanout active) | single pipe | pipes 0+2 |
+|---|---:|---:|
+| 1:1 bilinear | 229.9 | 229.9 |
+| 2:1 minified, no mips | 120.2 | 122.5 |
+| 1.5:1 trilinear | 116.5 | 145.6 |
+
+Q3 is unchanged (30.7 vs 30.6 fps): its surfaces are two-stage draws, which
+already occupy pipes 0 and 2.  Evidence and vendor addresses:
+`parhelia-p690-ganged-pipe-ta-re.md`.
+
+## Object creation destroyed other objects' storage
+
+TTM clears a newly placed object with a CPU `memset_io` over BAR0.  On the
+P690 BAR0 is a translated host aperture, so those zeros landed wherever the
+aperture happened to translate.  `--create-clobber-probe` showed a new
+512x512 colour target wiping 18944 of 24576 dwords of a resident texture, and
+the GL mipmap test failed on every second X server generation (the placement
+alternates with the front buffer).  The kernel now places new objects without
+CPU access and zeroes them through its own aperture window; dumb buffers are
+cleared through their own mapping.  This predates the resident-object change:
+before that, the same clear ran at first submit.
+
 ## Mip chain geometry (measured with `--mip-address-probe`)
 
 * Levels with a pitch of 64 or more reserve 16-row multiples, pitch-32 levels
@@ -197,6 +256,10 @@ driver (`parhelia-p690-zcompression-clear-banks-re.md`).
 ## Known issues found while measuring
 
 * `trace_vram_reloc=1` hangs the first submit after module load.
+* A valid draw can take longer than the old 50 ms asynchronous hang budget
+  (a 4:1 minified full-screen quad without mipmaps needs 53 ms) and the
+  device was declared hung in the middle of a measurement.  The budget is
+  now 2 s per fence section (`hang_timeout_ms`).
 * After the engine hung during a module reload, every following warm reboot
   hung the first 3D draw (fence 0x30 after a completed 2D clear,
   `BM=03000000 908=db8fa047 924=0020100a`), also with the previously working
@@ -226,7 +289,11 @@ driver (`parhelia-p690-zcompression-clear-banks-re.md`).
   `PROBE_TRI_Z`, `PROBE_PRIMWORD`, `PROBE_BOUNDED`, `PROBE_AGG`,
   `PROBE_COLOUR_FLAGS`, `PROBE_DEPTH_FLAGS`.
 * `parhelia-drm-test --texture-fill-probe DEV [COUNT]` with `PROBE_TEX`,
-  `PROBE_TEX_FLAGS`, `PROBE_TEX_Z`, `PROBE_PATCH=OLD:NEW`.
+  `PROBE_TEX_FLAGS`, `PROBE_TEX_Z`, `PROBE_PATCH=OLD:NEW[,OLD:NEW...]`,
+  `PROBE_LX_PIPES`, and `PROBE_KMS`/`PROBE_KMS_FLAGS` to keep a scanout of a
+  chosen allocation class active while measuring.
+* `parhelia-drm-test --create-clobber-probe DEV`: allocation side effects on
+  other objects' storage (`PROBE_PAD_KIB`, `PROBE_CLOBBER_CLOSE`).
 * `parhelia-drm-test --mip-address-probe DEV W H`: samples every level of a
   chain filled with self-indexing dwords and reports the fetched dword per
   texel against the Gallium layout.
