@@ -1711,6 +1711,11 @@ static bool parhelia_async_file_turn(struct parhelia_device *pdev,
 			parhelia_async_waiter_add(pdev, waiter);
 			return false;
 		}
+		if (!pdev->queued_slots && pdev->queue_next) {
+			pdev->queue_handoff = true;
+			parhelia_async_waiter_add(pdev, waiter);
+			return false;
+		}
 		if (pdev->queue_next &&
 		    time_after_eq(jiffies, pdev->queue_owner_deadline)) {
 			pdev->queue_handoff = true;
@@ -1723,6 +1728,13 @@ static bool parhelia_async_file_turn(struct parhelia_device *pdev,
 
 	parhelia_async_waiter_add(pdev, waiter);
 	first = parhelia_async_first_waiter(pdev);
+	/* A lease protects an active burst, not an idle file.  Once DWGSYNC has
+	 * retired the owner's last slot, the FIFO head can take ownership without
+	 * waiting out the remainder of the timeslice. */
+	if (!pdev->queued_slots && first == waiter) {
+		parhelia_async_file_claim(pdev, file);
+		return true;
+	}
 	if (first == waiter &&
 	    time_after_eq(jiffies, pdev->queue_owner_deadline))
 		pdev->queue_handoff = true;
@@ -1744,10 +1756,12 @@ static bool parhelia_async_file_turn_ready(struct parhelia_device *pdev,
 		return !READ_ONCE(pdev->queue_handoff);
 	if (READ_ONCE(pdev->queue_next) != file)
 		return false;
+	if (!READ_ONCE(pdev->queued_slots))
+		return true;
 	if (!READ_ONCE(pdev->queue_handoff))
 		return time_after_eq(jiffies,
 			READ_ONCE(pdev->queue_owner_deadline));
-	return !READ_ONCE(pdev->queued_slots);
+	return false;
 }
 
 static void parhelia_async_file_turn_cancel(struct parhelia_device *pdev,
@@ -1793,15 +1807,25 @@ static int parhelia_async_file_turn_static_selftest(void)
 	    parhelia_async_file_turn(pdev, c, &wc) || pdev->queue_next != b ||
 	    !parhelia_async_file_turn(pdev, a, &wa))
 		goto out;
-	/* At expiry A stops appending.  Only FIFO head B can claim after drain. */
-	pdev->queue_owner_deadline = jiffies - 1;
-	if (parhelia_async_file_turn(pdev, a, &wa) || !pdev->queue_handoff ||
-	    parhelia_async_file_turn(pdev, b, &wb))
-		goto out;
+	/* An empty A queue transfers immediately to FIFO head B, before expiry. */
 	pdev->queued_slots = 0;
-	if (parhelia_async_file_turn(pdev, c, &wc) ||
+	if (parhelia_async_file_turn(pdev, a, &wa) || !pdev->queue_handoff ||
+	    parhelia_async_file_turn(pdev, c, &wc) ||
 	    !parhelia_async_file_turn(pdev, b, &wb) ||
 	    pdev->queue_owner != b || pdev->queue_next != c || wb.queued)
+		goto out;
+	/* A live B burst retains the lease.  On expiry B joins the tail and only
+	 * FIFO head C can claim after its slots drain. */
+	pdev->queued_slots = 2;
+	if (!parhelia_async_file_turn(pdev, b, &wb))
+		goto out;
+	pdev->queue_owner_deadline = jiffies - 1;
+	if (parhelia_async_file_turn(pdev, b, &wb) || !pdev->queue_handoff ||
+	    parhelia_async_file_turn(pdev, c, &wc))
+		goto out;
+	pdev->queued_slots = 0;
+	if (!parhelia_async_file_turn(pdev, c, &wc) ||
+	    pdev->queue_owner != c || pdev->queue_next != b || wc.queued)
 		goto out;
 	ret = 0;
 out:
