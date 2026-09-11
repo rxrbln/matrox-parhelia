@@ -905,7 +905,8 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 	if (!parhelia_gem_is_owned(gem) ||
 	    !((bo->layout == PARHELIA_BO_LAYOUT_TEXTURE && texture_upload_probe) ||
 	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_COLOR ||
-	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_DEPTH) ||
+	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_DEPTH ||
+	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_SCANOUT) ||
 	    args->offset >= gem->size || args->size > gem->size - args->offset) {
 		ret = -EINVAL;
 		goto out_gem;

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 #ifndef __PARHELIA_DRV_H__
 #define __PARHELIA_DRV_H__
 
@@ -383,6 +384,7 @@ enum parhelia_placement_class {
 	PARHELIA_PLACEMENT_LEGACY,
 	PARHELIA_PLACEMENT_NATIVE_COLOR,
 	PARHELIA_PLACEMENT_NATIVE_DEPTH,
+	PARHELIA_PLACEMENT_NATIVE_SCANOUT,
 };
 
 struct parhelia_bo {

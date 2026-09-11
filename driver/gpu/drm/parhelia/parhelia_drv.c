@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 #include <linux/aperture.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
