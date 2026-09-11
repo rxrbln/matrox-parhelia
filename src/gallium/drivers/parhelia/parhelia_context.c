@@ -383,9 +383,21 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
    if (vertices && vertex_dwords && !screen->async_submit &&
        ctx->vram_vertex_enabled &&
        bytes <= sizeof(ctx->pending_vertices)) {
+      /* Async submission can be disabled after a pre-doorbell allocation
+       * failure.  Slot zero may still belong to an earlier queued draw at
+       * that point, so retire its fence before reusing the synchronous
+       * subrange.  The synchronous ioctl itself drains the remaining kernel
+       * queue before issuing this draw. */
+      if (ctx->vram_vertex_fence[0]) {
+         ret = parhelia_wait_fence(screen->fd, ctx->vram_vertex_fence[0],
+                                   -1, NULL);
+         if (ret)
+            return ret;
+         ctx->vram_vertex_fence[0] = 0;
+      }
       memcpy(ctx->vram_vertices, vertices, bytes);
-	  /* The map can be write-combined. Finish the CPU store before the ioctl
-	   * arms class-0 fetching; the kernel's fence then makes reuse safe. */
+      /* The map can be write-combined. Finish the CPU store before the ioctl
+       * arms class-3 fetching; the kernel's fence then makes reuse safe. */
       __sync_synchronize();
       ret = parhelia_batch_submit_vram(ph_screen(ctx->base.screen)->fd, batch,
                                        ctx->vram_vertex_handle, 0,
@@ -400,8 +412,8 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
 	   * only for that pre-submit rejection, never after an engine error. */
       ctx->vram_vertex_enabled = false;
    }
-   /* Class-3 fallback submissions retain their own kernel request-slot copy.
-    * Class-0 submissions above use three fenced local-VRAM subranges. */
+   /* Copy-submit fallback requests retain their own kernel vertex snapshot.
+    * CREATE_VERTEX submissions above use three fenced class-3 DMA subranges. */
    if (screen->async_submit) {
       ret = parhelia_batch_submit_async(screen->fd, batch, vertices,
                                         vertex_dwords, &ctx->fence);
