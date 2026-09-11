@@ -73,6 +73,8 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
 
       if (reloc->packet >= batch->packet_count)
          return -EINVAL;
+      if (reloc->type == PARHELIA_RELOC_BATCH_BOUNDARY)
+         return -EINVAL;
       if (reloc->type == PARHELIA_RELOC_DRAW)
          draw_packets[reloc->packet] = true;
    }
