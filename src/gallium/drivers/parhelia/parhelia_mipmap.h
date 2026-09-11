@@ -52,6 +52,7 @@ struct ph_mip_layout {
    size_t size;
    unsigned levels;
    bool tiled;
+   bool native_64x16_32;
 };
 
 static inline unsigned

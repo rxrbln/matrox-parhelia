@@ -23,6 +23,7 @@
 #define PARHELIA3D_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 /* ------------------------------------------------------------------ registers
@@ -471,7 +472,12 @@ uint32_t p3d_texture_tile_offset(uint32_t x, uint32_t y, uint32_t pitch);
 /* Texture layouts 2 and 3 share the 32x16 block order, but their texel
  * widths differ.  The 16-bit A1R5G5B5 route uses code 3. */
 uint32_t p3d_texture_tile_offset_cpp(uint32_t x, uint32_t y, uint32_t pitch,
-                                     unsigned cpp);
+                                    unsigned cpp);
+bool p3d_texture_uses_native_64x16(uint32_t chip_id, uint32_t tile_layout,
+                                  unsigned cpp);
+uint32_t p3d_texture_tile_offset_chip(uint32_t x, uint32_t y, uint32_t pitch,
+                                     unsigned cpp, uint32_t chip_id,
+                                     uint32_t tile_layout);
 
 /* ------------------------------------------------------------------ WARP */
 

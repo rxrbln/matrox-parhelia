@@ -167,3 +167,21 @@ p3d_texture_tile_offset_cpp(uint32_t x, uint32_t y, uint32_t pitch,
 		   ((x & 1u) << 1) | ((x & 0x1eu) << 3);
 	return block * 1024u + in_block;
 }
+
+bool
+p3d_texture_uses_native_64x16(uint32_t chip_id, uint32_t tile_layout,
+			      unsigned cpp)
+{
+	return chip_id == 0x2539 && tile_layout == PARHELIA_TILE_64X16_4K &&
+	       cpp == 4;
+}
+
+uint32_t
+p3d_texture_tile_offset_chip(uint32_t x, uint32_t y, uint32_t pitch,
+			     unsigned cpp, uint32_t chip_id,
+			     uint32_t tile_layout)
+{
+	if (p3d_texture_uses_native_64x16(chip_id, tile_layout, cpp))
+		return p3d_tile_offset_layout(x, y, pitch, tile_layout);
+	return p3d_texture_tile_offset_cpp(x, y, pitch, cpp);
+}
