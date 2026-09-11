@@ -725,6 +725,13 @@ irqreturn_t parhelia_irq_handler(int irq, void *arg)
 	parhelia_write(pdev, PARHELIA_MMIO_IRQ_ACK, status);
 	if (status & parhelia_vblank_mask(pdev))
 		drm_crtc_handle_vblank(&pdev->pipe.crtc);
+	/* Fence waiters re-read FENCE_DONE themselves; retirement needs the
+	 * submit mutex and runs from the workqueue. */
+	if (status & PARHELIA_IRQ_ENGINE) {
+		atomic64_inc(&pdev->submit_stats.engine_irqs);
+		wake_up_all(&pdev->submit_waitq);
+		mod_delayed_work(system_wq, &pdev->retire_work, 0);
+	}
 	return IRQ_HANDLED;
 }
 

@@ -104,6 +104,11 @@ static int parhelia_submit_stats_show(struct seq_file *m, void *data)
 		   atomic64_read(&stats->ring_end_writes));
 	seq_printf(m, "queue_high_water %lld\n",
 		   atomic64_read(&stats->queue_high_water));
+	seq_printf(m, "engine_irqs %lld\n", atomic64_read(&stats->engine_irqs));
+	seq_printf(m, "fence_waits %lld\n", atomic64_read(&stats->fence_waits));
+	seq_printf(m, "gpu_busy_ns %lld\n", atomic64_read(&stats->gpu_busy_ns));
+	seq_printf(m, "fence_wait_ns %lld\n",
+		   atomic64_read(&stats->fence_wait_ns));
 	return 0;
 }
 
@@ -397,6 +402,18 @@ static bool state_shadow_cache;
 module_param(state_shadow_cache, bool, 0400);
 MODULE_PARM_DESC(state_shadow_cache,
 		 "Omit proven repeated scalar 3D state CALLs (experimental, default false)");
+
+/* IRQ status bit 16 is the vendor driver's engine source, but it did not
+ * fire for these DWGSYNC packets on P690; keep it an opt-in experiment. */
+static bool engine_irq;
+module_param(engine_irq, bool, 0400);
+MODULE_PARM_DESC(engine_irq,
+		 "Wake fence waiters from IRQ status bit 16 (experimental, default false)");
+
+bool parhelia_engine_irq_enabled(void)
+{
+	return engine_irq;
+}
 
 static bool trace_state_shadow;
 module_param(trace_state_shadow, bool, 0400);
@@ -1449,9 +1466,11 @@ static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 	struct parhelia_bo *pbo = container_of(bo, struct parhelia_bo, gbo);
 	u64 band_pages = SZ_32M >> PAGE_SHIFT;
 
+	/* Colour and depth live in different 64 MiB banks: with both in bank B
+	 * a depth-tested fill ran at 202 instead of 666 Mpixel/s (P690 probe). */
 	if (pbo->placement_class == PARHELIA_PLACEMENT_NATIVE_COLOR)
 		return parhelia_vram_placement_range(bo, vram_size, false,
-						     2 * band_pages, 3 * band_pages);
+						     band_pages, 2 * band_pages);
 	if (pbo->placement_class == PARHELIA_PLACEMENT_NATIVE_DEPTH)
 		return parhelia_vram_placement_range(bo, vram_size, false,
 						     3 * band_pages, 4 * band_pages);
@@ -1495,8 +1514,8 @@ static int parhelia_vram_placement_static_selftest(void)
 	pbo.placement_class = PARHELIA_PLACEMENT_NATIVE_COLOR;
 	if (parhelia_vram_placement(&pbo.gbo, SZ_128M, true) ||
 	    pbo.gbo.placement.num_placement != 1 ||
-	    pbo.gbo.placements[0].fpfn != 2 * band_pages ||
-	    pbo.gbo.placements[0].lpfn != 3 * band_pages)
+	    pbo.gbo.placements[0].fpfn != band_pages ||
+	    pbo.gbo.placements[0].lpfn != 2 * band_pages)
 		return -EINVAL;
 	pbo.placement_class = PARHELIA_PLACEMENT_NATIVE_DEPTH;
 	if (parhelia_vram_placement(&pbo.gbo, SZ_128M, true) ||
@@ -1892,7 +1911,13 @@ out:
 static void parhelia_retire_locked(struct parhelia_device *pdev)
 {
 	u32 done = parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE) & ~7u;
+	struct parhelia_submit_slot *oldest = NULL;
 	u32 i;
+
+	if (done != pdev->progress_fence) {
+		pdev->progress_fence = done;
+		pdev->progress_jiffies = jiffies;
+	}
 
 	for (i = 0; i < PARHELIA_ASYNC_SLOTS; i++) {
 		struct parhelia_submit_slot *slot = &pdev->slots[i];
@@ -1901,21 +1926,52 @@ static void parhelia_retire_locked(struct parhelia_device *pdev)
 			continue;
 		if ((s32)(done - slot->fence) >= 0) {
 			dma_rmb();
+			if (submit_stats) {
+				struct parhelia_submit_stats *st = &pdev->submit_stats;
+				u64 now = ktime_get_ns();
+
+				atomic64_add(now - max(slot->submit_ns,
+						       st->last_retire_ns),
+					     &st->gpu_busy_ns);
+				st->last_retire_ns = now;
+			}
 			parhelia_slot_release_locked(pdev, slot, false);
 		}
 	}
 	/* A fence means the WARP/DWG work completed, but it does not by itself
-	 * prove a dead primary fetcher stopped on a fault.  Bound the queued work
-	 * exactly as the old ioctl did and quarantine all live allocations on a
-	 * timeout rather than returning them to userspace. */
+	 * prove a dead primary fetcher stopped on a fault.  Only the oldest
+	 * queued request can be executing: give it its per-request budget from
+	 * the later of its submission and the last fence progress, so a deep
+	 * queue of long but advancing work is never mistaken for a hang.
+	 * Quarantine all live allocations on a timeout rather than returning
+	 * them to userspace. */
 	for (i = 0; i < PARHELIA_ASYNC_SLOTS; i++) {
 		struct parhelia_submit_slot *slot = &pdev->slots[i];
 
-		if (slot->state != PARHELIA_SLOT_QUEUED ||
-		    !time_after_eq(jiffies, slot->deadline))
-			continue;
+		if (slot->state == PARHELIA_SLOT_QUEUED &&
+		    (!oldest || (s32)(slot->fence - oldest->fence) < 0))
+			oldest = slot;
+	}
+	if (oldest) {
+		unsigned long start = oldest->submitted;
+		struct parhelia_submit_slot *slot = oldest;
+
+		if (time_after(pdev->progress_jiffies, start))
+			start = pdev->progress_jiffies;
+		if (!time_after_eq(jiffies, start + oldest->budget))
+			return;
 		dev_err(&pdev->pdev->dev,
-			"asynchronous submit fence %08x timed out; wedged\n", slot->fence);
+			"asynchronous submit fence %08x made no progress for %u ms (done %08x); wedged\n",
+			slot->fence, jiffies_to_msecs(jiffies - start), done);
+		dev_err(&pdev->pdev->dev,
+			"BM=%08x prim=%08x/%08x sec=%08x/%08x 41c=%08x status450=%08x writeback=%08x DWGCTL=%08x 908=%08x 924=%08x\n",
+			parhelia_read(pdev, 0x08f0), parhelia_read(pdev, 0x0404),
+			parhelia_read(pdev, 0x0408), parhelia_read(pdev, 0x10a0),
+			parhelia_read(pdev, 0x10a4), parhelia_read(pdev, 0x041c),
+			parhelia_read(pdev, 0x0450),
+			READ_ONCE(((u32 *)pdev->writeback_cpu)[8]),
+			parhelia_read(pdev, 0x1300), parhelia_read(pdev, 0x0908),
+			parhelia_read(pdev, 0x0924));
 		pdev->wedged = true;
 		parhelia_state_shadow_invalidate(pdev, "asynchronous submit timeout");
 		pci_clear_master(pdev->pdev);
@@ -1930,7 +1986,6 @@ static void parhelia_retire_locked(struct parhelia_device *pdev)
 			slot->state = PARHELIA_SLOT_QUARANTINED;
 		}
 		wake_up_all(&pdev->submit_waitq);
-		break;
 	}
 }
 
@@ -4159,7 +4214,9 @@ retry_slot:
 		async_slot->primary_begin = pdev->primary_put;
 		async_slot->primary_end = pdev->primary_put + primary_words;
 		async_slot->call_count = total_calls;
-		async_slot->deadline = jiffies +
+		async_slot->submitted = jiffies;
+		async_slot->submit_ns = ktime_get_ns();
+		async_slot->budget =
 			usecs_to_jiffies(PARHELIA_FENCE_TIMEOUT_US *
 				plan->sync_sections) + 1;
 		async_slot->reloc_count = args->reloc_count;
@@ -4400,6 +4457,8 @@ int parhelia_wait_fence_ioctl(struct drm_device *drm, void *data,
 {
 	struct parhelia_device *pdev = to_parhelia(drm);
 	struct drm_parhelia_wait_fence *args = data;
+	u64 wait_begin = 0;
+	ktime_t poll_end;
 	long waited;
 	unsigned long timeout;
 	bool issued;
@@ -4418,6 +4477,21 @@ int parhelia_wait_fence_ioctl(struct drm_device *drm, void *data,
 		goto done;
 	if (!args->timeout_ns)
 		return -ETIME;
+	if (submit_stats) {
+		wait_begin = ktime_get_ns();
+		atomic64_inc(&pdev->submit_stats.fence_waits);
+	}
+	/* Retirement runs every jiffy.  Most render waits are shorter, so poll
+	 * the fence register at hrtimer resolution for up to 2 ms first. */
+	poll_end = ktime_add_us(ktime_get(), 2000);
+	while (!parhelia_fence_done_or_wedged(pdev, args->fence) &&
+	       ktime_before(ktime_get(), poll_end)) {
+		if (signal_pending(current))
+			return -ERESTARTSYS;
+		usleep_range(40, 80);
+	}
+	if (parhelia_fence_done_or_wedged(pdev, args->fence))
+		goto accounted;
 	if (args->timeout_ns < 0) {
 		waited = wait_event_interruptible(pdev->submit_waitq,
 			parhelia_fence_done_or_wedged(pdev, args->fence));
@@ -4431,6 +4505,10 @@ int parhelia_wait_fence_ioctl(struct drm_device *drm, void *data,
 	}
 	if (waited < 0)
 		return waited;
+accounted:
+	if (wait_begin)
+		atomic64_add(ktime_get_ns() - wait_begin,
+			     &pdev->submit_stats.fence_wait_ns);
 done:
 	args->completed = parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE) & ~7u;
 	return READ_ONCE(pdev->wedged) ? -EIO : 0;

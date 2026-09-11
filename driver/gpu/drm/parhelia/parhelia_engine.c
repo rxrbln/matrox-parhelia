@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 /* Parhelia 3D engine bring-up.
  *
  * Recovered from xf86-video-parhelia/src/parhelia3d/p3d_init.c. This resets
@@ -23,6 +24,13 @@
 static bool init_aperture = true;
 module_param(init_aperture, bool, 0400);
 MODULE_PARM_DESC(init_aperture, "Initialize owned host apertures before DRM registration");
+
+/* Vendor TEDLFCounters: 0x001e4087 on the P690 class, 0x00004087 on the
+ * older chips.  Zero keeps the power-on value. */
+static uint tedlf_counters;
+module_param(tedlf_counters, uint, 0400);
+MODULE_PARM_DESC(tedlf_counters,
+		 "Write this TEDLFCounters value to MMIO 0x0bc0 at engine init (0 = keep)");
 
 static void parhelia_rmw(struct parhelia_device *pdev, u32 reg,
 			  u32 and_mask, u32 or_mask)
@@ -82,6 +90,13 @@ int parhelia_engine_init(struct parhelia_device *pdev)
 	parhelia_rmw(pdev, 0x1c10, ~0u, 0x0808u);
 	parhelia_write(pdev, P3D_R_EOBTAG, 0x00070601u);
 	parhelia_write(pdev, P3D_R_WATERMARK, 0);
+	if (tedlf_counters) {
+		dev_info(&pdev->pdev->dev, "TEDLFCounters 0x0bc0 was %08x\n",
+			 parhelia_read(pdev, 0x0bc0));
+		parhelia_write(pdev, 0x0bc0, tedlf_counters);
+		dev_info(&pdev->pdev->dev, "TEDLFCounters 0x0bc0 set to %08x\n",
+			 parhelia_read(pdev, 0x0bc0));
+	}
 	if (init_aperture) {
 		unsigned int i;
 
@@ -136,6 +151,12 @@ int parhelia_engine_init(struct parhelia_device *pdev)
 		return ret;
 	}
 	pdev->engine_initialized = true;
+	if (parhelia_engine_irq_enabled()) {
+		parhelia_write(pdev, PARHELIA_MMIO_IRQ_ACK, PARHELIA_IRQ_ENGINE);
+		parhelia_write(pdev, PARHELIA_MMIO_IRQ_MASK,
+			       parhelia_read(pdev, PARHELIA_MMIO_IRQ_MASK) |
+			       PARHELIA_IRQ_ENGINE);
+	}
 	parhelia_root_trace_check(pdev, "engine_init:exit", 1, 0, 0);
 	return 0;
 }

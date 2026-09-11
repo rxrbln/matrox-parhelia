@@ -122,6 +122,9 @@ struct parhelia_bios {
 #define PARHELIA_MMIO_IRQ_STATUS	0x08f4
 #define PARHELIA_MMIO_IRQ_ACK		0x08f8
 #define PARHELIA_MMIO_IRQ_MASK		0x08fc
+/* Engine source enabled by the vendor Linux driver after the ring goes live
+ * (the soft-trap/DWGSYNC completion). */
+#define PARHELIA_IRQ_ENGINE		BIT(16)
 /* The vendor's OsSetVSyncInterruptState accepts 0x2 for head 0. */
 #define PARHELIA_IRQ_VBLANK_HEAD0	BIT(1)
 
@@ -282,7 +285,11 @@ struct parhelia_submit_slot {
 	u32 primary_begin;
 	u32 primary_end;
 	u32 call_count;
-	unsigned long deadline;
+	/* Hang budget and submission time; the budget runs from the later of
+	 * submission and the last observed fence progress. */
+	unsigned long budget;
+	unsigned long submitted;
+	u64 submit_ns;
 	struct parhelia_dma_block *blocks;
 	/* A single compact coherent secondary heap backs every packet in one
 	 * request. The CPU-only block index may exceed the hardware CALL count
@@ -339,6 +346,13 @@ struct parhelia_submit_stats {
 	atomic64_t ring_start_writes;
 	atomic64_t ring_end_writes;
 	atomic64_t queue_high_water;
+	atomic64_t engine_irqs;
+	atomic64_t fence_waits;
+	atomic64_t fence_wait_ns;
+	/* Queue-occupied time: from the later of submission and the previous
+	 * retirement to retirement, as observed by the retire path. */
+	atomic64_t gpu_busy_ns;
+	u64 last_retire_ns;
 };
 
 struct parhelia_bo;
@@ -449,6 +463,9 @@ struct parhelia_device {
 	bool queue_handoff;
 	u32 next_fence;
 	u32 first_fence;
+	/* Last FENCE_DONE value and when it advanced, for hang detection. */
+	u32 progress_fence;
+	unsigned long progress_jiffies;
 	bool primary_armed;
 	u64 fence_context;
 	u32 next_dma_tag;
@@ -518,6 +535,7 @@ bool parhelia_bios_ddc_pins(const struct parhelia_bios *bios,
 			    unsigned int line, u8 *scl, u8 *sda);
 int parhelia_ddc_init(struct parhelia_output *output);
 irqreturn_t parhelia_irq_handler(int irq, void *arg);
+bool parhelia_engine_irq_enabled(void);
 int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 			     struct drm_file *file);
 int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
