@@ -207,6 +207,98 @@ enum p3d_texenv { P3D_TEXENV_MODULATE = 0, P3D_TEXENV_REPLACE = 1,
 #define P3D_COMBINER_CONST(lo, hi) \
 	(((uint32_t)(lo) & 0x7ffu) | (((uint32_t)(hi) & 0x7ffu) << 16))
 
+/* ---- programmable fragment combiner -----------------------------------
+ *
+ * The five fixed-function texenv shapes above are special cases of a small
+ * programmable ALU.  One slot co-issues an RGB operation (sources 0x1264,
+ * opcode 0x126c) and an alpha operation (sources 0x1260, opcode 0x1268)
+ * over three sources A, B, C, each with a register, a modifier and a
+ * channel replicate.  Encoding and evidence:
+ * docs/parhelia-fragment-isa.md, docs/parhelia-p690-ganged-pipe-ta-re.md.
+ */
+enum p3d_comb_reg {
+	P3D_COMB_T0 = 0, P3D_COMB_T1 = 1, P3D_COMB_T2 = 2, P3D_COMB_T3 = 3,
+	P3D_COMB_R0 = 4,	/* also the fragment result register */
+	P3D_COMB_R1 = 5,
+	P3D_COMB_C0 = 0xe,	/* this instruction's first constant */
+	P3D_COMB_C1 = 0xf,	/* this instruction's second constant */
+	P3D_COMB_V0 = 0x10,	/* interpolated colour 0 */
+	P3D_COMB_V1 = 0x11,	/* interpolated colour 1 */
+};
+
+enum p3d_comb_mod {
+	P3D_COMB_MOD_NONE = 0,
+	P3D_COMB_MOD_NEG = 1,		/* -x */
+	P3D_COMB_MOD_BIAS = 2,		/* x - 0.5 */
+	P3D_COMB_MOD_BIAS_NEG = 3,
+	P3D_COMB_MOD_SIGNED = 4,	/* 2x - 1 */
+	P3D_COMB_MOD_SIGNED_NEG = 5,
+	P3D_COMB_MOD_INVERT = 0xf,	/* 1 - x */
+};
+
+/* Replicate one channel of a source.  The alpha half has only two bits, so
+ * P3D_COMB_REP_A degenerates to the natural alpha read there - which is the
+ * same value, so a .aaaa swizzle needs no special case. */
+enum p3d_comb_rep {
+	P3D_COMB_REP_NONE = 0, P3D_COMB_REP_B = 1, P3D_COMB_REP_G = 2,
+	P3D_COMB_REP_R = 3, P3D_COMB_REP_A = 4,
+};
+
+/* dst = the expression in the comment.  Values are 0x126c[14:9]. */
+enum p3d_comb_op {
+	P3D_COMB_MUL = 0x00,	/* A * C */
+	P3D_COMB_MOV = 0x02,	/* A */
+	P3D_COMB_SUB = 0x03,	/* A - B */
+	P3D_COMB_MAD = 0x04,	/* A * C + B */
+	P3D_COMB_LRP = 0x05,	/* A * C + B * (1 - C) */
+	P3D_COMB_ADD = 0x06,	/* A + B */
+	P3D_COMB_DP3 = 0x08,	/* dot3(A, C), broadcast */
+	P3D_COMB_DP4 = 0x10,	/* dot4(A, C), broadcast */
+	P3D_COMB_CND = 0x26,	/* A > 0.5 ? B : C */
+	P3D_COMB_CMV = 0x2e,
+	P3D_COMB_CMP = 0x3e,	/* A >= 0 ? B : C */
+};
+
+/* 0x126c[19:17], a signed shift count: 0..3 multiply, 6 and 7 divide. */
+enum p3d_comb_scale {
+	P3D_COMB_SCALE_1 = 0, P3D_COMB_SCALE_2 = 1, P3D_COMB_SCALE_4 = 2,
+	P3D_COMB_SCALE_8 = 3, P3D_COMB_SCALE_D4 = 6, P3D_COMB_SCALE_D2 = 7,
+};
+
+struct p3d_comb_src {
+	uint8_t reg;	/* enum p3d_comb_reg */
+	uint8_t mod;	/* enum p3d_comb_mod */
+	uint8_t rep;	/* enum p3d_comb_rep */
+};
+
+/* One half of a co-issued slot.  @used = 0 leaves that half a MOV r0, r0. */
+struct p3d_comb_half {
+	uint8_t used;
+	uint8_t op;	/* enum p3d_comb_op */
+	uint8_t dst;	/* enum p3d_comb_reg, only t0..t3/r0/r1 are writable */
+	uint8_t scale;	/* enum p3d_comb_scale */
+	uint8_t sat;
+	struct p3d_comb_src src[3];	/* A, B, C */
+};
+
+struct p3d_comb_inst {
+	struct p3d_comb_half rgb, alpha;
+	/* Up to two constants, shared by both halves of this slot.  Values are
+	 * clamped to [-1, 1) by the Q1.10 register format. */
+	uint8_t has_const[2];
+	float constant[2][4];
+};
+
+/* Ten slots exist and the count is padded to five or ten.  The driver only
+ * emits five: more sets the 0x1300 half-rate bit, which is untested. */
+#define P3D_COMB_MAX_INSTRUCTIONS 10u
+#define P3D_COMB_QUANTUM 5u
+
+struct p3d_comb_program {
+	unsigned count;
+	struct p3d_comb_inst inst[P3D_COMB_MAX_INSTRUCTIONS];
+};
+
 struct p3d_texture {
 	uint32_t base, width, height;
 	uint32_t fmt;		/* 0x32 A8R8G8B8, 0x33 X8R8G8B8, 0x11 L8 */
@@ -381,6 +473,11 @@ struct p3d_state {
 	int		   cull;	/* 0x1130[1:0]: 0 none, 1 cull CW, 2 cull CCW */
 	uint32_t	   warp_entry;
 	unsigned	   dw_per_vertex;
+	/* A compiled fragment program.  When set it replaces the fixed-function
+	 * texenv ALU stages; the pipe-merge slots and every sampler descriptor
+	 * are unchanged.  Ignored for the sampled-alpha companion and RGBA
+	 * vertex-alpha shapes, which own their own combiner words. */
+	const struct p3d_comb_program *comb;
 	const struct p3d_texture *tex;	/* unit 0 */
 	const struct p3d_texture *tex1;	/* unit 1; NULL = single unit */	/* NULL = untextured */
 	/* P690 workaround proven by the RGB-companion cutout probe: preserve

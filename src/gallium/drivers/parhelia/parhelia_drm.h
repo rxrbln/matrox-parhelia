@@ -25,6 +25,7 @@
 #define DRM_PARHELIA_GET_BO_INFO	0x05
 #define DRM_PARHELIA_UPLOAD_RENDER	0x06
 #define DRM_PARHELIA_DOWNLOAD_RENDER	0x07
+#define DRM_PARHELIA_WARP_PROGRAM	0x08
 
 #define DRM_IOCTL_PARHELIA_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_PARHELIA_GET_PARAM, \
@@ -50,6 +51,9 @@
 #define DRM_IOCTL_PARHELIA_DOWNLOAD_RENDER \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_PARHELIA_DOWNLOAD_RENDER, \
 		struct drm_parhelia_upload_render)
+#define DRM_IOCTL_PARHELIA_WARP_PROGRAM \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_PARHELIA_WARP_PROGRAM, \
+		 struct drm_parhelia_warp_program)
 
 /* Linear storage does not use the tiled render-target address decoder and
  * therefore needs only the native surface alignment, not a 32 MiB SUN90
@@ -168,6 +172,10 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_NATIVE_RT_CLASSES	27
 /* Kernel transient-aperture upload/download for opaque render storage. */
 #define PARHELIA_PARAM_RENDER_TRANSFER	28
+/* Instructions one WARP_PROGRAM slot holds, zero when the ioctl is absent. */
+#define PARHELIA_PARAM_WARP_PROGRAM_INSTRUCTIONS	31
+/* WARP program slots this file may hold at once. */
+#define PARHELIA_PARAM_WARP_PROGRAM_SLOTS	32
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
 /* Retired unsafe generic packing capability; kernels report zero. */
@@ -307,6 +315,35 @@ struct drm_parhelia_submit {
 /* Wait for a terminal submit fence. timeout_ns is relative: zero polls and
  * -1 requests an interruptible unbounded wait. completed always reports the
  * current masked DWGSYNC value, including on a timeout. */
+/*
+ * Upload one caller-owned WARP vertex program and bind it to a kernel-owned
+ * instruction-store slot.
+ *
+ * @code points at @count 96-bit bundles, three little-endian dwords each.
+ * @slot is zero on the first call and is then filled in with the slot the
+ * kernel allocated for this file; passing it back re-uploads the same slot.
+ * @entry receives the entry token to write to WARP_ENTRY; it is only valid
+ * for submits from this file and stops being accepted when the slot is
+ * released.  PARHELIA_WARP_PROGRAM_FREE releases @slot and uploads nothing.
+ *
+ * The kernel validates every bundle.  A program runs on the vertex engine
+ * with access to the constant file, which is also the engine's block-state
+ * file, so the accepted subset is deliberately narrow: arithmetic opcodes
+ * only, no control class and therefore no loops, no relative addressing, no
+ * constant-file destination, and every register index bounded.  Rejected
+ * programs leave the slot's previous contents untouched.
+ */
+struct drm_parhelia_warp_program {
+	__u64 code;
+	__u32 count;		/* instructions, not dwords */
+	__u32 flags;
+	__u32 slot;		/* in/out: 0 allocates */
+	__u32 pad;
+	__u64 entry;		/* out: WARP_ENTRY token */
+};
+
+#define PARHELIA_WARP_PROGRAM_FREE	(1u << 0)
+
 struct drm_parhelia_wait_fence {
 	__u32 fence;
 	__u32 flags;

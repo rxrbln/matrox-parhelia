@@ -346,6 +346,100 @@ p3d_fence_block(struct p3d_cs *cs, uint32_t tag)
 	p3d_reglist(cs, ARRAY(rw));
 }
 
+/* Instruction index -> hardware slot address.  Five ALUs are addressed in two
+ * passes (slot = 2 * pair + pass) with the pair 3 skipped; every vendor
+ * emitter walks exactly this order. */
+static const uint8_t p3d_comb_slot[P3D_COMB_MAX_INSTRUCTIONS] = {
+	0, 2, 4, 8, 10, 1, 3, 5, 9, 11,
+};
+
+/* Signed Q1.10 with round-toward-zero and the vendor's asymmetric clamp. */
+static uint32_t
+p3d_comb_const_word(float lo, float hi)
+{
+	int32_t a = (int32_t)(lo * 1024.0f), b = (int32_t)(hi * 1024.0f);
+
+	if (a > 0x3ff) a = 0x3ff;
+	if (a <= -1024) a = -1024;
+	if (b > 0x3ff) b = 0x3ff;
+	if (b <= -1024) b = -1024;
+	return P3D_COMBINER_CONST(a, b);
+}
+
+static uint32_t
+p3d_comb_sources(const struct p3d_comb_half *h, uint32_t slot)
+{
+	if (!h->used)		/* MOV r0, r0 keeps the half inert */
+		return slot | (P3D_COMB_R0 << 5);
+	return slot | ((h->src[0].reg & 0x1fu) << 5) |
+	       ((h->src[0].mod & 0xfu) << 10) |
+	       ((h->src[1].reg & 0x1fu) << 14) |
+	       ((h->src[1].mod & 0xfu) << 19) |
+	       ((h->src[2].reg & 0x1fu) << 23) |
+	       ((uint32_t)(h->src[2].mod & 0xfu) << 28);
+}
+
+/* @alpha_half clears the replicate bit that selects alpha: the alpha pipe
+ * reads alpha anyway and the vendor packers never set it there. */
+static uint32_t
+p3d_comb_opcode(const struct p3d_comb_half *h, int alpha_half)
+{
+	uint32_t word;
+
+	if (!h->used)
+		return ((uint32_t)P3D_COMB_MOV << 9) | (P3D_COMB_R0 << 20);
+	word = ((uint32_t)(h->op & 0x3fu) << 9) |
+	       ((uint32_t)(h->src[0].rep & 7u)) |
+	       ((uint32_t)(h->src[1].rep & 7u) << 3) |
+	       ((uint32_t)(h->src[2].rep & 7u) << 6) |
+	       ((uint32_t)(h->scale & 7u) << 17) |
+	       ((uint32_t)(h->dst & 0xfu) << 20) |
+	       ((uint32_t)(h->sat ? 1u : 0u) << 24);
+	return alpha_half ? word & ~0x124u : word;
+}
+
+/* Emit a compiled fragment program starting at instruction index @first,
+ * padding the slot walk out to the five-instruction quantum. */
+static void
+p3d_emit_comb_program(struct p3d_cs *cs, const struct p3d_comb_program *prog,
+		      unsigned first)
+{
+	struct p3d_rw rw[8];
+	unsigned i, emitted = first;
+
+	for (i = 0; i < prog->count && emitted < P3D_COMB_QUANTUM; i++, emitted++) {
+		const struct p3d_comb_inst *in = &prog->inst[i];
+		uint32_t slot = p3d_comb_slot[emitted];
+
+		rw[0].reg = P3D_R_COMB_RGB;
+		rw[0].val = p3d_comb_sources(&in->rgb, slot);
+		rw[1].reg = P3D_R_COMB_ALPHA;
+		rw[1].val = p3d_comb_sources(&in->alpha, 0);
+		rw[2].reg = 0x126c; rw[2].val = p3d_comb_opcode(&in->rgb, 0);
+		rw[3].reg = 0x1268; rw[3].val = p3d_comb_opcode(&in->alpha, 1);
+		rw[4].reg = 0x1278;
+		rw[4].val = in->has_const[0] ?
+			p3d_comb_const_word(in->constant[0][0], in->constant[0][1]) : 0;
+		rw[5].reg = 0x127c;
+		rw[5].val = in->has_const[0] ?
+			p3d_comb_const_word(in->constant[0][2], in->constant[0][3]) : 0;
+		rw[6].reg = 0x1280;
+		rw[6].val = in->has_const[1] ?
+			p3d_comb_const_word(in->constant[1][0], in->constant[1][1]) : 0;
+		rw[7].reg = 0x1284;
+		rw[7].val = in->has_const[1] ?
+			p3d_comb_const_word(in->constant[1][2], in->constant[1][3]) : 0;
+		p3d_reglist(cs, rw, 8);
+	}
+	/* MOV r0, r0 in every unused slot: the padding is the terminator. */
+	for (; emitted < P3D_COMB_QUANTUM; emitted++) {
+		rw[0].reg = P3D_R_COMB_RGB;
+		rw[0].val = 0x80u | p3d_comb_slot[emitted];
+		rw[1].reg = 0x126c; rw[1].val = 0x00400400u;
+		p3d_reglist(cs, rw, 2);
+	}
+}
+
 /* Emit one fixed-function texture-environment ALU stage.  The texture-address
  * stages occupy slots 0 (and 2 for unit 1), so the matching ALU stages are 2
  * or 4 for one unit and 4 / 8 for two.  The encodings are the measured table
@@ -778,6 +872,10 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			rw[7].reg = 0x1284; rw[7].val = 0;
 			p3d_reglist(cs, rw, 8);
 		}
+		if (st->comb && !st->sampled_alpha_companion) {
+			p3d_emit_comb_program(cs, st->comb, nunit > 1 ? 2u : 1u);
+			return;
+		}
 		p3d_emit_texenv(cs, nunit > 1 ? 4u : 2u, 0, 1, t,
 				st->comb_op);
 
@@ -813,6 +911,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 				p3d_reglist(cs, rw, 2);
 			}
 		}
+	} else if (st->comb) {
+		p3d_emit_comb_program(cs, st->comb, 0);
 	} else {
 		static const uint32_t pad[] = { 0x82, 0x84, 0x88, 0x8a };
 		size_t i;
