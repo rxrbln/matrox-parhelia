@@ -4816,6 +4816,17 @@ ph_copy_texel_from_gpu(uint8_t *dst, const uint8_t *src, bool swap_rb,
    ph_copy_texel_to_gpu(dst, src, swap_rb, cpp);
 }
 
+static bool
+ph_resource_uses_sampler_layout(const struct parhelia_resource *r)
+{
+   return r->upload_texture ||
+          ((r->base.bind & PIPE_BIND_SAMPLER_VIEW) &&
+           !(r->base.bind & (PIPE_BIND_RENDER_TARGET |
+                             PIPE_BIND_DISPLAY_TARGET |
+                             PIPE_BIND_SCANOUT |
+                             PIPE_BIND_DEPTH_STENCIL)));
+}
+
 static void *
 ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
        unsigned usage, const struct pipe_box *box,
@@ -4894,10 +4905,12 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
                ph_copy_texel_from_gpu((uint8_t *)t->staging +
                                           y * t->base.stride + x * cpp,
                                       (uint8_t *)r->map +
-                                      (r->mip.levels ?
+                                      (ph_resource_uses_sampler_layout(r) &&
+                                       r->mip.levels ?
                                        ph_mip_texel_offset_cpp(&r->mip, level,
                                                            box->x + x, box->y + y,
                                                            false, cpp) :
+                                       ph_resource_uses_sampler_layout(r) ?
                                        p3d_texture_tile_offset_chip(
                                           box->x + x, box->y + y,
                                           ph_sampler_storage_pitch(
@@ -4905,7 +4918,12 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
                                              r->base.width0, cpp),
                                           cpp,
                                           ph_screen(r->base.screen)->chip_id,
-                                          r->tile_layout)), swap_rb, cpp);
+                                          r->tile_layout) :
+                                       p3d_tile_offset_layout(box->x + x,
+                                                              box->y + y,
+                                                              r->stride,
+                                                              r->tile_layout)),
+                                      swap_rb, cpp);
       }
    } else if (usage & PIPE_MAP_READ) {
       /* A lower level outside the P690-supported backing remains a valid
@@ -4948,7 +4966,7 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
          for (int y = 0; y < transfer->box.height; y++)
             for (int x = 0; x < transfer->box.width; x++)
             ph_copy_texel_to_gpu((uint8_t *)r->map +
-                                  ((r->base.bind & PIPE_BIND_SAMPLER_VIEW) ?
+                                  (ph_resource_uses_sampler_layout(r) ?
                                    (r->mip.levels ?
                                     ph_mip_texel_offset_cpp(&r->mip, transfer->level,
                                                         transfer->box.x + x,
