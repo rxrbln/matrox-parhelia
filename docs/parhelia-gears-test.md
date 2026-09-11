@@ -141,6 +141,10 @@ the inner cylinder, a tube whose near and far walls overlap.  Gear 0 then draws
 in 204 packets instead of 400 with **exactly the same 45 wrong pixels**, and a
 frame costs 11.6 ms instead of 14.6 - **86 fps** for 800 triangles at 1024x768.
 
+These batching measurements are from the 0528.  On the P690 a multi-triangle
+0x97 range currently draws only its first triangle and 4 triangles hang
+(`parhelia-p690-q3-performance-analysis.md`).
+
 ### What the driver has to do
 
 * **Never put two triangles that overlap in screen space in one draw packet.**
