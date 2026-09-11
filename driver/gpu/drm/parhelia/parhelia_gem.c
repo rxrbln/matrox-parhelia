@@ -383,6 +383,13 @@ void parhelia_bo_set_layout(struct drm_gem_vram_object *gbo, u8 layout,
 	bo->gpu_pitch = gpu_pitch;
 }
 
+void parhelia_bo_set_placement_class(struct drm_gem_vram_object *gbo, u8 class)
+{
+	struct parhelia_bo *bo = container_of(gbo, struct parhelia_bo, gbo);
+
+	bo->placement_class = class;
+}
+
 void parhelia_bo_make_unmappable(struct drm_gem_vram_object *gbo)
 {
 	if (texture_upload_probe)

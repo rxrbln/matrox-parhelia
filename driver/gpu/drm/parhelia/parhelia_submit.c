@@ -1408,8 +1408,9 @@ static bool parhelia_is_vram_operand(const u32 *cmd, u32 length, u32 dword)
  * discontinuity.  Render-target alignment is imposed by CREATE_RENDER and is
  * preserved while TTM chooses one of these bounded placements.
  */
-static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
-				    u64 vram_size, bool split_banks)
+static int parhelia_vram_placement_range(struct drm_gem_vram_object *bo,
+					  u64 vram_size, bool split_banks,
+					  u64 range_fpfn, u64 range_lpfn)
 {
 	u64 vram_pages = vram_size >> PAGE_SHIFT;
 	u64 bank_pages = vram_pages >> 1;
@@ -1418,12 +1419,19 @@ static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 	bo->placement.placement = bo->placements;
 	bo->placements[0].mem_type = TTM_PL_VRAM;
 	bo->placements[0].flags = 0;
-	bo->placements[0].fpfn = 0;
-	bo->placements[0].lpfn = split_banks ? bank_pages : 0;
+	bo->placements[0].fpfn = range_fpfn;
+	bo->placements[0].lpfn = range_lpfn;
 	bo->placement.num_placement = 1;
+	if (range_lpfn) {
+		if (range_fpfn >= range_lpfn || range_lpfn > vram_pages ||
+		    bo_pages > range_lpfn - range_fpfn)
+			return -E2BIG;
+		return 0;
+	}
 
 	if (!split_banks)
 		return 0;
+	bo->placements[0].lpfn = bank_pages;
 	if (!bank_pages || bo_pages > bank_pages)
 		return -E2BIG;
 	bo->placements[1].mem_type = TTM_PL_VRAM;
@@ -1434,13 +1442,30 @@ static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 	return 0;
 }
 
+static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
+				    u64 vram_size, bool split_banks)
+{
+	struct parhelia_bo *pbo = container_of(bo, struct parhelia_bo, gbo);
+	u64 band_pages = SZ_32M >> PAGE_SHIFT;
+
+	if (pbo->placement_class == PARHELIA_PLACEMENT_NATIVE_COLOR)
+		return parhelia_vram_placement_range(bo, vram_size, false,
+						     2 * band_pages, 3 * band_pages);
+	if (pbo->placement_class == PARHELIA_PLACEMENT_NATIVE_DEPTH)
+		return parhelia_vram_placement_range(bo, vram_size, false,
+						     3 * band_pages, 4 * band_pages);
+	return parhelia_vram_placement_range(bo, vram_size, split_banks, 0, 0);
+}
+
 static int parhelia_vram_placement_static_selftest(void)
 {
 	struct drm_gem_vram_object bo = { };
+	struct parhelia_bo pbo = { };
 	u64 bank_pages = SZ_64M >> PAGE_SHIFT;
+	u64 band_pages = SZ_32M >> PAGE_SHIFT;
 
 	bo.bo.base.size = SZ_2M;
-	if (parhelia_vram_placement(&bo, SZ_128M, true) ||
+	if (parhelia_vram_placement_range(&bo, SZ_128M, true, 0, 0) ||
 	    bo.placement.placement != bo.placements ||
 	    bo.placement.num_placement != 2 || bo.placements[0].fpfn ||
 	    bo.placements[0].lpfn != bank_pages ||
@@ -1448,11 +1473,35 @@ static int parhelia_vram_placement_static_selftest(void)
 	    bo.placements[1].lpfn != 2 * bank_pages)
 		return -EINVAL;
 	bo.bo.base.size = SZ_64M + PAGE_SIZE;
-	if (parhelia_vram_placement(&bo, SZ_128M, true) != -E2BIG)
+	if (parhelia_vram_placement_range(&bo, SZ_128M, true, 0, 0) != -E2BIG)
 		return -EINVAL;
 	bo.bo.base.size = SZ_2M;
-	if (parhelia_vram_placement(&bo, SZ_128M, false) ||
+	if (parhelia_vram_placement_range(&bo, SZ_128M, false, 0, 0) ||
 	    bo.placement.num_placement != 1 || bo.placements[0].lpfn)
+		return -EINVAL;
+	bo.bo.base.size = SZ_2M;
+	if (parhelia_vram_placement_range(&bo, SZ_128M, false, bank_pages,
+					    bank_pages + (SZ_32M >> PAGE_SHIFT)) ||
+	    bo.placement.num_placement != 1 ||
+	    bo.placements[0].fpfn != bank_pages ||
+	    bo.placements[0].lpfn != bank_pages + (SZ_32M >> PAGE_SHIFT))
+		return -EINVAL;
+	bo.bo.base.size = SZ_32M + PAGE_SIZE;
+	if (parhelia_vram_placement_range(&bo, SZ_128M, false, bank_pages,
+					    bank_pages + (SZ_32M >> PAGE_SHIFT)) != -E2BIG)
+		return -EINVAL;
+	pbo.gbo.bo.base.size = SZ_2M;
+	pbo.placement_class = PARHELIA_PLACEMENT_NATIVE_COLOR;
+	if (parhelia_vram_placement(&pbo.gbo, SZ_128M, true) ||
+	    pbo.gbo.placement.num_placement != 1 ||
+	    pbo.gbo.placements[0].fpfn != 2 * band_pages ||
+	    pbo.gbo.placements[0].lpfn != 3 * band_pages)
+		return -EINVAL;
+	pbo.placement_class = PARHELIA_PLACEMENT_NATIVE_DEPTH;
+	if (parhelia_vram_placement(&pbo.gbo, SZ_128M, true) ||
+	    pbo.gbo.placement.num_placement != 1 ||
+	    pbo.gbo.placements[0].fpfn != 3 * band_pages ||
+	    pbo.gbo.placements[0].lpfn != 4 * band_pages)
 		return -EINVAL;
 	return 0;
 }
@@ -2895,21 +2944,27 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	int ret;
 
 	if (!args->width || args->width > 2048 || !args->height || args->height > 2048 ||
-	    args->flags & ~(PARHELIA_CREATE_RENDER_LINEAR | PARHELIA_CREATE_RENDER_TEXTURE) ||
-	    ((args->flags & PARHELIA_CREATE_RENDER_LINEAR) &&
-	     (args->flags & PARHELIA_CREATE_RENDER_TEXTURE)) || args->pad ||
+	    args->flags & ~(PARHELIA_CREATE_RENDER_LINEAR |
+			    PARHELIA_CREATE_RENDER_TEXTURE |
+			    PARHELIA_CREATE_RENDER_NATIVE_COLOR |
+			    PARHELIA_CREATE_RENDER_NATIVE_DEPTH) ||
+	    hweight32(args->flags) > 1 || args->pad ||
 	    args->handle || args->pitch || args->size || args->mmap_offset)
 		return -EINVAL;
 	if (!to_parhelia(drm)->raw_aperture_owned)
 		return -EOPNOTSUPP;
-	/* P690 live rendering currently requires native colour/depth targets on a
-	 * 32 MiB base.  The vendor allocator documents a smaller surface-layout
-	 * alignment, but arbitrary 8 KiB placements corrupt raster output on this
-	 * chip; retain the hardware-proven constraint until its address folding is
-	 * fully decoded. */
+	if ((args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
+			    PARHELIA_CREATE_RENDER_NATIVE_DEPTH)) &&
+	    (pdev->pdev->device != PARHELIA_P690 || pdev->vram_size < SZ_128M))
+		return -EOPNOTSUPP;
+	/* Legacy flags=0 retains the exact-anchor policy.  Explicit P690 colour
+	 * and depth classes use the vendor allocator's distinct 32 MiB bands and
+	 * hardware-verified 8 KiB in-band surface alignment. */
 	align_pages = pdev->pdev->device == PARHELIA_P690 &&
 		      !(args->flags & (PARHELIA_CREATE_RENDER_LINEAR |
-				       PARHELIA_CREATE_RENDER_TEXTURE)) ?
+				       PARHELIA_CREATE_RENDER_TEXTURE |
+				       PARHELIA_CREATE_RENDER_NATIVE_COLOR |
+				       PARHELIA_CREATE_RENDER_NATIVE_DEPTH)) ?
 			      SZ_32M / PAGE_SIZE :
 			      max_t(unsigned long, 1, SZ_8K / PAGE_SIZE);
 	/* Tiled surfaces occupy complete hardware tile rows.  Rounding only the
@@ -2944,10 +2999,18 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	else
 		layout = PARHELIA_BO_LAYOUT_NATIVE_64X32;
 	parhelia_bo_set_layout(bo, layout, args->width, args->height, pitch);
+	if (args->flags & PARHELIA_CREATE_RENDER_NATIVE_COLOR)
+		parhelia_bo_set_placement_class(bo,
+			PARHELIA_PLACEMENT_NATIVE_COLOR);
+	else if (args->flags & PARHELIA_CREATE_RENDER_NATIVE_DEPTH)
+		parhelia_bo_set_placement_class(bo,
+			PARHELIA_PLACEMENT_NATIVE_DEPTH);
 	if (layout == PARHELIA_BO_LAYOUT_TEXTURE)
 		parhelia_bo_make_unmappable(bo);
 	ret = drm_gem_handle_create(file, &bo->bo.base, &handle);
-	if (!ret && (layout != PARHELIA_BO_LAYOUT_TEXTURE ||
+	if (!ret && !(args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
+				  PARHELIA_CREATE_RENDER_NATIVE_DEPTH)) &&
+	    (layout != PARHELIA_BO_LAYOUT_TEXTURE ||
 		     !parhelia_texture_upload_enabled()))
 		args->mmap_offset = drm_vma_node_offset_addr(&bo->bo.base.vma_node);
 	drm_gem_object_put(&bo->bo.base);
@@ -3115,6 +3178,10 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 	case PARHELIA_PARAM_TEXTURE_UPLOAD:
 		args->value = pdev->pdev->device == PARHELIA_P690 &&
 			pdev->raw_aperture_owned && parhelia_texture_upload_enabled();
+		break;
+	case PARHELIA_PARAM_NATIVE_RT_CLASSES:
+		args->value = pdev->pdev->device == PARHELIA_P690 &&
+			pdev->raw_aperture_owned && pdev->vram_size >= SZ_128M;
 		break;
 	default:
 		return -EINVAL;

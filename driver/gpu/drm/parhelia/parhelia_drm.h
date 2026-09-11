@@ -54,6 +54,11 @@
  * the SUN90 render-target path.  It needs tiled storage, but not the 32 MiB
  * render-target bank separation. */
 #define PARHELIA_CREATE_RENDER_TEXTURE	(1u << 1)
+/* P690 native render-target classes.  The recovered vendor allocator keeps
+ * colour and depth in separate 32 MiB policy bands while packing each class
+ * at the hardware's 8 KiB surface alignment. */
+#define PARHELIA_CREATE_RENDER_NATIVE_COLOR	(1u << 3)
+#define PARHELIA_CREATE_RENDER_NATIVE_DEPTH	(1u << 4)
 
 /* Bring-up tiled render allocation, deliberately separate from linear dumb
  * scanout. Both 32-bit colour and S8Z24 use this storage. The kernel reserves
@@ -158,6 +163,8 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_PACK_ADJACENT	24
 /* Boundary-aware adjacent-packet packing and CALL_BOUNDARY relocations. */
 #define PARHELIA_PARAM_PACK_ADJACENT_BOUNDARIES	25
+/* P690 exposes separate packed native colour/depth allocation classes. */
+#define PARHELIA_PARAM_NATIVE_RT_CLASSES	27
 
 #define PARHELIA_TEXTURE_PIPES_PAIRED	0
 #define PARHELIA_TEXTURE_PIPES_SINGLE	1

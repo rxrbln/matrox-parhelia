@@ -365,6 +365,12 @@ struct parhelia_aperture_mapping {
  * raw TTM mapping.  Dumb framebuffers additionally own a long-lived host
  * aperture descriptor which gives their native bytes a CPU-linear alias.
  */
+enum parhelia_placement_class {
+	PARHELIA_PLACEMENT_LEGACY,
+	PARHELIA_PLACEMENT_NATIVE_COLOR,
+	PARHELIA_PLACEMENT_NATIVE_DEPTH,
+};
+
 struct parhelia_bo {
 	struct drm_gem_vram_object gbo;
 	struct parhelia_aperture_mapping aperture;
@@ -377,6 +383,7 @@ struct parhelia_bo {
 	size_t host_size;
 	u8 layout;
 	u8 aperture_slot;
+	u8 placement_class;
 	bool host_aperture;
 };
 
@@ -532,6 +539,7 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 			 struct drm_mode_create_dumb *args);
 void parhelia_bo_set_layout(struct drm_gem_vram_object *gbo, u8 layout,
 			    u32 width, u32 height, u32 gpu_pitch);
+void parhelia_bo_set_placement_class(struct drm_gem_vram_object *gbo, u8 class);
 void parhelia_bo_make_unmappable(struct drm_gem_vram_object *gbo);
 bool parhelia_texture_upload_enabled(void);
 bool parhelia_bo_is_native(const struct parhelia_bo *bo);
