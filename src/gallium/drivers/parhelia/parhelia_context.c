@@ -29,6 +29,7 @@
 #include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_pack_color.h"
+#include "util/u_prim.h"
 #include "util/u_surface.h"
 #include "util/u_transfer.h"
 #include "util/u_upload_mgr.h"
@@ -268,6 +269,11 @@ struct ph_context {
    unsigned triangles;
    unsigned lines;
    unsigned points;
+   /* The current draw's triangles come from expanded points or lines or
+    * unfilled polygons: GL never face-culls those. */
+   bool derived_triangles;
+   /* Viewport 0 maps GL window y downwards (window-system framebuffer). */
+   bool viewport_y_flip;
 };
 
 struct ph_stage {
@@ -2963,7 +2969,8 @@ ph_submit_vertices(struct ph_context *ctx)
    state.warp_entry = ctx->warp_passthrough;
    state.dither = !ctx->blend || ctx->blend->dither;
    state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
-   state.cull = ph_hardware_cull(ctx->rasterizer);
+   state.cull = ctx->derived_triangles ? 0 :
+                ph_hardware_cull(ctx->rasterizer);
 	state.has_depth = depth != NULL;
 	state.dw_per_vertex = texture ?
 	                              ((texture1 || ctx->native_sampled_alpha) ?
@@ -3476,8 +3483,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
    float *dst;
 
    /* The hardware exposes only one-face cull selectors.  FRONT_AND_BACK has
-    * no packet encoding and must reject the primitive before staging it. */
-   if (ctx->rasterizer &&
+    * no packet encoding and must reject the polygon before staging it. */
+   if (!ctx->derived_triangles && ctx->rasterizer &&
        ctx->rasterizer->cull_face == PIPE_FACE_FRONT_AND_BACK)
       return;
 
@@ -3705,16 +3712,163 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
    ctx->triangles++;
 }
 
+/* Emit a window-space polygon as a fan through the triangle stage.  Corner i
+ * copies every attribute of src[i] and replaces only its x/y; a flat-shaded
+ * polygon takes all colours from @provoking. */
+static void
+ph_stage_fan(struct draw_stage *stage, const struct vertex_header *const *src,
+             const float (*xy)[2], unsigned n,
+             const struct vertex_header *provoking)
+{
+   struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   const int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
+   const int col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
+   struct prim_header tri = {0};
+
+   for (unsigned i = 1; i + 1 < n; i++) {
+      const unsigned corner[3] = {0, i, i + 1};
+
+      for (unsigned k = 0; k < 3; k++) {
+         struct vertex_header *v = dup_vert(stage, src[corner[k]], k);
+
+         v->data[pos][0] = xy[corner[k]][0];
+         v->data[pos][1] = xy[corner[k]][1];
+         if (provoking && col >= 0)
+            memcpy(v->data[col], provoking->data[col], 4 * sizeof(float));
+         tri.v[k] = v;
+      }
+      ph_stage_tri(stage, &tri);
+      if (ctx->submit_error)
+         return;
+   }
+}
+
+/* GL centres an odd aliased point on floor(v) + 1/2 and an even one on
+ * floor(v + 1/2) in bottom-up window space; a flipped axis mirrors the ties. */
+static float
+ph_point_centre(float v, bool odd, bool flip)
+{
+   if (flip)
+      return odd ? ceilf(v) - 0.5f : ceilf(v - 0.5f);
+   return odd ? floorf(v) + 0.5f : floorf(v + 0.5f);
+}
+
+/* Aliased points are integer squares, odd sizes centred on a pixel centre
+ * and even sizes on a pixel corner.  Smooth points become an aliased disc
+ * polygon: the open path has no coverage antialiasing. */
+static void
+ph_expand_point(struct draw_stage *stage, struct prim_header *prim,
+                float size, bool smooth)
+{
+   const struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   const struct pipe_rasterizer_state *rast = ctx->rasterizer;
+   const int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
+   const float *p = prim->v[0]->data[pos];
+   const struct vertex_header *src[32];
+   float xy[32][2];
+   unsigned n;
+
+   if (!smooth) {
+      const float s = CLAMP(roundf(size), 1.0f, 2048.0f);
+      /* Integer pixel centres when half_pixel_center is off. */
+      const float bias = rast && !rast->half_pixel_center ? 0.5f : 0.0f;
+      const bool odd = (unsigned)s & 1;
+      const float cx = ph_point_centre(p[0] + bias, odd, false);
+      const float cy = ph_point_centre(p[1] + bias, odd, ctx->viewport_y_flip);
+      const float h = 0.5f * s;
+
+      xy[0][0] = cx - h - bias; xy[0][1] = cy - h - bias;
+      xy[1][0] = cx + h - bias; xy[1][1] = cy - h - bias;
+      xy[2][0] = cx + h - bias; xy[2][1] = cy + h - bias;
+      xy[3][0] = cx - h - bias; xy[3][1] = cy + h - bias;
+      n = 4;
+   } else {
+      const float r = 0.5f * CLAMP(size, 1.0f, 2048.0f);
+
+      n = r < 2.0f ? 8 : r < 8.0f ? 16 : 32;
+      for (unsigned i = 0; i < n; i++) {
+         const float a = 2.0f * (float)M_PI * i / n;
+
+         xy[i][0] = p[0] + r * cosf(a);
+         xy[i][1] = p[1] + r * sinf(a);
+      }
+   }
+   for (unsigned i = 0; i < n; i++)
+      src[i] = prim->v[0];
+   ph_stage_fan(stage, src, (const float (*)[2])xy, n, NULL);
+}
+
+/* Aliased lines use the draw module's wide-line quad (minor-axis offset and
+ * half-pixel end adjustment); smooth lines use the vendor's perpendicular
+ * +-width/2 displacement. */
+static void
+ph_expand_line(struct draw_stage *stage, struct prim_header *prim,
+               float width, bool smooth)
+{
+   const struct pipe_rasterizer_state *rast = ((struct ph_stage *)stage)->ctx->rasterizer;
+   const int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
+   const float *p0 = prim->v[0]->data[pos], *p1 = prim->v[1]->data[pos];
+   const struct vertex_header *src[4] = {
+      prim->v[0], prim->v[1], prim->v[1], prim->v[0],
+   };
+   const struct vertex_header *provoking = NULL;
+   const float dx = p1[0] - p0[0], dy = p1[1] - p0[1];
+   float xy[4][2] = {
+      {p0[0], p0[1]}, {p1[0], p1[1]}, {p1[0], p1[1]}, {p0[0], p0[1]},
+   };
+   float ox = 0.0f, oy = 0.0f;
+
+   if (rast && rast->flatshade)
+      provoking = rast->flatshade_first ? prim->v[0] : prim->v[1];
+   if (smooth) {
+      const float len = sqrtf(dx * dx + dy * dy);
+      const float h = 0.5f * CLAMP(width, 1.0f, 2048.0f);
+
+      if (len <= 0.0f)
+         return;
+      ox = -dy / len * h;
+      oy = dx / len * h;
+   } else {
+      const float h = 0.5f * CLAMP(roundf(width), 1.0f, 2048.0f);
+      const bool half = rast && rast->half_pixel_center;
+      const float bias = half ? 0.125f : 0.0f;
+
+      if (fabsf(dx) > fabsf(dy)) {
+         const float shift = !half ? 0.0f : dx > 0.0f ? -0.5f : 0.5f;
+
+         oy = h;
+         for (unsigned i = 0; i < 4; i++) {
+            xy[i][0] += shift;
+            xy[i][1] -= bias;
+         }
+      } else {
+         const float shift = !half ? 0.0f : dy > 0.0f ? -0.5f : 0.5f;
+
+         ox = h;
+         for (unsigned i = 0; i < 4; i++) {
+            xy[i][0] += bias;
+            xy[i][1] += shift;
+         }
+      }
+   }
+   xy[0][0] -= ox; xy[0][1] -= oy;
+   xy[1][0] -= ox; xy[1][1] -= oy;
+   xy[2][0] += ox; xy[2][1] += oy;
+   xy[3][0] += ox; xy[3][1] += oy;
+   ph_stage_fan(stage, src, (const float (*)[2])xy, 4, provoking);
+}
+
 /* The vendor's GL capture proves the complete unit-point draw delta from a
  * triangle: class 0, primitive word 0x00060020, raster image 0x04000024 and a
  * one-vertex byte range.  Its own client produces exactly one covered pixel.
- * Wider, smoothed, sprite and per-vertex-size points need additional WARP and
- * coverage state and deliberately remain outside this exact native subset. */
+ * Sized, smooth, per-vertex-size and textured points are expanded to
+ * triangles; sprites are expanded by the draw module. */
 static void
 ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
 {
    struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
-   float *dst;
+   const struct pipe_rasterizer_state *rast = ctx->rasterizer;
+   float *dst, size = rast ? rast->point_size : 1.0f;
    int pos, col;
    bool has_texture;
    bool depth;
@@ -3724,21 +3878,29 @@ ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
        !ctx->fb.cbufs[0].texture)
       return;
 
-   has_texture = ctx->num_sampler_views && ctx->sampler_views[0] &&
-                 ctx->sampler_views[0]->texture;
-   if (has_texture ||
-       (ctx->rasterizer &&
-        (ctx->rasterizer->point_smooth ||
-         ctx->rasterizer->point_quad_rasterization ||
-         ctx->rasterizer->point_size_per_vertex ||
-         ctx->rasterizer->sprite_coord_enable ||
-         fabsf(ctx->rasterizer->point_size - 1.0f) > 0.0001f)))
-      return;
-
    pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
    col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
    if (pos < 0)
       return;
+   if (rast && rast->point_size_per_vertex) {
+      const int psize = draw_find_shader_output(stage->draw,
+                                                TGSI_SEMANTIC_PSIZE, 0);
+
+      if (psize >= 0)
+         size = prim->v[0]->data[psize][0];
+   }
+   has_texture = ph_samples_unit0(ctx);
+   if (getenv("PARHELIA_TRACE_PRIM"))
+      fprintf(stderr, "parhelia: point %g,%g size=%g per-vertex=%u tex=%u smooth=%u cull=%u derived=%u\n",
+              prim->v[0]->data[pos][0], prim->v[0]->data[pos][1], size,
+              rast ? rast->point_size_per_vertex : 0, has_texture,
+              rast ? rast->point_smooth : 0, rast ? rast->cull_face : 0,
+              ctx->derived_triangles);
+   if (has_texture || roundf(size) > 1.0f ||
+       (rast && (rast->point_smooth || rast->point_quad_rasterization))) {
+      ph_expand_point(stage, prim, size, rast && rast->point_smooth);
+      return;
+   }
 
    if (ctx->triangles || ctx->lines) {
       ph_submit_vertices(ctx);
@@ -3775,14 +3937,14 @@ ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
  * only the primitive class and the two-vertex DRAW byte range differ.  The
  * vendor GL capture confirms exactly that delta (0x10b0 = 0x0006103d).
  *
- * Keep textured and smooth lines outside this first native path.  Their
- * fragment/coverage semantics need more than merely selecting the line
- * primitive, while dropping ordinary GL_LINES altogether is an existing and
- * much more fundamental correctness bug. */
+ * Textured and smooth lines are expanded to triangles: their fragment and
+ * coverage semantics on the native line primitive are unproven.  Aliased
+ * lines of width 1.5 and more arrive already expanded by the draw module. */
 static void
 ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
 {
    struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   const struct pipe_rasterizer_state *rast = ctx->rasterizer;
    float *dst;
    int pos, col;
    bool has_texture;
@@ -3793,17 +3955,24 @@ ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
        !ctx->fb.cbufs[0].texture)
       return;
 
-   has_texture = ctx->num_sampler_views && ctx->sampler_views[0] &&
-                 ctx->sampler_views[0]->texture;
-   if (has_texture ||
-       (ctx->rasterizer && (ctx->rasterizer->line_smooth ||
-                            ctx->rasterizer->line_width >= 1.5f)))
-      return;
-
    pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
    col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
    if (pos < 0)
       return;
+   has_texture = ph_samples_unit0(ctx);
+   if (getenv("PARHELIA_TRACE_PRIM"))
+      fprintf(stderr, "parhelia: line %g,%g-%g,%g width=%g tex=%u smooth=%u cull=%u derived=%u\n",
+              prim->v[0]->data[pos][0], prim->v[0]->data[pos][1],
+              prim->v[1]->data[pos][0], prim->v[1]->data[pos][1],
+              rast ? rast->line_width : 1.0f, has_texture,
+              rast ? rast->line_smooth : 0, rast ? rast->cull_face : 0,
+              ctx->derived_triangles);
+   if (has_texture || (rast && (rast->line_smooth ||
+                                roundf(rast->line_width) > 1.0f))) {
+      ph_expand_line(stage, prim, rast ? rast->line_width : 1.0f,
+                     rast && rast->line_smooth);
+      return;
+   }
 
    /* A pending triangle batch owns the shared staging array.  Publish it once
     * at the primitive-class transition, then retain following line segments. */
@@ -3849,7 +4018,11 @@ static void ph_stage_flush(struct draw_stage *s, unsigned flags)
    (void)flags;
 }
 static void ph_stage_reset(struct draw_stage *s) { (void)s; }
-static void ph_stage_destroy(struct draw_stage *s) { FREE(s); }
+static void ph_stage_destroy(struct draw_stage *s)
+{
+   draw_free_temp_verts(s);
+   FREE(s);
+}
 
 static struct draw_stage *
 ph_create_stage(struct ph_context *ctx)
@@ -3865,6 +4038,11 @@ ph_create_stage(struct ph_context *ctx)
    s->base.flush = ph_stage_flush;
    s->base.reset_stipple_counter = ph_stage_reset;
    s->base.destroy = ph_stage_destroy;
+   /* One fan triangle at a time: ph_stage_tri copies each vertex out. */
+   if (!draw_alloc_temp_verts(&s->base, 3)) {
+      FREE(s);
+      return NULL;
+   }
    return &s->base;
 }
 
@@ -3875,6 +4053,7 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
 {
    struct ph_context *ctx = ph_context(pipe);
    const void *indices = NULL;
+   bool derived;
 
    if (num_draws > 1) {
       util_draw_multi(pipe, info, drawid_offset, indirect, draws, num_draws);
@@ -3907,6 +4086,17 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
          ctx->constant_size[MESA_SHADER_VERTEX]);
    } else {
       draw_set_mapped_constant_buffer(ctx->draw, MESA_SHADER_VERTEX, 0, NULL, 0);
+   }
+   derived = u_reduced_prim(info->mode) != MESA_PRIM_TRIANGLES ||
+             (ctx->rasterizer &&
+              (ctx->rasterizer->fill_front != PIPE_POLYGON_MODE_FILL ||
+               ctx->rasterizer->fill_back != PIPE_POLYGON_MODE_FILL));
+   if (derived != ctx->derived_triangles) {
+      /* The cull selector is per batch; keep polygons and derived
+       * triangles in separate batches. */
+      if (ctx->triangles)
+         ph_submit_vertices(ctx);
+      ctx->derived_triangles = derived;
    }
    draw_vbo(ctx->draw, info, drawid_offset, NULL, draws, num_draws, 0);
    draw_flush(ctx->draw);
@@ -4344,6 +4534,8 @@ static void ph_set_viewport(struct pipe_context *p, unsigned start,
                  start + i, vp[i].scale[0], vp[i].scale[1], vp[i].scale[2],
                  vp[i].translate[0], vp[i].translate[1], vp[i].translate[2]);
    }
+   if (!start && count)
+      ctx->viewport_y_flip = vp[0].scale[1] < 0.0f;
    draw_set_viewport_states(ctx->draw, start, count, vp);
 }
 static void ph_set_clip(struct pipe_context *p, const struct pipe_clip_state *clip)
@@ -5348,6 +5540,9 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    if (!stage)
       goto fail;
    draw_set_rasterize_stage(ctx->draw, stage);
+   /* Quad-rasterized (sprite) points become textured quads in the draw
+    * module, which also generates their sprite coordinates. */
+   draw_wide_point_sprites(ctx->draw, true);
 
    ctx->base.destroy = ph_destroy_context;
    ctx->base.draw_vbo = ph_draw_vbo;

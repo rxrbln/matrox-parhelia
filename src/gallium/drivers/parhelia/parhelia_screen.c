@@ -1064,8 +1064,16 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * create the ARGB rendering+scanout front buffer requested by glamor. */
    caps->dmabuf = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
    caps->max_render_targets = 1;
+   /* Vendor ranges: aliased 1..2048, smooth 0.25..10 in 0.25 steps.  Sized
+    * points and wide or smooth lines are expanded to triangles, so smooth
+    * sizes below one pixel have no coverage path and start at 1.0. */
+   caps->min_point_size = caps->min_point_size_aa = 1.0f;
+   caps->min_line_width = caps->min_line_width_aa = 1.0f;
+   caps->max_point_size = caps->max_line_width = 2048.0f;
+   caps->max_point_size_aa = caps->max_line_width_aa = 10.0f;
+   caps->point_size_granularity = caps->line_width_granularity = 0.25f;
    /* The PLNWT solid fill takes an arbitrary rectangle and bit-plane mask;
-    * its tiled row order is characterized only for the P690 64x16 layout. */
+    * partial-tile fills are hardware-verified only on the P690 64x16 layout. */
    caps->clear_scissored = caps->clear_masked =
       s->tile_layout == PARHELIA_TILE_64X16_4K;
    /* Native shared render/scanout images support the chip's full 2048-pixel
