@@ -35,6 +35,15 @@ Environment: `LD_LIBRARY_PATH=/root/parhelia-mip/lib:/root/parhelia-mesa/lib64`,
 | mip levels actually defined (level-aware copy), trilinear | 23.5 | 42.5 |
 | same, `r_textureMode GL_LINEAR_MIPMAP_NEAREST` | 26.4 | 37.9 |
 | same + `PARHELIA_BATCH_STATE_STREAM=1` | 28.0 | 35.7 |
+| textured WARP program writing T2 (locks up vertex-alpha draws, reverted) | 28.9 | 34.6 |
+| T2 priming draw, resident BOs, measured mip geometry, deferred uploads, trilinear | 23.5 | 42.5 |
+| same, `GL_LINEAR_MIPMAP_NEAREST` | 26.4 | 37.9 |
+
+The last two rows are the committed state (kernel `0c28239` with
+`pack_adjacent_packets=1`, Mesa `4a8f9bc`): 791 frames in 30.0 s and 33.6 s,
+35-38 s wall time including the level load, no engine hangs.  The level load
+took 92-142 s before texture uploads were deferred to the first draw (each
+level copy re-uploaded the whole object).
 
 640x480 reached 46.6 fps at the start of this work.
 
@@ -155,6 +164,23 @@ Mpixel/s, which is why colour moved to bank A.  Any read-modify-write stream
   (0x0bc0, new `tedlf_counters=` module parameter) 0x4087 vs 0x1e4087 made no
   measurable difference.
 
+## Mip chain geometry (measured with `--mip-address-probe`)
+
+* Levels with a pitch of 64 or more reserve 16-row multiples, pitch-32 levels
+  32-row multiples; every level starts 4 KiB aligned.
+* The tail starts at the first level with w <= 32 and h <= 16.  A 32-wide
+  tail level sits at (0,0) with compact (pitch-32) addressing; the smaller
+  levels use the tail table x {0,16,24,16,24}, y {0,0,0,8,8} shifted by
+  x+32.
+* Bases up to 32 texels wide use the compact pitch-32 order, wider bases the
+  native pitch >= 64 order.
+* LOD bias: 0x11c0[24:16], signed 4.4 with a -4 offset (0x1c0 = bias 0).
+
+`tools/parhelia-gl-mipmap-test.c` checks these against synthetic data
+(square, non-square and narrow chains, tails, trilinear, `glGenerateMipmap`,
+per-level `glGetTexImage`, `GL_TEXTURE_BASE_LEVEL` 2/3/5, scaled and flipped
+blits): 0 failing checks with Mesa `4a8f9bc`.
+
 ## Assessment of the 60 fps goal
 
 A textured, depth-writing pixel costs ~16 bytes of memory traffic split over
@@ -174,7 +200,24 @@ driver (`parhelia-p690-zcompression-clear-banks-re.md`).
 * After the engine hung during a module reload, every following warm reboot
   hung the first 3D draw (fence 0x30 after a completed 2D clear,
   `BM=03000000 908=db8fa047 924=0020100a`), also with the previously working
-  module and parameters.  A cold power cycle is required.
+  module and parameters; after a cold power cycle every draw was rejected.
+  **Root cause: WARP temporary T2.**  Draws depend on T2, which holds garbage
+  after power-on and a stale value after a warm reboot until a program writes
+  it.  The replace, passthrough and multitexture programs now write it
+  (`mul T2, v5, r1.0000 | mov o11, v0`, kernel `aa7afa1`); the textured
+  program must not (with the write, the first 9-dword RGBA vertex-alpha batch
+  of the demo, submit 58224, locked up the engine every run; kernel
+  `0c28239`).  Mesa primes T2 with one degenerate passthrough draw per
+  context (`ph_prime_warp()`).  Initializing it from the kernel at load time
+  through WARP loader mode 8 or draw mode 2 did not work.
+* Textures sampled garbage past their first 16 KiB whenever X was running:
+  TTM evicted and moved VRAM BOs with a CPU memcpy through BAR0, which on the
+  P690 is a translated host aperture, so moved contents were corrupted.
+  Render and texture BOs are resident on P690 now (kernel `0a3ecce`).
+  Hypotheses measured and rejected first: DCM priorities, 0x1c24, texture
+  unit priming (MMIO and command stream), 0x10fc/0x1330, the combiner entry,
+  the WARP invalidate bit, aperture slot validity, host aperture readback
+  drain, VRAM reservation, scanout activity and a second DRM client.
 * ioquake3 can block in `XGrabPointer` during shutdown after SIGTERM.
 
 ## Tools added
@@ -188,4 +231,13 @@ driver (`parhelia-p690-zcompression-clear-banks-re.md`).
   chain filled with self-indexing dwords and reports the fetched dword per
   texel against the Gallium layout.
 * `tools/parhelia-gl-mipmap-test.c`: synthetic GL mipmap/blit conformance.
-* Mesa `PARHELIA_STATS=1|sync`, `PARHELIA_TRACE_MIPS=1`, `PARHELIA_NO_MIPS=1`.
+* `--mip-address-probe` options: `PROBE_MIP_CONTENT`, `PROBE_STALE`,
+  `PROBE_PAD_KIB`, `PROBE_COLOUR_PAD_KIB`, `PROBE_PAUSE_S`, `PROBE_KMS`,
+  `PROBE_HOLD_DUMB=WxH`, `PROBE_SINGLE`.
+* `--transfer-probe`, `--draw-sequence-probe` (`PROBE_PRIME`, `PROBE_SEQ_TEX`,
+  `PROBE_SEQ_REPLACE`, `PROBE_SEQ_ENV`, `PROBE_SEQ_DEGENERATE`, `PROBE_DUMP`).
+* Mesa `PARHELIA_STATS=1|sync`, `PARHELIA_TRACE_MIPS=1`, `PARHELIA_NO_MIPS=1`,
+  `PARHELIA_DUMP_BATCHES`, and the hang recorder (`/tmp/parhelia-hang-PID.txt`
+  or `PARHELIA_HANG_DUMP`: the last 16 batches with vertices).
+* `/root/parhelia-mmio REG[=VAL]|START-END` (source
+  `/home/ai/src/parhelia/tools/parhelia-mmio.c`): BAR2 register access.
