@@ -1434,56 +1434,9 @@ static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 	return 0;
 }
 
-/* P690 native color/depth bases are hardware-proven only at 32, 64 and
- * 96 MiB.  Keep long-lived dumb scanouts in the four intervening 16 MiB
- * windows so an X front buffer cannot permanently consume one of only three
- * render anchors.  Generic textures and linear buffers retain normal TTM
- * placement and remain evictable.  This does not relax render-target
- * alignment: one native target still begins exactly at each anchor. */
-static int parhelia_p690_class_placement(struct parhelia_bo *bo, u64 vram_size)
-{
-	static const u8 render_windows[] = { 2, 4, 6 };
-	static const u8 scanout_windows[] = { 1, 3, 5, 7 };
-	const u8 *windows;
-	u32 window_count, count = 0;
-	u64 size = bo->gbo.bo.base.size;
-	u32 i;
-
-	if (size > SZ_16M)
-		return -E2BIG;
-	if (bo->placement_class == PARHELIA_PLACEMENT_RENDER) {
-		windows = render_windows;
-		window_count = ARRAY_SIZE(render_windows);
-	} else if (bo->placement_class == PARHELIA_PLACEMENT_SCANOUT) {
-		windows = scanout_windows;
-		window_count = ARRAY_SIZE(scanout_windows);
-	} else {
-		return -EINVAL;
-	}
-
-	for (i = 0; i < window_count; i++) {
-		u64 begin = (u64)windows[i] * SZ_16M;
-		struct ttm_place *place;
-
-		if (begin > vram_size || SZ_16M > vram_size - begin)
-			continue;
-		place = &bo->p690_placements[count++];
-		place->mem_type = TTM_PL_VRAM;
-		place->flags = 0;
-		place->fpfn = begin >> PAGE_SHIFT;
-		place->lpfn = (begin + SZ_16M) >> PAGE_SHIFT;
-	}
-	if (!count)
-		return -ENOSPC;
-	bo->gbo.placement.placement = bo->p690_placements;
-	bo->gbo.placement.num_placement = count;
-	return 0;
-}
-
 static int parhelia_vram_placement_static_selftest(void)
 {
 	struct drm_gem_vram_object bo = { };
-	struct parhelia_bo render = { }, scanout = { };
 	u64 bank_pages = SZ_64M >> PAGE_SHIFT;
 
 	bo.bo.base.size = SZ_2M;
@@ -1501,23 +1454,6 @@ static int parhelia_vram_placement_static_selftest(void)
 	if (parhelia_vram_placement(&bo, SZ_128M, false) ||
 	    bo.placement.num_placement != 1 || bo.placements[0].lpfn)
 		return -EINVAL;
-	render.gbo.bo.base.size = SZ_2M;
-	render.placement_class = PARHELIA_PLACEMENT_RENDER;
-	if (parhelia_p690_class_placement(&render, SZ_128M) ||
-	    render.gbo.placement.num_placement != 3 ||
-	    render.p690_placements[0].fpfn != SZ_32M >> PAGE_SHIFT ||
-	    render.p690_placements[1].fpfn != SZ_64M >> PAGE_SHIFT ||
-	    render.p690_placements[2].fpfn != (96ULL << 20) >> PAGE_SHIFT)
-		return -EINVAL;
-	scanout.gbo.bo.base.size = SZ_16M;
-	scanout.placement_class = PARHELIA_PLACEMENT_SCANOUT;
-	if (parhelia_p690_class_placement(&scanout, SZ_128M) ||
-	    scanout.gbo.placement.num_placement != 4 ||
-	    scanout.p690_placements[0].fpfn != SZ_16M >> PAGE_SHIFT ||
-	    scanout.p690_placements[1].fpfn != (48ULL << 20) >> PAGE_SHIFT ||
-	    scanout.p690_placements[2].fpfn != (80ULL << 20) >> PAGE_SHIFT ||
-	    scanout.p690_placements[3].fpfn != (112ULL << 20) >> PAGE_SHIFT)
-		return -EINVAL;
 	return 0;
 }
 
@@ -1533,14 +1469,8 @@ int parhelia_vram_pin(struct drm_gem_vram_object *bo)
 	if (ret)
 		return ret;
 	if (!bo->bo.pin_count) {
-		struct parhelia_bo *pbo = to_parhelia_bo(&bo->bo.base);
-
-		if (pdev->pdev->device == PARHELIA_P690 &&
-		    pbo->placement_class != PARHELIA_PLACEMENT_GENERIC)
-			ret = parhelia_p690_class_placement(pbo, pdev->vram_size);
-		else
-			ret = parhelia_vram_placement(bo, pdev->vram_size,
-				pdev->pdev->device == PARHELIA_P690);
+		ret = parhelia_vram_placement(bo, pdev->vram_size,
+			pdev->pdev->device == PARHELIA_P690);
 		if (ret)
 			goto out;
 		ret = ttm_bo_validate(&bo->bo, &bo->placement, &ctx);
