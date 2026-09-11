@@ -1203,13 +1203,19 @@ static bool
 ph_use_native_sampled_alpha(struct ph_context *ctx, bool textured,
                             bool multitextured, bool depth)
 {
+   const char *mode = getenv("PARHELIA_NATIVE_SAMPLED_ALPHA");
    const struct pipe_rt_blend_state *blend =
       ctx->blend ? &ctx->blend->rt[0] : NULL;
    const struct pipe_sampler_state *sampler;
    const struct parhelia_resource *texture, *color, *zs = NULL;
    bool source_over, cutout;
 
-   if (!textured || multitextured || !ctx->p690_multitexture ||
+   /* Keep the newly proven combiner route explicit until both live Q3 draw
+    * classes have passed sustained scene testing.  "cutout" and "blend"
+    * isolate the two state classes; "all" enables both. */
+   if (!mode || (strcmp(mode, "cutout") && strcmp(mode, "blend") &&
+                 strcmp(mode, "all")) ||
+       !textured || multitextured || !ctx->p690_multitexture ||
        !ctx->warp_textured_multitex || !ctx->fs || !ctx->dsa || !blend ||
        ctx->fs->sampler_mask != BITFIELD_BIT(0) ||
        ctx->fs->texenv != P3D_TEXENV_MODULATE ||
@@ -1269,6 +1275,10 @@ ph_use_native_sampled_alpha(struct ph_context *ctx, bool textured,
       fabsf(ctx->dsa->alpha_ref_value - 0.5f) <= 0.0001f &&
       depth && ctx->dsa->depth_enabled && ctx->dsa->depth_writemask &&
       ctx->dsa->depth_func == PIPE_FUNC_LEQUAL && !blend->blend_enable;
+   if (!strcmp(mode, "cutout"))
+      return cutout;
+   if (!strcmp(mode, "blend"))
+      return source_over;
    return source_over || cutout;
 }
 
