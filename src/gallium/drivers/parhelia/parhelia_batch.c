@@ -314,15 +314,7 @@ parhelia_batch_clear_surface(struct parhelia_batch *batch, uint32_t handle,
 {
    return parhelia_batch_clear_rect_surface(batch, handle, width, height,
                                             pitch, format, value, 0xffffffffu,
-                                            0, 0, width, height, false);
-}
-
-/* P690 2D fills address a tiled row y as 3-D row fill_row(y): bits 0 and 1
- * swap inside each 4-row group (hardware fill-geometry probe). */
-static unsigned
-fill_row(unsigned y)
-{
-   return (y & ~3u) | ((y & 1u) << 1) | ((y >> 1) & 1u);
+                                            0, 0, width, height);
 }
 
 int
@@ -331,17 +323,12 @@ parhelia_batch_clear_rect_surface(struct parhelia_batch *batch,
                                   unsigned surface_height, unsigned pitch,
                                   unsigned format, uint32_t value,
                                   uint32_t write_mask, unsigned x, unsigned y,
-                                  unsigned width, unsigned height,
-                                  bool row_swizzle)
+                                  unsigned width, unsigned height)
 {
    struct p3d_reloc calls[PH_BATCH_PACKETS];
    uint32_t ring[PH_BATCH_PACKETS * 5];
    struct p3d_cs cs;
    struct p3d_surface surface = {.pitch = pitch, .fmt = format};
-   /* Up to three head rows, one aligned body and three tail rows before
-    * merging; at most three runs remain. */
-   unsigned start[7], end[7], runs = 0;
-   unsigned head_end, tail_start;
 
    /* Only the allocation is whole 16-row tile rows; the fill rectangle may
     * start and end inside a tile. */
@@ -353,47 +340,12 @@ parhelia_batch_clear_rect_surface(struct parhelia_batch *batch,
       return -EINVAL;
    if (format != 0x32 && format != 0x36)
       return -EINVAL;
-   if (!row_swizzle) {
-      start[runs] = y;
-      end[runs++] = y + height;
-   } else {
-      head_end = (y + 3) & ~3u;
-      if (head_end > y + height)
-         head_end = y + height;
-      tail_start = (y + height) & ~3u;
-      if (tail_start < head_end)
-         tail_start = head_end;
-      for (unsigned r = y; r < head_end; r++, runs++)
-         start[runs] = fill_row(r), end[runs] = start[runs] + 1;
-      if (head_end < tail_start)
-         start[runs] = head_end, end[runs++] = tail_start;
-      for (unsigned r = tail_start; r < y + height; r++, runs++)
-         start[runs] = fill_row(r), end[runs] = start[runs] + 1;
-      /* Sort by start, then merge touching fill-space runs. */
-      for (unsigned i = 1; i < runs; i++)
-         for (unsigned j = i; j && start[j - 1] > start[j]; j--) {
-            unsigned s = start[j], e = end[j];
-
-            start[j] = start[j - 1], end[j] = end[j - 1];
-            start[j - 1] = s, end[j - 1] = e;
-         }
-      unsigned merged = 0;
-      for (unsigned i = 0; i < runs; i++) {
-         if (merged && start[i] == end[merged - 1])
-            end[merged - 1] = end[i];
-         else
-            start[merged] = start[i], end[merged++] = end[i];
-      }
-      runs = merged;
-   }
    batch->command_count = 0;
    batch->packet_count = 0;
    batch->reloc_count = 0;
    p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
-   for (unsigned i = 0; i < runs; i++)
-      p3d_emit_clear(&cs, &surface, value, write_mask, x, start[i], width,
-                     end[i] - start[i]);
+   p3d_emit_clear(&cs, &surface, value, write_mask, x, y, width, height);
    return batch_finish(batch, &cs, calls, handle, 0, 0, 0, 0, 0, 0, 0,
                        false);
 }

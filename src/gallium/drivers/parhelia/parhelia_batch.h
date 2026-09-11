@@ -76,15 +76,14 @@ int parhelia_batch_clear_surface(struct parhelia_batch *batch, uint32_t handle,
                                  uint32_t value);
 /* Solid fill of [x,x+width) x [y,y+height) inside a surface_width by
  * tile-row-aligned surface_height allocation.  Destination bits outside
- * write_mask are preserved by the GPU.  row_swizzle selects the P690 64x16
- * fill row order, splitting partial 4-row groups into extra packets. */
+ * write_mask are preserved by the GPU. */
 int parhelia_batch_clear_rect_surface(struct parhelia_batch *batch,
                                       uint32_t handle, unsigned surface_width,
                                       unsigned surface_height, unsigned pitch,
                                       unsigned format, uint32_t value,
                                       uint32_t write_mask, unsigned x,
                                       unsigned y, unsigned width,
-                                      unsigned height, bool row_swizzle);
+                                      unsigned height);
 int parhelia_batch_blit(struct parhelia_batch *batch,
                         uint32_t dst_handle, unsigned dst_pitch,
                         unsigned dst_type, unsigned dst_x, unsigned dst_y,

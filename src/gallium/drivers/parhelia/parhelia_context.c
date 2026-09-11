@@ -97,8 +97,7 @@ ph_mip_texel_offset(const struct ph_mip_layout *mip, unsigned level,
    return image->offset + (linear ?
           ((size_t)y * image->pitch + x) * 4 :
           (native ?
-           p3d_tile_offset_layout(x, y, physical_pitch,
-                                  PARHELIA_TILE_64X16_4K) :
+           p3d_texture_tile_offset_64x16(x, y, physical_pitch) :
            p3d_texture_tile_offset(x, y, image->pitch)));
 }
 
@@ -115,8 +114,7 @@ ph_mip_texel_offset_cpp(const struct ph_mip_layout *mip, unsigned level,
    return image->offset + (linear ?
           ((size_t)y * image->pitch + x) * cpp :
           (native ?
-           p3d_tile_offset_layout(x, y, physical_pitch,
-                                  PARHELIA_TILE_64X16_4K) :
+           p3d_texture_tile_offset_64x16(x, y, physical_pitch) :
            p3d_texture_tile_offset_cpp(x, y, image->pitch, cpp)));
 }
 
@@ -4469,9 +4467,7 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
    ret = parhelia_batch_clear_rect_surface(batch, r->handle, r->base.width0,
                                            alloc_height, r->stride, format,
                                            value, write_mask, x, y, width,
-                                           height,
-                                           r->tile_layout ==
-                                              PARHELIA_TILE_64X16_4K);
+                                           height);
    if (getenv("PARHELIA_TRACE"))
       fprintf(stderr,
               "parhelia: GPU clear resource=%u fmt=%#x value=%#x mask=%#x %u,%u %ux%u ret=%d\n",

@@ -281,8 +281,8 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
          memcpy((uint8_t *)r->map +
                    (r->upload_texture ?
                     (r->mip.native_64x16_32 ?
-                     p3d_tile_offset_layout(x, y, r->mip.level[0].pitch,
-                                            PARHELIA_TILE_64X16_4K) :
+                     p3d_texture_tile_offset_64x16(x, y,
+                                                   r->mip.level[0].pitch) :
                      p3d_texture_tile_offset(x, y,
                                              r->mip.level[0].pitch)) :
                     p3d_tile_offset_layout(x, y, r->stride, r->tile_layout)),

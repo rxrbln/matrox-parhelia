@@ -497,6 +497,9 @@ uint32_t p3d_texture_tile_offset(uint32_t x, uint32_t y, uint32_t pitch);
  * widths differ.  The 16-bit A1R5G5B5 route uses code 3. */
 uint32_t p3d_texture_tile_offset_cpp(uint32_t x, uint32_t y, uint32_t pitch,
                                     unsigned cpp);
+/* P690 32-bit texture sampling order; differs from the 64x16 render-target
+ * order in y bits 0 and 1. */
+uint32_t p3d_texture_tile_offset_64x16(uint32_t x, uint32_t y, uint32_t pitch);
 bool p3d_texture_uses_native_64x16(uint32_t chip_id, uint32_t tile_layout,
                                   unsigned cpp);
 uint32_t p3d_texture_tile_offset_chip(uint32_t x, uint32_t y, uint32_t pitch,

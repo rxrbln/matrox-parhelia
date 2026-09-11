@@ -71,9 +71,11 @@ p3d_tile_position(uint32_t offset, uint32_t pitch, uint32_t *x, uint32_t *y)
 }
 
 /* The 128-bit LX/P690 path halves a tile vertically: 64x16 pixels and
- * 4096 bytes.  The low-bit interleave is unchanged and x5 still XORs the
- * tile-row parity.  A full P690 coordinate-ramp capture verifies all 65,536
- * dwords as a bijection with at most the rasterizer's two-LSB dither error. */
+ * 4096 bytes, x5 still XORs the tile-row parity.  Unlike the 64x32 formula
+ * above, y bit 0 is dword-index bit 3 and y bit 1 is bit 6: a model-free
+ * P690 probe shows 3-D rectangles and 2D fills writing identical bytes, and
+ * GL points read back in place only with this order.  The earlier
+ * coordinate-ramp check tolerated two LSBs and could not see a one-row swap. */
 uint32_t
 p3d_tile_offset_layout(uint32_t x, uint32_t y, uint32_t pitch,
 		       uint32_t layout)
@@ -94,10 +96,10 @@ p3d_tile_offset_layout(uint32_t x, uint32_t y, uint32_t pitch,
 	i =  ( ix        & 1)       |
 	     ((ix >> 1)  & 1) << 1  |
 	     ((ix >> 2)  & 1) << 2  |
-	     ((iy >> 1)  & 1) << 3  |
+	     ( iy        & 1) << 3  |
 	     ((ix >> 3)  & 1) << 4  |
 	     ((ix >> 4)  & 1) << 5  |
-	     ( iy        & 1) << 6  |
+	     ((iy >> 1)  & 1) << 6  |
 	     x5               << 7  |
 	     ((iy >> 2)  & 1) << 8  |
 	     ((iy >> 3)  & 1) << 9;
@@ -128,7 +130,7 @@ p3d_tile_position_layout(uint32_t offset, uint32_t pitch, uint32_t layout,
 	*x = tcol * P3D_TILE_W +
 	     (b[0] | b[1] << 1 | b[2] << 2 | b[4] << 3 | b[5] << 4 |
 	      ((b[7] ^ (trow & 1)) << 5));
-	*y = trow * 16 + (b[6] | b[3] << 1 | b[8] << 2 | b[9] << 3);
+	*y = trow * 16 + (b[3] | b[6] << 1 | b[8] << 2 | b[9] << 3);
 }
 
 uint32_t
@@ -168,6 +170,31 @@ p3d_texture_tile_offset_cpp(uint32_t x, uint32_t y, uint32_t pitch,
 	return block * 1024u + in_block;
 }
 
+/* The P690 texture unit reads 32-bit 64x16 textures with y bit 0 in
+ * dword-index bit 6 and y bit 1 in bit 3: the render-target order with
+ * those two bits exchanged.  Sampling tests validated this order; the
+ * 3-D and 2D engines write the one in p3d_tile_offset_layout(). */
+uint32_t
+p3d_texture_tile_offset_64x16(uint32_t x, uint32_t y, uint32_t pitch)
+{
+	uint32_t tpr = pitch / P3D_TILE_W, tcol = x / P3D_TILE_W, trow = y / 16;
+	uint32_t ix = x % P3D_TILE_W, iy = y % 16;
+	uint32_t x5 = ((ix >> 5) & 1) ^ (trow & 1);
+	uint32_t i;
+
+	i =  ( ix        & 1)       |
+	     ((ix >> 1)  & 1) << 1  |
+	     ((ix >> 2)  & 1) << 2  |
+	     ((iy >> 1)  & 1) << 3  |
+	     ((ix >> 3)  & 1) << 4  |
+	     ((ix >> 4)  & 1) << 5  |
+	     ( iy        & 1) << 6  |
+	     x5               << 7  |
+	     ((iy >> 2)  & 1) << 8  |
+	     ((iy >> 3)  & 1) << 9;
+	return (trow * tpr + tcol) * 4096 + i * 4;
+}
+
 bool
 p3d_texture_uses_native_64x16(uint32_t chip_id, uint32_t tile_layout,
 			      unsigned cpp)
@@ -182,6 +209,6 @@ p3d_texture_tile_offset_chip(uint32_t x, uint32_t y, uint32_t pitch,
 			     uint32_t tile_layout)
 {
 	if (p3d_texture_uses_native_64x16(chip_id, tile_layout, cpp))
-		return p3d_tile_offset_layout(x, y, pitch, tile_layout);
+		return p3d_texture_tile_offset_64x16(x, y, pitch);
 	return p3d_texture_tile_offset_cpp(x, y, pitch, cpp);
 }
