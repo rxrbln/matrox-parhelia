@@ -232,3 +232,64 @@ walk differs from the P690 vendor allocator.
 After the forced-level test passes, reopen the LOD range (`0x11c4` high word
 `0xf000`) and test derivative-selected levels and trilinear filtering.  Keeping
 that as a later test separates physical chain addressing from LOD calculation.
+
+## Live P690 mip-tail placement
+
+The follow-up P690 test used one 64x64 A8R8G8B8 chain with a different solid
+colour at every level, `GL_NEAREST_MIPMAP_NEAREST`, `GL_NEAREST`, and repeat
+wrap.  Quads with successively doubled texture-coordinate ranges selected the
+levels independently.  Levels 0 and 1 sampled from their separate allocation
+bands; levels 2 through 6 sampled from the one block at `base + 0x5000`.
+
+The native 64x16 permutation at a physical pitch of 64 texels places tail
+levels 2, 3, and 4 at the binary-derived logical origins `(0,0)`, `(16,0)`,
+and `(24,0)`.  Solid blue, yellow, and cyan results establish those level
+regions.  A direct use of adjacent physical Y rows for the 2x2 image at
+`(16,8)` produced alternating magenta and black scanlines.  Only one of its
+two uploaded logical rows was present where the sampler read it.
+
+The corrected 2x2 upload advances a logical Y coordinate by two native rows:
+
+```
+physical_x = 16 + logical_x
+physical_y =  8 + 2 * logical_y
+physical_offset = 0x5000 + native_64x16_offset(physical_x, physical_y,
+                                               pitch=64)
+```
+
+For 32-bit texels the four offsets within the shared tail block are therefore:
+
+| logical texel | native coordinate | byte offset in tail block |
+|---:|---:|---:|
+| `(0,0)` | `(16,8)`  | `0x0880` |
+| `(1,0)` | `(17,8)`  | `0x0884` |
+| `(0,1)` | `(16,10)` | `0x08a0` |
+| `(1,1)` | `(17,10)` | `0x08a4` |
+
+This is not symmetric scaling.  A second live test uploaded a row-major 2x2
+image containing red, green, blue, and white.  A nearest-filtered 2x2 repeat
+covered a 256x256 window with exactly 16,384 pixels of each colour.  Thus X
+remains adjacent (`x + 1`), while the second Y row is at `y + 2`.  The naive
+second-row offsets at native coordinates `(16,9)` and `(17,9)` are `0x0980`
+and `0x0984`; the sampler does not use them for this mip level.
+
+The 1x1 level remains at the P690 table origin `(24,8)`, native byte offset
+`0x08c0` within the same block.  Its forced-level panel sampled solid white,
+so it needs neither the 2x2 Y-spacing adjustment nor another allocation.
+
+The resulting P690 32-bit implementation rule is:
+
+```
+level 0, pitch >= 64: native 64x16 permutation, declared physical pitch [spatially proven]
+level 1, 32x32:       one compact 4-KiB child                         [solid proven]
+levels 2..4:          native 64x16 at physical pitch 64              [solid proven]
+level 5, 2x2:         native tail origin plus (x, 2*y)               [spatially proven]
+level 6, 1x1:         native tail origin (24,8)                       [proven]
+```
+
+The saved P690 binary establishes the shared block, logical origins, and one
+base address.  The native permutation and the 2x2 row spacing are live P690
+results.  They must remain separately identified: the constructor's logical
+tail coordinates do not expose this physical SUN90 address-unit quirk.  Solid
+colours do not distinguish permutations within the 32x32, 16x16, 8x8, and
+4x4 regions; coordinate ramps remain the final spatial check for those levels.
