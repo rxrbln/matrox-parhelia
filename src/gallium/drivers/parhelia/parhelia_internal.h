@@ -38,6 +38,10 @@ struct parhelia_screen {
    bool texture_upload;
    bool native_rt_classes;
    bool render_transfer;
+   /* Native 8- and 16-bit sampler storage, and native S3TC.  Both stay
+    * gated until they retire on this silicon. */
+   bool narrow_formats;
+   bool s3tc;
    /* Zero means GET_PARAM was unavailable or returned an invalid value. */
    uint32_t kernel_max_packets;
    uint64_t vram_size;
@@ -119,6 +123,18 @@ ph_resource(struct pipe_resource *r)
 {
    return (struct parhelia_resource *)r;
 }
+
+/* Native sampler storage of a Gallium format: the hardware format code for
+ * 0x11e0[29:24] and its bytes per texel.  Formats outside this table are
+ * converted to a 32-bit BGRA texel by the Gallium transfer path. */
+struct ph_sampler_format {
+   uint32_t code;
+   unsigned cpp;
+   /* Bytes per 4x4 S3TC block; zero for an uncompressed format. */
+   unsigned block_bytes;
+};
+
+bool ph_sampler_format(enum pipe_format format, struct ph_sampler_format *out);
 
 void ph_resource_resolve_linear(struct parhelia_resource *r);
 void ph_resource_upload_tiled(struct parhelia_resource *r);

@@ -144,7 +144,31 @@ ph_mip_texel_offset_cpp(const struct ph_mip_layout *mip, unsigned level,
 static unsigned
 ph_texture_cpp(enum pipe_format format)
 {
-   return format == PIPE_FORMAT_B5G5R5A1_UNORM ? 2 : 4;
+   struct ph_sampler_format native;
+
+   return ph_sampler_format(format, &native) ? native.cpp : 4;
+}
+
+/* Fill the format half of a texture descriptor.  An untiled sampler reads the
+ * paired linear shadow (layout 0); a tiled one selects the storage order for
+ * its texel size.  @packed marks the temporary A1R5G5B5 repacking of an
+ * otherwise 32-bit image. */
+static void
+ph_texture_descriptor_format(const struct parhelia_resource *texture,
+                             bool packed, bool tiled, struct p3d_texture *tex)
+{
+   struct ph_sampler_format native = { 0x32, 4 };
+
+   if (packed)
+      native = (struct ph_sampler_format){ 0x26, 2 };
+   else if (!ph_sampler_format(texture->base.format, &native) &&
+            (texture->base.format == PIPE_FORMAT_R8G8B8X8_UNORM))
+      native.code = 0x33;
+   tex->fmt = native.code;
+   /* Layout 5 makes the storage and the width/height fields describe 4x4
+    * blocks; a compressed image has no linear companion to fall back to. */
+   tex->texelcode = native.block_bytes ? 5 :
+                    tiled ? ph_sampler_texelcode(native.cpp) : 0;
 }
 
 static unsigned
@@ -3178,13 +3202,16 @@ ph_submit_vertices(struct ph_context *ctx)
     * launch. Without it, use only the P690 base-level format/dimension shape
     * recovered for layout 2; all small, mip-described and unusual textures
     * retain the conservative linear sampler backing. */
+   /* A compressed image exists only in layout 5; it has no linear shadow. */
    if (texture)
-      texture_tiled = texture->upload_texture ? true : tiled_textures ?
+      texture_tiled = texture->upload_texture || texture->mip.block_bytes ?
+         true : tiled_textures ?
          (!small_texture_linear ||
           (texture->base.width0 >= 32 && texture->base.height0 >= 32)) :
          ph_auto_tiled_texture(ctx, texture, sampler);
    if (texture1)
-      texture1_tiled = texture1->upload_texture ? true : tiled_textures ?
+      texture1_tiled = texture1->upload_texture || texture1->mip.block_bytes ?
+         true : tiled_textures ?
          (!small_texture_linear ||
           (texture1->base.width0 >= 32 && texture1->base.height0 >= 32)) :
          ph_auto_tiled_texture(ctx, texture1, sampler1);
@@ -3370,14 +3397,8 @@ ph_submit_vertices(struct ph_context *ctx)
        * paired linear shadow; layout 2 reads the native 32x16 sampler tiles. */
       tex.width = texture->base.width0;
       tex.height = texture->base.height0;
-      tex.fmt = (rgb5a1_texture ||
-                 texture->base.format == PIPE_FORMAT_B5G5R5A1_UNORM) ? 0x26 :
-                (texture->base.format == PIPE_FORMAT_B8G8R8X8_UNORM ||
-                 texture->base.format == PIPE_FORMAT_R8G8B8X8_UNORM) ?
-                   0x33 : 0x32;
-      tex.texelcode = texture_tiled ?
-         ((rgb5a1_texture ||
-           texture->base.format == PIPE_FORMAT_B5G5R5A1_UNORM) ? 3 : 2) : 0;
+      ph_texture_descriptor_format(texture, rgb5a1_texture, texture_tiled,
+                                   &tex);
       tex.min_filter = ph_sampler_image_filter(
          sampler && sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR,
          sampler ? sampler->max_anisotropy : 0);
@@ -3419,12 +3440,7 @@ ph_submit_vertices(struct ph_context *ctx)
       } else if (texture1) {
          tex1.width = texture1->base.width0;
          tex1.height = texture1->base.height0;
-         tex1.fmt = texture1->base.format == PIPE_FORMAT_B5G5R5A1_UNORM ? 0x26 :
-                    (texture1->base.format == PIPE_FORMAT_B8G8R8X8_UNORM ||
-                     texture1->base.format == PIPE_FORMAT_R8G8B8X8_UNORM) ?
-                       0x33 : 0x32;
-         tex1.texelcode = texture1_tiled ?
-            (texture1->base.format == PIPE_FORMAT_B5G5R5A1_UNORM ? 3 : 2) : 0;
+         ph_texture_descriptor_format(texture1, false, texture1_tiled, &tex1);
          tex1.min_filter = ph_sampler_image_filter(
             sampler1 && sampler1->min_img_filter == PIPE_TEX_FILTER_LINEAR,
             sampler1 ? sampler1->max_anisotropy : 0);
@@ -5491,7 +5507,7 @@ ph_copy_texture_box(struct ph_context *ctx,
 
    ph_submit_vertices(ctx);
    if (!width || !height || width != dwidth || height != dheight ||
-       src_box->depth != 1 || cpp != 4 ||
+       src_box->depth != 1 || (cpp != 4 && cpp != 2 && cpp != 1) ||
        util_format_get_blocksize(dst->format) != cpp ||
        !ph_level_extent(sr, src_level, &src_w, &src_h) ||
        !ph_level_extent(dr, dst_level, &dst_w, &dst_h) ||
@@ -5944,6 +5960,30 @@ ph_resource_uses_sampler_layout(const struct parhelia_resource *r)
                              PIPE_BIND_DEPTH_STENCIL)));
 }
 
+/* Move the S3TC blocks of @box between a block-linear staging image and the
+ * macrotiled hardware image.  Block rows of the staging image are @stride
+ * bytes apart; the hardware address comes from ph_dxt_block_offset(). */
+static void
+ph_copy_blocks(struct parhelia_resource *r, void *staging, unsigned stride,
+               const struct pipe_box *box, bool to_gpu)
+{
+   const unsigned block = r->mip.block_bytes;
+   const unsigned pitch = r->mip.level[0].pitch;
+   const unsigned bw = (box->width + 3) / 4, bh = (box->height + 3) / 4;
+
+   for (unsigned j = 0; j < bh; j++)
+      for (unsigned i = 0; i < bw; i++) {
+         uint8_t *host = (uint8_t *)staging + (size_t)j * stride + i * block;
+         uint8_t *gpu = (uint8_t *)r->map +
+            ph_dxt_block_offset(pitch, box->x / 4 + i, box->y / 4 + j, block);
+
+         if (to_gpu)
+            memcpy(gpu, host, block);
+         else
+            memcpy(host, gpu, block);
+      }
+}
+
 static void *
 ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
        unsigned usage, const struct pipe_box *box,
@@ -5974,7 +6014,39 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
       image_width = MAX2(res->width0 >> level, 1);
       image_height = MAX2(res->height0 >> level, 1);
    }
-   if ((cpp != 4 && cpp != 2) || level > res->last_level ||
+   /* A compressed map is block-linear: the box stays in texels while the
+    * stride counts block bytes.  Gallium already requires the origin to be
+    * block-aligned unless it is the image edge. */
+   if (r->mip.block_bytes) {
+      if (level || !r->map || box->x < 0 || box->y < 0 ||
+          (box->x & 3) || (box->y & 3) ||
+          (unsigned)box->x + (unsigned)box->width > image_width ||
+          (unsigned)box->y + (unsigned)box->height > image_height) {
+         FREE(t);
+         return NULL;
+      }
+      t->base.stride = util_format_get_stride(res->format, box->width);
+      t->base.layer_stride = (uintptr_t)t->base.stride *
+         util_format_get_nblocksy(res->format, box->height);
+      t->staging = CALLOC(1, t->base.layer_stride);
+      if (!t->staging) {
+         FREE(t);
+         return NULL;
+      }
+      if (usage & (PIPE_MAP_READ | PIPE_MAP_WRITE)) {
+         ph_submit_vertices(ctx);
+         if (ph_wait_async(ctx) || ctx->submit_error) {
+            FREE(t->staging);
+            FREE(t);
+            return NULL;
+         }
+      }
+      if ((usage & PIPE_MAP_READ) && (r->mip_defined & BITFIELD_BIT(0)))
+         ph_copy_blocks(r, t->staging, t->base.stride, box, false);
+      *out = &t->base;
+      return t->staging;
+   }
+   if ((cpp != 4 && cpp != 2 && cpp != 1) || level > res->last_level ||
        (!r->map && !r->linear_map) || box->x < 0 || box->y < 0 ||
        box->width < 0 || box->height < 0 ||
        (unsigned)box->x + (unsigned)box->width > image_width ||
@@ -6067,6 +6139,18 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
    struct parhelia_resource *r = ph_resource(transfer->resource);
    unsigned cpp = util_format_get_blocksize(transfer->resource->format);
    bool swap_rb = ph_format_needs_rb_swap(transfer->resource->format);
+   if (texture && r->mip.block_bytes && t->staging && r->map) {
+      if (transfer->usage & PIPE_MAP_WRITE) {
+         ph_copy_blocks(r, t->staging, transfer->stride, &transfer->box, true);
+         __sync_synchronize();
+         r->upload_dirty |= r->upload_texture;
+         r->content_generation++;
+         r->mip_defined |= BITFIELD_BIT(0);
+      }
+      FREE(t->staging);
+      FREE(t);
+      return;
+   }
    if (texture && t->base.level < ph_resource_mip_levels(r) && t->staging &&
        (transfer->usage & PIPE_MAP_WRITE)) {
       /* Do not apply a partial RGBA update over the temporary 16-bit packed

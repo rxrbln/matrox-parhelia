@@ -405,6 +405,9 @@ struct p3d_texture {
 	enum p3d_texenv	env;
 	uint32_t	env_colour_rg, env_colour_ba;	/* P3D_COMBINER_CONST pairs */
 	uint32_t	reloc_offset;	/* base level byte offset, relocated */
+	/* Diagnostic override of the per-unit auxiliary window
+	 * 0x11cc, 0x11d0, 0x11c8, 0x11d4, 0x11d8; NULL keeps the defaults. */
+	const uint32_t	*aux;
 };
 
 uint32_t p3d_tex_filter(const struct p3d_texture *t);

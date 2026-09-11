@@ -126,6 +126,62 @@ static const char *ph_vendor(struct pipe_screen *s) { return "Mesa"; }
 static const char *ph_device_vendor(struct pipe_screen *s) { return "Matrox"; }
 static int ph_fd(struct pipe_screen *s) { return ph_screen(s)->fd; }
 
+/* Native sampler codes for 0x11e0[29:24], recovered from the vendor format
+ * record table (Linux mtx1646 .text+0x7c050, sampler variants 2/3; the
+ * channel masks that name each internal id come from mtx3404 .text+0x79c60
+ * and agree with the Windows MTXPARD.dll 0x83d50 pixel-format classifier).
+ *
+ * The P690 texture unit never delivers a sampled alpha channel: a texel with
+ * A=0 still paints RGB, on 32-bit 0x32 and on 16-bit 0x26 alike (measured,
+ * docs/parhelia-p690-sampler-alpha-emission-re.md and the RGB5_A1 alpha
+ * probe).  That limits every format equally, so it is not a reason to leave a
+ * colour format out; it is the reason A8 (code 0x12) and A8L8 (0x22), whose
+ * only information is alpha, are not listed. */
+bool
+ph_sampler_format(enum pipe_format format, struct ph_sampler_format *out)
+{
+   struct ph_sampler_format native;
+
+   switch (format) {
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+      native = (struct ph_sampler_format){ 0x32, 4 };
+      break;
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      native = (struct ph_sampler_format){ 0x33, 4 };
+      break;
+   case PIPE_FORMAT_B5G5R5A1_UNORM:
+      native = (struct ph_sampler_format){ 0x26, 2 };
+      break;
+   case PIPE_FORMAT_B5G6R5_UNORM:
+      native = (struct ph_sampler_format){ 0x28, 2 };
+      break;
+   case PIPE_FORMAT_B4G4R4A4_UNORM:
+      native = (struct ph_sampler_format){ 0x24, 2 };
+      break;
+   case PIPE_FORMAT_L8_UNORM:
+      native = (struct ph_sampler_format){ 0x11, 1 };
+      break;
+   /* S3TC: DXT1 RGB and RGBA share code 0x08, the endpoint order inside each
+    * BC1 block selects punch-through alpha (MTXPARD.dll 0x83f80 maps the
+    * FOURCCs, mtx1646 builds the records at .text+0x7e813 and following). */
+   case PIPE_FORMAT_DXT1_RGB:
+   case PIPE_FORMAT_DXT1_RGBA:
+      native = (struct ph_sampler_format){ 0x08, 0, 8 };
+      break;
+   case PIPE_FORMAT_DXT3_RGBA:
+      native = (struct ph_sampler_format){ 0x0a, 0, 16 };
+      break;
+   case PIPE_FORMAT_DXT5_RGBA:
+      native = (struct ph_sampler_format){ 0x0c, 0, 16 };
+      break;
+   default:
+      return false;
+   }
+   if (out)
+      *out = native;
+   return true;
+}
+
 static bool
 ph_format_supported(struct pipe_screen *s, enum pipe_format format,
                     enum pipe_texture_target target, unsigned samples,
@@ -148,17 +204,44 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
          supported = true;
       } else if (target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_RECT) {
          switch (format) {
-		 case PIPE_FORMAT_B5G5R5A1_UNORM:
-		    /* A1R5G5B5: vendor format id 0x08 -> sampler code 0x26.  It
-		     * is sampler-only until a 16-bpp render-target route is known. */
-		    supported = !(bind & (PIPE_BIND_DEPTH_STENCIL |
-		                          PIPE_BIND_SCANOUT |
-		                          PIPE_BIND_DISPLAY_TARGET |
-		                          PIPE_BIND_SHARED));
-		    break;
+         case PIPE_FORMAT_B5G5R5A1_UNORM:
+         case PIPE_FORMAT_B5G6R5_UNORM:
+         case PIPE_FORMAT_B4G4R4A4_UNORM:
+         case PIPE_FORMAT_L8_UNORM:
+            /* Native 8- and 16-bit sampler storage (codes 0x26, 0x28, 0x24,
+             * 0x11).  There is no recovered render-target, depth or display
+             * descriptor at these texel sizes, so they stay sampler-only.
+             * Their alpha is no worse off than the 32-bit formats': this
+             * texture unit emits none for any of them. */
+            supported = ph_screen(s)->narrow_formats &&
+                        (bind & PIPE_BIND_SAMPLER_VIEW) &&
+                        !(bind & (PIPE_BIND_RENDER_TARGET |
+                                  PIPE_BIND_DEPTH_STENCIL |
+                                  PIPE_BIND_SCANOUT |
+                                  PIPE_BIND_DISPLAY_TARGET |
+                                  PIPE_BIND_SHARED));
+            break;
          case PIPE_FORMAT_B8G8R8A8_UNORM:
          case PIPE_FORMAT_B8G8R8X8_UNORM:
             supported = !(bind & PIPE_BIND_DEPTH_STENCIL);
+            break;
+         case PIPE_FORMAT_DXT1_RGB:
+         case PIPE_FORMAT_DXT1_RGBA:
+         case PIPE_FORMAT_DXT3_RGBA:
+         case PIPE_FORMAT_DXT5_RGBA:
+            /* Native S3TC, sampler-only.  The recovered uploader rounds the
+             * macrotile row to align(width,32) while the descriptor pitch
+             * helper uses the next power of two; those agree only for a
+             * power-of-two width, so non-power-of-two compressed storage
+             * stays off until it is measured. */
+            supported = ph_screen(s)->s3tc &&
+                        target == PIPE_TEXTURE_2D &&
+                        (bind & PIPE_BIND_SAMPLER_VIEW) &&
+                        !(bind & (PIPE_BIND_RENDER_TARGET |
+                                  PIPE_BIND_DEPTH_STENCIL |
+                                  PIPE_BIND_SCANOUT |
+                                  PIPE_BIND_DISPLAY_TARGET |
+                                  PIPE_BIND_SHARED));
             break;
          case PIPE_FORMAT_Z24_UNORM_S8_UINT:
             supported = !(bind & PIPE_BIND_RENDER_TARGET);
@@ -241,12 +324,14 @@ void
 ph_resource_upload_tiled(struct parhelia_resource *r)
 {
    struct parhelia_batch *batch = NULL;
+   const unsigned cpp = r && r->mip.cpp ? r->mip.cpp : 4;
    uint32_t fence;
    int ret = -EINVAL;
 
    if (!r || !r->linear_dirty || r->tiled_dirty || !r->linear_map)
       return;
-   if (!ph_env("PARHELIA_CPU_BLIT") &&
+   /* The 2D engine copies 32-bit pixels; a narrower texel needs the CPU. */
+   if (cpp == 4 && !ph_env("PARHELIA_CPU_BLIT") &&
        r->handle && r->linear_handle && !(r->linear_stride & 3) &&
        r->linear_stride / 4 <= 0x3fff) {
       batch = calloc(1, sizeof(*batch));
@@ -283,11 +368,11 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
                     (r->mip.native_64x16_32 ?
                      p3d_texture_tile_offset_64x16(x, y,
                                                    r->mip.level[0].pitch) :
-                     p3d_texture_tile_offset(x, y,
-                                             r->mip.level[0].pitch)) :
+                     p3d_texture_tile_offset_cpp(x, y,
+                                                 r->mip.level[0].pitch, cpp)) :
                     p3d_tile_offset_layout(x, y, r->stride, r->tile_layout)),
                 (uint8_t *)r->linear_map +
-                   (size_t)y * r->linear_stride + x * 4, 4);
+                   (size_t)y * r->linear_stride + x * cpp, cpp);
    if (r->transfer_shadow && ph_resource_upload_shadow(r))
       return;
    r->upload_dirty |= r->upload_texture;
@@ -444,9 +529,13 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
       templ->width0 <= 512 && templ->height0 <= 512 &&
       !(templ->bind & PIPE_BIND_DEPTH_STENCIL);
-   const bool p690_native_texture32 = sampler_storage &&
-      p3d_texture_uses_native_64x16(screen->chip_id, screen->tile_layout,
-                                    util_format_get_blocksize(templ->format));
+   struct ph_sampler_format native_format = { 0x32, 4, 0 };
+   const bool native_storage = sampler_storage &&
+      ph_sampler_format(templ->format, &native_format);
+   const unsigned block_bytes = native_storage ? native_format.block_bytes : 0;
+   const unsigned cpp = native_storage && !block_bytes ? native_format.cpp : 4;
+   const bool p690_native_texture32 = sampler_storage && !block_bytes &&
+      p3d_texture_uses_native_64x16(screen->chip_id, screen->tile_layout, cpp);
    const bool native_depth = screen->native_rt_classes &&
       (templ->bind & PIPE_BIND_DEPTH_STENCIL);
    const bool native_color = screen->native_rt_classes && !sampler_storage &&
@@ -473,8 +562,11 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
          goto fail;
       return &r->base;
    }
+   /* A compressed image only has a native block layout; there is no 32-bit
+    * fallback storage for one. */
    if (templ->width0 > max_width || templ->height0 > max_height ||
        templ->depth0 != 1 ||
+       (util_format_is_compressed(templ->format) && !block_bytes) ||
        templ->array_size != 1) {
       fprintf(stderr,
               "parhelia: reject resource target=%u format=%u %ux%ux%u array=%u levels=%u bind=%#x\n",
@@ -491,9 +583,25 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
                 !(templ->width0 & (templ->width0 - 1)) &&
                 !(templ->height0 & (templ->height0 - 1)) ?
                    templ->last_level + 1 : 1;
-   if (!ph_mip_layout_init_chip(&r->mip, templ->width0, templ->height0,
-                                mip_levels, true, p690_native_texture32))
+   if (!ph_mip_layout_init_cpp(&r->mip, templ->width0, templ->height0,
+                               mip_levels, true, p690_native_texture32, cpp))
       goto fail;
+   /* A compressed image is stored as 4x4 blocks in 32x16-texel macrotiles.
+    * Its level pitch stays a texel count; only the byte size differs. */
+   if (block_bytes) {
+      /* The vendor uploader rounds the macrotile row to align(width,32)
+       * while the descriptor pitch is the next power of two; they agree only
+       * for a power-of-two width. */
+      if ((templ->width0 & (templ->width0 - 1)) ||
+          (templ->height0 & (templ->height0 - 1)))
+         goto fail;
+      r->mip.block_bytes = block_bytes;
+      r->mip.level[0].pitch = MAX2(32u, ph_mip_next_pot(templ->width0));
+      r->mip.size = ph_mip_align(ph_dxt_level_size(templ->width0,
+                                                   templ->height0,
+                                                   block_bytes),
+                                 block_bytes == 8 ? 0x800u : 0x1000u);
+   }
    if (p690_native_texture32) {
       /* Live spatial sampling proves the hybrid address permutations used
        * for this vendor chain; ph_mip_physical_coords() selects each one. */
@@ -527,13 +635,17 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
                                    0x2000);
       }
    }
+   /* The allocation ABI only describes 32-bit texture rows.  A chain, or an
+    * 8/16-bit image whose byte size no longer follows width0*height0*4, asks
+    * for the rows of that wider shape which cover its storage. */
+   const unsigned create_pitch = MAX2(r->mip.level[0].pitch, 64u);
    struct drm_parhelia_create_render create = {
       .width = p690_native_texture32 ? MAX2(templ->width0, 64u) :
-                                      templ->width0,
+               cpp != 4 || block_bytes ? create_pitch : templ->width0,
       /* Rows of the (possibly wider) allocation that hold the chain. */
-      .height = mip_levels > 1 ?
-         (r->mip.size + (size_t)MAX2(r->mip.level[0].pitch, 64u) * 4 - 1) /
-         ((size_t)MAX2(r->mip.level[0].pitch, 64u) * 4) :
+      .height = mip_levels > 1 || cpp != 4 || block_bytes ?
+         (r->mip.size + (size_t)create_pitch * 4 - 1) /
+         ((size_t)create_pitch * 4) :
          templ->height0,
    };
    /* A tiled sampler uses the texture-unit address path.  Keeping the 32 MiB
@@ -623,19 +735,22 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
          goto fail;
       }
    }
-   if (!share_native &&
+   /* A compressed image has no linear companion: layout 5 is the only
+    * storage the sampler decodes, and nothing detiles blocks. */
+   if (!share_native && !block_bytes &&
        (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
                        PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW))) {
       /* CREATE_DUMB is a modeset-only ioctl and is unavailable through a
        * render node.  A second render allocation is valid linear sampler
        * storage when its descriptor selects texture layout 0; it also gives
        * the conservative non-aliasing placement required by this hardware. */
-      if (!ph_mip_layout_init(&r->linear_mip, templ->width0, templ->height0,
-                              mip_levels, false))
+      if (!ph_mip_layout_init_cpp(&r->linear_mip, templ->width0,
+                                  templ->height0, mip_levels, false, false,
+                                  cpp))
          goto fail;
       struct drm_parhelia_create_render linear = {
          .width = ALIGN_POT(templ->width0, 32),
-         .height = mip_levels > 1 ?
+         .height = mip_levels > 1 || cpp != 4 ?
             (r->linear_mip.size +
              (size_t)r->linear_mip.level[0].pitch * 4 - 1) /
             ((size_t)r->linear_mip.level[0].pitch * 4) :
@@ -644,7 +759,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       };
       if (r->upload_texture) {
          r->linear_size = r->linear_mip.size;
-         r->linear_stride = r->linear_mip.level[0].pitch * 4;
+         r->linear_stride = r->linear_mip.level[0].pitch * cpp;
          r->linear_map = align_malloc(r->linear_size, 64);
          if (!r->linear_map)
             goto fail;
@@ -663,7 +778,8 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
          if (r->linear_stride < ALIGN_POT(templ->width0, 32) * 4 ||
              (r->linear_stride & 3))
             goto fail;
-         if (mip_levels > 1 && linear.size < r->linear_mip.size)
+         if ((mip_levels > 1 || cpp != 4) &&
+             linear.size < r->linear_mip.size)
             goto fail;
          r->linear_handle_owned = true;
          r->linear_map = mmap(NULL, r->linear_size, PROT_READ | PROT_WRITE,
@@ -1087,6 +1203,11 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->render_transfer =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &render_transfer) &&
       render_transfer.value == 1;
+   /* Native narrow-texel and S3TC storage are implemented but have not
+    * retired on this silicon; PARHELIA_NARROW_FORMATS=1 and PARHELIA_S3TC=1
+    * enable them for testing. */
+   s->narrow_formats = s->texture_upload && ph_env("PARHELIA_NARROW_FORMATS");
+   s->s3tc = s->texture_upload && ph_env("PARHELIA_S3TC");
    if (!ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &max_packets) &&
        max_packets.value && max_packets.value <= PH_BATCH_PACKETS)
       s->kernel_max_packets = max_packets.value;

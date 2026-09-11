@@ -788,13 +788,14 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 
 			rw[0].reg = P3D_R_TEX_FILTER; rw[0].val = p3d_tex_filter(tu);
 			rw[1].reg = P3D_R_TEX_WRAP;   rw[1].val = p3d_tex_wrap(tu);
-			rw[2].reg = 0x11d4;           rw[2].val = 0;
-			rw[3].reg = 0x11d8;           rw[3].val = 0;
+			rw[2].reg = 0x11d4;           rw[2].val = tu->aux ? tu->aux[3] : 0;
+			rw[3].reg = 0x11d8;           rw[3].val = tu->aux ? tu->aux[4] : 0;
 			p3d_reglist(cs, rw, 4);
 
-			rw[0].reg = 0x11cc; rw[0].val = 0xffffffffu;
-			rw[1].reg = 0x11d0; rw[1].val = 0;
-			rw[2].reg = 0x11c8; rw[2].val = 0;
+			rw[0].reg = 0x11cc;
+			rw[0].val = tu->aux ? tu->aux[0] : 0xffffffffu;
+			rw[1].reg = 0x11d0; rw[1].val = tu->aux ? tu->aux[1] : 0;
+			rw[2].reg = 0x11c8; rw[2].val = tu->aux ? tu->aux[2] : 0;
 			/* the vendor LX table value for one or two stages */
 			rw[3].reg = P3D_R_TEX_CACHE; rw[3].val = 0x00500000u;
 			p3d_reglist(cs, rw, lx ? 4 : 3);

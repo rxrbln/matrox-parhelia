@@ -52,6 +52,10 @@ struct ph_mip_layout {
    struct ph_mip_level level[PH_MAX_MIP_LEVELS];
    size_t size;
    unsigned levels;
+   /* Bytes per texel of the sampler storage this chain describes. */
+   unsigned cpp;
+   /* Bytes per 4x4 block when the storage is S3TC; zero otherwise. */
+   unsigned block_bytes;
    bool tiled;
    bool native_64x16_32;
 };
@@ -70,6 +74,33 @@ ph_mip_next_pot(unsigned value)
    while (result < value && result < (1u << 31))
       result <<= 1;
    return result;
+}
+
+/* S3TC storage is macro-tiled: one macrotile is 8x4 S3TC blocks, that is
+ * 32x16 logical texels and 32 blocks, and macrotiles are row-major over a
+ * pitch given in logical texels.  Recovered from the Linux uploader mtx2799
+ * at .text+0x20720; see docs/parhelia-mesa-s3tc-implementation.md. */
+static inline size_t
+ph_dxt_block_offset(unsigned pitch, unsigned bx, unsigned by,
+                    unsigned block_bytes)
+{
+   const unsigned macro = (by >> 2) * (pitch >> 5) + (bx >> 3);
+
+   return (size_t)macro * (32u * block_bytes) +
+          (size_t)(by & 3u) * (8u * block_bytes) +
+          (size_t)(bx & 7u) * block_bytes;
+}
+
+/* A compressed level reserves 32 texel columns and, per mtx625
+ * .text+0x5b8c0, 32 rows up to a height of 32 and 64 rows above it. */
+static inline size_t
+ph_dxt_level_size(unsigned width, unsigned height, unsigned block_bytes)
+{
+   const unsigned rows = height <= 32 ? 32u : 64u;
+   const unsigned align = block_bytes == 8 ? 0x200u : 0x400u;
+
+   return ph_mip_align((ph_mip_align(width, 32) / 4) *
+                       (ph_mip_align(height, rows) / 4) * block_bytes, align);
 }
 
 static inline unsigned
@@ -105,9 +136,9 @@ ph_mip_tail_position(unsigned tail, unsigned *x, unsigned *y)
  * larger than 32x16, and a 32-wide tail level occupies the left half of the
  * 64x16 tail block with the smaller levels' table shifted right by 32. */
 static inline bool
-ph_mip_layout_init_chip(struct ph_mip_layout *out, unsigned width,
-                        unsigned height, unsigned requested_levels, bool tiled,
-                        bool p690)
+ph_mip_layout_init_cpp(struct ph_mip_layout *out, unsigned width,
+                       unsigned height, unsigned requested_levels, bool tiled,
+                       bool p690, unsigned cpp)
 {
    size_t next = 0, tail_base = 0;
    unsigned tail = 0, tail_shift = 0;
@@ -115,9 +146,11 @@ ph_mip_layout_init_chip(struct ph_mip_layout *out, unsigned width,
 
    if (!out || !width || !height || !requested_levels ||
        requested_levels > PH_MAX_MIP_LEVELS ||
-       requested_levels > ph_mip_max_levels(width, height))
+       requested_levels > ph_mip_max_levels(width, height) ||
+       (cpp != 1 && cpp != 2 && cpp != 4))
       return false;
-   *out = (struct ph_mip_layout){ .levels = requested_levels, .tiled = tiled };
+   *out = (struct ph_mip_layout){ .levels = requested_levels, .cpp = cpp,
+                                  .tiled = tiled };
 
    for (unsigned i = 0; i < requested_levels; i++) {
       struct ph_mip_level *level = &out->level[i];
@@ -136,7 +169,7 @@ ph_mip_layout_init_chip(struct ph_mip_layout *out, unsigned width,
 
          if (!tail_started) {
             tail_base = ph_mip_align((unsigned)next, level_align);
-            bytes = (size_t)32 * (tiled ? 32 : 16) * 4;
+            bytes = (size_t)32 * (tiled ? 32 : 16) * cpp;
             next = tail_base + bytes;
             tail_started = true;
          }
@@ -154,7 +187,7 @@ ph_mip_layout_init_chip(struct ph_mip_layout *out, unsigned width,
          rows = !tiled ? height :
                 p690 && pitch >= 64 ? ph_mip_align(height, 16) :
                 ph_mip_align(height, 32);
-         bytes = (size_t)pitch * rows * 4;
+         bytes = (size_t)pitch * rows * cpp;
          level->offset = ph_mip_align((unsigned)next, level_align);
          next = level->offset + bytes;
       }
@@ -164,6 +197,15 @@ ph_mip_layout_init_chip(struct ph_mip_layout *out, unsigned width,
    }
    out->size = ph_mip_align((unsigned)next, tiled ? 0x2000 : 0x200);
    return out->size != 0;
+}
+
+static inline bool
+ph_mip_layout_init_chip(struct ph_mip_layout *out, unsigned width,
+                        unsigned height, unsigned requested_levels, bool tiled,
+                        bool p690)
+{
+   return ph_mip_layout_init_cpp(out, width, height, requested_levels, tiled,
+                                 p690, 4);
 }
 
 static inline bool
