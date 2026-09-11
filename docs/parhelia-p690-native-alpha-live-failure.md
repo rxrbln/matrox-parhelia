@@ -108,3 +108,40 @@ proved physical-pipe-2 TA source.  Only after that test passes should Q3 use
 the native route.  Changing padding again or changing the alpha comparator
 cannot discriminate the remaining fault because the present uniform probe
 already proves those parts while bypassing the failing spatial behavior.
+
+## Correction to the first spatial result
+
+The first run of commit `551317e` reported `spatial-bad=3187` and
+`spatial-depth-bad=2920`, but those numbers do not establish a unit-1 mapping
+failure.  The preflight intentionally changed unit 0 from red to green for its
+equal-Z check.  The new spatial phase cleared colour and depth but failed to
+restore unit 0 to red before comparing accepted pixels with red.  Thus all
+2,512 opaque pixels in the expected mask were already liable to fail the
+colour comparison even with exact unit-1 coordinates, and the green equal-Z
+replay could never preserve a red first-pass silhouette.
+
+Mesa commit `5bdaecc` restores the red unit-0 texture before the spatial draw.
+It also adds `--p690-rgb-companion-spatial-variants`, a diagnostic matrix which
+keeps the production emitter unchanged and tries:
+
+* normal and independently transposed ST0/ST1;
+* layout-2 and linear byte ordering for the uploaded unit-1 image;
+* TA source 0, 1 and the current P690 physical source 2; and
+* the normal unit-1-to-o4 attribute map versus unit-1-to-o3.
+
+Each pass reports mismatch counts against both the normal and transposed mask,
+exact colour populations, and eight 64-bit silhouette rows.  Run the corrected
+baseline first.  If it is exact, no coordinate or upload change follows from
+the old failure.  Otherwise the matrix has direct interpretations: only the
+linear upload passing identifies storage order; only the o3 route passing
+identifies attribute routing; `swap-st1` matching the transposed reference and
+`swap-st0` matching the normal reference proves the expected ST1 source.
+
+The Windows PARD binary supports the normal logical routing.  Its
+`TEXCOORDINDEX` state is copied to texture-address record `+0x08[6:4]` at
+`0x17ab19`, then the WARP generator consumes that compiled stage state; the
+vendor generator writes unit *i* to output `a(3+i)` and reads vertex coordinate
+`r(7+i)`.  This agrees with the current two-unit program's `o3 <- v7`,
+`o4 <- v8` and `0x1118 = 0x6543`.  Consequently the corrected baseline is the
+evidence-backed first test; changing it to physical-pipe output o5 is not
+supported by the vendor program construction.
