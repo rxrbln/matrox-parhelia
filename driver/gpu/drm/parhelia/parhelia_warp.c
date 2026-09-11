@@ -62,10 +62,11 @@ static const u32 warp_constant_loader[] = {
 	0x00000200, 0x00040000, 0x00000000,
 };
 
-/* Every draw program writes temporary T2 (mul T2, v5, r1.0000 | mov o11,
- * v0; add o1, v5, r1.0000), as the replace program does: the setup stage
- * reads T2, and after power-on or a warm reboot it otherwise holds garbage
- * or a stale value (rejected draws, or an engine lock-up). */
+/* The passthrough and multitexture programs write temporary T2 (mul T2,
+ * v5, r1.0000 | mov o11, v0; add o1, v5, r1.0000) as the replace program
+ * does: draws depend on T2, which after power-on holds garbage (every draw
+ * rejected) and after a warm reboot a stale value (engine lock-up) until
+ * some program writes it. */
 static const u32 warp_passthrough[] = {
 	0x00083e00, 0x00440000, 0xb89a2249,
 	0x0800bebf, 0x00440215, 0xba9a2249,
@@ -87,10 +88,11 @@ static const u32 warp_vertex_probe[] = {
 	0x00080200, 0x00440000, 0x301a21a2,
 };
 
+/* No T2 write here: in this program it locked up vertex-alpha draws.  The
+ * passthrough and multitexture programs initialize T2 instead. */
 static const u32 warp_textured[] = {
 	0x00083e00, 0x00440000, 0xb89a2249,
-	0x0800bebf, 0x00440215, 0xba9a2249,
-	0x08087e00, 0x00440015, 0xb89a2249,
+	0x08087ebf, 0x00440215, 0xb89a2249,
 	0x0078023f, 0x00440200, 0xb01a21a2,
 	0x00000200, 0x00040000, 0x14c00000,
 	0x00080200, 0x00440000, 0x301a21a2,
