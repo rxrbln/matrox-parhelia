@@ -257,6 +257,7 @@ struct ph_context {
 	unsigned vram_vertex_slot_dwords;
 	bool vram_vertex_enabled;
    unsigned triangles;
+   unsigned lines;
 };
 
 struct ph_stage {
@@ -2577,6 +2578,104 @@ ph_submit_rgb_alpha_two_pass(struct ph_context *ctx,
    return ret;
 }
 
+/* Lines use the ordinary transformed-vertex path, but carry two vertices per
+ * relocated DRAW packet.  Keep consecutive compatible callbacks in the same
+ * state batch: Q3 issues enough small line lists that rebuilding and appending
+ * a complete state stream per segment is measurable even when the eventual
+ * kernel submission is aggregated. */
+static void
+ph_submit_lines(struct ph_context *ctx)
+{
+   struct parhelia_batch *batch = &ctx->build_batch;
+   struct parhelia_resource *color, *depth = NULL;
+   const struct pipe_rt_blend_state *blend =
+      ctx->blend ? &ctx->blend->rt[0] : NULL;
+   struct p3d_state state = {0};
+   unsigned count = ctx->lines;
+   int ret;
+
+   if (!count || ctx->submit_error)
+      goto out;
+   if (!ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture) {
+      ctx->submit_error = -EINVAL;
+      goto out;
+   }
+
+   color = ph_resource(ctx->fb.cbufs[0].texture);
+   if (ctx->fb.zsbuf.texture)
+      depth = ph_resource(ctx->fb.zsbuf.texture);
+   if (!color->handle || (depth && !depth->handle) || color->upload_texture ||
+       (depth && depth->upload_texture)) {
+      ctx->submit_error = -EINVAL;
+      goto out;
+   }
+   if (ctx->aggregate_batches && color->linear_dirty && ph_drain_batch(ctx))
+      goto out;
+   ph_resource_upload_tiled(color);
+
+   state.colour.pitch = color->stride;
+   state.colour.fmt = 0x32;
+   state.screen_w = ctx->fb.width;
+   state.screen_h = ctx->fb.height;
+   state.prim = P3D_LINES;
+   state.warp_entry = ctx->warp_passthrough;
+   state.dither = !ctx->blend || ctx->blend->dither;
+   state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
+   state.has_depth = depth != NULL;
+   state.dw_per_vertex = depth ? 6 : 5;
+   if (depth) {
+      state.depth.pitch = depth->stride;
+      state.depth.fmt = 0x36;
+      state.depth_slot = 1;
+      state.depth_test = ctx->dsa && ctx->dsa->depth_enabled;
+      state.depth_write = ctx->dsa && ctx->dsa->depth_writemask;
+      state.depth_func = ph_compare(ctx->dsa ? ctx->dsa->depth_func :
+                                               PIPE_FUNC_LESS);
+   }
+   if (ctx->dsa) {
+      state.alpha_test = ctx->dsa->alpha_enabled;
+      state.alpha_func = ph_compare(ctx->dsa->alpha_func);
+      state.alpha_ref = CLAMP((int)lrintf(ctx->dsa->alpha_ref_value * 255.0f),
+                              0, 255);
+   }
+   if (blend) {
+      state.blend = blend->blend_enable;
+      state.blend_src = ph_blend_factor(blend->rgb_src_factor);
+      state.blend_dst = ph_blend_factor(blend->rgb_dst_factor);
+      state.mask_r = !!(blend->colormask & PIPE_MASK_R);
+      state.mask_g = !!(blend->colormask & PIPE_MASK_G);
+      state.mask_b = !!(blend->colormask & PIPE_MASK_B);
+      state.mask_a = !!(blend->colormask & PIPE_MASK_A);
+   }
+   ph_apply_fragment_state(ctx, &state, depth != NULL);
+
+   ret = parhelia_batch_state(batch, color->handle,
+                              depth ? depth->handle : 0, &state, count);
+   if (!ret)
+      ret = ph_submit_batch(ctx, batch, ctx->vertices,
+                            count * 2 * state.dw_per_vertex,
+                            color, depth, NULL, NULL);
+   if (ret) {
+      ctx->submit_error = ret;
+      goto out;
+   }
+   color->tiled_dirty = true;
+   color->linear_dirty = false;
+   color->mip_defined |= BITFIELD_BIT(0);
+   color->content_generation++;
+   if (depth) {
+      depth->tiled_dirty = true;
+      depth->content_generation++;
+      depth->mip_defined |= BITFIELD_BIT(0);
+   }
+   if (getenv("PARHELIA_TRACE"))
+      fprintf(stderr,
+              "parhelia: submit lines=%u color=%u depth=%u ret=0\n",
+              count, color->handle, depth ? depth->handle : 0);
+out:
+   ctx->lines = 0;
+}
+
 static void
 ph_submit_vertices(struct ph_context *ctx)
 {
@@ -2598,6 +2697,11 @@ ph_submit_vertices(struct ph_context *ctx)
    bool one_pass_multitexture = false;
    int ret;
 
+   assert(!ctx->lines || !ctx->triangles);
+   if (ctx->lines) {
+      ph_submit_lines(ctx);
+      return;
+   }
    if (!ctx->triangles || ctx->submit_error)
       goto out;
    if (!ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture) {
@@ -3270,6 +3374,14 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	unsigned dpv;
    float *dst;
 
+   /* Preserve mixed-primitive ordering while allowing every run of compatible
+    * line callbacks to share one state block. */
+   if (ctx->lines) {
+      ph_submit_vertices(ctx);
+      if (ctx->submit_error)
+         return;
+   }
+
 	vertex_alpha = ph_use_vertex_alpha(ctx, textured, multitextured, depth,
 				  col >= 0);
 	native_sampled_alpha =
@@ -3503,15 +3615,11 @@ static void
 ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
 {
    struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
-   struct parhelia_batch *batch = &ctx->build_batch;
-   struct parhelia_resource *color, *depth = NULL;
-   const struct pipe_rt_blend_state *blend =
-      ctx->blend ? &ctx->blend->rt[0] : NULL;
-   struct p3d_state state = {0};
-   float vertices[2 * 6];
-   float *dst = vertices;
-   int pos, col, ret;
+   float *dst;
+   int pos, col;
    bool has_texture;
+   bool depth;
+   unsigned dpv;
 
    if (ctx->submit_error || !ctx->fb.nr_cbufs ||
        !ctx->fb.cbufs[0].texture)
@@ -3524,64 +3632,27 @@ ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
                             ctx->rasterizer->line_width >= 1.5f)))
       return;
 
-   /* A pending triangle batch owns ctx->vertices.  Publish it before this
-    * two-vertex packet so primitive state and byte ranges cannot be mixed. */
-   ph_submit_vertices(ctx);
-   if (ctx->submit_error)
-      return;
-
    pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
    col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
    if (pos < 0)
       return;
 
-   color = ph_resource(ctx->fb.cbufs[0].texture);
-   if (ctx->fb.zsbuf.texture)
-      depth = ph_resource(ctx->fb.zsbuf.texture);
-   if (!color->handle || (depth && !depth->handle) || color->upload_texture ||
-       (depth && depth->upload_texture)) {
-      ctx->submit_error = -EINVAL;
-      return;
+   /* A pending triangle batch owns the shared staging array.  Publish it once
+    * at the primitive-class transition, then retain following line segments. */
+   if (ctx->triangles) {
+      ph_submit_vertices(ctx);
+      if (ctx->submit_error)
+         return;
    }
-   if (ctx->aggregate_batches && color->linear_dirty && ph_drain_batch(ctx))
-      return;
-   ph_resource_upload_tiled(color);
-
-   state.colour.pitch = color->stride;
-   state.colour.fmt = 0x32;
-   state.screen_w = ctx->fb.width;
-   state.screen_h = ctx->fb.height;
-   state.prim = P3D_LINES;
-   state.warp_entry = ctx->warp_passthrough;
-   state.dither = !ctx->blend || ctx->blend->dither;
-   state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
-   state.has_depth = depth != NULL;
-   state.dw_per_vertex = depth ? 6 : 5;
-   if (depth) {
-      state.depth.pitch = depth->stride;
-      state.depth.fmt = 0x36;
-      state.depth_slot = 1;
-      state.depth_test = ctx->dsa && ctx->dsa->depth_enabled;
-      state.depth_write = ctx->dsa && ctx->dsa->depth_writemask;
-      state.depth_func = ph_compare(ctx->dsa ? ctx->dsa->depth_func :
-                                               PIPE_FUNC_LESS);
+   depth = ctx->fb.zsbuf.texture != NULL;
+   dpv = depth ? 6 : 5;
+   if (ctx->lines == ph_triangle_batch_limit(ctx) ||
+       (ctx->lines + 1) * 2 * dpv > ph_logical_vertex_limit(ctx)) {
+      ph_submit_vertices(ctx);
+      if (ctx->submit_error)
+         return;
    }
-   if (ctx->dsa) {
-      state.alpha_test = ctx->dsa->alpha_enabled;
-      state.alpha_func = ph_compare(ctx->dsa->alpha_func);
-      state.alpha_ref = CLAMP((int)lrintf(ctx->dsa->alpha_ref_value * 255.0f),
-                              0, 255);
-   }
-   if (blend) {
-      state.blend = blend->blend_enable;
-      state.blend_src = ph_blend_factor(blend->rgb_src_factor);
-      state.blend_dst = ph_blend_factor(blend->rgb_dst_factor);
-      state.mask_r = !!(blend->colormask & PIPE_MASK_R);
-      state.mask_g = !!(blend->colormask & PIPE_MASK_G);
-      state.mask_b = !!(blend->colormask & PIPE_MASK_B);
-      state.mask_a = !!(blend->colormask & PIPE_MASK_A);
-   }
-   ph_apply_fragment_state(ctx, &state, depth != NULL);
+   dst = &ctx->vertices[ctx->lines * 2 * dpv];
 
    for (unsigned v = 0; v < 2; v++) {
       const float *p = prim->v[v]->data[pos];
@@ -3596,33 +3667,15 @@ ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
       *dst++ = c[1];
       *dst++ = c[2];
    }
-
-   ret = parhelia_batch_state(batch, color->handle,
-                              depth ? depth->handle : 0, &state, 1);
-   if (!ret)
-      ret = ph_submit_batch(ctx, batch, vertices, 2 * state.dw_per_vertex,
-                            color, depth, NULL, NULL);
-   if (ret) {
-      ctx->submit_error = ret;
-      return;
-   }
-   color->tiled_dirty = true;
-   color->linear_dirty = false;
-   color->mip_defined |= BITFIELD_BIT(0);
-   color->content_generation++;
-   if (depth) {
-      depth->tiled_dirty = true;
-      depth->content_generation++;
-      depth->mip_defined |= BITFIELD_BIT(0);
-   }
+   ctx->lines++;
 }
 static void ph_stage_flush(struct draw_stage *s, unsigned flags)
 {
    /* draw_flush() ends the software frontend's draw, but each transformed
-    * triangle is already copied into ctx->vertices by ph_stage_tri().  Keep
-    * compatible DRAW packets together until a packet-state setter, resource
-    * operation, explicit pipe flush, or the negotiated packet cap submits
-    * them.
+    * triangle or line is already copied into ctx->vertices by its stage.
+    * Keep compatible DRAW packets together until a packet-state setter,
+    * resource operation, explicit pipe flush, or the negotiated packet cap
+    * submits them.
     */
    (void)s;
    (void)flags;
