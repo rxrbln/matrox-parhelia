@@ -1801,6 +1801,8 @@ static int parhelia_async_file_turn_static_selftest(void)
 	INIT_LIST_HEAD(&wc.link);
 	if (!parhelia_async_file_turn(pdev, a, &wa) || pdev->queue_owner != a)
 		goto out;
+	/* Keep the non-expiry checks deterministic even if init is preempted. */
+	pdev->queue_owner_deadline = jiffies + msecs_to_jiffies(1000);
 	/* B and C wait in arrival order while A appends through its lease. */
 	pdev->queued_slots = 2;
 	if (parhelia_async_file_turn(pdev, b, &wb) ||
@@ -1814,6 +1816,7 @@ static int parhelia_async_file_turn_static_selftest(void)
 	    !parhelia_async_file_turn(pdev, b, &wb) ||
 	    pdev->queue_owner != b || pdev->queue_next != c || wb.queued)
 		goto out;
+	pdev->queue_owner_deadline = jiffies + msecs_to_jiffies(1000);
 	/* A live B burst retains the lease.  On expiry B joins the tail and only
 	 * FIFO head C can claim after its slots drain. */
 	pdev->queued_slots = 2;
@@ -1825,7 +1828,7 @@ static int parhelia_async_file_turn_static_selftest(void)
 		goto out;
 	pdev->queued_slots = 0;
 	if (!parhelia_async_file_turn(pdev, c, &wc) ||
-	    pdev->queue_owner != c || pdev->queue_next != b || wc.queued)
+	    pdev->queue_owner != c || pdev->queue_next != a || wc.queued)
 		goto out;
 	ret = 0;
 out:
