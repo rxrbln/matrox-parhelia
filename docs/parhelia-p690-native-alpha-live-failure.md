@@ -81,18 +81,20 @@ WARP probe likewise keeps the fragment sampler on unit 0 when it tests the
 second coordinate attribute.  No retained probe currently verifies a spatial
 image fetched through unit 1.
 
-That missing test is the smallest next step.  Extend the offscreen companion
-probe with a 64 by 64 asymmetric mask whose expected output identifies both
-axes, for example:
+Mesa commit `551317e` adds that missing test to the offscreen companion probe.
+It uses a 64 by 64 asymmetric mask whose expected output identifies both axes:
 
-* red increases with X and green increases with Y, with a unique corner tag;
+* unequal X and Y cuts plus a diagonal term make a binary mask which cannot
+  pass after a constant, transposed, wrapped or incorrectly tiled fetch;
 * draw two triangles covering a known rectangle with unit-1 coordinates
   spanning `(0,0)` through `(1,1)`;
-* select `t1.r` into RGB for direct readback, or use alpha test at several
-  thresholds and compare the complete binary silhouette; and
-* run nearest first, then linear and repeat/clamp boundary cases.
+* compare every pixel in the first alpha-tested red silhouette; and
+* replay opaque green at equal Z under LESS, requiring prior accepted pixels
+  to stay red and prior rejected pixels to become green.
 
-Keep unit 0 constant during this test.  If the spatial result fails, vary the
+The command remains `--p690-rgb-companion-cutout-probe`; success now reports
+both `spatial-bad=0` and `spatial-depth-bad=0`.  Unit 0 stays constant during
+the spatial pass.  If the result fails, vary the
 second-coordinate descriptor/output routing independently of the already
 proved physical-pipe-2 TA source.  Only after that test passes should Q3 use
 the native route.  Changing padding again or changing the alpha comparator
