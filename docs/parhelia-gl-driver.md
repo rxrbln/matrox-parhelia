@@ -198,10 +198,16 @@ Corrected register roles (`CDPSTextureEngine::UpdateHardware`):
   (2 bits per axis at [1:0]/[4:3]/[7:6], bit12 always set). See
   docs/parhelia-fragment-isa.md §11.
 
-**Format codes** (proven, corrected): 8bpp `0x10` (0x11 in texture desc), 15bpp
-1:5:5:5 `0x26`, 16bpp 5:6:5/4:4:4:4 `0x28`, **32bpp 8:8:8:8 `0x32`**, 2:10:10:10
-`0x34`, DXT/S3TC `0x2e` (**suspect**: MTXPARD 0xa3b40 classifies code 0x2e as 16 bpp, not 4). (This also corrects the framebuffer descriptor: 32bpp
-is 0x32, not 0x28.)
+**Format codes** (proven, corrected): raw 8-bit class `0x10`, L8 `0x11`, A8
+`0x12`, A4R4G4B4 `0x24`, X4R4G4B4 `0x25`, A1R5G5B5 `0x26`, X1R5G5B5 `0x27`,
+R5G6B5 `0x28`, L16 `0x21`, A8L8 `0x22`, **32bpp 8:8:8:8 `0x32`**, X8R8G8B8
+`0x33`, 2:10:10:10 `0x34`, DXT1..DXT5 `0x08`..`0x0c`, UYVY/YUY2 `0x2e`. (This
+also corrects the framebuffer descriptor: 32bpp is 0x32, not 0x28.)  4:4:4:4
+does **not** share `0x28` with 5:6:5 and DXT is not `0x2e`; the full record
+table, the three extra format bits in `0x11e0` (`[30]` BGR swap, `[31]`
+signed/bump, `[23]` YUV byte order) and the texel-layout rule (4 for 8- and
+16-bit, 2 for 32-bit, 5 for compressed) are in
+docs/parhelia-narrow-texture-formats-re.md.
 
 **Texel layout (linear):** `dst = base + y*pitchBytes + x*bpp`, `pitchBytes =
 ((width+31)&~31) * bpp/8`. Directly implements `glTexImage2D`. Tiling

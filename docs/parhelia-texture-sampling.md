@@ -595,8 +595,8 @@ so it applies to every layout and both flag values.
 | layout 1 | 2 |
 | layout 2, 3 | 32 (16 with the variant bit) |
 | layout 4, 5, variant bit set | 32 |
-| layout 4, 5, 30/32 bpp | 32 if height <= 32, else 64 |
-| layout 4, 5, other bpp | 16 if height <= 16, else 32 |
+| layout 4, 5, 30/32 bpp (arm `0x5b8a6`) | 16 if height <= 16, else 32 |
+| layout 4, 5, 4/8/16 bpp (arm `0x5b8c0`) | 32 if height <= 32, else 64 |
 | anything else | invalid |
 
 `height` is that level's own `0x11e4[13:0]`, so for layouts 4/5 `Ha` changes
