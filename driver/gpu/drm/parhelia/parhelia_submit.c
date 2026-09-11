@@ -792,6 +792,23 @@ static int parhelia_range_call_static_selftest(void)
 		0x8f000001, 0, 3, 0xdeadbeef,
 		0x8f000001, 3, 6,
 	};
+	const struct drm_parhelia_packet generic_packets[] = {
+		{ .offset = 0, .length = 3 },
+		{ .offset = 3, .length = 3 },
+		{ .offset = 6, .length = 8 },
+		{ .offset = 14, .length = 3 },
+		{ .offset = 17, .length = 3 },
+		{ .offset = 20, .length = 3 },
+	};
+	u32 generic_commands[] = {
+		1, 0x212121c9, 0xf,
+		1, 0x212121ac, 0x3fff8842,
+		6, 0x212121dd, 0, 0x3e403c3c,
+		0x20000002, 0x20000002, 0, 2,
+		1, 0x212121b2, 7,
+		0x97080001, 0x11111003, 0x1111103f,
+		0x97080001, 0x22222003, 0x2222203f,
+	};
 	const struct drm_parhelia_packet packets[] = {
 		{ .offset = 0, .length = 3 },
 		{ .offset = 3, .length = 3 },
@@ -806,7 +823,7 @@ static int parhelia_range_call_static_selftest(void)
 		0x8f000001, 6, 9,
 		0x97080001, 0x11111003, 0x1111103f,
 	};
-	u32 copied[6] = { };
+	u32 copied[9] = { };
 	struct parhelia_call_plan *plan;
 	int ret = -EINVAL;
 
@@ -836,7 +853,7 @@ static int parhelia_range_call_static_selftest(void)
 	commands[8] = 0x2222203f;
 	if (parhelia_copy_packet_span(copied, commands, packets,
 				       plan->blocks[2], plan->packet_spans[2]) != 6 ||
-	    memcmp(copied, commands + 3, sizeof(copied)) ||
+	    memcmp(copied, commands + 3, 6 * sizeof(*copied)) ||
 	    copied[0] != 0x8f000001 || copied[3] != 0x8f000001 ||
 	    copied[4] != 0x22222003 || copied[5] != 0x2222203f)
 		goto out;
@@ -884,6 +901,39 @@ static int parhelia_range_call_static_selftest(void)
 	parhelia_pack_adjacent_packet_calls(plan, word_limit_packets, 2);
 	if (plan->count != 2 || plan->blocks[0] || plan->packet_spans[0] != 1 ||
 	    plan->blocks[1] != 1 || plan->packet_spans[1] != 1)
+		goto out;
+
+	/* Match a complete userspace state section: the opening watermark splits
+	 * its prefix, the WARP bind remains at the end of its packet span and is
+	 * immediately followed by the synthetic stage CALL, and ordinary state
+	 * plus both relocated-draw packet shapes share the final span.
+	 */
+	memset(plan, 0, sizeof(*plan));
+	plan->stage_modes[2] = 1;
+	if (parhelia_plan_calls(plan, ARRAY_SIZE(generic_packets), 1, false))
+		goto out;
+	parhelia_pack_adjacent_packet_calls(plan, generic_packets,
+					    ARRAY_SIZE(generic_packets));
+	if (plan->count != 7 || plan->blocks[0] != 0 ||
+	    plan->packet_spans[0] != 1 ||
+	    plan->blocks[1] != ARRAY_SIZE(generic_packets) ||
+	    plan->packet_spans[1] || plan->blocks[2] != 1 ||
+	    plan->packet_spans[2] != 2 ||
+	    plan->blocks[3] != ARRAY_SIZE(generic_packets) + 3 ||
+	    plan->packet_spans[3] || plan->blocks[4] != 3 ||
+	    plan->packet_spans[4] != 3 ||
+	    plan->blocks[5] != ARRAY_SIZE(generic_packets) + 1 ||
+	    plan->packet_spans[5] ||
+	    plan->blocks[6] != ARRAY_SIZE(generic_packets) + 2 ||
+	    plan->packet_spans[6])
+		goto out;
+	generic_commands[18] = 0x33333003;
+	generic_commands[19] = 0x3333303f;
+	if (parhelia_copy_packet_span(copied, generic_commands, generic_packets,
+				      plan->blocks[4], plan->packet_spans[4]) != 9 ||
+	    memcmp(copied, generic_commands + 14, sizeof(copied)) ||
+	    copied[3] != 0x97080001 || copied[4] != 0x33333003 ||
+	    copied[6] != 0x97080001 || copied[7] != 0x22222003)
 		goto out;
 	ret = 0;
 out:
@@ -2627,6 +2677,11 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 			!full_sync && !post_draw_wb && coalesce_primary ?
 			PARHELIA_ASYNC_SLOTS : 0;
 		break;
+	case PARHELIA_PARAM_PACK_ADJACENT:
+		args->value = pack_adjacent_packets && pdev->async_primary_cpu &&
+			!trace_submit && !full_sync && !post_draw_wb &&
+			coalesce_primary && !state_shadow_cache;
+		break;
 	case PARHELIA_PARAM_STATEFUL_SUBMIT:
 		args->value = stateful_submit && pdev->async_primary_cpu &&
 			!trace_submit && !full_sync && !post_draw_wb &&
@@ -2681,7 +2736,7 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	u32 fence_step = (replay_fences || full_sync) ? 16 : 8;
 	u32 fence_span;
 	u32 first_draw;
-	bool defer_packet_packing;
+	bool defer_packet_packing, generic_packet_packing;
 	const char *async_failure_stage = "request setup";
 	int ret = 0;
 
@@ -2690,8 +2745,11 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	static_assert(PARHELIA_PLAN_CAPACITY >=
 		      2u * PARHELIA_MAX_USER_PACKETS + 6u);
 	static_assert(PARHELIA_MAX_DRAW_DWORDS <= PARHELIA_DMA_BLOCK_DWORDS);
+	generic_packet_packing = async && pack_adjacent_packets &&
+		coalesce_primary && !trace_submit && !full_sync && !post_draw_wb &&
+		!state_shadow_cache;
 	defer_packet_packing = coalesce_primary && !trace_submit && !full_sync &&
-		!post_draw_wb && (pack_draw_packets || pack_adjacent_packets);
+		!post_draw_wb && (pack_draw_packets || generic_packet_packing);
 
 	if (args->flags & ~(PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC) ||
 	    !args->packet_count || args->packet_count > PARHELIA_MAX_USER_PACKETS ||
@@ -3274,7 +3332,7 @@ retry_slot:
 		}
 	}
 	if (defer_packet_packing) {
-		if (pack_adjacent_packets)
+		if (generic_packet_packing)
 			parhelia_pack_adjacent_packet_calls(plan, packets, args->packet_count);
 		else
 			parhelia_coalesce_draw_calls(plan, commands, packets,

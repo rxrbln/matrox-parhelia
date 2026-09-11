@@ -154,6 +154,8 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_TEXTURE_UPLOAD	22
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
+/* Validated generic adjacent-packet secondary-CALL packing is active. */
+#define PARHELIA_PARAM_PACK_ADJACENT	24
 
 #define PARHELIA_TEXTURE_PIPES_PAIRED	0
 #define PARHELIA_TEXTURE_PIPES_SINGLE	1
