@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 
@@ -524,6 +525,26 @@ static void parhelia_apply_vid_reset(struct parhelia_device *pdev,
 		       ~PARHELIA_DCT_RESET);
 }
 
+/* DC_START takes the same bank-encoded address as the engine's SURF
+ * operands: bank A is identity, bank B starts at 128 MiB.  A flat BAR offset
+ * into bank B leaves the controller fetching stale memory (P690 test with the
+ * native colour class at 64 MiB physical). */
+static int parhelia_scanout_address(struct parhelia_device *pdev,
+				    struct drm_gem_object *gem, u32 *address)
+{
+	int ret;
+
+	ret = parhelia_vram_gpu_addr(pdev, drm_gem_vram_of_gem(gem), 0,
+				     gem->size, address);
+	if (!ret && (*address > 0x0ffffc00 || !IS_ALIGNED(*address, 1024)))
+		ret = -ERANGE;
+	if (ret)
+		dev_warn_ratelimited(&pdev->pdev->dev,
+				     "scanout BO has no valid display address: %d\n",
+				     ret);
+	return ret;
+}
+
 static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 				 struct drm_crtc_state *crtc_state,
 				 struct drm_plane_state *plane_state)
@@ -532,7 +553,6 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	struct drm_display_mode *m = &crtc_state->adjusted_mode;
 	struct drm_framebuffer *fb = plane_state->fb;
 	struct drm_gem_object *gem;
-	struct drm_gem_vram_object *gbo;
 	struct parhelia_bo *bo;
 	u32 address;
 	u32 dc;
@@ -552,13 +572,8 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	gem = drm_gem_fb_get_obj(fb, 0);
 	if (!gem)
 		return;
-	gbo = drm_gem_vram_of_gem(gem);
 	bo = to_parhelia_bo(gem);
-	/* DC_START is a framebuffer-aperture byte offset.  It does not use the
-	 * graphics engine's discontinuous bank-A/bank-B address encoding. */
-	if (parhelia_vram_bar_addr(pdev, gbo, 0, gbo->bo.base.size,
-				   &address) ||
-	    address > 0x0ffffc00 || !IS_ALIGNED(address, 1024))
+	if (parhelia_scanout_address(pdev, gem, &address))
 		return;
 	pitch = bo->gpu_pitch / 4;
 
@@ -645,10 +660,7 @@ static void parhelia_pipe_update(struct drm_simple_display_pipe *pipe,
 			struct parhelia_bo *bo = gem ? to_parhelia_bo(gem) : NULL;
 			u32 address;
 
-			if (gem && !parhelia_vram_bar_addr(pdev,
-					drm_gem_vram_of_gem(gem), 0, gem->size,
-					&address) &&
-			    address <= 0x0ffffc00 && IS_ALIGNED(address, 1024)) {
+			if (gem && !parhelia_scanout_address(pdev, gem, &address)) {
 				u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
 				u32 format = 0x32030000 |
 					     (bo->gpu_pitch / 4);
