@@ -4091,10 +4091,14 @@ retry:
 			if (slot->state == PARHELIA_SLOT_QUEUED && slot->file == file) {
 				mutex_unlock(&pdev->submit_lock);
 				/* postclose must not release a CREATE_VERTEX allocation while an
-				 * in-flight class-3 batch still owns its GEM lookup. */
+				 * in-flight class-3 batch still owns its GEM lookup.  A retired
+				 * slot can be reused by another DRM client before this waiter runs;
+				 * ownership changing away from @file is therefore completion for
+				 * this close, even when the slot is already queued again. */
 				wait_event(pdev->submit_waitq,
 					READ_ONCE(pdev->wedged) ||
-					READ_ONCE(slot->state) != PARHELIA_SLOT_QUEUED);
+					READ_ONCE(slot->state) != PARHELIA_SLOT_QUEUED ||
+					READ_ONCE(slot->file) != file);
 				goto retry;
 			}
 		}
