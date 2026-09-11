@@ -1232,6 +1232,18 @@ ph_copy_present_quad(struct ph_context *ctx,
        !(dst->base.bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET)) ||
        !src->linear_map || (!dst->map && !dst->linear_map))
       return false;
+   /* Only the plain 7-dword XY/RGB/ST stream, and no fragment state which
+    * would make the result differ from a copy. */
+   if (ctx->vertex_alpha || ctx->alpha_micro || ctx->alpha_micro_cutout ||
+       ctx->cpu_alpha_cutout || ctx->rgb_alpha_two_pass ||
+       ctx->native_sampled_alpha ||
+       (ctx->blend && (ctx->blend->rt[0].blend_enable ||
+                       ctx->blend->logicop_enable ||
+                       ctx->blend->rt[0].colormask != PIPE_MASK_RGBA)) ||
+       (ctx->dsa && (ctx->dsa->alpha_enabled ||
+                     ctx->dsa->stencil[0].enabled)) ||
+       (ctx->rasterizer && ctx->rasterizer->scissor))
+      return false;
    for (unsigned v = 0; v < 6; v++) {
       const float *p = &ctx->vertices[v * 7];
       minx = MIN2(minx, p[0]);
@@ -1250,6 +1262,19 @@ ph_copy_present_quad(struct ph_context *ctx,
        height != (int)src->base.height0 ||
        x0 < 0 || y0 < 0 || x0 + width > (int)dst->base.width0 ||
        y0 + height > (int)dst->base.height0)
+      return false;
+   /* The copy places texel (s,t) at (x0 + s*w, y0 + t*h): every vertex must
+    * carry exactly that texture coordinate, unflipped. */
+   for (unsigned v = 0; v < 6; v++) {
+      const float *p = &ctx->vertices[v * 7];
+
+      if (fabsf(p[5] - (p[0] - x0) / width) > 0.001f ||
+          fabsf(p[6] - (p[1] - y0) / height) > 0.001f)
+         return false;
+   }
+   /* A render-shadow target has no linear companion for the GPU copy, and
+    * CPU writes to its shadow would never reach VRAM. */
+   if (dst->transfer_shadow && !dst->linear_handle)
       return false;
    /* The copy and its CPU fallback consume both mappings immediately. */
    if (ctx->aggregate_batches && ph_drain_batch(ctx))
