@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 /* Gallium screen and GEM resources for the kernel-owned Parhelia render path. */
 #include <errno.h>
 #include <fcntl.h>
@@ -160,8 +161,13 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
             supported = !(bind & PIPE_BIND_DEPTH_STENCIL);
             break;
          case PIPE_FORMAT_Z24_UNORM_S8_UINT:
-         case PIPE_FORMAT_S8_UINT_Z24_UNORM:
             supported = !(bind & PIPE_BIND_RENDER_TARGET);
+            break;
+         case PIPE_FORMAT_S8_UINT_Z24_UNORM:
+            /* Native 0x36 depth is the low 24 bits; this order has no
+             * depth/stencil surface descriptor. */
+            supported = !(bind & (PIPE_BIND_RENDER_TARGET |
+                                  PIPE_BIND_DEPTH_STENCIL));
             break;
          default:
             /* The texture unit consumes a 32-bit texel.  Gallium's format
@@ -1014,6 +1020,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * create the ARGB rendering+scanout front buffer requested by glamor. */
    caps->dmabuf = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
    caps->max_render_targets = 1;
+   /* The PLNWT solid fill takes an arbitrary rectangle and bit-plane mask;
+    * its tiled row order is characterized only for the P690 64x16 layout. */
+   caps->clear_scissored = caps->clear_masked =
+      s->tile_layout == PARHELIA_TILE_64X16_4K;
    /* Native shared render/scanout images support the chip's full 2048-pixel
     * surface extent.  DRI rejects a GBM image before resource_create() when
     * either dimension exceeds this cap, so reporting 1024 prevented glamor

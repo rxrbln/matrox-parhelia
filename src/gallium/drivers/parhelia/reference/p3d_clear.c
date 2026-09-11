@@ -29,11 +29,14 @@ p3d_surface_cfg_type(const struct p3d_surface *s, unsigned type)
 	       ((s->fmt & 0x3fu) << 24);
 }
 
+/* PLNWT (0x1324) is the fill's bit-plane mask, as in the vendor XAA solid
+ * fill.  Write it every time: 3D draws leave their colour mask in it. */
 void
 p3d_emit_clear(struct p3d_cs *cs, const struct p3d_surface *s, uint32_t value,
-	       uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+	       uint32_t write_mask, uint32_t x, uint32_t y, uint32_t w,
+	       uint32_t h)
 {
-	struct p3d_rw rw[10];
+	struct p3d_rw rw[11];
 	uint32_t cfg = p3d_surface_cfg(s);
 	size_t n = 0;
 
@@ -42,6 +45,7 @@ p3d_emit_clear(struct p3d_cs *cs, const struct p3d_surface *s, uint32_t value,
 	rw[n].reg = P3D_R_SURF1_BASE;     rw[n].val = s->base; n++;
 	rw[n].reg = P3D_R_SURF1_BASE + 4; rw[n].val = cfg;     n++;
 	rw[n].reg = 0x12c0;               rw[n].val = 0xffffffffu; n++;
+	rw[n].reg = P3D_R_COLMASK;        rw[n].val = write_mask; n++;
 	rw[n].reg = P3D_R_DWGCTL;         rw[n].val = P3D_DWGCTL_SOLID; n++;
 	rw[n].reg = P3D_R_FCOL;           rw[n].val = value;   n++;
 	rw[n].reg = 0x1304;               rw[n].val = 0;       n++;
@@ -82,7 +86,9 @@ p3d_emit_clear_frame(struct p3d_cs *cs, const struct p3d_state *st,
 	/* a tiled target only takes whole 32-row tile rows */
 	uint32_t h = (st->screen_h + 31) & ~31u;
 
-	p3d_emit_clear(cs, &st->colour, colour, 0, 0, st->screen_w, h);
+	p3d_emit_clear(cs, &st->colour, colour, 0xffffffffu, 0, 0,
+		       st->screen_w, h);
 	if (st->has_depth)
-		p3d_emit_clear(cs, &st->depth, depth, 0, 0, st->screen_w, h);
+		p3d_emit_clear(cs, &st->depth, depth, 0xffffffffu, 0, 0,
+			       st->screen_w, h);
 }

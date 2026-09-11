@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 /* Software vertex processing followed by native Parhelia raster submission. */
 #include <assert.h>
 #include <errno.h>
@@ -28,6 +29,7 @@
 #include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_pack_color.h"
+#include "util/u_surface.h"
 #include "util/u_transfer.h"
 #include "util/u_upload_mgr.h"
 
@@ -1020,6 +1022,7 @@ ph_apply_fragment_state(struct ph_context *ctx, struct p3d_state *state,
       state->mask_g = !!(blend->colormask & PIPE_MASK_G);
       state->mask_b = !!(blend->colormask & PIPE_MASK_B);
       state->mask_a = !!(blend->colormask & PIPE_MASK_A);
+      state->mask_explicit = true;
    }
    if (ctx->rasterizer && ctx->rasterizer->scissor) {
       state->scissor = true;
@@ -3060,6 +3063,7 @@ ph_submit_vertices(struct ph_context *ctx)
       state.mask_g = !!(blend->colormask & PIPE_MASK_G);
       state.mask_b = !!(blend->colormask & PIPE_MASK_B);
       state.mask_a = !!(blend->colormask & PIPE_MASK_A);
+      state.mask_explicit = true;
    }
    ph_apply_fragment_state(ctx, &state, depth != NULL);
    if (ctx->alpha_micro_cutout) {
@@ -4369,29 +4373,81 @@ ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *
       draw_set_zs_format(ctx->draw, fb->zsbuf.format);
 }
 
+/* PLNWT bit planes of the colour components enabled in @colormask. */
+static uint32_t
+ph_colour_write_mask(enum pipe_format format, unsigned colormask)
+{
+   const struct util_format_description *desc = util_format_description(format);
+   const unsigned surf_mask = util_format_colormask(desc);
+   uint32_t mask = 0;
+
+   if ((colormask & surf_mask) == surf_mask)
+      return 0xffffffffu;
+   for (unsigned c = 0; c < 4; c++) {
+      const unsigned s = desc->swizzle[c];
+
+      if (!(colormask & BITFIELD_BIT(c)) || s > PIPE_SWIZZLE_W)
+         continue;
+      mask |= BITFIELD_MASK(desc->channel[s].size) << desc->channel[s].shift;
+   }
+   return mask;
+}
+
+/* Native format 0x36 keeps Z24 in [23:0] and stencil in [31:24]. */
+static uint32_t
+ph_zs_write_mask(unsigned buffers, uint8_t stencil_mask)
+{
+   return ((buffers & PIPE_CLEAR_DEPTH) ? 0x00ffffffu : 0) |
+          ((buffers & PIPE_CLEAR_STENCIL) ? (uint32_t)stencil_mask << 24 : 0);
+}
+
 static void
 ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
-                 unsigned format, uint32_t value, unsigned width,
-                 unsigned height)
+                 unsigned format, uint32_t value, uint32_t write_mask,
+                 unsigned x, unsigned y, unsigned width, unsigned height)
 {
    struct parhelia_batch *batch = &ctx->build_batch;
+   unsigned alloc_height;
+   bool full;
    int ret;
-   if (!r || !r->handle || ctx->submit_error)
+   if (!r || !r->handle || ctx->submit_error || !write_mask)
       return;
    if (r->upload_texture) {
       ctx->submit_error = -EOPNOTSUPP;
       return;
+   }
+   if (x >= r->base.width0 || y >= r->base.height0)
+      return;
+   width = MIN2(width, r->base.width0 - x);
+   height = MIN2(height, r->base.height0 - y);
+   if (!width || !height)
+      return;
+   full = !x && !y && width == r->base.width0 &&
+          height == r->base.height0 && write_mask == 0xffffffffu;
+   /* A partial clear keeps old tiled bits, so an authoritative linear image
+    * must first become the tiled one. */
+   if (!full && r->linear_dirty) {
+      ph_resource_upload_tiled(r);
+      if (r->linear_dirty) {
+         ctx->submit_error = -EIO;
+         return;
+      }
    }
    if (getenv("PARHELIA_CPU_CLEAR") && r->map && !r->transfer_shadow) {
       /* The normal path queues this packet behind previous 3D work.  A CPU
        * diagnostic must establish the same ordering before touching the
        * tiled mapping directly. */
       ph_wait_async(ctx);
-      for (unsigned y = 0; y < height; y++)
-         for (unsigned x = 0; x < width; x++)
-            memcpy((uint8_t *)r->map +
-                   p3d_tile_offset_layout(x, y, r->stride, r->tile_layout),
-                   &value, sizeof(value));
+      for (unsigned j = y; j < y + height; j++)
+         for (unsigned i = x; i < x + width; i++) {
+            uint8_t *texel = (uint8_t *)r->map +
+               p3d_tile_offset_layout(i, j, r->stride, r->tile_layout);
+            uint32_t old;
+
+            memcpy(&old, texel, sizeof(old));
+            old = (old & ~write_mask) | (value & write_mask);
+            memcpy(texel, &old, sizeof(old));
+         }
       r->upload_dirty |= r->upload_texture;
       r->tiled_dirty = true;
       r->linear_dirty = false;
@@ -4399,14 +4455,27 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
       r->content_generation++;
       if (getenv("PARHELIA_TRACE"))
          fprintf(stderr,
-                 "parhelia: CPU clear resource=%u fmt=%#x value=%#x %ux%u stride=%u layout=%u\\n",
-                 r->handle, format, value, width, height, r->stride,
-                 r->tile_layout);
+                 "parhelia: CPU clear resource=%u fmt=%#x value=%#x mask=%#x %u,%u %ux%u stride=%u layout=%u\n",
+                 r->handle, format, value, write_mask, x, y, width, height,
+                 r->stride, r->tile_layout);
       return;
    }
-   ret = parhelia_batch_clear_surface(batch, r->handle, width,
-                                      ALIGN_POT(height, 32), r->stride,
-                                      format, value);
+   /* The kernel allocates whole tile rows: 16 on P690, 32 otherwise. */
+   alloc_height = ALIGN_POT(r->base.height0,
+                            r->tile_layout == PARHELIA_TILE_64X16_4K ? 16 : 32);
+   /* The whole-surface fill may also cover the padding tile rows. */
+   if (full)
+      height = alloc_height;
+   ret = parhelia_batch_clear_rect_surface(batch, r->handle, r->base.width0,
+                                           alloc_height, r->stride, format,
+                                           value, write_mask, x, y, width,
+                                           height,
+                                           r->tile_layout ==
+                                              PARHELIA_TILE_64X16_4K);
+   if (getenv("PARHELIA_TRACE"))
+      fprintf(stderr,
+              "parhelia: GPU clear resource=%u fmt=%#x value=%#x mask=%#x %u,%u %ux%u ret=%d\n",
+              r->handle, format, value, write_mask, x, y, width, height, ret);
    if (!ret)
       /* A clear has no CPU consumer before the next ordered 3D batch.  Use
        * the same fenced async queue as draws so Q3 does not retire colour and
@@ -4425,27 +4494,110 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
 }
 
 static void
+ph_clear_colour(struct ph_context *ctx, const struct pipe_surface *surf,
+                const union pipe_color_union *color, unsigned colormask,
+                unsigned x, unsigned y, unsigned width, unsigned height)
+{
+   const uint32_t mask = ph_colour_write_mask(surf->format, colormask);
+   union util_color packed;
+
+   if (!mask)
+      return;
+   util_pack_color(color->f, surf->format, &packed);
+   ph_clear_surface(ctx, ph_resource(surf->texture), 0x32, packed.ui[0],
+                    mask, x, y, width, height);
+}
+
+static void
+ph_clear_zs(struct ph_context *ctx, const struct pipe_surface *surf,
+            unsigned buffers, uint8_t stencil_mask, double depth,
+            unsigned stencil, unsigned x, unsigned y, unsigned width,
+            unsigned height)
+{
+   const uint32_t mask = ph_zs_write_mask(buffers, stencil_mask);
+
+   if (!mask)
+      return;
+   if (surf->format != PIPE_FORMAT_Z24_UNORM_S8_UINT) {
+      ctx->submit_error = -EOPNOTSUPP;
+      return;
+   }
+   ph_clear_surface(ctx, ph_resource(surf->texture), 0x36,
+                    util_pack_z_stencil(surf->format, depth, stencil), mask,
+                    x, y, width, height);
+}
+
+static void
 ph_clear(struct pipe_context *p, unsigned buffers, uint32_t color_mask,
          uint8_t stencil_mask, const struct pipe_scissor_state *scissor,
          const union pipe_color_union *color, double depth, unsigned stencil)
 {
    struct ph_context *ctx = ph_context(p);
-   union util_color packed;
-   (void)color_mask;
-   (void)stencil_mask;
-   (void)scissor;
+   unsigned x0 = 0, y0 = 0, x1 = ctx->fb.width, y1 = ctx->fb.height;
+
    ph_submit_vertices(ctx);
+   if (scissor) {
+      x0 = MIN2(scissor->minx, x1);
+      y0 = MIN2(scissor->miny, y1);
+      x1 = MIN2(scissor->maxx, x1);
+      y1 = MIN2(scissor->maxy, y1);
+   }
+   if (x0 >= x1 || y0 >= y1)
+      return;
    if ((buffers & PIPE_CLEAR_COLOR0) && ctx->fb.nr_cbufs &&
-       ctx->fb.cbufs[0].texture) {
-      util_pack_color(color[0].f, ctx->fb.cbufs[0].format, &packed);
-      ph_clear_surface(ctx, ph_resource(ctx->fb.cbufs[0].texture), 0x32,
-                       packed.ui[0], ctx->fb.width, ctx->fb.height);
+       ctx->fb.cbufs[0].texture)
+      ph_clear_colour(ctx, &ctx->fb.cbufs[0], &color[0],
+                      color_mask & PIPE_MASK_RGBA, x0, y0, x1 - x0, y1 - y0);
+   if ((buffers & PIPE_CLEAR_DEPTHSTENCIL) && ctx->fb.zsbuf.texture)
+      ph_clear_zs(ctx, &ctx->fb.zsbuf, buffers, stencil_mask, depth, stencil,
+                  x0, y0, x1 - x0, y1 - y0);
+}
+
+/* The clear packet addresses the base image only. */
+static bool
+ph_surface_is_base(const struct pipe_surface *surf)
+{
+   return surf->texture && surf->texture->target != PIPE_BUFFER &&
+          !surf->level && !surf->first_layer && !surf->last_layer;
+}
+
+static void
+ph_clear_render_target(struct pipe_context *p, struct pipe_surface *dst,
+                       const union pipe_color_union *color,
+                       unsigned dstx, unsigned dsty,
+                       unsigned width, unsigned height,
+                       bool render_condition_enabled)
+{
+   struct ph_context *ctx = ph_context(p);
+
+   (void)render_condition_enabled;
+   ph_submit_vertices(ctx);
+   if (!ph_surface_is_base(dst) || ph_resource(dst->texture)->upload_texture) {
+      util_clear_render_target(p, dst, color, dstx, dsty, width, height);
+      return;
    }
-   if ((buffers & PIPE_CLEAR_DEPTHSTENCIL) && ctx->fb.zsbuf.texture) {
-      uint32_t z = util_pack_z_stencil(ctx->fb.zsbuf.format, depth, stencil);
-      ph_clear_surface(ctx, ph_resource(ctx->fb.zsbuf.texture), 0x36, z,
-                       ctx->fb.width, ctx->fb.height);
+   ph_clear_colour(ctx, dst, color, PIPE_MASK_RGBA, dstx, dsty, width,
+                   height);
+}
+
+static void
+ph_clear_depth_stencil(struct pipe_context *p, struct pipe_surface *dst,
+                       unsigned clear_flags, double depth, unsigned stencil,
+                       unsigned dstx, unsigned dsty,
+                       unsigned width, unsigned height,
+                       bool render_condition_enabled)
+{
+   struct ph_context *ctx = ph_context(p);
+
+   (void)render_condition_enabled;
+   ph_submit_vertices(ctx);
+   if (!ph_surface_is_base(dst) || ph_resource(dst->texture)->upload_texture) {
+      util_clear_depth_stencil(p, dst, clear_flags, depth, stencil, dstx,
+                               dsty, width, height);
+      return;
    }
+   ph_clear_zs(ctx, dst, clear_flags, 0xff, depth, stencil, dstx, dsty,
+               width, height);
 }
 
 static void
@@ -5157,6 +5309,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.resource_copy_region = ph_resource_copy_region;
    ctx->base.blit = ph_blit;
    ctx->base.clear = ph_clear;
+   ctx->base.clear_render_target = ph_clear_render_target;
+   ctx->base.clear_depth_stencil = ph_clear_depth_stencil;
    ctx->base.create_blend_state = ph_create_blend;
    ctx->base.bind_blend_state = ph_bind_blend;
    ctx->base.delete_blend_state = ph_delete_state;

@@ -307,8 +307,10 @@ struct p3d_state {
 	int		   dither;
 	/* 0x1324 colour write mask, one byte per channel in the render
 	 * target's own order: B [7:0], G [15:8], R [23:16], A [31:24].
-	 * glColorMask(1,0,1,1) was captured as 0xffff00ff. */
+	 * glColorMask(1,0,1,1) was captured as 0xffff00ff.  All four clear
+	 * means all channels on unless mask_explicit asks for no colour writes. */
 	int		   mask_r, mask_g, mask_b, mask_a;
+	int		   mask_explicit;
 	/* Transform.  With a transforming WARP program the vertices arrive in
 	 * clip space and the program reads the matrix from the constant file:
 	 * c0..c3 are the MVP rows (c[r] = M[r], M[r+4], M[r+8], M[r+12]), c8 is
@@ -402,12 +404,13 @@ struct p3d_state {
 /* Emit the whole per-batch state.  Call once, then p3d_emit_draw per
  * primitive. */
 /* the 2D solid fill; must be emitted BEFORE p3d_emit_state, which rebinds the
- * surface slots the fill overwrites.  Z24 is unsigned normalised: far = 0x00ffffff */
+ * surface slots the fill overwrites.  Z24 is unsigned normalised: far = 0x00ffffff
+ * write_mask is PLNWT: destination bits outside it keep their old value. */
 #define P3D_ZCLEAR_FAR	0x00ffffffu
 #define P3D_ZCLEAR_NEAR	0x00000000u
 void	 p3d_emit_clear(struct p3d_cs *cs, const struct p3d_surface *s,
-			uint32_t value, uint32_t x, uint32_t y,
-			uint32_t w, uint32_t h);
+			uint32_t value, uint32_t write_mask, uint32_t x,
+			uint32_t y, uint32_t w, uint32_t h);
 void	 p3d_emit_blit(struct p3d_cs *cs, const struct p3d_surface *dst,
 		       unsigned dst_type, uint32_t dst_x, uint32_t dst_y,
 		       const struct p3d_surface *src, unsigned src_type,

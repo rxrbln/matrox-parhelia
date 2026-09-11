@@ -197,7 +197,8 @@ p3d_tex_wrap(const struct p3d_texture *t)
 static uint32_t
 p3d_colour_mask(const struct p3d_state *st)
 {
-	if (!st->mask_r && !st->mask_g && !st->mask_b && !st->mask_a)
+	if (!st->mask_explicit &&
+	    !st->mask_r && !st->mask_g && !st->mask_b && !st->mask_a)
 		return 0xffffffffu;	/* nothing set = all channels on */
 	return (st->mask_b ? 0x000000ffu : 0u) |
 	       (st->mask_g ? 0x0000ff00u : 0u) |
