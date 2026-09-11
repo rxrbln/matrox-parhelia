@@ -723,7 +723,6 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	struct drm_framebuffer *fb = plane_state->fb;
 	struct drm_gem_object *gem;
 	struct parhelia_bo *bo;
-	u32 address;
 	u32 cpp, pitch_pixels;
 
 	if (crtc_state->color_mgmt_changed) {
@@ -751,23 +750,75 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	    bo->gpu_pitch / cpp != ALIGN(fb->width, 64) ||
 	    bo->gpu_pitch / cpp > 0x3fff)
 		return -EINVAL;
-	if (parhelia_vram_bar_addr(to_parhelia(pipe->crtc.dev), &bo->gbo,
-				   0, bo->gbo.bo.base.size, &address) ||
-	    address > 0x0ffffc00 || !IS_ALIGNED(address, 1024))
-		return -EINVAL;
+	/* Atomic check runs before begin_fb_access() pins the new framebuffer.
+	 * drm_gem_vram_offset() is therefore invalid here and would both WARN and
+	 * reject an otherwise valid first modeset.  The VRAM helper pins and
+	 * places the BO before enable()/update(); those callbacks validate the
+	 * resulting controller address before programming DC_START.
+	 */
 	return 0;
 }
 
 static int parhelia_pipe_begin_fb_access(struct drm_simple_display_pipe *pipe,
 					 struct drm_plane_state *plane_state)
 {
-	return drm_gem_vram_plane_helper_prepare_fb(&pipe->plane, plane_state);
+	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
+	struct drm_framebuffer *fb = plane_state->fb;
+	struct drm_gem_object *gem;
+	struct parhelia_bo *bo;
+	u8 old_class;
+	int ret;
+
+	if (!fb)
+		return 0;
+	gem = drm_gem_fb_get_obj(fb, 0);
+	if (!gem || !parhelia_gem_is_owned(gem))
+		return -EINVAL;
+	bo = to_parhelia_bo(gem);
+
+	/* Capture PRIME/render synchronization before changing placement.  The
+	 * render queue must then retire so its temporary pin cannot make the
+	 * scanout pin silently retain a render anchor. */
+	ret = drm_gem_plane_helper_prepare_fb(&pipe->plane, plane_state);
+	if (ret)
+		return ret;
+	if (plane_state->fence) {
+		ret = dma_fence_wait(plane_state->fence, true);
+		if (ret)
+			return ret;
+	}
+	ret = parhelia_submit_idle_lock(pdev);
+	if (ret)
+		return ret;
+	old_class = bo->placement_class;
+	bo->placement_class = PARHELIA_PLACEMENT_SCANOUT;
+	ret = parhelia_vram_pin(&bo->gbo);
+	if (ret)
+		bo->placement_class = old_class;
+	mutex_unlock(&pdev->submit_lock);
+	return ret;
 }
 
 static void parhelia_pipe_end_fb_access(struct drm_simple_display_pipe *pipe,
 					struct drm_plane_state *plane_state)
 {
-	drm_gem_vram_plane_helper_cleanup_fb(&pipe->plane, plane_state);
+	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
+	struct drm_framebuffer *fb = plane_state->fb;
+	struct drm_gem_object *gem;
+	struct parhelia_bo *bo;
+
+	if (!fb)
+		return;
+	gem = drm_gem_fb_get_obj(fb, 0);
+	if (!gem || !parhelia_gem_is_owned(gem))
+		return;
+	bo = to_parhelia_bo(gem);
+	mutex_lock(&pdev->submit_lock);
+	parhelia_vram_unpin(&bo->gbo);
+	if (!bo->host_aperture)
+		bo->placement_class = parhelia_bo_is_native(bo) ?
+			PARHELIA_PLACEMENT_RENDER : PARHELIA_PLACEMENT_GENERIC;
+	mutex_unlock(&pdev->submit_lock);
 }
 
 static const struct drm_simple_display_pipe_funcs parhelia_pipe_funcs = {
