@@ -399,6 +399,8 @@ struct parhelia_bo {
 	u8 aperture_slot;
 	u8 placement_class;
 	bool host_aperture;
+	/* Pinned from creation until free. */
+	bool resident;
 };
 
 static inline struct parhelia_bo *to_parhelia_bo(struct drm_gem_object *gem)

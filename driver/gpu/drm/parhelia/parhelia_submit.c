@@ -3066,6 +3066,18 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	else if (args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 				PARHELIA_CREATE_RENDER_NATIVE_DEPTH))
 		parhelia_bo_force_unmappable(bo);
+	/* TTM moves VRAM objects with a CPU copy through BAR0, which on P690 is
+	 * a translated aperture rather than a linear view of VRAM: a moved
+	 * texture lost everything past its first 16 KiB.  Keep render and
+	 * texture storage resident for its whole lifetime instead. */
+	if (pdev->pdev->device == PARHELIA_P690) {
+		ret = parhelia_vram_pin(bo);
+		if (ret) {
+			drm_gem_object_put(&bo->bo.base);
+			return ret;
+		}
+		to_parhelia_bo(&bo->bo.base)->resident = true;
+	}
 	ret = drm_gem_handle_create(file, &bo->bo.base, &handle);
 	if (!ret && !(args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 				  PARHELIA_CREATE_RENDER_NATIVE_DEPTH)) &&

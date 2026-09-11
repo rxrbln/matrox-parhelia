@@ -538,6 +538,8 @@ static void parhelia_raw_object_free(struct drm_gem_object *gem)
 
 	parhelia_root_trace_check(pdev, "raw_free:enter",
 				  to_parhelia_bo(gem)->layout, gem->size, 0);
+	if (to_parhelia_bo(gem)->resident)
+		parhelia_vram_unpin(drm_gem_vram_of_gem(gem));
 	drm_gem_vram_put(drm_gem_vram_of_gem(gem));
 }
 
