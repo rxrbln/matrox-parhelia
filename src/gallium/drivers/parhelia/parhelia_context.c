@@ -396,6 +396,8 @@ ph_now_ns(void)
    return ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
+static void ph_hang_write(void);
+
 static int
 ph_wait_fence_counted(struct ph_context *ctx, uint32_t fence)
 {
@@ -407,6 +409,8 @@ ph_wait_fence_counted(struct ph_context *ctx, uint32_t fence)
       ctx->stat.waits++;
       ctx->stat.wait_ns += ph_now_ns() - start;
    }
+   if (ret == -EIO)
+      ph_hang_write();
    return ret;
 }
 
@@ -539,6 +543,39 @@ ph_create_vertex_ring(struct ph_context *ctx)
               screen->async_slots);
 }
 
+/* The P690 draw programs depend on WARP temporary T2, which only the
+ * passthrough, multitexture and replace programs write; after power-on it
+ * holds garbage and textured draws are rejected until one of them ran.  A
+ * degenerate passthrough triangle at context creation initializes it. */
+static void
+ph_prime_warp(struct ph_context *ctx)
+{
+   struct parhelia_screen *screen = ph_screen(ctx->base.screen);
+   struct drm_parhelia_create_render target = {
+      .flags = PARHELIA_CREATE_RENDER_NATIVE_COLOR, .width = 64, .height = 16,
+   };
+   struct parhelia_batch *batch = &ctx->build_batch;
+   static const float point[3][5] = {
+      {1, 1, 0, 0, 0}, {1, 1, 0, 0, 0}, {1, 1, 0, 0, 0},
+   };
+   uint32_t fence = 0;
+
+   if (screen->chip_id != 0x2539 ||
+       ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &target))
+      return;
+   struct p3d_state state = {
+      .colour = {.pitch = target.pitch / 4, .fmt = 0x32},
+      .screen_w = 64, .screen_h = 16, .prim = P3D_TRIANGLES,
+      .warp_entry = ctx->warp_passthrough, .dw_per_vertex = 5,
+   };
+
+   if (!parhelia_batch_state(batch, target.handle, 0, &state, 1) &&
+       !parhelia_batch_submit_async(screen->fd, batch, point, 15, &fence))
+      parhelia_wait_fence(screen->fd, fence, 2000000000ll, NULL);
+   struct drm_gem_close close_bo = {.handle = target.handle};
+   ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close_bo);
+}
+
 static bool
 ph_batch_has_full_boundary(const struct parhelia_batch *batch)
 {
@@ -553,6 +590,29 @@ ph_submit_batch_now_untimed(struct ph_context *ctx,
                             const struct parhelia_batch *batch,
                             const void *vertices, unsigned vertex_dwords);
 
+static void
+ph_write_batch(FILE *dump, const struct parhelia_batch *batch,
+               unsigned serial, uint32_t fence)
+{
+   fprintf(dump, "submit %u fence %#x packets %u dwords %u relocs %u\n",
+           serial, fence, batch->packet_count, batch->command_count,
+           batch->reloc_count);
+   for (unsigned i = 0; i < batch->packet_count; i++) {
+      const struct drm_parhelia_packet *packet = &batch->packets[i];
+
+      fprintf(dump, " p%u:", i);
+      for (unsigned w = 0; w < packet->length &&
+                           packet->offset + w < batch->command_count; w++)
+         fprintf(dump, " %08x", batch->commands[packet->offset + w]);
+      fprintf(dump, "\n");
+   }
+   for (unsigned i = 0; i < batch->reloc_count; i++)
+      fprintf(dump, " r%u: type %u packet %u dword %u handle %u delta %#x\n",
+              i, batch->relocs[i].type, batch->relocs[i].packet,
+              batch->relocs[i].dword, batch->relocs[i].handle,
+              batch->relocs[i].delta);
+}
+
 /* PARHELIA_DUMP_BATCHES=path appends every submitted batch's packets. */
 static void
 ph_dump_batch(const struct parhelia_batch *batch)
@@ -565,18 +625,75 @@ ph_dump_batch(const struct parhelia_batch *batch)
       return;
    if (!dump && !(dump = fopen(path, "a")))
       return;
-   fprintf(dump, "submit %u packets %u dwords %u relocs %u\n", serial++,
-           batch->packet_count, batch->command_count, batch->reloc_count);
-   for (unsigned i = 0; i < batch->packet_count; i++) {
-      const struct drm_parhelia_packet *packet = &batch->packets[i];
+   ph_write_batch(dump, batch, serial++, 0);
+   fflush(dump);
+}
 
-      fprintf(dump, " p%u:", i);
-      for (unsigned w = 0; w < packet->length &&
-                           packet->offset + w < batch->command_count; w++)
-         fprintf(dump, " %08x", batch->commands[packet->offset + w]);
+/* The last submitted batches, written to /tmp/parhelia-hang-PID.txt (or
+ * PARHELIA_HANG_DUMP) when the kernel first reports an engine hang. */
+#define PH_HANG_HISTORY 16
+
+static struct {
+   struct parhelia_batch *batch[PH_HANG_HISTORY];
+   float *vertices[PH_HANG_HISTORY];
+   unsigned vertex_dwords[PH_HANG_HISTORY];
+   uint32_t fence[PH_HANG_HISTORY];
+   unsigned next, serial;
+   bool written;
+} ph_hang;
+
+static void
+ph_hang_record(const struct parhelia_batch *batch, const void *vertices,
+               unsigned vertex_dwords, uint32_t fence)
+{
+   unsigned slot = ph_hang.next++ % PH_HANG_HISTORY;
+
+   if (!ph_hang.batch[slot] &&
+       (!(ph_hang.batch[slot] = MALLOC(sizeof(*batch))) ||
+        !(ph_hang.vertices[slot] = MALLOC(PH_BATCH_VERTEX_DWORDS * 4)))) {
+      FREE(ph_hang.batch[slot]);
+      ph_hang.batch[slot] = NULL;
+      return;
+   }
+   memcpy(ph_hang.batch[slot], batch, sizeof(*batch));
+   ph_hang.vertex_dwords[slot] = vertices ?
+      MIN2(vertex_dwords, PH_BATCH_VERTEX_DWORDS) : 0;
+   memcpy(ph_hang.vertices[slot], vertices ? vertices : ph_hang.vertices[slot],
+          ph_hang.vertex_dwords[slot] * 4);
+   ph_hang.fence[slot] = fence;
+   ph_hang.serial++;
+}
+
+static void
+ph_hang_write(void)
+{
+   char path[64];
+   const char *env = getenv("PARHELIA_HANG_DUMP");
+   FILE *dump;
+
+   if (ph_hang.written)
+      return;
+   ph_hang.written = true;
+   snprintf(path, sizeof(path), "/tmp/parhelia-hang-%d.txt", (int)getpid());
+   dump = fopen(env ? env : path, "w");
+   if (!dump)
+      return;
+   for (unsigned i = 0; i < PH_HANG_HISTORY; i++) {
+      unsigned slot = (ph_hang.next + i) % PH_HANG_HISTORY;
+
+      if (!ph_hang.batch[slot])
+         continue;
+      ph_write_batch(dump, ph_hang.batch[slot],
+                     ph_hang.serial - PH_HANG_HISTORY + i,
+                     ph_hang.fence[slot]);
+      fprintf(dump, " vertices %u:", ph_hang.vertex_dwords[slot]);
+      for (unsigned v = 0; v < ph_hang.vertex_dwords[slot]; v++)
+         fprintf(dump, " %g", ph_hang.vertices[slot][v]);
       fprintf(dump, "\n");
    }
-   fflush(dump);
+   fclose(dump);
+   fprintf(stderr, "parhelia: engine hang, last batches written to %s\n",
+           env ? env : path);
 }
 
 static int
@@ -589,8 +706,14 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
    if (ph_env("PARHELIA_DUMP_BATCHES"))
       ph_dump_batch(batch);
 
-   if (!ctx->stats_sync)
-      return ph_submit_batch_now_untimed(ctx, batch, vertices, vertex_dwords);
+   if (!ctx->stats_sync) {
+      ret = ph_submit_batch_now_untimed(ctx, batch, vertices, vertex_dwords);
+      if (!ret)
+         ph_hang_record(batch, vertices, vertex_dwords, ctx->fence);
+      else if (ret == -EIO)
+         ph_hang_write();
+      return ret;
+   }
    start = ph_now_ns();
    ret = ph_submit_batch_now_untimed(ctx, batch, vertices, vertex_dwords);
    if (!ret && ctx->async_pending) {
@@ -5382,8 +5505,6 @@ ph_copy_texture_box(struct ph_context *ctx,
    dr->mip_defined |= BITFIELD_BIT(dst_level);
    dr->content_generation++;
    FREE(staging);
-   if (dr->upload_texture)
-      ph_resource_upload_texture(dr);
    return true;
 }
 
@@ -5925,11 +6046,9 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
             r->linear_dirty = false;
          }
       }
-      /* Upload now to keep ordinary texture creation eager.  A temporary
-       * aperture allocation failure leaves upload_dirty set; sampler bind
-       * retries it before allowing a draw to reference this BO. */
-      if (r->upload_texture)
-         ph_resource_upload_texture(r);
+      /* The upload is deferred to the first draw that samples the texture:
+       * uploading the whole BO per level made loading a mip chain cost one
+       * full-object aperture transfer per level. */
    }
    FREE(t->staging);
    FREE(t);
@@ -6118,6 +6237,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
 	if (!ctx->base.stream_uploader)
 	   goto fail;
 	ph_create_vertex_ring(ctx);
+	ph_prime_warp(ctx);
    if (ctx->aggregate_batches && ph_env("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: aggregation limits commands=%u vertices=%u packets=%u relocs=%u kernel_packets=%u dma_ring=%u\n",
