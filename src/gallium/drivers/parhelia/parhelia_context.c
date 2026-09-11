@@ -38,6 +38,8 @@
 #include "parhelia_batch.h"
 #include "parhelia_internal.h"
 #include "parhelia_sampler.h"
+#include "parhelia_fs_compile.h"
+#include "parhelia_vs_compile.h"
 
 struct ph_velems {
    unsigned count;
@@ -64,6 +66,10 @@ struct ph_fs {
    enum p3d_texenv texenv;
    unsigned coord_semantic;
    unsigned coord_index;
+   /* The data-flow compiler's result.  Valid only for shaders whose colour
+    * expression the combiner can evaluate; everything else keeps the
+    * instruction-shape matcher above and the draw module. */
+   struct ph_fs_program program;
 };
 
 struct ph_transfer {
@@ -93,6 +99,7 @@ static int ph_prepare_alpha_companions(struct ph_context *ctx,
 static uint64_t ph_texture_base_hash(const struct parhelia_resource *texture,
                                      bool tiled, unsigned *alpha_zero,
                                      unsigned *alpha_nonzero);
+static const struct p3d_comb_program *ph_compiled_combiner(struct ph_context *ctx);
 static bool ph_copy_texture_box(struct ph_context *ctx,
                                 struct pipe_resource *dst, unsigned dst_level,
                                 int dstx, int dsty,
@@ -3389,6 +3396,7 @@ ph_submit_vertices(struct ph_context *ctx)
       tex.filter = ph_sampler_filter_word(&tex, sampler);
       tex.wrap = ph_sampler_wrap_word(&tex, sampler);
       tex.env = ctx->fs->texenv;
+      state.comb = ph_compiled_combiner(ctx);
       state.tex = &tex;
       state.warp_entry = (texture1 || ctx->native_sampled_alpha) ?
                          ctx->warp_textured_multitex :
@@ -4867,6 +4875,36 @@ ph_nir_texenv(nir_shader *nir, enum p3d_texenv fallback)
    return fallback;
 }
 
+/* Use the compiled combiner program when it matches this draw.  The special
+ * alpha routes own their own combiner words, and the serial multitexture
+ * passes rewrite the environment per pass, so they keep the fixed-function
+ * emission.  Opt-in until the compiler has been through the GL tests. */
+static const struct p3d_comb_program *
+ph_compiled_combiner(struct ph_context *ctx)
+{
+   struct ph_fs *fs = ctx->fs;
+   const uint8_t *base = NULL;
+
+   if (!fs || !fs->program.valid || !ph_env("PARHELIA_FS_COMPILER"))
+      return NULL;
+   if (ctx->native_sampled_alpha || ctx->vertex_alpha || ctx->alpha_micro ||
+       ctx->alpha_micro_cutout || ctx->cpu_alpha_cutout ||
+       ctx->rgb_alpha_two_pass)
+      return NULL;
+   if (fs->program.const_ref_count) {
+      if (ctx->user_constants[MESA_SHADER_FRAGMENT])
+         base = ctx->user_constants[MESA_SHADER_FRAGMENT];
+      else if (ctx->constants[MESA_SHADER_FRAGMENT])
+         base = ph_resource(ctx->constants[MESA_SHADER_FRAGMENT])->malloc_data;
+      if (!base)
+         return NULL;
+      ph_fs_update_constants(&fs->program,
+                             base + ctx->constant_offset[MESA_SHADER_FRAGMENT],
+                             ctx->constant_size[MESA_SHADER_FRAGMENT]);
+   }
+   return &fs->program.comb;
+}
+
 static void *ph_create_fs(struct pipe_context *p,
                           const struct pipe_shader_state *s)
 {
@@ -4911,6 +4949,23 @@ static void *ph_create_fs(struct pipe_context *p,
                                       P3D_TEXENV_REPLACE;
          if (s->type == PIPE_SHADER_IR_NIR)
             fs->texenv = ph_nir_texenv(s->ir.nir, fs->texenv);
+         if (s->type == PIPE_SHADER_IR_NIR) {
+            /* Slot 0 merges the ganged texture pipes and, with two units,
+             * slot 1 merges the second; the rest of the five-instruction
+             * quantum is the program's. */
+            unsigned units = util_bitcount(fs->sampler_mask);
+            unsigned budget = P3D_COMB_QUANTUM - (units > 0) - (units > 1);
+
+            if (ph_fs_compile(s->ir.nir, budget, &fs->program) &&
+                fs->program.sampler_mask != fs->sampler_mask)
+               fs->program.valid = false;
+         }
+         if (ph_env("PARHELIA_TRACE")) {
+            fprintf(stderr,
+                    "parhelia: fs=%p combiner %s (%u instructions, %u runtime constants)\n",
+                    (void *)fs, fs->program.valid ? "compiled" : "not compiled",
+                    fs->program.comb.count, fs->program.const_ref_count);
+         }
          if (ph_env("PARHELIA_TRACE")) {
             fprintf(stderr,
                     "parhelia: create fs=%p samplers=%#x serial=%u texenv=%u inputs=%u uses_color=%u coord=%u/%u\n",

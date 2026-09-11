@@ -207,6 +207,100 @@ enum p3d_texenv { P3D_TEXENV_MODULATE = 0, P3D_TEXENV_REPLACE = 1,
 #define P3D_COMBINER_CONST(lo, hi) \
 	(((uint32_t)(lo) & 0x7ffu) | (((uint32_t)(hi) & 0x7ffu) << 16))
 
+/* ---- WARP vertex programs ----------------------------------------------
+ *
+ * A 96-bit bundle is a primary operation writing destination port B plus an
+ * optional secondary operation that reads src2 and writes port A.  Encoding
+ * and evidence: docs/parhelia-p690-warp-isa-re.md.
+ */
+enum p3d_warp_src_file {
+	P3D_WARP_FILE_V = 0,	/* vertex-fetch input */
+	P3D_WARP_FILE_R = 1,	/* temporary */
+	P3D_WARP_FILE_T = 2,	/* latch */
+	P3D_WARP_FILE_C = 3,	/* constant / engine block state */
+};
+
+enum p3d_warp_dst_file {
+	P3D_WARP_FILE_DST_T = 0,	/* latch; T1 is the address register */
+	P3D_WARP_FILE_DST_R = 1,
+	P3D_WARP_FILE_DST_O = 2,	/* output slot */
+	P3D_WARP_FILE_DST_C = 3,	/* constant file - never from userspace */
+};
+
+/* Three bits per component: 0..3 select x y z w, 4 is the literal 0.0 and 5
+ * the literal 1.0, which is how a program gets constants without a slot. */
+#define P3D_WARP_SWZ(x, y, z, w) \
+	((uint16_t)((x) | ((y) << 3) | ((z) << 6) | ((w) << 9)))
+#define P3D_WARP_SWZ_IDENTITY	P3D_WARP_SWZ(0, 1, 2, 3)	/* 0x688 */
+#define P3D_WARP_SWZ_ZERO	P3D_WARP_SWZ(4, 4, 4, 4)	/* 0x924 */
+#define P3D_WARP_SWZ_ONE	P3D_WARP_SWZ(5, 5, 5, 5)	/* 0xb6d */
+#define P3D_WARP_SWZ_XYZ1	P3D_WARP_SWZ(0, 1, 2, 5)
+#define P3D_WARP_SWZ_XYZ0	P3D_WARP_SWZ(0, 1, 2, 4)
+
+enum p3d_warp_op {
+	P3D_WARP_WRA = 0x60,	/* arithmetic no-op, carries a secondary op */
+	P3D_WARP_MAX = 0x62,
+	P3D_WARP_ADD = 0x71,
+	P3D_WARP_MUL = 0x75,
+	P3D_WARP_MAD = 0x76,	/* s0 * s1 + s2 */
+	P3D_WARP_DP4 = 0x77,
+	P3D_WARP_DP3 = 0x78,
+	P3D_WARP_SMUL = 0x89,	/* dst.c = s1.c * (1 / s0.w): perspective divide */
+};
+
+#define P3D_WARP_SOP_MOV 1
+
+/* Fixed-function vertex-fetch slots, in the classic D3D numbering the
+ * attribute descriptors use. */
+#define P3D_WARP_V_POSITION	0
+#define P3D_WARP_V_COLOUR	5
+#define P3D_WARP_V_TEXCOORD0	7
+
+struct p3d_warp_src {
+	uint8_t  file;		/* enum p3d_warp_src_file */
+	uint8_t  index;		/* 0..127; above 15 uses the extension field */
+	uint8_t  neg;
+	uint16_t swizzle;
+};
+
+struct p3d_warp_inst {
+	uint8_t op;		/* primary opcode */
+	uint8_t dst_file, dst_index, dst_mask;
+	uint8_t nsrc;
+	struct p3d_warp_src src[3];
+	uint8_t sop;		/* secondary opcode, 0 = none */
+	uint8_t sdst_file, sdst_index, sdst_mask;
+	struct p3d_warp_src ssrc;	/* the secondary operand, i.e. src2 */
+};
+
+void p3d_warp_encode(const struct p3d_warp_inst *in, uint32_t out[3]);
+
+/* The shapes a fixed-function vertex pipeline needs.  A transforming program
+ * reads the matrix from @matrix_slot..+3 and the viewport pair from
+ * @viewport_scale_slot / @viewport_offset_slot, does the perspective divide
+ * itself and hands the setup unit a window-space position.
+ *
+ * @write_t2 primes WARP temporary T2, which every draw depends on.  A program
+ * that samples a texture must NOT write it: doing so locked the engine on the
+ * first vertex-alpha draw.  See docs/parhelia-p690-warp-isa-re.md section 3.3.
+ */
+struct p3d_warp_shape {
+	int	 transform;
+	unsigned matrix_slot;
+	unsigned viewport_scale_slot, viewport_offset_slot;
+	int	 light;
+	unsigned light_slot, material_slot, ambient_slot;
+	int	 colour_white;	/* GL_REPLACE: force the vertex colour to 1 */
+	int	 write_t2;
+	int	 clip_copy;	/* o11 <- the pre-viewport position */
+	unsigned texcoords;	/* o3 <- v7, o4 <- v8, ... */
+};
+
+/* Returns the instruction count including END and its padding word, or 0 when
+ * the program does not fit in @max instructions. */
+unsigned p3d_warp_build(const struct p3d_warp_shape *shape, uint32_t *out,
+			unsigned max);
+
 /* ---- programmable fragment combiner -----------------------------------
  *
  * The five fixed-function texenv shapes above are special cases of a small
