@@ -11,7 +11,8 @@ The three principal source files had SHA-256 prefixes `644bd1a1` (context),
 `07e17ddc` (screen), and `4a5ece5b` (state emitter).  Later changes must re-audit
 the affected rows rather than assuming this snapshot still applies.  This
 snapshot includes Mesa commits `e4a6857` (unit lines), `83c89f6` (2x
-anisotropy), and `8a80b19` (stencil, scissor, and blend state).
+anisotropy), `78a7bd5` (stencil, scissor, and blend state), and `eb7c52e`
+(batched consecutive lines).
 
 Status has a deliberately strict meaning:
 
