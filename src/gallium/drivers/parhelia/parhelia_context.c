@@ -272,6 +272,22 @@ ph_context(struct pipe_context *p)
    return (struct ph_context *)p;
 }
 
+static unsigned
+ph_hardware_cull(const struct pipe_rasterizer_state *rasterizer)
+{
+   if (!rasterizer || rasterizer->cull_face == PIPE_FACE_NONE ||
+       rasterizer->cull_face == PIPE_FACE_FRONT_AND_BACK)
+      return 0;
+
+   /* The P690 probe proves code 1 rejects det>0 (the draw module's CW
+    * winding) and code 2 rejects det<0 (CCW). */
+   if (rasterizer->cull_face == PIPE_FACE_BACK)
+      return rasterizer->front_ccw ? 1 : 2;
+   if (rasterizer->cull_face == PIPE_FACE_FRONT)
+      return rasterizer->front_ccw ? 2 : 1;
+   return 0;
+}
+
 static inline unsigned
 ph_triangle_batch_limit(const struct ph_context *ctx)
 {
@@ -2854,6 +2870,7 @@ ph_submit_vertices(struct ph_context *ctx)
    state.warp_entry = ctx->warp_passthrough;
    state.dither = !ctx->blend || ctx->blend->dither;
    state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
+   state.cull = ph_hardware_cull(ctx->rasterizer);
 	state.has_depth = depth != NULL;
 	state.dw_per_vertex = texture ?
 	                              ((texture1 || ctx->native_sampled_alpha) ?
@@ -3363,6 +3380,12 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	unsigned dpv;
    float *dst;
 
+   /* The hardware exposes only one-face cull selectors.  FRONT_AND_BACK has
+    * no packet encoding and must reject the primitive before staging it. */
+   if (ctx->rasterizer &&
+       ctx->rasterizer->cull_face == PIPE_FACE_FRONT_AND_BACK)
+      return;
+
    /* Preserve mixed-primitive ordering while allowing every run of compatible
     * line callbacks to share one state block. */
    if (ctx->points || ctx->lines) {
@@ -3837,6 +3860,9 @@ static void ph_bind_rasterizer(struct pipe_context *p, void *s)
       return;
    ph_submit_vertices(ctx);
    ctx->rasterizer = s;
+   /* Early software rejection avoids transforming and uploading backfaces;
+    * the independently hardware-proven 0x1130 selector remains programmed as
+    * the final raster guard for every surviving batch. */
    draw_set_rasterizer_state(ctx->draw, s, s);
 }
 static void ph_delete_state(struct pipe_context *p, void *s)
