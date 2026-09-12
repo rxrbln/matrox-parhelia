@@ -172,6 +172,10 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_NATIVE_RT_CLASSES	27
 /* Kernel transient-aperture upload/download for opaque render storage. */
 #define PARHELIA_PARAM_RENDER_TRANSFER	28
+/* Hardware transform-and-lighting: warp_transform with the o3 (and o4)
+ * texture-coordinate pass-through, so a transformed draw can be textured. */
+#define PARHELIA_PARAM_WARP_TRANSFORM_TEXTURED	29
+#define PARHELIA_PARAM_WARP_TRANSFORM_MULTITEX	30
 /* Instructions one WARP_PROGRAM slot holds, zero when the ioctl is absent. */
 #define PARHELIA_PARAM_WARP_PROGRAM_INSTRUCTIONS	31
 /* WARP program slots this file may hold at once. */

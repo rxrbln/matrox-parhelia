@@ -653,7 +653,7 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	rw[3].reg = 0x112c; rw[3].val = 0x3f800000u;
 	p3d_reglist(cs, rw, 4);
 
-	nd = p3d_descriptors(desc, st->tex != NULL, st->has_depth,
+	nd = p3d_descriptors(desc, st->tex != NULL, p3d_position_has_z(st),
 			     st->pos_desc, st->col_desc,
 			     st->tex && st->tex->env == P3D_TEXENV_REPLACE,
 			     st->tex1 != NULL || st->second_texcoord_probe,
@@ -1021,7 +1021,7 @@ p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 	reset[0].reg = P3D_R_DESC_INDEX;
 	reset[0].val = 0;
 	p3d_reglist(cs, ARRAY(reset));
-	nd = p3d_descriptors(desc, !!st->tex, !!st->has_depth,
+	nd = p3d_descriptors(desc, !!st->tex, p3d_position_has_z(st),
 			     st->pos_desc, st->col_desc,
 			     st->tex && st->tex->env == P3D_TEXENV_REPLACE,
 			     !!st->tex1,

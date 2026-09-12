@@ -446,7 +446,7 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 	       (input->second_texcoord_probe &&
 	        (!input->tex || input->tex1 || input->has_depth ||
 	         input->vertex_alpha || input->transform)) ||
-	       (input->dw_per_vertex != 5u + !!input->has_depth +
+	       (input->dw_per_vertex != 5u + !!p3d_position_has_z(input) +
 	        2 * (!!input->tex + !!input->tex1 +
 	             !!input->second_texcoord_probe) + !!input->vertex_alpha) ||
 	       (input->sampled_alpha_companion &&

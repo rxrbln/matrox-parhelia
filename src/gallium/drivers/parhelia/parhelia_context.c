@@ -17,6 +17,8 @@
 #include "draw/draw_fs.h"
 #include "draw/draw_pipe.h"
 #include "draw/draw_vertex.h"
+#include "translate/translate.h"
+#include "translate/translate_cache.h"
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
 #include "util/blend.h"
@@ -44,6 +46,19 @@
 struct ph_velems {
    unsigned count;
    struct pipe_vertex_element elem[PIPE_MAX_ATTRIBS];
+};
+
+/* Fixed-function vertex program recognised for hardware transform: the only
+ * computed output is POSITION = MVP * input, every other output copies an
+ * input attribute verbatim.  The WARP transform programs express exactly that
+ * shape, so anything else keeps the software vertex pipeline. */
+struct ph_vs {
+   struct draw_vertex_shader *draw;
+   bool ff_transform;
+   unsigned mvp_offset;         /* vec4 index of MVP row 0 in constbuf 0 */
+   int pos_input;               /* driver_location of the position input */
+   int colour_input;            /* -1 when the program writes no colour */
+   int texcoord_input[2];       /* -1 when the set is not written */
 };
 
 /* P690 serializes fixed-function texture shapes without a proven native
@@ -215,6 +230,26 @@ struct ph_context {
    uint32_t warp_textured;
    uint32_t warp_textured_multitex;
    uint32_t warp_replace;
+   /* Hardware transform: the kernel's WARP transform programs and the
+    * constant loader that uploads the matrix and viewport. */
+   uint32_t warp_transform;
+   uint32_t warp_transform_textured;
+   uint32_t warp_transform_multitex;
+   uint32_t warp_constant_loader;
+   bool tcl_available;
+   bool tcl_forced_off;
+   bool tcl_multitexture;
+   bool have_viewport;
+   struct ph_vs *vs;
+   struct pipe_viewport_state viewport;
+   /* Set while the pending batch carries object-space vertices.  mvp holds
+    * the WARP c0..c3 rows, i.e. the transpose of the shader's matrix. */
+   bool transform;
+   float mvp[16];
+   struct translate_cache *tcl_cache;
+   uint32_t *tcl_elts;
+   unsigned tcl_elts_cap;
+   unsigned tcl_draws, tcl_fallbacks, tcl_clip_fallbacks;
    uint32_t fence;
    bool async_pending;
    int submit_error;
@@ -456,12 +491,19 @@ ph_stats_frame(struct ph_context *ctx)
    now = ph_now_ns();
    if (ctx->stat.start_ns)
       fprintf(stderr,
-              "parhelia stats/frame: %.2f ms, %.0f batches (%.0f draw), %.0f triangles, %.0f submits, %.0f vertex dwords, %.1f clears (%.2f Mpixel), %.1f waits %.2f ms\n",
+              "parhelia stats/frame: %.2f ms, %.0f batches (%.0f draw), %.0f triangles, %.0f draw packets, %.0f submits, %.0f vertex dwords, %.1f clears (%.2f Mpixel), %.1f waits %.2f ms\n",
               (now - ctx->stat.start_ns) / n / 1e6, ctx->stat.batches / n,
               ctx->stat.draw_batches / n, ctx->stat.triangles / n,
+              ctx->stat.draw_packets / n,
               ctx->stat.submits / n, ctx->stat.vertex_dwords / n,
               ctx->stat.clears / n, ctx->stat.clear_pixels / n / 1e6,
               ctx->stat.waits / n, ctx->stat.wait_ns / n / 1e6);
+   if (ctx->stat.start_ns && (ctx->tcl_draws || ctx->tcl_fallbacks))
+      fprintf(stderr,
+              "parhelia stats/frame: %.1f hardware-transform draws, %.1f not expressible, %.1f handed back to the software clipper\n",
+              ctx->tcl_draws / n, ctx->tcl_fallbacks / n,
+              ctx->tcl_clip_fallbacks / n);
+   ctx->tcl_draws = ctx->tcl_fallbacks = ctx->tcl_clip_fallbacks = 0;
    for (unsigned k = 0; ctx->stats_sync && k < PH_STAT_KINDS; k++)
       if (ctx->stat.kind_count[k])
          fprintf(stderr,
@@ -3130,6 +3172,22 @@ out:
       ctx->lines = 0;
 }
 
+/* Pick the WARP program: the transforming variants when the batch carries
+ * object-space vertices, the pass-through variants otherwise.  There is no
+ * transforming GL_REPLACE program; the transformed textured one leaves the
+ * unused colour in o1 and the combiner ignores it. */
+static uint32_t
+ph_warp_entry(const struct ph_context *ctx, bool textured, bool two_sets,
+              bool replace)
+{
+   if (ctx->transform)
+      return two_sets ? ctx->warp_transform_multitex :
+             textured ? ctx->warp_transform_textured : ctx->warp_transform;
+   return two_sets ? ctx->warp_textured_multitex :
+          textured ? (replace ? ctx->warp_replace : ctx->warp_textured) :
+                     ctx->warp_passthrough;
+}
+
 static void
 ph_submit_vertices(struct ph_context *ctx)
 {
@@ -3142,6 +3200,7 @@ ph_submit_vertices(struct ph_context *ctx)
    const struct pipe_sampler_state *sampler = NULL, *sampler1 = NULL;
    const struct pipe_rt_blend_state *blend;
    unsigned dpv;
+   bool zpos;
    bool submitted = false;
    bool tiled_textures = ph_env("PARHELIA_TEXTURE_TILED");
    bool small_texture_linear = ph_env("PARHELIA_SMALL_TEXTURE_LINEAR");
@@ -3337,7 +3396,8 @@ ph_submit_vertices(struct ph_context *ctx)
               ctx->dsa->alpha_enabled, ctx->dsa->depth_enabled,
               ctx->dsa->depth_writemask);
    }
-   if (texture && !texture1 && !depth && ph_copy_present_quad(ctx, color, texture))
+   if (texture && !texture1 && !depth && !ctx->transform &&
+       ph_copy_present_quad(ctx, color, texture))
       goto out;
    if (ctx->cpu_alpha_cutout) {
       if (ctx->aggregate_batches && ph_drain_batch(ctx))
@@ -3361,17 +3421,31 @@ ph_submit_vertices(struct ph_context *ctx)
    state.screen_w = ctx->fb.width;
    state.screen_h = ctx->fb.height;
    state.prim = P3D_TRIANGLES;
-   state.warp_entry = ctx->warp_passthrough;
+   state.warp_entry = ph_warp_entry(ctx, false, false, false);
    state.dither = !ctx->blend || ctx->blend->dither;
    state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
    state.cull = ctx->derived_triangles ? 0 :
                 ph_hardware_cull(ctx->rasterizer);
 	state.has_depth = depth != NULL;
+	/* A transforming batch carries object-space positions, the matrix in
+	 * c0..c3 and the viewport in c8/c9, so its position always has z. */
+	state.transform = ctx->transform;
+	if (state.transform) {
+		state.mvp = ctx->mvp;
+		state.const_loader_entry = ctx->warp_constant_loader;
+		for (unsigned i = 0; i < 3; i++) {
+			state.vp_scale[i] = ctx->viewport.scale[i];
+			state.vp_offset[i] = ctx->viewport.translate[i];
+		}
+		state.vp_scale[3] = 1.0f;
+		state.vp_offset[3] = 2.0f * fabsf(ctx->viewport.scale[1]);
+	}
+	zpos = depth != NULL || state.transform;
 	state.dw_per_vertex = texture ?
 	                              ((texture1 || ctx->native_sampled_alpha) ?
-	                               (depth ? 10 : 9) :
-	                               (depth ? 8 : 7)) :
-	                               (depth ? 6 : 5);
+	                               (zpos ? 10 : 9) :
+	                               (zpos ? 8 : 7)) :
+	                               (zpos ? 6 : 5);
 	/* ph_stage_tri selected the exact one-texture MODULATE source-alpha
 	 * predicate.  Re-evaluate it against the resolved depth/texture resources,
 	 * then label the Z-bound 9-dword form explicitly for batch validation. */
@@ -3419,10 +3493,9 @@ ph_submit_vertices(struct ph_context *ctx)
       tex.env = ctx->fs->texenv;
       state.comb = ph_compiled_combiner(ctx);
       state.tex = &tex;
-      state.warp_entry = (texture1 || ctx->native_sampled_alpha) ?
-                         ctx->warp_textured_multitex :
-                         ((ctx->fs->uses_color || ctx->alpha_micro) ? ctx->warp_textured :
-                                                ctx->warp_replace);
+      state.warp_entry =
+         ph_warp_entry(ctx, true, texture1 || ctx->native_sampled_alpha,
+                       !ctx->fs->uses_color && !ctx->alpha_micro);
       if (ctx->native_sampled_alpha) {
          tex1 = tex;
          tex1.reloc_offset = 0;
@@ -3549,8 +3622,8 @@ ph_submit_vertices(struct ph_context *ctx)
 		const float *v0 = &ctx->vertices[0];
 		const float *v1 = &ctx->vertices[dpv];
 		const float *v2 = &ctx->vertices[2 * dpv];
-		unsigned st = state.vertex_alpha ? (depth ? 7 : 6) :
-		              (depth ? 6 : 5);
+		unsigned st = state.vertex_alpha ? (zpos ? 7 : 6) :
+		              (zpos ? 6 : 5);
       fprintf(stderr,
               "parhelia: textured vertices p0=%g,%g st0=%g,%g p1=%g,%g st1=%g,%g p2=%g,%g st2=%g,%g\n",
 		      v0[0], v0[1], v0[st], v0[st + 1],
@@ -3558,16 +3631,14 @@ ph_submit_vertices(struct ph_context *ctx)
 		      v2[0], v2[1], v2[st], v2[st + 1]);
    }
    if (ctx->native_sampled_alpha) {
-      ret = parhelia_batch_state_multitextured(batch, color->handle,
-                                                depth ? depth->handle : 0,
-                                                texture_handle,
-                                                texture1_handle, &state,
-                                                ctx->triangles);
+      ret = ph_batch_primitives(ctx, batch, &state, color->handle,
+                                depth ? depth->handle : 0, texture_handle,
+                                texture1_handle, ctx->triangles);
    } else if (texture1 && ph_screen(ctx->base.screen)->single_texture_pipe &&
        !one_pass_multitexture) {
       struct p3d_state lightmap = state;
       struct p3d_texture lightmap_tex = tex1;
-      unsigned packed_dpv = depth ? 8 : 7;
+      unsigned packed_dpv = zpos ? 8 : 7;
 
       submitted = true;
 
@@ -3582,12 +3653,11 @@ ph_submit_vertices(struct ph_context *ctx)
          lightmap.tex = &lightmap_tex;
          lightmap.tex1 = NULL;
          lightmap.dw_per_vertex = packed_dpv;
-         lightmap.warp_entry = ctx->warp_replace;
-         ph_pack_multitex_vertices(ctx, true, depth != NULL);
-         ret = parhelia_batch_state_textured(batch, color->handle,
-                                             depth ? depth->handle : 0,
-                                             texture1_handle, &lightmap,
-                                             ctx->triangles);
+         lightmap.warp_entry = ph_warp_entry(ctx, true, false, true);
+         ph_pack_multitex_vertices(ctx, true, zpos);
+         ret = ph_batch_primitives(ctx, batch, &lightmap, color->handle,
+                                   depth ? depth->handle : 0, texture1_handle,
+                                   0, ctx->triangles);
          if (!ret)
             ret = ph_submit_batch(ctx, batch, ctx->packed_vertices,
                                   ctx->triangles * 3 * packed_dpv,
@@ -3595,13 +3665,12 @@ ph_submit_vertices(struct ph_context *ctx)
       } else {
          state.tex1 = NULL;
          state.dw_per_vertex = packed_dpv;
-         state.warp_entry = ctx->fs->uses_color ? ctx->warp_textured :
-                            ctx->warp_replace;
-         ph_pack_multitex_vertices(ctx, false, depth != NULL);
-         ret = parhelia_batch_state_textured(batch, color->handle,
-                                             depth ? depth->handle : 0,
-                                             texture_handle, &state,
-                                             ctx->triangles);
+         state.warp_entry = ph_warp_entry(ctx, true, false,
+                                          !ctx->fs->uses_color);
+         ph_pack_multitex_vertices(ctx, false, zpos);
+         ret = ph_batch_primitives(ctx, batch, &state, color->handle,
+                                   depth ? depth->handle : 0, texture_handle,
+                                   0, ctx->triangles);
          if (!ret)
             ret = ph_submit_batch(ctx, batch, ctx->packed_vertices,
                                   ctx->triangles * 3 * packed_dpv,
@@ -3613,7 +3682,7 @@ ph_submit_vertices(struct ph_context *ctx)
          lightmap.tex = &lightmap_tex;
          lightmap.tex1 = NULL;
          lightmap.dw_per_vertex = packed_dpv;
-         lightmap.warp_entry = ctx->warp_replace;
+         lightmap.warp_entry = ph_warp_entry(ctx, true, false, true);
          lightmap.blend = true;
          if (ctx->fs->serial_op == PH_SERIAL_ADD) {
             lightmap.blend_src = P3D_BF_ONE;
@@ -3632,31 +3701,21 @@ ph_submit_vertices(struct ph_context *ctx)
             lightmap.depth_write = false;
             lightmap.depth_func = P3D_CMP_EQUAL;
          }
-         ph_pack_multitex_vertices(ctx, true, depth != NULL);
-         ret = parhelia_batch_state_textured(batch, color->handle,
-                                             depth ? depth->handle : 0,
-                                             texture1_handle,
-                                             &lightmap, ctx->triangles);
+         ph_pack_multitex_vertices(ctx, true, zpos);
+         ret = ph_batch_primitives(ctx, batch, &lightmap, color->handle,
+                                   depth ? depth->handle : 0, texture1_handle,
+                                   0, ctx->triangles);
          if (!ret)
             ret = ph_submit_batch(ctx, batch, ctx->packed_vertices,
                                   ctx->triangles * 3 * packed_dpv,
                                   color, depth, texture1, NULL);
       }
-   } else if (texture1)
-      ret = parhelia_batch_state_multitextured(batch, color->handle,
-                                               depth ? depth->handle : 0,
-                                               texture_handle,
-                                               texture1_handle, &state,
-                                               ctx->triangles);
-   else if (texture)
-      ret = parhelia_batch_state_textured(batch, color->handle,
-                                          depth ? depth->handle : 0,
-                                          texture_handle, &state,
-                                          ctx->triangles);
-   else
-      ret = parhelia_batch_state(batch, color->handle,
-                                 depth ? depth->handle : 0, &state,
-                                 ctx->triangles);
+   } else
+      ret = ph_batch_primitives(ctx, batch, &state, color->handle,
+                                depth ? depth->handle : 0,
+                                texture ? texture_handle : 0,
+                                texture1 ? texture1_handle : 0,
+                                ctx->triangles);
    if (!ret && !submitted)
       ret = ph_submit_batch(ctx, batch, ctx->vertices,
                             ctx->triangles * 3 * dpv,
@@ -3693,6 +3752,7 @@ out:
 	ctx->cpu_alpha_cutout = false;
 	ctx->rgb_alpha_two_pass = false;
 	ctx->native_sampled_alpha = false;
+	ctx->transform = false;
 }
 
 static float
@@ -4533,6 +4593,764 @@ ph_update_effective_views(struct ph_context *ctx)
    }
 }
 
+/* ------------------------------------------------------- hardware transform
+ *
+ * The WARP transform programs read an object-space position from the vertex
+ * stream, the matrix from constant slots c0..c3 and the viewport from c8/c9,
+ * and hand the setup unit a window-space position.  That is exactly the shape
+ * of Mesa's fixed-function vertex program, so a bound vertex shader whose only
+ * computed output is POSITION = MVP * input can run on the chip instead of in
+ * the software vertex pipeline.  Everything else keeps the draw module.
+ */
+enum ph_val_kind {
+   PH_VAL_NONE = 0,
+   PH_VAL_CONST,
+   PH_VAL_DEREF,
+   PH_VAL_UBO,
+   PH_VAL_INPUT,
+   PH_VAL_ROW,
+};
+
+struct ph_val {
+   enum ph_val_kind kind;
+   nir_variable *var;      /* DEREF */
+   uint32_t value;         /* CONST */
+   uint32_t base;          /* UBO: vec4 index; ROW: the matrix's row-0 index */
+   uint32_t input;         /* INPUT/ROW: input driver_location */
+   uint8_t comp;           /* ROW: destination component, or all four */
+   uint8_t terms;          /* ROW: which of the four products are folded in */
+};
+
+static const struct ph_val *
+ph_val_of(const struct ph_val *vals, unsigned count, const nir_def *def)
+{
+   return def->index < count ? &vals[def->index] : NULL;
+}
+
+/* xyzw on all @n components. */
+static bool
+ph_swizzle_identity(const nir_alu_instr *alu, unsigned src, unsigned n)
+{
+   for (unsigned i = 0; i < n; i++)
+      if (alu->src[src].swizzle[i] != i)
+         return false;
+   return true;
+}
+
+/* One component of @src broadcast over all @n components. */
+static bool
+ph_swizzle_broadcast(const nir_alu_instr *alu, unsigned src, unsigned n,
+                     unsigned *comp)
+{
+   *comp = alu->src[src].swizzle[0];
+   for (unsigned i = 1; i < n; i++)
+      if (alu->src[src].swizzle[i] != *comp)
+         return false;
+   return true;
+}
+
+/* One term of a matrix product: the matrix row in @ubo scaled by the vertex
+ * component in @in.  @row_comp is the destination component for the scalar
+ * form and PH_ALL_COMPONENTS for the vector form. */
+#define PH_ALL_COMPONENTS 0xffu
+
+static bool
+ph_match_matrix_term(const nir_alu_instr *alu, const struct ph_val *a,
+                     const struct ph_val *b, unsigned n,
+                     const struct ph_val **ubo, unsigned *row_comp,
+                     const struct ph_val **in, unsigned *term)
+{
+   unsigned ui;
+
+   if (a && a->kind == PH_VAL_UBO && b && b->kind == PH_VAL_INPUT) {
+      ui = 0;
+      *ubo = a;
+      *in = b;
+   } else if (b && b->kind == PH_VAL_UBO && a && a->kind == PH_VAL_INPUT) {
+      ui = 1;
+      *ubo = b;
+      *in = a;
+   } else {
+      return false;
+   }
+   if (n == 1) {
+      *row_comp = alu->src[ui].swizzle[0];
+      *term = alu->src[ui ^ 1].swizzle[0];
+      return true;
+   }
+   *row_comp = PH_ALL_COMPONENTS;
+   return ph_swizzle_identity(alu, ui, n) &&
+          ph_swizzle_broadcast(alu, ui ^ 1, n, term);
+}
+
+static bool
+ph_vs_analyze_alu(const nir_alu_instr *alu, struct ph_val *vals,
+                  unsigned count, struct ph_val *out)
+{
+   const struct ph_val *src[4] = {0};
+   unsigned n = nir_op_infos[alu->op].num_inputs;
+   unsigned width = alu->def.num_components;
+
+   if (n > 4 || alu->def.bit_size != 32)
+      return false;
+   for (unsigned i = 0; i < n; i++)
+      src[i] = ph_val_of(vals, count, alu->src[i].src.ssa);
+
+   switch (alu->op) {
+   case nir_op_fmul: {
+      const struct ph_val *ubo, *in;
+      unsigned row_comp, term;
+
+      if ((width != 1 && width != 4) ||
+          !ph_match_matrix_term(alu, src[0], src[1], width, &ubo, &row_comp,
+                                &in, &term) ||
+          term > 3 || ubo->base < term)
+         return false;
+      /* The scalar form starts the chain at term 0; the vector form adds its
+       * four products in any order. */
+      if (width == 1 && term)
+         return false;
+      out->kind = PH_VAL_ROW;
+      out->base = ubo->base - term;
+      out->input = in->input;
+      out->comp = row_comp;
+      out->terms = 1u << term;
+      return true;
+   }
+   case nir_op_fadd: {
+      const struct ph_val *a = src[0], *b = src[1];
+
+      if (width != 4 || !a || !b || a->kind != PH_VAL_ROW ||
+          b->kind != PH_VAL_ROW || a->comp != PH_ALL_COMPONENTS ||
+          b->comp != PH_ALL_COMPONENTS || a->base != b->base ||
+          a->input != b->input || (a->terms & b->terms) ||
+          !ph_swizzle_identity(alu, 0, 4) || !ph_swizzle_identity(alu, 1, 4))
+         return false;
+      *out = *a;
+      out->terms |= b->terms;
+      return true;
+   }
+   case nir_op_ffma:
+   case nir_op_ffma_weak: {
+      const struct ph_val *ubo, *in, *prev = src[2];
+      unsigned row_comp, term;
+
+      if (width != 1 || !prev || prev->kind != PH_VAL_ROW ||
+          !ph_match_matrix_term(alu, src[0], src[1], 1, &ubo, &row_comp, &in,
+                                &term) ||
+          term == 0 || term > 3 || prev->terms != (1u << term) - 1u ||
+          prev->comp != row_comp || prev->input != in->input ||
+          prev->base + term != ubo->base)
+         return false;
+      *out = *prev;
+      out->terms |= 1u << term;
+      return true;
+   }
+   case nir_op_vec4:
+      for (unsigned i = 0; i < 4; i++) {
+         if (!src[i] || src[i]->kind != PH_VAL_ROW || src[i]->terms != 0xf ||
+             src[i]->comp != i || src[i]->base != src[0]->base ||
+             src[i]->input != src[0]->input)
+            return false;
+      }
+      out->kind = PH_VAL_ROW;
+      out->base = src[0]->base;
+      out->input = src[0]->input;
+      out->comp = PH_ALL_COMPONENTS;
+      out->terms = 0xf;
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* True when @nir is the fixed-function shape the WARP transform expresses. */
+static bool
+ph_vs_analyze(nir_shader *nir, struct ph_vs *vs)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   struct ph_val *vals;
+   bool ok = true;
+   bool have_position = false;
+
+   vs->pos_input = vs->colour_input = -1;
+   vs->texcoord_input[0] = vs->texcoord_input[1] = -1;
+   if (!impl || exec_list_length(&impl->body) != 1)
+      return false;
+   nir_index_ssa_defs(impl);
+   vals = calloc(impl->ssa_alloc, sizeof(*vals));
+   if (!vals)
+      return false;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         struct ph_val val = {0};
+         nir_def *def = NULL;
+
+         switch (instr->type) {
+         case nir_instr_type_load_const: {
+            nir_load_const_instr *lc = nir_instr_as_load_const(instr);
+
+            if (lc->def.num_components != 1 || lc->def.bit_size != 32) {
+               ok = false;
+               break;
+            }
+            val.kind = PH_VAL_CONST;
+            val.value = lc->value[0].u32;
+            def = &lc->def;
+            break;
+         }
+         case nir_instr_type_deref: {
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+
+            if (deref->deref_type != nir_deref_type_var) {
+               ok = false;
+               break;
+            }
+            val.kind = PH_VAL_DEREF;
+            val.var = deref->var;
+            def = &deref->def;
+            break;
+         }
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            const struct ph_val *a, *b;
+
+            switch (in->intrinsic) {
+            case nir_intrinsic_load_ubo:
+            case nir_intrinsic_load_ubo_vec4: {
+               uint32_t vec4;
+
+               a = ph_val_of(vals, impl->ssa_alloc, in->src[0].ssa);
+               b = ph_val_of(vals, impl->ssa_alloc, in->src[1].ssa);
+               if (in->def.num_components != 4 || !a || !b ||
+                   a->kind != PH_VAL_CONST || a->value != 0 ||
+                   b->kind != PH_VAL_CONST) {
+                  ok = false;
+                  break;
+               }
+               /* load_ubo counts bytes, load_ubo_vec4 counts vec4s and puts
+                * the constant part in its base index. */
+               if (in->intrinsic == nir_intrinsic_load_ubo) {
+                  if (b->value & 15u) {
+                     ok = false;
+                     break;
+                  }
+                  vec4 = b->value / 16u;
+               } else {
+                  if (b->value || nir_intrinsic_component(in)) {
+                     ok = false;
+                     break;
+                  }
+                  vec4 = nir_intrinsic_base(in);
+               }
+               /* Bound it: the row arithmetic below would otherwise wrap. */
+               if (vec4 > (1u << 16)) {
+                  ok = false;
+                  break;
+               }
+               val.kind = PH_VAL_UBO;
+               val.base = vec4;
+               def = &in->def;
+               break;
+            }
+            case nir_intrinsic_load_deref:
+               a = ph_val_of(vals, impl->ssa_alloc, in->src[0].ssa);
+               if (!a || a->kind != PH_VAL_DEREF ||
+                   a->var->data.mode != nir_var_shader_in) {
+                  ok = false;
+                  break;
+               }
+               val.kind = PH_VAL_INPUT;
+               val.input = a->var->data.driver_location;
+               def = &in->def;
+               break;
+            case nir_intrinsic_store_deref: {
+               const struct ph_val *value;
+               int *slot;
+
+               a = ph_val_of(vals, impl->ssa_alloc, in->src[0].ssa);
+               value = ph_val_of(vals, impl->ssa_alloc, in->src[1].ssa);
+               if (!a || a->kind != PH_VAL_DEREF ||
+                   a->var->data.mode != nir_var_shader_out ||
+                   nir_intrinsic_write_mask(in) != 0xf || !value) {
+                  ok = false;
+                  break;
+               }
+               if (a->var->data.location == VARYING_SLOT_POS) {
+                  if (value->kind != PH_VAL_ROW ||
+                      value->comp != PH_ALL_COMPONENTS ||
+                      value->terms != 0xf || have_position) {
+                     ok = false;
+                     break;
+                  }
+                  have_position = true;
+                  vs->mvp_offset = value->base;
+                  vs->pos_input = value->input;
+                  break;
+               }
+               if (a->var->data.location == VARYING_SLOT_COL0)
+                  slot = &vs->colour_input;
+               else if (a->var->data.location == VARYING_SLOT_TEX0)
+                  slot = &vs->texcoord_input[0];
+               else if (a->var->data.location == VARYING_SLOT_TEX1)
+                  slot = &vs->texcoord_input[1];
+               else {
+                  ok = false;
+                  break;
+               }
+               if (value->kind != PH_VAL_INPUT || *slot >= 0) {
+                  ok = false;
+                  break;
+               }
+               *slot = value->input;
+               break;
+            }
+            default:
+               ok = false;
+               break;
+            }
+            break;
+         }
+         case nir_instr_type_alu:
+            if (!ph_vs_analyze_alu(nir_instr_as_alu(instr), vals,
+                                   impl->ssa_alloc, &val)) {
+               ok = false;
+               break;
+            }
+            def = &nir_instr_as_alu(instr)->def;
+            break;
+         case nir_instr_type_jump:
+            break;
+         default:
+            ok = false;
+            break;
+         }
+         if (!ok)
+            break;
+         if (def && def->index < impl->ssa_alloc)
+            vals[def->index] = val;
+      }
+      if (!ok)
+         break;
+   }
+   free(vals);
+   return ok && have_position;
+}
+
+/* The shader's matrix rows are the rows of the transposed matrix, so
+ * ubo_row[k][i] scales input component k into output component i.  WARP
+ * computes r2.i = dot(v, c_i), so c_i[k] = ubo_row[k][i]. */
+static bool
+ph_tcl_matrix(struct ph_context *ctx, float mvp[16])
+{
+   const uint8_t *base = NULL;
+   const float *rows;
+
+   if (ctx->user_constants[MESA_SHADER_VERTEX])
+      base = ctx->user_constants[MESA_SHADER_VERTEX];
+   else if (ctx->constants[MESA_SHADER_VERTEX])
+      base = ph_resource(ctx->constants[MESA_SHADER_VERTEX])->malloc_data;
+   if (!base)
+      return false;
+   base += ctx->constant_offset[MESA_SHADER_VERTEX];
+   /* The matrix offset comes out of the shader, so it bounds nothing by
+    * itself: the constant buffer has to be known and big enough. */
+   if (ctx->constant_size[MESA_SHADER_VERTEX] < 64 ||
+       ctx->vs->mvp_offset > (ctx->constant_size[MESA_SHADER_VERTEX] - 64) / 16)
+      return false;
+   rows = (const float *)(base + ctx->vs->mvp_offset * 16);
+   for (unsigned i = 0; i < 4; i++)
+      for (unsigned k = 0; k < 4; k++)
+         mvp[i * 4 + k] = rows[k * 4 + i];
+   return true;
+}
+
+/* Object-space positions still have to reach the raster inside the parts of
+ * clip space the hardware can carry: the transform program divides by w
+ * itself, and the vendor stack never asked this silicon to survive w <= 0
+ * (docs/parhelia-raster-clip.md section 8).  Everything outside the frustum
+ * in z, or outside the guard band in x and y, keeps the software clipper. */
+#define PH_TCL_GUARD_BAND 8160.0f
+
+static bool
+ph_tcl_vertices_fit(const struct ph_context *ctx, const float *vertices,
+                    unsigned count, unsigned dpv)
+{
+   const float *m = ctx->mvp;
+   float gx = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[0])) /
+              MAX2(fabsf(ctx->viewport.scale[0]), 1e-6f);
+   float gy = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[1])) /
+              MAX2(fabsf(ctx->viewport.scale[1]), 1e-6f);
+
+   if (gx <= 1.0f || gy <= 1.0f)
+      return false;
+   for (unsigned v = 0; v < count; v++) {
+      const float *p = vertices + v * dpv;
+      float x = m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3];
+      float y = m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7];
+      float z = m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11];
+      float w = m[12] * p[0] + m[13] * p[1] + m[14] * p[2] + m[15];
+
+      if (!(w > 1e-6f) || !(fabsf(x) <= gx * w) || !(fabsf(y) <= gy * w) ||
+          !(z >= -w) || !(z <= w))
+         return false;
+   }
+   return true;
+}
+
+struct ph_tcl_layout {
+   bool textured, multitextured;
+   unsigned dpv;
+   unsigned colour_offset, tex_offset[2];
+};
+
+/* Everything the hardware transform cannot express keeps the draw module: the
+ * alpha work-arounds own the vertex layout, the software clipper owns user
+ * clip planes, and polygon offset has no place in the WARP program. */
+static bool
+ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
+{
+   const struct pipe_rasterizer_state *rs = ctx->rasterizer;
+   bool textured = ph_samples_unit0(ctx);
+   bool multitextured = textured && ctx->fs &&
+                        (ctx->fs->sampler_mask & BITFIELD_BIT(1)) &&
+                        (!ph_screen(ctx->base.screen)->single_texture_pipe ||
+                         ctx->fs->serial_op != PH_SERIAL_UNSUPPORTED) &&
+                        ctx->num_sampler_views > 1 && ctx->sampler_views[1] &&
+                        ctx->sampler_views[1]->texture;
+   bool depth = ctx->fb.zsbuf.texture != NULL;
+   bool colour;
+
+   if (!ctx->tcl_available || ctx->tcl_forced_off || !ctx->vs ||
+       !ctx->vs->ff_transform || !ctx->velems || ctx->derived_triangles ||
+       !ctx->have_viewport || !ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture)
+      return false;
+   colour = ctx->vs->colour_input >= 0;
+   if (rs && (rs->clip_plane_enable || rs->offset_tri || rs->offset_line ||
+              rs->offset_point || rs->rasterizer_discard || rs->flatshade ||
+              rs->clip_halfz || !rs->depth_clip_near || !rs->depth_clip_far ||
+              rs->fill_front != PIPE_POLYGON_MODE_FILL ||
+              rs->fill_back != PIPE_POLYGON_MODE_FILL))
+      return false;
+   /* The alpha routes below re-shape or replace the vertex stream. */
+   if (ph_use_vertex_alpha(ctx, textured, multitextured, depth, colour) ||
+       ph_use_alpha_micro(ctx, textured, multitextured, depth, colour) ||
+       ph_use_alpha_micro_cutout(ctx, textured, multitextured, depth, colour) ||
+       ph_use_cpu_alpha_cutout(ctx, textured, multitextured, depth, colour) ||
+       ph_use_rgb_alpha_two_pass(ctx, textured, multitextured, colour) ||
+       ph_use_native_sampled_alpha(ctx, textured, multitextured, depth))
+      return false;
+   if ((textured && ctx->vs->texcoord_input[0] < 0) ||
+       (multitextured && ctx->vs->texcoord_input[1] < 0))
+      return false;
+   /* A two-set transformed draw wedges the engine: the GL test's two-unit
+    * scene stopped the pipeline dead on 2026-09-11 (async fence 0x180 made no
+    * progress for 2001 ms) while the untextured and single-texture scenes
+    * were pixel-identical to the software path.  Keep the route behind an
+    * explicit opt-in until that is understood. */
+   if (multitextured &&
+       (!ctx->warp_transform_multitex || !ctx->tcl_multitexture))
+      return false;
+   if (textured && !ctx->warp_transform_textured)
+      return false;
+
+   lay->textured = textured;
+   lay->multitextured = multitextured;
+   lay->colour_offset = 3;
+   lay->tex_offset[0] = 6;
+   lay->tex_offset[1] = 8;
+   lay->dpv = 6 + (textured ? 2 : 0) + (multitextured ? 2 : 0);
+   return true;
+}
+
+/* One translate element per attribute the WARP program consumes. */
+static bool
+ph_tcl_add_element(struct ph_context *ctx, struct translate_key *key,
+                   int input, enum pipe_format output, unsigned offset,
+                   unsigned max_components)
+{
+   const struct pipe_vertex_element *e;
+
+   if (input < 0 || (unsigned)input >= ctx->velems->count)
+      return false;
+   e = &ctx->velems->elem[input];
+   if (e->instance_divisor || e->dual_slot ||
+       util_format_get_nr_components(e->src_format) > max_components ||
+       e->vertex_buffer_index >= ctx->draw->pt.nr_vertex_buffers)
+      return false;
+   key->element[key->nr_elements].type = TRANSLATE_ELEMENT_NORMAL;
+   key->element[key->nr_elements].input_format = e->src_format;
+   key->element[key->nr_elements].output_format = output;
+   key->element[key->nr_elements].input_buffer = e->vertex_buffer_index;
+   key->element[key->nr_elements].input_offset = e->src_offset;
+   key->element[key->nr_elements].instance_divisor = 0;
+   key->element[key->nr_elements].output_offset = offset;
+   key->nr_elements++;
+   return true;
+}
+
+static uint32_t *
+ph_tcl_elts(struct ph_context *ctx, unsigned count)
+{
+   if (ctx->tcl_elts_cap < count) {
+      uint32_t *elts = realloc(ctx->tcl_elts, count * sizeof(*elts));
+
+      if (!elts)
+         return NULL;
+      ctx->tcl_elts = elts;
+      ctx->tcl_elts_cap = count;
+   }
+   return ctx->tcl_elts;
+}
+
+static uint32_t
+ph_tcl_index(const void *indices, unsigned size, unsigned i, int bias)
+{
+   uint32_t v = size == 1 ? ((const uint8_t *)indices)[i] :
+                size == 2 ? ((const uint16_t *)indices)[i] :
+                            ((const uint32_t *)indices)[i];
+   return v + bias;
+}
+
+/* Expand the draw into an independent-triangle index list.  The hardware draws
+ * one triangle per packet, so strips, fans and quads are resolved here rather
+ * than by a draw-module stage. */
+static unsigned
+ph_tcl_expand(struct ph_context *ctx, const struct pipe_draw_info *info,
+              const struct pipe_draw_start_count_bias *draw, uint32_t **out)
+{
+   const void *indices = NULL;
+   unsigned size = info->index_size, count = draw->count, ntri, n = 0;
+   uint32_t *elts;
+
+   switch (info->mode) {
+   case MESA_PRIM_TRIANGLES:
+      ntri = count / 3;
+      break;
+   case MESA_PRIM_TRIANGLE_STRIP:
+   case MESA_PRIM_TRIANGLE_FAN:
+   case MESA_PRIM_POLYGON:
+      ntri = count >= 3 ? count - 2 : 0;
+      break;
+   case MESA_PRIM_QUADS:
+      ntri = (count / 4) * 2;
+      break;
+   case MESA_PRIM_QUAD_STRIP:
+      ntri = count >= 4 ? (count / 2 - 1) * 2 : 0;
+      break;
+   default:
+      return 0;
+   }
+   if (!ntri || ntri > UINT_MAX / 3)
+      return 0;
+   if (size) {
+      indices = info->has_user_indices ? info->index.user :
+                (info->index.resource ?
+                 ph_resource(info->index.resource)->malloc_data : NULL);
+      if (!indices)
+         return 0;
+      indices = (const uint8_t *)indices + (size_t)draw->start * size;
+   }
+   elts = ph_tcl_elts(ctx, ntri * 3);
+   if (!elts)
+      return 0;
+
+#define PH_ELT(i) (size ? ph_tcl_index(indices, size, (i), draw->index_bias) : \
+                          draw->start + (i))
+   switch (info->mode) {
+   case MESA_PRIM_TRIANGLES:
+      for (unsigned i = 0; i < ntri * 3; i++)
+         elts[n++] = PH_ELT(i);
+      break;
+   case MESA_PRIM_TRIANGLE_STRIP:
+      for (unsigned i = 0; i < ntri; i++) {
+         /* An odd strip triangle swaps its first two vertices so the
+          * independent triangle keeps the strip's winding. */
+         elts[n++] = PH_ELT(i & 1 ? i + 1 : i);
+         elts[n++] = PH_ELT(i & 1 ? i : i + 1);
+         elts[n++] = PH_ELT(i + 2);
+      }
+      break;
+   case MESA_PRIM_TRIANGLE_FAN:
+   case MESA_PRIM_POLYGON:
+      for (unsigned i = 0; i < ntri; i++) {
+         elts[n++] = PH_ELT(0);
+         elts[n++] = PH_ELT(i + 1);
+         elts[n++] = PH_ELT(i + 2);
+      }
+      break;
+   case MESA_PRIM_QUADS:
+      /* Split on the same diagonal as the draw module, so a quad that the
+       * clip predicate hands back interpolates identically. */
+      for (unsigned q = 0; q < ntri / 2; q++) {
+         elts[n++] = PH_ELT(q * 4);
+         elts[n++] = PH_ELT(q * 4 + 1);
+         elts[n++] = PH_ELT(q * 4 + 3);
+         elts[n++] = PH_ELT(q * 4 + 1);
+         elts[n++] = PH_ELT(q * 4 + 2);
+         elts[n++] = PH_ELT(q * 4 + 3);
+      }
+      break;
+   case MESA_PRIM_QUAD_STRIP:
+      /* Quad q has corners 2q, 2q+1, 2q+3, 2q+2 in that order. */
+      for (unsigned q = 0; q < ntri / 2; q++) {
+         elts[n++] = PH_ELT(q * 2);
+         elts[n++] = PH_ELT(q * 2 + 1);
+         elts[n++] = PH_ELT(q * 2 + 2);
+         elts[n++] = PH_ELT(q * 2 + 1);
+         elts[n++] = PH_ELT(q * 2 + 3);
+         elts[n++] = PH_ELT(q * 2 + 2);
+      }
+      break;
+   default:
+      return 0;
+   }
+#undef PH_ELT
+   *out = elts;
+   return ntri;
+}
+
+/* Draw the triangles [first, ntri) of an expanded list through the software
+ * pipeline, used when a chunk does not fit the hardware clip volume. */
+static void
+ph_tcl_software_tail(struct ph_context *ctx, const uint32_t *elts,
+                     unsigned first, unsigned ntri)
+{
+   struct pipe_draw_info info = {0};
+   struct pipe_draw_start_count_bias draw = {0};
+
+   info.mode = MESA_PRIM_TRIANGLES;
+   info.index_size = 4;
+   info.has_user_indices = true;
+   info.index.user = elts;
+   info.instance_count = 1;
+   draw.start = first * 3;
+   draw.count = (ntri - first) * 3;
+   ctx->tcl_clip_fallbacks++;
+   draw_set_indexes(ctx->draw, elts, 4, ~0u);
+   draw_vbo(ctx->draw, &info, 0, NULL, &draw, 1, 0);
+   draw_flush(ctx->draw);
+   draw_set_indexes(ctx->draw, NULL, 0, 0);
+}
+
+/* Fill the object-space vertex stream for one draw and, when every vertex
+ * lands inside the hardware clip volume, keep it for a transforming batch.
+ * Returns false when the caller must use the software pipeline instead. */
+static bool
+ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
+            const struct pipe_draw_start_count_bias *draw)
+{
+   struct ph_tcl_layout lay;
+   struct translate_key key = {0};
+   struct translate *translate;
+   uint32_t *elts = NULL;
+   unsigned ntri, done = 0, limit;
+   float mvp[16];
+
+   if (info->primitive_restart || info->instance_count != 1 ||
+       !ph_tcl_layout(ctx, &lay) || !ph_tcl_matrix(ctx, mvp))
+      goto fallback;
+
+   key.output_stride = lay.dpv * sizeof(float);
+   if (!ph_tcl_add_element(ctx, &key, ctx->vs->pos_input,
+                           PIPE_FORMAT_R32G32B32_FLOAT, 0, 3))
+      goto fallback;
+   if (ctx->vs->colour_input >= 0 &&
+       !ph_tcl_add_element(ctx, &key, ctx->vs->colour_input,
+                           PIPE_FORMAT_R32G32B32_FLOAT,
+                           lay.colour_offset * sizeof(float), 4))
+      goto fallback;
+   for (unsigned u = 0; u < 2; u++) {
+      if (!(u ? lay.multitextured : lay.textured))
+         continue;
+      if (!ph_tcl_add_element(ctx, &key, ctx->vs->texcoord_input[u],
+                              PIPE_FORMAT_R32G32_FLOAT,
+                              lay.tex_offset[u] * sizeof(float), 2))
+         goto fallback;
+   }
+   ntri = ph_tcl_expand(ctx, info, draw, &elts);
+   if (!ntri)
+      goto fallback;
+   if (!ctx->tcl_cache) {
+      ctx->tcl_cache = translate_cache_create();
+      if (!ctx->tcl_cache)
+         goto fallback;
+   }
+   translate = translate_cache_find(ctx->tcl_cache, &key);
+   if (!translate)
+      goto fallback;
+   for (unsigned i = 0; i < key.nr_elements; i++) {
+      unsigned b = key.element[i].input_buffer;
+      const struct pipe_vertex_buffer *vb = &ctx->draw->pt.vertex_buffer[b];
+      const uint8_t *map = vb->is_user_buffer ? vb->buffer.user :
+                           (vb->buffer.resource ?
+                            ph_resource(vb->buffer.resource)->malloc_data :
+                            NULL);
+      unsigned stride = 0;
+
+      if (!map)
+         goto fallback;
+      for (unsigned e = 0; e < ctx->velems->count; e++)
+         if (ctx->velems->elem[e].vertex_buffer_index == b)
+            stride = ctx->velems->elem[e].src_stride;
+      translate->set_buffer(translate, b, map + vb->buffer_offset, stride, ~0u);
+   }
+
+   /* Mixed primitive kinds keep their order, and a batch carrying
+    * window-space or differently transformed vertices ends here. */
+   if (ctx->points || ctx->lines ||
+       (ctx->triangles && (!ctx->transform || memcmp(ctx->mvp, mvp, sizeof mvp))))
+      ph_submit_vertices(ctx);
+   if (ctx->submit_error)
+      return true;
+   memcpy(ctx->mvp, mvp, sizeof mvp);
+   ctx->transform = true;
+   ctx->tcl_draws++;
+
+   limit = ph_triangle_batch_limit(ctx);
+   while (done < ntri) {
+      unsigned room = ph_logical_vertex_limit(ctx) / (3 * lay.dpv);
+      unsigned space = MIN2(limit, room);
+      unsigned chunk;
+      float *dst;
+
+      if (ctx->triangles >= space) {
+         ph_submit_vertices(ctx);
+         if (ctx->submit_error)
+            return true;
+         continue;
+      }
+      ctx->transform = true;
+      chunk = MIN2(ntri - done, space - ctx->triangles);
+      dst = &ctx->vertices[ctx->triangles * 3 * lay.dpv];
+      translate->run_elts(translate, elts + done * 3, chunk * 3, 0, 0, dst);
+      if (ctx->vs->colour_input < 0) {
+         for (unsigned v = 0; v < chunk * 3; v++) {
+            float *c = dst + v * lay.dpv + lay.colour_offset;
+
+            c[0] = c[1] = c[2] = 1.0f;
+         }
+      }
+      if (!ph_tcl_vertices_fit(ctx, dst, chunk * 3, lay.dpv)) {
+         /* Publish what already fitted, then let the software clipper own
+          * the rest of this draw. */
+         if (ctx->triangles)
+            ph_submit_vertices(ctx);
+         ctx->transform = false;
+         if (!ctx->submit_error)
+            ph_tcl_software_tail(ctx, elts, done, ntri);
+         return true;
+      }
+      ctx->triangles += chunk;
+      done += chunk;
+   }
+   return true;
+fallback:
+   ctx->tcl_fallbacks++;
+   return false;
+}
+
 static void
 ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
             unsigned drawid_offset, const struct pipe_draw_indirect_info *indirect,
@@ -4586,8 +5404,15 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
          ph_submit_vertices(ctx);
       ctx->derived_triangles = derived;
    }
+   if (!derived && ph_draw_tcl(ctx, info, draws))
+      goto unbind;
+   /* A software-transformed batch must not inherit an object-space one. */
+   if (ctx->transform && ctx->triangles)
+      ph_submit_vertices(ctx);
+   ctx->transform = false;
    draw_vbo(ctx->draw, info, drawid_offset, NULL, draws, num_draws, 0);
    draw_flush(ctx->draw);
+unbind:
    for (unsigned i = 0; i < ctx->draw->pt.nr_vertex_buffers; i++)
       draw_set_mapped_vertex_buffer(ctx->draw, i, NULL, 0);
    if (indices)
@@ -4744,15 +5569,55 @@ static void ph_set_shader_images(struct pipe_context *p, mesa_shader_stage sh,
 static void *ph_create_vs(struct pipe_context *p,
                           const struct pipe_shader_state *s)
 {
-   if (s->type == PIPE_SHADER_IR_NIR)
+   struct ph_vs *vs = CALLOC_STRUCT(ph_vs);
+
+   if (!vs)
+      return NULL;
+   vs->pos_input = vs->colour_input = -1;
+   vs->texcoord_input[0] = vs->texcoord_input[1] = -1;
+   if (s->type == PIPE_SHADER_IR_NIR) {
       nir_shader_gather_info(s->ir.nir,
                              nir_shader_get_entrypoint(s->ir.nir));
-   return draw_create_vertex_shader(ph_context(p)->draw, s);
+      /* Analyse before handing the shader over: the draw module rewrites it. */
+      vs->ff_transform = ph_vs_analyze(s->ir.nir, vs);
+      if (ph_env("PARHELIA_TRACE_TCL") &&
+          !strcmp(getenv("PARHELIA_TRACE_TCL"), "dump"))
+         nir_print_shader(s->ir.nir, stderr);
+      if (ph_env("PARHELIA_TRACE_TCL"))
+         fprintf(stderr,
+                 "parhelia: vs hardware-transform=%u mvp=%#x pos=%d col=%d st=%d/%d\n",
+                 vs->ff_transform, vs->mvp_offset, vs->pos_input,
+                 vs->colour_input, vs->texcoord_input[0],
+                 vs->texcoord_input[1]);
+   }
+   vs->draw = draw_create_vertex_shader(ph_context(p)->draw, s);
+   if (!vs->draw) {
+      FREE(vs);
+      return NULL;
+   }
+   return vs;
 }
 static void ph_bind_vs(struct pipe_context *p, void *s)
-{ draw_bind_vertex_shader(ph_context(p)->draw, s); }
+{
+   struct ph_context *ctx = ph_context(p);
+   struct ph_vs *vs = s;
+
+   if (ctx->triangles && ctx->transform &&
+       (!vs || !vs->ff_transform || vs != ctx->vs))
+      ph_submit_vertices(ctx);
+   ctx->vs = vs;
+   draw_bind_vertex_shader(ctx->draw, vs ? vs->draw : NULL);
+}
 static void ph_delete_vs(struct pipe_context *p, void *s)
-{ draw_delete_vertex_shader(ph_context(p)->draw, s); }
+{
+   struct ph_context *ctx = ph_context(p);
+   struct ph_vs *vs = s;
+
+   if (ctx->vs == vs)
+      ctx->vs = NULL;
+   draw_delete_vertex_shader(ctx->draw, vs->draw);
+   FREE(vs);
+}
 
 static bool
 ph_nir_uses_texture(nir_shader *nir)
@@ -5076,8 +5941,15 @@ static void ph_set_viewport(struct pipe_context *p, unsigned start,
                  start + i, vp[i].scale[0], vp[i].scale[1], vp[i].scale[2],
                  vp[i].translate[0], vp[i].translate[1], vp[i].translate[2]);
    }
-   if (!start && count)
+   if (!start && count) {
       ctx->viewport_y_flip = vp[0].scale[1] < 0.0f;
+      /* c8/c9 are per batch: a transforming batch cannot span viewports. */
+      if (ctx->triangles && ctx->transform &&
+          memcmp(&ctx->viewport, &vp[0], sizeof ctx->viewport))
+         ph_submit_vertices(ctx);
+      ctx->viewport = vp[0];
+      ctx->have_viewport = true;
+   }
    draw_set_viewport_states(ctx->draw, start, count, vp);
 }
 static void ph_set_clip(struct pipe_context *p, const struct pipe_clip_state *clip)
@@ -6256,6 +7128,9 @@ ph_destroy_context(struct pipe_context *p)
    if (p->stream_uploader)
       u_upload_destroy(p->stream_uploader);
    ph_destroy_vertex_ring(ctx);
+   if (ctx->tcl_cache)
+      translate_cache_destroy(ctx->tcl_cache);
+   free(ctx->tcl_elts);
    draw_destroy(ctx->draw);
    FREE(ctx);
 }
@@ -6276,6 +7151,18 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    };
    struct drm_parhelia_get_param replace = {
       .param = PARHELIA_PARAM_WARP_REPLACE,
+   };
+   struct drm_parhelia_get_param transform = {
+      .param = PARHELIA_PARAM_WARP_TRANSFORM,
+   };
+   struct drm_parhelia_get_param transform_textured = {
+      .param = PARHELIA_PARAM_WARP_TRANSFORM_TEXTURED,
+   };
+   struct drm_parhelia_get_param transform_multitex = {
+      .param = PARHELIA_PARAM_WARP_TRANSFORM_MULTITEX,
+   };
+   struct drm_parhelia_get_param constant_loader = {
+      .param = PARHELIA_PARAM_WARP_CONSTANT_LOADER,
    };
    struct draw_stage *stage;
    (void)flags;
@@ -6306,6 +7193,26 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->warp_passthrough = warp.value;
    ctx->warp_textured = textured.value;
    ctx->warp_replace = replace.value;
+   /* Hardware transform needs the untextured program, its textured variant
+    * and the constant loader; an older kernel simply has none of them. */
+   if (!ioctl(ph_screen(screen)->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &transform) &&
+       !ioctl(ph_screen(screen)->fd, DRM_IOCTL_PARHELIA_GET_PARAM,
+              &transform_textured) &&
+       !ioctl(ph_screen(screen)->fd, DRM_IOCTL_PARHELIA_GET_PARAM,
+              &constant_loader) &&
+       transform.value && transform_textured.value && constant_loader.value) {
+      ctx->warp_transform = transform.value;
+      ctx->warp_transform_textured = transform_textured.value;
+      ctx->warp_constant_loader = constant_loader.value;
+      if (!ioctl(ph_screen(screen)->fd, DRM_IOCTL_PARHELIA_GET_PARAM,
+                 &transform_multitex))
+         ctx->warp_transform_multitex = transform_multitex.value;
+      ctx->tcl_available = debug_get_bool_option("PARHELIA_HW_TCL", true);
+   }
+   ctx->tcl_forced_off = ph_env("PARHELIA_NO_HW_TCL");
+   ctx->tcl_multitexture =
+      debug_get_bool_option("PARHELIA_HW_TCL_MULTITEX", false);
+   ctx->viewport.scale[0] = ctx->viewport.scale[1] = 1.0f;
    ctx->async_submit = ph_screen(screen)->async_submit;
    ctx->stats_sync = getenv("PARHELIA_STATS") &&
                      !strcmp(getenv("PARHELIA_STATS"), "sync");

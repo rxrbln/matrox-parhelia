@@ -652,6 +652,12 @@ void	 p3d_emit_constant_group(struct p3d_cs *cs, const struct p3d_state *st,
 void	 p3d_viewport(struct p3d_state *st, float x0, float y0,
 		      float w, float h, float zn, float zf);
 size_t	 p3d_warp_transform(uint32_t *out, size_t cap);
+/* A transforming program reads an object-space position, so its vertices
+ * always carry z even when no depth buffer is bound. */
+static inline int p3d_position_has_z(const struct p3d_state *st)
+{
+	return st->has_depth || st->transform;
+}
 size_t	 p3d_warp_lighting(uint32_t *out, size_t cap);
 /* GL_REPLACE: writes a constant white colour so MUL(TEX, PREV) passes TEX */
 size_t	 p3d_warp_replace(uint32_t *out, size_t cap);
