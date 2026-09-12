@@ -262,10 +262,13 @@ struct parhelia_bios {
  * "not allocated".  One slot holds a whole program including its END and the
  * trailing padding bundle. */
 #define PARHELIA_WARP_USER_SLOTS		32u
-#define PARHELIA_WARP_USER_SLOT_INSTRUCTIONS	64u
+/* Instruction fetch is host DMA, so the image size is a driver policy choice
+ * rather than a hardware limit: 128 bundles per image is what a compiled GLSL
+ * vertex shader needs, and the whole heap is 96 KiB of coherent memory. */
+#define PARHELIA_WARP_USER_SLOT_INSTRUCTIONS	256u
 /* Two program images per slot; an upload never lands on the address the
  * engine most recently fetched from.  See warp_user_entry(). */
-#define PARHELIA_WARP_USER_IMAGE_INSTRUCTIONS	32u
+#define PARHELIA_WARP_USER_IMAGE_INSTRUCTIONS	128u
 #define PARHELIA_WARP_USER_FILE_SLOTS		8u
 #define PARHELIA_WARP_USER_INSTRUCTIONS \
 	(PARHELIA_WARP_USER_SLOTS * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS)
