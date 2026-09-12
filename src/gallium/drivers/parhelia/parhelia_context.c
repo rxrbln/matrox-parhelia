@@ -7693,8 +7693,14 @@ ph_prepare_rgb5a1(struct parhelia_resource *texture)
          uint16_t value = (p[3] ? 0x8000u : 0) |
                           ((uint16_t)(p[2] >> 3) << 10) |
                           ((uint16_t)(p[1] >> 3) << 5) | (p[0] >> 3);
+         /* The descriptor selects the storage order for a two-byte texel, so
+          * the repack must write the order this chip really reads there: the
+          * generic vendor order put the high y bits of a small image where
+          * the address unit never looks, drawing its top half only. */
          uint8_t *dst = (uint8_t *)texture->map +
-            p3d_texture_tile_offset_cpp(x, y, pitch, 2);
+            p3d_texture_tile_offset_chip(x, y, pitch, 2,
+                                         ph_screen(texture->base.screen)->chip_id,
+                                         texture->tile_layout);
          memcpy(dst, &value, sizeof(value));
       }
    __sync_synchronize();
