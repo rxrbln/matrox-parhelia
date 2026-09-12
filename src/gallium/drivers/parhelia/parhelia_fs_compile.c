@@ -20,6 +20,9 @@
  */
 #include <string.h>
 
+#include <stdio.h>
+#include <stdlib.h>
+
 #include "parhelia_fs_compile.h"
 
 #define PH_FS_MAX_VALUES 256u
@@ -152,6 +155,33 @@ ph_fs_leaf(struct ph_fs_ctx *ctx, nir_def *def, struct ph_fs_value *out)
       unsigned base;
 
       switch (load->intrinsic) {
+      case nir_intrinsic_load_deref: {
+         /* Gallium hands this driver un-lowered IO, so a varying arrives as
+          * a dereference of its variable. */
+         nir_deref_instr *deref = nir_src_as_deref(load->src[0]);
+
+         if (!deref || deref->deref_type != nir_deref_type_var ||
+             !(deref->var->data.mode & nir_var_shader_in))
+            return false;
+         if (deref->var->data.location == VARYING_SLOT_COL0)
+            out->reg = P3D_COMB_V0;
+         else if (deref->var->data.location == VARYING_SLOT_COL1)
+            out->reg = P3D_COMB_V1;
+         else
+            return false;
+         ctx->uses_color = true;
+         return true;
+      }
+      case nir_intrinsic_load_ubo_vec4:
+         /* Constant buffer 0 addressed in vec4s rather than bytes. */
+         if (!nir_src_is_const(load->src[0]) ||
+             nir_src_as_uint(load->src[0]) != 0 ||
+             !nir_src_is_const(load->src[1]))
+            return false;
+         out->is_constant = true;
+         out->vec4_index = nir_src_as_uint(load->src[1]);
+         out->reg = P3D_COMB_C0;
+         return true;
       case nir_intrinsic_load_input:
       case nir_intrinsic_load_interpolated_input: {
          unsigned location = nir_intrinsic_io_semantics(load).location;
@@ -507,6 +537,22 @@ ph_fs_output(nir_shader *nir, nir_def **rgb, nir_def **alpha)
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             store = nir_instr_as_intrinsic(instr);
+            if (store->intrinsic == nir_intrinsic_store_deref) {
+               nir_deref_instr *deref = nir_src_as_deref(store->src[0]);
+               int location;
+
+               if (!deref || deref->deref_type != nir_deref_type_var ||
+                   !(deref->var->data.mode & nir_var_shader_out))
+                  return false;
+               location = deref->var->data.location;
+               if (location != FRAG_RESULT_COLOR &&
+                   location != FRAG_RESULT_DATA0)
+                  return false;
+               if (value || nir_intrinsic_write_mask(store) != 0xf)
+                  return false;
+               value = store->src[1].ssa;
+               continue;
+            }
             if (store->intrinsic != nir_intrinsic_store_output)
                continue;
             if (nir_intrinsic_io_semantics(store).location !=
@@ -626,9 +672,34 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
    struct ph_fs_half rgb, alpha;
    nir_def *rgb_def, *alpha_def;
 
+   const bool trace = getenv("PARHELIA_TRACE_FS") != NULL;
+
    memset(out, 0, sizeof(*out));
-   if (!max_instructions || !ph_fs_output(nir, &rgb_def, &alpha_def))
+   if (trace) {
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_alu)
+                  fprintf(stderr, "  fs alu %s\n",
+                          nir_op_infos[nir_instr_as_alu(instr)->op].name);
+               else if (instr->type == nir_instr_type_intrinsic)
+                  fprintf(stderr, "  fs intrinsic %s\n",
+                          nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic].name);
+               else if (instr->type == nir_instr_type_tex)
+                  fprintf(stderr, "  fs tex\n");
+               else if (instr->type == nir_instr_type_load_const)
+                  fprintf(stderr, "  fs const\n");
+               else
+                  fprintf(stderr, "  fs instr type %u\n", instr->type);
+            }
+         }
+      }
+   }
+   if (!max_instructions || !ph_fs_output(nir, &rgb_def, &alpha_def)) {
+      if (trace)
+         fprintf(stderr, "  fs: no usable colour output store\n");
       return false;
+   }
    /* One block and no control flow: the combiner cannot branch. */
    nir_foreach_function_impl(impl, nir) {
       if (exec_list_length(&impl->body) != 1)
@@ -648,17 +719,60 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
       }
    }
 
-   if (!ph_fs_compile_half(&ctx, rgb_def, false, &rgb))
+   if (!ph_fs_compile_half(&ctx, rgb_def, false, &rgb)) {
+      if (trace)
+         fprintf(stderr, "  fs: rgb half not expressible\n");
       return false;
+   }
    if (rgb_def == alpha_def) {
       /* Identical algebra: the alpha half is the same instruction list, so
        * the two halves align with no padding. */
       alpha = rgb;
    } else if (!ph_fs_compile_half(&ctx, alpha_def, true, &alpha)) {
+      if (trace)
+         fprintf(stderr, "  fs: alpha half not expressible\n");
       return false;
    }
-   if (!ph_fs_merge(&rgb, &alpha, ctx.max_instructions, out))
+   if (!ph_fs_merge(&rgb, &alpha, ctx.max_instructions, out)) {
+      if (trace)
+         fprintf(stderr, "  fs: halves do not fit %u slots\n",
+                 ctx.max_instructions);
       return false;
+   }
+   if (trace) {
+      static const char *const reg[32] = {
+         "t0", "t1", "t2", "t3", "r0", "r1", "?6", "?7", "?8", "?9",
+         "?a", "?b", "?c", "?d", "c0", "c1", "v0", "v1",
+      };
+      static const char *const op[0x40] = {
+         [P3D_COMB_MUL] = "mul", [P3D_COMB_MOV] = "mov",
+         [P3D_COMB_SUB] = "sub", [P3D_COMB_MAD] = "mad",
+         [P3D_COMB_LRP] = "lrp", [P3D_COMB_ADD] = "add",
+         [P3D_COMB_DP3] = "dp3", [P3D_COMB_DP4] = "dp4",
+      };
+
+      for (unsigned i = 0; i < out->comb.count; i++) {
+         const struct p3d_comb_inst *in = &out->comb.inst[i];
+         const struct p3d_comb_half *half[2] = { &in->rgb, &in->alpha };
+
+         for (unsigned h = 0; h < 2; h++)
+            fprintf(stderr, "  fs %u %s %s %s <- %s.%u%s %s.%u%s %s.%u%s\n",
+                    i, h ? "a" : "rgb",
+                    half[h]->used ? (op[half[h]->op & 0x3f] ?: "??") : "(none)",
+                    reg[half[h]->dst & 0x1f] ?: "?",
+                    reg[half[h]->src[0].reg & 0x1f] ?: "?", half[h]->src[0].rep,
+                    half[h]->src[0].mod ? "!" : "",
+                    reg[half[h]->src[1].reg & 0x1f] ?: "?", half[h]->src[1].rep,
+                    half[h]->src[1].mod ? "!" : "",
+                    reg[half[h]->src[2].reg & 0x1f] ?: "?", half[h]->src[2].rep,
+                    half[h]->src[2].mod ? "!" : "");
+         for (unsigned k = 0; k < 2; k++)
+            if (in->has_const[k])
+               fprintf(stderr, "  fs %u c%u = %g %g %g %g\n", i, k,
+                       in->constant[k][0], in->constant[k][1],
+                       in->constant[k][2], in->constant[k][3]);
+      }
+   }
    out->sampler_mask = ctx.sampler_mask;
    out->uses_color = ctx.uses_color;
    out->valid = true;

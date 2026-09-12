@@ -417,18 +417,22 @@ p3d_emit_comb_program(struct p3d_cs *cs, const struct p3d_comb_program *prog,
 		rw[1].val = p3d_comb_sources(&in->alpha, 0);
 		rw[2].reg = 0x126c; rw[2].val = p3d_comb_opcode(&in->rgb, 0);
 		rw[3].reg = 0x1268; rw[3].val = p3d_comb_opcode(&in->alpha, 1);
+		/* Component order, hardware-proven with the GL combiner test: the
+		 * first register carries red and ALPHA, the second blue and green.
+		 * Packing (r, g) and (b, a) made a constant's green read as its
+		 * alpha in an otherwise exact MUL. */
 		rw[4].reg = 0x1278;
 		rw[4].val = in->has_const[0] ?
-			p3d_comb_const_word(in->constant[0][0], in->constant[0][1]) : 0;
+			p3d_comb_const_word(in->constant[0][0], in->constant[0][3]) : 0;
 		rw[5].reg = 0x127c;
 		rw[5].val = in->has_const[0] ?
-			p3d_comb_const_word(in->constant[0][2], in->constant[0][3]) : 0;
+			p3d_comb_const_word(in->constant[0][2], in->constant[0][1]) : 0;
 		rw[6].reg = 0x1280;
 		rw[6].val = in->has_const[1] ?
-			p3d_comb_const_word(in->constant[1][0], in->constant[1][1]) : 0;
+			p3d_comb_const_word(in->constant[1][0], in->constant[1][3]) : 0;
 		rw[7].reg = 0x1284;
 		rw[7].val = in->has_const[1] ?
-			p3d_comb_const_word(in->constant[1][2], in->constant[1][3]) : 0;
+			p3d_comb_const_word(in->constant[1][2], in->constant[1][1]) : 0;
 		p3d_reglist(cs, rw, 8);
 	}
 	/* MOV r0, r0 in every unused slot: the padding is the terminator. */
