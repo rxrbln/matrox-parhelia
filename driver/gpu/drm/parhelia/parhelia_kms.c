@@ -1029,9 +1029,14 @@ static const struct parhelia_output_desc parhelia_lx_outputs[] = {
 	},
 };
 
+/* The retail 0527/0528 boards carry two DVI-I connectors and no VGA socket:
+ * an analog monitor reaches them through a DVI-I adapter on the DAC pins, so
+ * both connectors are DVI-I and each keeps its own DAC route.  Declaring the
+ * first one VGA also suppressed its DVI-I subconnector property and forced
+ * output->edid_digital false before any EDID was read. */
 static const struct parhelia_output_desc parhelia_original_outputs[] = {
 	{
-		.connector_type = DRM_MODE_CONNECTOR_VGA,
+		.connector_type = DRM_MODE_CONNECTOR_DVII,
 		.ddc_line = 0,
 		.ddc_scl = 3, .ddc_sda = 1,
 		.preferred_head = 0,
@@ -1046,7 +1051,7 @@ static const struct parhelia_output_desc parhelia_original_outputs[] = {
 		.preferred_head = 1,
 		.digital_route = PARHELIA_ROUTE_DVO1,
 		.analog_route = PARHELIA_ROUTE_DAC1,
-		.expose = false,
+		.expose = true,
 		.ready = false,
 	},
 };
