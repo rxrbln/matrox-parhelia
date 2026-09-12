@@ -190,14 +190,16 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 #define PARHELIA_DC_HDISP		0x008
 #define PARHELIA_DC_VDISP		0x04c
 #define PARHELIA_DC_PARAMS		0x088
-#define PARHELIA_DC_LUT_GATE		0x1aa
 #define PARHELIA_DC_LUT_LATCH		BIT(31)
 #define PARHELIA_DC_LUT_COMPONENT_MASK	0x0000ffc0
-#define PARHELIA_DC_CTRL_ON		0x00040201
-/* The original boards' vendor path enables the controller with the enable bit
- * alone.  The P690 value additionally sets bit 9, the primary-LUT bypass, and
- * bit 18, a sticky bandwidth-fault flag; it stays as it is because that is
- * what has been driving a P690 display. */
+/* Both families enable the controller with the enable bit alone.  Bit 9 is the
+ * primary-LUT bypass (`HSLPARSetPrimaryLUTBypass` sets exactly that bit with no
+ * device test) and bit 18 a sticky bandwidth-fault flag the vendor *clears*
+ * (`HSLPARResetBandwidthState`); `HSLPARGetDCParameters` builds 0x00000001 for
+ * any progressive primary mode on either device id.  The LUT is loaded before
+ * this word is written, so clearing the bypass activates a ramp instead of
+ * changing the picture. */
+#define PARHELIA_DC_CTRL_ON_SUN90	0x00000001
 #define PARHELIA_DC_CTRL_ON_ORIGINAL	0x00000001
 /* The original family latches the scanout base from bits [26:11], so an
  * address carrying bit 10 would be truncated; the P690 latches [27:10]. */

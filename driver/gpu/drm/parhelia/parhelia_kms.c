@@ -117,10 +117,10 @@ static u32 parhelia_vblank_mask(struct parhelia_device *pdev)
 	return parhelia_kms_head(pdev) ? BIT(28) : PARHELIA_IRQ_VBLANK_HEAD0;
 }
 
-/* The display controller owns a 256-entry RGB LUT.  The VBIOS sequence is
- * gate=0x08, index/R/G/B (blue carries the latch bit), gate=0x00.  The LUT is
- * physically ten bits wide.  HSLPARSetPrimaryLUT in the vendor driver writes
- * the high ten bits of each DRM 16-bit component directly into bits 15:6. */
+/* The display controller owns a 256-entry RGB LUT, physically ten bits wide.
+ * HSLPARSetPrimaryLUT writes index, then R, G and B per entry with blue
+ * carrying the latch bit, each component masked 0xffc0 - the high ten bits of
+ * a 16-bit DRM component land in bits 15:6. */
 static void parhelia_pipe_load_gamma(struct drm_simple_display_pipe *pipe,
 				     const struct drm_property_blob *blob)
 {
@@ -129,7 +129,10 @@ static void parhelia_pipe_load_gamma(struct drm_simple_display_pipe *pipe,
 	u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
 	unsigned int i;
 
-	parhelia_write8(pdev, dc + PARHELIA_DC_LUT_GATE, 0x08);
+	/* No vendor path brackets the LUT with a gate byte, and dc + 0x1aa is not
+	 * a gate: at dc 0x1800 it is byte 2 of 0x19a8, the *second* controller's
+	 * DC_CTRL, so the pair of writes set and cleared that controller's bit 19
+	 * (parhelia-p690-output-path-re.md section 5.9). */
 	for (i = 0; i < 256; i++) {
 		u16 red = lut ? lut[i].red : i * 257;
 		u16 green = lut ? lut[i].green : i * 257;
@@ -144,7 +147,6 @@ static void parhelia_pipe_load_gamma(struct drm_simple_display_pipe *pipe,
 		parhelia_write(pdev, dc + PARHELIA_DC_LUT_B,
 			       b | PARHELIA_DC_LUT_LATCH);
 	}
-	parhelia_write8(pdev, dc + PARHELIA_DC_LUT_GATE, 0x00);
 }
 
 static int parhelia_connector_get_modes(struct drm_connector *connector)
@@ -364,7 +366,7 @@ static bool parhelia_clock_solve(struct parhelia_device *pdev, u32 clock,
 static u32 parhelia_dc_ctrl_on(struct parhelia_device *pdev)
 {
 	return pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL ?
-		PARHELIA_DC_CTRL_ON_ORIGINAL : PARHELIA_DC_CTRL_ON;
+		PARHELIA_DC_CTRL_ON_ORIGINAL : PARHELIA_DC_CTRL_ON_SUN90;
 }
 
 static u32 parhelia_dc_start_mask(struct parhelia_device *pdev)
