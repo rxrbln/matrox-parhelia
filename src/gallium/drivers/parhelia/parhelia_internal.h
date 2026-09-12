@@ -19,6 +19,13 @@
       ph_env_cached_ = getenv(name) != NULL; \
    ph_env_cached_ != 0; })
 
+/* Texture units a draw can actually drive today.  The state emitter banks all
+ * four of the original Parhelia's units, and the host selftest covers three
+ * and four, but a draw past two still needs a WARP program writing o3..o6, a
+ * vertex layout with that many coordinate sets and the matching combiner
+ * stages.  Raise this when those land. */
+#define PH_TEXTURE_UNITS_DRIVEN 2u
+
 #define PH_VRAM_VERTEX_LEGACY_SLOTS 3
 #define PH_VRAM_VERTEX_SLOTS_MAX 16
 
@@ -26,6 +33,7 @@ struct parhelia_screen {
    struct pipe_screen base;
    int fd;
    uint32_t chip_id;
+   unsigned texture_units;	/* what the chip has, not what a draw drives */
    uint32_t tile_layout;
    bool single_texture_pipe;
    bool vram_vertex;

@@ -896,7 +896,22 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       create.flags = PARHELIA_CREATE_RENDER_NATIVE_COLOR;
    /* The X front buffer is the one front-rendered scanout image: its
     * display refresh belongs in bank B, away from colour and textures. */
-   if (native_color &&
+   /* With page flipping the image the CRTC refreshes is a *client* colour
+    * buffer, which carries SCANOUT but not USE_FRONT_RENDERING, so it landed
+    * in the render band and its refresh competed with colour, depth and
+    * texture traffic - the very cost the display band exists to avoid.
+    * PARHELIA_FLIP_DISPLAY_BAND=1 places flip candidates there too. */
+   if (native_color && (templ->bind & PIPE_BIND_SCANOUT) &&
+       !(templ->bind & PIPE_BIND_USE_FRONT_RENDERING) &&
+       ph_env("PARHELIA_FLIP_DISPLAY_BAND")) {
+      create.flags = PARHELIA_CREATE_RENDER_NATIVE_SCANOUT;
+      if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &create)) {
+         create.flags = PARHELIA_CREATE_RENDER_NATIVE_COLOR;
+         create.handle = create.pitch = 0;
+         create.size = create.mmap_offset = 0;
+      }
+   }
+   if (!create.handle && native_color &&
        (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_USE_FRONT_RENDERING)) ==
        (PIPE_BIND_SCANOUT | PIPE_BIND_USE_FRONT_RENDERING)) {
       create.flags = PARHELIA_CREATE_RENDER_NATIVE_SCANOUT;
@@ -1343,6 +1358,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct parhelia_screen *s = CALLOC_STRUCT(parhelia_screen);
    struct drm_parhelia_get_param chip = {.param = PARHELIA_PARAM_CHIP_ID};
    struct drm_parhelia_get_param tile = {.param = PARHELIA_PARAM_TILE_LAYOUT};
+   struct drm_parhelia_get_param units = {
+      .param = PARHELIA_PARAM_TEXTURE_UNITS,
+   };
    struct drm_parhelia_get_param vram = {.param = PARHELIA_PARAM_VRAM_SIZE};
    struct drm_parhelia_get_param pipe_mode = {
       .param = PARHELIA_PARAM_TEXTURE_PIPE_MODE,
@@ -1386,9 +1404,12 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
    if (s->fd < 0 || ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &chip) ||
        ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &tile) ||
+       ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &units) ||
        ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &vram) ||
        ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &pipe_mode))
       goto fail;
+   s->texture_units = units.value >= 1 && units.value <= P3D_MAX_TEXTURE_UNITS ?
+      (unsigned)units.value : 2u;
    switch (chip.value) {
    case 0x0527:
    case 0x0528:
@@ -1593,10 +1614,15 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    fs->max_const_buffer0_size = 16 * 4 * sizeof(float);
    fs->max_const_buffers = 1;
    fs->max_temps = 16;
-   /* All supported chips expose at least two texture address units.  The
-    * P690 executes them through one physical pipe, but still supports the
-    * documented two-unit diffuse/lightmap state used by Quake III. */
-   fs->max_texture_samplers = fs->max_sampler_views = 2;
+   /* The chip's own count, from the kernel: four on the original Parhelia
+    * (0x0527/0x0528), two on the LX family, whose pair executes through one
+    * physical pipe.  Bounded by what a draw can actually drive - the state
+    * emitter banks all four units and the selftest covers three and four, but
+    * a draw past two also needs a WARP program writing o3..o6, a vertex
+    * layout carrying that many coordinate sets and matching combiner stages.
+    * Raising PH_TEXTURE_UNITS_DRIVEN is what turns the extra units on. */
+   fs->max_texture_samplers = fs->max_sampler_views =
+      MIN2(s->texture_units, PH_TEXTURE_UNITS_DRIVEN);
    fs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
    s->base.destroy = ph_destroy;
    s->base.context_create = ph_context_create;

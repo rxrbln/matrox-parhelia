@@ -550,6 +550,9 @@ enum p3d_stencil_op {
 #define P3D_Z_GEQUAL	P3D_CMP_GEQUAL
 typedef enum p3d_cmp p3d_zfunc_t;
 
+/* The original Parhelia has four texture units; the LX family has two. */
+#define P3D_MAX_TEXTURE_UNITS 4u
+
 struct p3d_state {
 	struct p3d_surface colour;
 	struct p3d_surface depth;	/* .base 0 = none */
@@ -667,6 +670,13 @@ struct p3d_state {
 	unsigned	   comb_slot_base;
 	const struct p3d_texture *tex;	/* unit 0 */
 	const struct p3d_texture *tex1;	/* unit 1; NULL = single unit */	/* NULL = untextured */
+	/* Units 2 and 3 exist on the original Parhelia (0x0527/0x0528), which
+	 * has four texture units; the LX family has two and leaves these NULL.
+	 * The units must be contiguous: a unit is active only if every lower
+	 * one is.  parhelia-multitexture.md section 1 has the register model -
+	 * 0x11c0..0x11e4 is one window that 0x1200 + unit*4 banks. */
+	const struct p3d_texture *tex2;	/* unit 2; original family only */
+	const struct p3d_texture *tex3;	/* unit 3; original family only */
 	/* P690 workaround proven by the RGB-companion cutout probe: preserve
 	 * unit-0 RGB and replicate unit-1 red into fragment alpha. */
 	int		   sampled_alpha_companion;
@@ -752,6 +762,31 @@ void	 p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 
 /* Derived values, exposed because a driver wants them for validation. */
 uint32_t p3d_primword(enum p3d_prim prim);
+
+/* The texture bound to unit @u, or NULL.  Units are contiguous, so the first
+ * NULL ends the active set. */
+static inline const struct p3d_texture *
+p3d_state_unit(const struct p3d_state *st, unsigned u)
+{
+	switch (u) {
+	case 0:  return st->tex;
+	case 1:  return st->tex1;
+	case 2:  return st->tex2;
+	case 3:  return st->tex3;
+	default: return NULL;
+	}
+}
+
+/* How many contiguous texture units this state drives, 0 when untextured. */
+static inline unsigned
+p3d_state_units(const struct p3d_state *st)
+{
+	unsigned u = 0;
+
+	while (u < P3D_MAX_TEXTURE_UNITS && p3d_state_unit(st, u))
+		u++;
+	return u;
+}
 uint32_t p3d_prim_class(enum p3d_prim prim);
 unsigned p3d_vertices_per_primitive(enum p3d_prim prim);
 /* Smallest vertex count that draws one primitive of this kind. */
