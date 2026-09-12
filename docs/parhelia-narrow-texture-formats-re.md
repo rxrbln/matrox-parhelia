@@ -193,72 +193,96 @@ The primitive is a 16-byte micro-tile: 4x4 texels at 8 bits, 2x4 at 16 bits,
 storage span with its own byte index, samples the image 1:1 through the format
 under test and reports which address model each fetched texel matches.
 
-## Measured on the P690 so far
+## Measured on the P690
 
-`--texture-format-probe` has not yet produced a format result.  Two runs both
-wedged the engine on their textured draw:
+`parhelia-drm-test --texture-format-probe` fills a texture BO with its own
+byte index, samples it 1:1 through the format under test and reports which
+byte the unit fetched.  Every format below reproduced **every** texel:
+
+| descriptor | decode | sizes measured |
+|---|---|---|
+| `0x11` layout 4 | L8, alpha reads 1 | 64x64, 32x128, 128x64 |
+| `0x24` layout 4 | A4R4G4B4, alpha reads 1 | 64x32, 128x64 |
+| `0x26` layout 4 | A1R5G5B5, alpha reads 1 | 64x32, 64x64, 128x64, 32x32, 32x64, 32x128, 16x64, 256x256 |
+| `0x28` layout 4 | R5G6B5 | 64x32, 128x64 |
+| `0x12` layout 4 | A8 — **samples as zero** | 64x64 |
+
+So texel layout 4 is confirmed for 8- and 16-bit, the channel decodes are
+confirmed, and A8 is confirmed useless: its only information is alpha, which
+this unit does not emit.  Alpha reads as one for every format.
+
+### The texel order
+
+It is neither the vendor's generic 32x16-block formula nor this chip's own
+32-bit 64x16 order, and the two texel sizes do not share one order:
 
 ```
-run 1, no WARP prime:  fence 00000030 made no progress for 2001 ms (done 00000028)
-run 2, WARP primed:    fence 00000048 made no progress for 2002 ms (done 00000040)
+16-bit   byte bit 1, 2, 4, 6, 7, 9  = x0..x5     bit 3, 5, 8, 10, 11 = y0..y4
+ 8-bit   byte bit 0, 1, 2, 4, 6, 9  = x0..x5     bit 3, 5, 7, 8, 10  = y0..y4
 ```
 
-In run 2 the prime draw and the surface clear both retired (`done 00000040`),
-so the descriptor under test is what the engine stopped on.
+A tile always spans 64x32 texels of storage: 4096 bytes at two bytes per
+texel, 2048 at one.  x bit 5 carries the tile-row parity, as it does in every
+other Parhelia surface order — the `y bit 32` fetch delta is `0x1200` at a
+64-texel pitch, that is one tile plus a flip of bit 9.
 
-**This is not yet attributable to the format fields.**  The probe's command
-stream was compared against `--mip-address-probe`'s, which is the closest
-known-good textured draw, by building both on the host and decoding their
-register writes.  They are identical except for exactly the three registers
-under test:
+The parity is also what lets a 32-texel pitch work: two consecutive 32-row
+bands then share one tile and are told apart by that bit alone (`y bit 32`
+delta `0x200`, `y bit 64` delta `0x1000`).  Both cases fall out of
 
-```
-  11e0 = 32020040   vs  26000040    format and texel layout
-  11e4 = 60010020   vs  00010020    max level
-  11c0 = 01c01040   vs  01c01000    mip filter
+```c
+tile = ((y / 32) * pitch) / 64 + x / 64;      /* multiply before dividing */
 ```
 
-so the draw's shape, vertex descriptors, WARP bind, surfaces, combiner and
-packet framing are the same.  What the runs do **not** establish is that
-`--mip-address-probe` still passes on this tree: the shared kernel has grown
-userspace WARP program upload (`6b4237f`), page flips (`f6a3a14`) and
-uncommitted submit/WARP work since the handover's `43c0490`, and the loaded
-module defaults to `pack_draw_packets=Y`.  Another agent's own run wedged the
-same machine 60 seconds after the next reboot, with a different fence.
+`reference/p3d_tile.c:p3d_texture_tile_offset_p690_narrow()` implements this
+and `p3d_texture_tile_offset_chip()` dispatches to it for chip 0x2539 at one
+or two bytes per texel.
 
-**The next hardware session must run `--mip-address-probe /dev/dri/renderD128
-64 32` first.**  If that wedges too, the regression is in the shared tree and
-not in these descriptors; if it passes, the format fields are the cause and
-the sweep should continue one combination at a time.  Every wedge costs a
-reboot: a plain module reload afterwards fails in `warp_gate_ready()`
-(`parhelia_warp.c:193`) with `WARP store busy`, and the driver has no engine
-reset path.
+### At the GL level
 
-Two findings that hold regardless:
+`tools/parhelia-gl-texformat-test` reports 0 failing checks, and the stored
+component sizes show the storage the driver really chose:
+
+```
+RGB5_A1     R5G5B5A1   native      RGB565   R5G6B5   native
+LUMINANCE8  L8         native      RGBA8    R8G8B8A8 native
+RGBA4       R8G8B8A8   wider fallback
+```
+
+`GL_RGBA4` cannot reach the native `0x24` storage: `st_format.c` adds
+`PIPE_BIND_RENDER_TARGET` to the bindings for it (and for `GL_RGB4`,
+`GL_RGBA2`, `GL_RGB`, `GL_RGBA`, `GL_RGB8`, `GL_RGBA8`) even for an ordinary
+texture, and there is no 16-bit render-target descriptor to advertise.
+`GL_RGB5_A1` and `GL_RGB565` are not on that list, which is why they do reach
+it.  The format stays in the table because its encoding is measured; the
+state tracker simply never asks for it.
+
+Regressions after the change: GL clear, primitive and mipmap tests pass, the
+texture test keeps only its documented FBO-readback failure, and the Q3
+timedemo is unchanged at 30.9 fps with and without `PARHELIA_NO_NARROW_FORMATS=1`
+(Q3's own textures are 32-bit).
+
+### Getting there
+
+Two earlier probe runs wedged the engine, and both were red herrings:
 
 * **A fresh engine needs an untextured draw before any textured one.**  WARP
   temporary T2 holds garbage until a program writes it, which the handover
-  records for Mesa; it applies to every non-Mesa client too.
-  `probe_prime_warp()` now issues one degenerate untextured passthrough draw,
-  exactly like Mesa's `ph_prime_warp()`, and its fence does retire.
-* **`reset_on_probe=1` must not be used on the P690.**  After the engine is
-  wedged, a plain module reload fails with `WARP store busy: BM=03020000` and
-  `-ETIMEDOUT: cannot initialize WARP engine`.  Loading with
-  `reset_on_probe=1` does clear that condition and the module probes cleanly,
-  but `pci_reset_function_locked()` also clears the DRAM timings that POST
-  established, and `parhelia_drv.c` deliberately never reprograms the memory
-  controller ("preserving firmware-programmed SUN90 memory controller").  Every
-  VRAM access is corrupt from then on, and stays corrupt across further plain
-  reloads:
+  records for Mesa; it applies to every non-Mesa client.  `probe_prime_warp()`
+  issues one degenerate untextured passthrough draw, like `ph_prime_warp()`.
+* **`reset_on_probe=1` must not be used on the P690.**  After a wedge a plain
+  module reload fails in `warp_gate_ready()` (`parhelia_warp.c:193`) with
+  `WARP store busy`, and there is no engine reset path.  Loading with
+  `reset_on_probe=1` does clear that, but `pci_reset_function_locked()` also
+  clears the DRAM timings POST established, and `parhelia_drv.c` deliberately
+  never reprograms the memory controller.  Every VRAM access is corrupt from
+  then on and stays corrupt across further reloads
+  (`--native-transfer-probe`: mismatch; `--masked-clear-probe`: 65536/65536).
+  Only a reboot, which re-POSTs the card, restores it.
 
-  ```
-  --native-transfer-probe : semantic class 0 transfer data mismatch
-  --masked-clear-probe    : 65536/65536 mismatches
-  --mip-address-probe 64 32 : transfer round trip 0: 4096/4096 dwords differ
-  ```
-
-  Only a real reboot, which re-POSTs the card, restores it.  The recovery for
-  a wedged engine therefore remains the documented warm reboot.
+Once a reference draw with the known-good 32-bit descriptor was added in
+front of the sweep it passed 0/2048 on a healthy engine, and no run since has
+wedged anything.
 
 ## Sampled alpha
 
