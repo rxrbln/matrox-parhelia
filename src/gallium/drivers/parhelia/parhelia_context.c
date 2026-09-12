@@ -3716,6 +3716,12 @@ ph_submit_vertices(struct ph_context *ctx)
    state.screen_h = ctx->fb.height;
    state.prim = P3D_TRIANGLES;
    state.warp_entry = ph_warp_entry(ctx, false, false, false);
+   /* An untextured draw can still need a compiled fragment program - fixed
+    * function fog is a mix between the fragment colour and a constant - as
+    * long as that program samples nothing. */
+   state.comb = ctx->fs && ctx->fs->program.valid &&
+                !ctx->fs->program.sampler_mask ?
+                ph_compiled_combiner(ctx, false) : NULL;
    state.dither = !ctx->blend || ctx->blend->dither;
    state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
    state.cull = ctx->derived_triangles ? 0 :

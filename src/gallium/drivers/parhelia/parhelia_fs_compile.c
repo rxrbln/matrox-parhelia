@@ -166,7 +166,9 @@ ph_fs_leaf(struct ph_fs_ctx *ctx, nir_def *def, struct ph_fs_value *out)
             return false;
          if (deref->var->data.location == VARYING_SLOT_COL0)
             out->reg = P3D_COMB_V0;
-         else if (deref->var->data.location == VARYING_SLOT_COL1)
+         else if (deref->var->data.location == VARYING_SLOT_COL1 ||
+                  deref->var->data.location == VARYING_SLOT_FOGC)
+            /* The vertex side puts the fog coordinate in colour 1. */
             out->reg = P3D_COMB_V1;
          else
             return false;
@@ -194,7 +196,7 @@ ph_fs_leaf(struct ph_fs_ctx *ctx, nir_def *def, struct ph_fs_value *out)
 
          if (location == VARYING_SLOT_COL0)
             out->reg = P3D_COMB_V0;
-         else if (location == VARYING_SLOT_COL1)
+         else if (location == VARYING_SLOT_COL1 || location == VARYING_SLOT_FOGC)
             out->reg = P3D_COMB_V1;
          else
             return false;
@@ -720,9 +722,19 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
                if (instr->type == nir_instr_type_alu)
                   fprintf(stderr, "  fs alu %s\n",
                           nir_op_infos[nir_instr_as_alu(instr)->op].name);
-               else if (instr->type == nir_instr_type_intrinsic)
-                  fprintf(stderr, "  fs intrinsic %s\n",
-                          nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic].name);
+               else if (instr->type == nir_instr_type_intrinsic) {
+                  nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+                  nir_deref_instr *d = in->intrinsic == nir_intrinsic_load_deref ||
+                                       in->intrinsic == nir_intrinsic_store_deref ?
+                                       nir_src_as_deref(in->src[0]) : NULL;
+
+                  fprintf(stderr, "  fs intrinsic %s%s%s\n",
+                          nir_intrinsic_infos[in->intrinsic].name,
+                          d && d->deref_type == nir_deref_type_var ? " var location " : "",
+                          d && d->deref_type == nir_deref_type_var ?
+                          gl_varying_slot_name_for_stage(d->var->data.location,
+                                                         MESA_SHADER_FRAGMENT) : "");
+               }
                else if (instr->type == nir_instr_type_tex)
                   fprintf(stderr, "  fs tex\n");
                else if (instr->type == nir_instr_type_load_const)

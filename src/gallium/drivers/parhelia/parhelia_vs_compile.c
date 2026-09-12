@@ -849,7 +849,12 @@ ph_vs_output_slot(unsigned location, unsigned *slot)
 {
    if (location == VARYING_SLOT_COL0)
       *slot = 1;
-   else if (location == VARYING_SLOT_COL1)
+   else if (location == VARYING_SLOT_COL1 || location == VARYING_SLOT_FOGC)
+      /* The fixed-function fog coordinate rides in colour 1: the combiner's
+       * only interpolated inputs are the two colours, and the fragment stage
+       * reads this one back as v1.  A shader that wants both a specular
+       * colour and fog would collide, and ph_vs_collect refuses that because
+       * the slot is already taken. */
       *slot = 2;
    else if (location >= VARYING_SLOT_TEX0 && location <= VARYING_SLOT_TEX7)
       *slot = 3 + (location - VARYING_SLOT_TEX0);
