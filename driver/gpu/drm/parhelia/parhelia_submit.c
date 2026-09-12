@@ -3031,7 +3031,7 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	struct drm_gem_vram_object *bo;
 	unsigned long align_pages;
 	u8 layout;
-	u32 allocation_height, pitch_pixels, pitch;
+	u32 allocation_height, pitch_pixels, pitch, cpp, tile_width;
 	size_t bo_size;
 	u32 handle;
 	int ret;
@@ -3042,9 +3042,16 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 			    PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 			    PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
 			    PARHELIA_CREATE_RENDER_NATIVE_SCANOUT) ||
-	    hweight32(args->flags) > 1 || args->pad ||
+	    hweight32(args->flags) > 1 || (args->cpp && args->cpp != 4 &&
+					   args->cpp != 2) ||
 	    args->handle || args->pitch || args->size || args->mmap_offset)
 		return -EINVAL;
+	cpp = args->cpp ? args->cpp : 4;
+	/* The 16 bpp tile geometry is measured only for the 64x16 layout, and
+	 * the sampler keeps its own storage order for narrow texture images. */
+	if (cpp == 2 && (pdev->chip->tile_layout != PARHELIA_TILE_64X16_4K ||
+			 (args->flags & PARHELIA_CREATE_RENDER_TEXTURE)))
+		return -EOPNOTSUPP;
 	if (!to_parhelia(drm)->raw_aperture_owned)
 		return -EOPNOTSUPP;
 	if ((args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
@@ -3077,11 +3084,12 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	 * pitch.  Returning the render-target ALIGN(width, 64) pitch here
 	 * underallocated NPOT images such as 300x300 before the transient upload
 	 * path made that mismatch observable without a raw BAR mapping. */
+	tile_width = 64 * 4 / cpp;
 	if (args->flags & PARHELIA_CREATE_RENDER_TEXTURE)
 		pitch_pixels = roundup_pow_of_two(max_t(u32, args->width, 32));
 	else
-		pitch_pixels = ALIGN(args->width, 64);
-	pitch = pitch_pixels * 4;
+		pitch_pixels = ALIGN(args->width, tile_width);
+	pitch = pitch_pixels * cpp;
 	bo_size = ALIGN((size_t)pitch * allocation_height, 8192);
 	bo = drm_gem_vram_create(drm, bo_size, align_pages);
 	if (IS_ERR(bo))
