@@ -1895,6 +1895,13 @@ ph_warn_once(const char *fmt, ...)
 static bool
 ph_sampler_wrap(unsigned wrap, enum p3d_wrap *code)
 {
+   /* PARHELIA_LEGACY_WRAP restores the pre-measurement mapping, which sent
+    * every non-repeat mode to code 6.  It is wrong, and exists only to A/B
+    * the cost of the real one. */
+   if (ph_env("PARHELIA_LEGACY_WRAP")) {
+      *code = wrap == PIPE_TEX_WRAP_REPEAT ? P3D_WRAP_REPEAT : P3D_WRAP_CLAMP;
+      return true;
+   }
    switch (wrap) {
    case PIPE_TEX_WRAP_REPEAT:
       *code = P3D_WRAP_REPEAT;
