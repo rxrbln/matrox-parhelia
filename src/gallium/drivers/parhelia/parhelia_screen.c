@@ -1250,7 +1250,7 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * there is no software fragment fallback: a shader the driver cannot lower
     * is still rendered by the hardware, with the wrong algebra.  Advertising
     * GLSL 1.20 is therefore only defensible once the data-flow compiler is
-    * on; with the instruction-shape matcher alone, 23 of the 26 checks in
+    * on; with the instruction-shape matcher alone, 24 of the 27 checks in
     * tools/parhelia-gl-combiner-test render the wrong colour.  Report 1.10
     * by default so applications that can choose a fixed-function path do. */
    caps->glsl_feature_level = caps->glsl_feature_level_compatibility =
