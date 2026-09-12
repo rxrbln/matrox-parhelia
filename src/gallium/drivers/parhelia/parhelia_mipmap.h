@@ -46,12 +46,23 @@ struct ph_mip_level {
    size_t offset;
    unsigned width, height, pitch;
    unsigned tail_x, tail_y;
+   /* Storage one image of this level occupies.  A cube map's six faces are
+    * this many bytes apart; a volume's slices are interleaved instead. */
+   size_t bytes;
 };
 
 struct ph_mip_layout {
    struct ph_mip_level level[PH_MAX_MIP_LEVELS];
    size_t size;
    unsigned levels;
+   /* Slices of a volume image, or 6 for a cube map; 1 for a plain 2-D or
+    * 1-D image.  The texture-address unit derives a slice's own address from
+    * the descriptor's count in 0x11e4[27:16]. */
+   unsigned slices;
+   /* The six faces of a cube map are whole level images laid out
+    * face-minor inside a level (vendor mtx3887, .text+0x27cb3), where a
+    * volume interleaves its slices inside one storage tile. */
+   bool cube;
    /* Bytes per texel of the sampler storage this chain describes. */
    unsigned cpp;
    /* Bytes per 4x4 block when the storage is S3TC; zero otherwise. */
@@ -157,7 +168,7 @@ ph_mip_layout_init_cpp(struct ph_mip_layout *out, unsigned width,
    for (unsigned i = 0; i < requested_levels; i++) {
       struct ph_mip_level *level = &out->level[i];
       unsigned pitch, rows, level_align;
-      size_t bytes;
+      size_t bytes = (size_t)32 * (tiled ? 32 : 16) * cpp;
 
       level->width = width;
       level->height = height;
@@ -171,7 +182,6 @@ ph_mip_layout_init_cpp(struct ph_mip_layout *out, unsigned width,
 
          if (!tail_started) {
             tail_base = ph_mip_align((unsigned)next, level_align);
-            bytes = (size_t)32 * (tiled ? 32 : 16) * cpp;
             next = tail_base + bytes;
             tail_started = true;
          }
@@ -193,6 +203,7 @@ ph_mip_layout_init_cpp(struct ph_mip_layout *out, unsigned width,
          level->offset = ph_mip_align((unsigned)next, level_align);
          next = level->offset + bytes;
       }
+      level->bytes = bytes;
 
       width = width > 1 ? width >> 1 : 1;
       height = height > 1 ? height >> 1 : 1;
@@ -216,6 +227,39 @@ ph_mip_layout_init(struct ph_mip_layout *out, unsigned width, unsigned height,
 {
    return ph_mip_layout_init_chip(out, width, height, requested_levels, tiled,
                                   false);
+}
+
+static inline unsigned
+ph_mip_log2(unsigned value)
+{
+   unsigned bits = 0;
+
+   while ((1u << bits) < value)
+      bits++;
+   return bits;
+}
+
+/* Byte offset of texel (x,y) of slice @z in the measured P690 volume order
+ * (parhelia-drm-test --texture-volume-probe; see
+ * docs/parhelia-p690-volume-cube-targets.md).  The 512-byte granule of 32x4
+ * texels is the unit the slices interleave in, the four granules of a 32x16
+ * sub-tile follow it, and the sub-tile index is Gray-coded exactly as the two
+ * 32-wide halves of the plain 64x16 texture tile are.  A volume therefore
+ * does NOT hold whole 2-D images side by side. */
+static inline size_t
+ph_volume_texel_offset(unsigned x, unsigned y, unsigned z, unsigned pitch,
+                       unsigned slices, unsigned cpp)
+{
+   const unsigned zbits = ph_mip_log2(slices);
+   const unsigned tile = (y >> 4) * (pitch >> 5) + (x >> 5);
+   const unsigned gray = tile ^ (tile >> 1);
+   const unsigned granule = (x & 7u) | ((y & 1u) << 3) |
+                            (((x >> 3) & 3u) << 4) | (((y >> 1) & 1u) << 6);
+   unsigned index = granule | (z << 7) | (((y >> 2) & 3u) << (7 + zbits)) |
+                    (gray << (9 + zbits));
+
+   index ^= (gray & 1u) << 7;
+   return (size_t)index * cpp;
 }
 
 static inline unsigned

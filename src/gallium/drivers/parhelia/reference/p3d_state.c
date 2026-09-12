@@ -269,7 +269,7 @@ p3d_vtxcap(unsigned dw_per_vertex)
 static size_t
 p3d_descriptors(struct p3d_rw *out, int textured, int with_z,
 		uint32_t pos_override, uint32_t col_override, int no_colour,
-		int two_tex, int vertex_alpha)
+		int two_tex, int vertex_alpha, int texcoord3)
 {
 	size_t n = 0;
 
@@ -280,6 +280,20 @@ p3d_descriptors(struct p3d_rw *out, int textured, int with_z,
 		return n;
 	}
 	if (with_z) {
+	/* A three-component coordinate set takes the dwords the colour would
+	 * occupy, so the stream is position then S,T,R and nothing else.  That
+	 * keeps dw_per_vertex at the two-component figure: 7 without a depth or
+	 * transformed position, 8 with one. */
+	if (texcoord3) {
+		out[n].reg = P3D_R_DESC;
+		out[n].val = with_z ? 0x21c00000u : 0x20c00000u;
+		n++;
+		out[n].reg = P3D_R_DESC;
+		out[n].val = with_z ? 0xa1c70030u : 0xa1c70020u;
+		n++;
+		out[n].reg = P3D_R_DESC; out[n].val = 0; n++;
+		return n;
+	}
 		/* a THREE-component position: mask 7 in [25:22] instead of 3,
 		 * so z reaches the setup unit, and the colour moves to dword 3.
 		 * When the isolated depth-RGBA probe is selected, colour expands
@@ -688,7 +702,7 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			     st->pos_desc, st->col_desc,
 			     st->tex && st->tex->env == P3D_TEXENV_REPLACE,
 			     st->tex1 != NULL || st->second_texcoord_probe,
-			     st->vertex_alpha);
+			     st->vertex_alpha, st->texcoord3);
 
 	rw[0].reg = P3D_R_ATTR_PRESENT; rw[0].val = p3d_attr_present(desc, nd);
 	rw[1].reg = P3D_R_ATTR_MAP0;    rw[1].val = 0x00287210u;
@@ -811,9 +825,16 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			rw[1].reg = P3D_R_TEX_SURF_BASE; rw[1].val = tu->base;
 			rw[2].reg = P3D_R_TEX_SURF_W;
 			rw[2].val = (tu->width & 0x3fff) |
-				    ((tu->texelcode & 7) << 16) | (tu->fmt << 24);
+				    ((tu->texelcode & 7) << 16) |
+				    ((tu->type & 3u) << 19) | (tu->fmt << 24);
+			/* [18:16] is the coordinate mode: the default 4 feeds
+			 * the address unit two coordinates, 6 three. */
+			if (tu->coord_mode)
+				rw[0].val = (rw[0].val & ~0x00070000u) |
+					    ((tu->coord_mode & 7u) << 16);
 			rw[3].reg = P3D_R_TEX_SURF_H;
-			rw[3].val = (tu->height & 0x3fff) | (1u << 16) |
+			rw[3].val = (tu->height & 0x3fff) |
+				    ((tu->depth ? tu->depth & 0xfffu : 1u) << 16) |
 				    ((tu->max_level & 0xfu) << 28);
 			p3d_reglist(cs, rw, 4);
 
@@ -1063,7 +1084,7 @@ p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 			     st->pos_desc, st->col_desc,
 			     st->tex && st->tex->env == P3D_TEXENV_REPLACE,
 			     !!st->tex1,
-			     !!st->vertex_alpha);
+			     !!st->vertex_alpha, !!st->texcoord3);
 	p3d_reglist(cs, desc, nd);
 
 	for (i = 0; i < nprim; i++)

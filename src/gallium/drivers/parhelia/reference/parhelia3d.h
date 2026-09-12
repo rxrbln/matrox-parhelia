@@ -433,6 +433,19 @@ struct p3d_comb_program {
 	struct p3d_comb_inst inst[P3D_COMB_MAX_INSTRUCTIONS];
 };
 
+/* Sampler target.  0x11e0[20:19] carries the surface type: the Linux HAL's
+ * descriptor writer mtx3424 (.text+0x1eab0) ORs (type & 3) << 3 into the byte
+ * that is 0x11e0[23:16], and its three surface-class builders pass 0 for 2-D
+ * (mtx1747 .text+0x290ed), 1 for a cube map (mtx3887 .text+0x279b1) and 2 for
+ * a volume (mtx325 .text+0x28677).  There is no 1-D class: GL_TEXTURE_1D is a
+ * height-1 2-D surface.  0x1200+4u[18:16] is the coordinate mode, 4 for the
+ * two-coordinate targets and 6 for the three-coordinate ones.  See
+ * docs/parhelia-p690-volume-cube-targets.md. */
+enum p3d_tex_type { P3D_TEX_TYPE_2D = 0, P3D_TEX_TYPE_CUBE = 1,
+		    P3D_TEX_TYPE_VOLUME = 2 };
+#define P3D_TEX_COORD_2D	4u
+#define P3D_TEX_COORD_3D	6u
+
 struct p3d_texture {
 	uint32_t base, width, height;
 	uint32_t fmt;		/* 0x32 A8R8G8B8, 0x33 X8R8G8B8, 0x11 L8 */
@@ -441,6 +454,12 @@ struct p3d_texture {
 	enum p3d_filter min_filter, mag_filter;
 	enum p3d_mip	mip_filter;
 	enum p3d_wrap	wrap_s, wrap_t, wrap_r;
+	/* Volume and cube-map descriptor.  0x11e4[27:16] is the slice count with
+	 * a minimum of one, 0x11e0[20:19] the surface type and 0x1200+4u[18:16]
+	 * the coordinate mode; zero in either keeps the plain 2-D descriptor. */
+	uint32_t	depth;
+	unsigned	type;
+	unsigned	coord_mode;
 	unsigned	max_level;	/* 0x11e4[31:28] */
 	enum p3d_texenv	env;
 	/* GL_TEXTURE_ENV_COLOR for P3D_TEXENV_BLEND, in the hardware's own
@@ -644,6 +663,12 @@ struct p3d_state {
 	 * separates the multitexture WARP program's o4 output from unit-1 texture
 	 * state.  Gallium never sets this field. */
 	int		   second_texcoord_probe;
+	/* The vertex carries a three-component coordinate set 0 (s, t, r), which
+	 * a volume or cube-map sampler needs.  The attribute port has room for
+	 * the third component only where the vertex colour would sit, so this
+	 * shape drops the colour attribute; the combiner takes its primary
+	 * colour from the WARP replace program's constant instead. */
+	int		   texcoord3;
 	/* 1 selects the P690-proven single live pipe.  Value 2 is diagnostic
 	 * only: it additionally retains the vendor's disabled unit-1 pipe mask
 	 * (0x0001000c), while issuing no second sampler descriptor. */
