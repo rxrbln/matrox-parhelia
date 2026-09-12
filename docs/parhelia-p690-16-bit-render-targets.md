@@ -165,6 +165,68 @@ alignment, and returns a byte pitch.  `cpp = 2` is refused for the texture
 class (the sampler has its own narrow order) and on any chip that is not the
 64x16/4 KiB layout, since that is all that has been measured.
 
+## 5a. The scanout path (MEASURED)
+
+`DC_FORMAT` already encoded `0x28` for RGB565; the plane, the framebuffer
+object and the dumb allocation did not.  With those three opened up:
+
+* `--narrow-scanout-probe` 3-D draws eight 5:6:5 colour bars into a native
+  scanout object, publishes it with `ADDFB2 DRM_FORMAT_RGB565` and modesets
+  onto it.  At 1920x1200: **0 of 2304000 pixels differ** from the model, the
+  active head's `DC_CTRL` reads `0x00040201`, `DC_START` `0x08000000` (the
+  bank-B display band) and **`DC_FORMAT` `0x28030780`** — format `0x28`,
+  type 3, pitch `0x780` = 1920 pixels.  `--scanout-dump`, now format aware,
+  recovers all eight bars through a GPU copy of what the CRTC scans.
+* The 16 bpp host-aperture code is **`0x20`**, the vendor's "2-D view" entry
+  for every 16 bpp format.  `--narrow-dumb-probe` writes one distinct
+  halfword per pixel through a 16 bpp dumb buffer's CPU mapping and reads the
+  object back with the 2-D engine: **all 32768 land exactly where the measured
+  16 bpp tile order says.**
+* The X modesetting driver's native Present/DRI2 BITBLT takes the same
+  two-byte 2-D view (`0x20030000 | pitch_in_pixels`);
+  `xserver-modesetting-16bpp-present-blit.patch` carries that change.
+
+With those in place an X server starts at **depth 16** with DRI3 and direct
+rendering, glxgears runs, and ioquake3 gets a real
+`color(16-bits) Z(16-bit) stencil(0-bits)` visual.
+
+## 5b. ioquake3 in a 16-bit visual: SLOWER, and why (MEASURED)
+
+The 1280x1024 `bench` timedemo, `GL_LINEAR_MIPMAP_NEAREST`, same build, same
+machine, same session:
+
+| screen | ioquake3 visual | fps | frame times min/avg/max |
+|---|---|---|---|
+| depth 24 | color 24, Z 24, stencil 8 | **31.9** | 17.0 / 31.3 / 58.0 ms |
+| depth 16 | color 16, Z 16, stencil 0 | **29.0** | 24.0 / 34.4 / 92.0 ms |
+
+`+set r_colorbits 16 +set r_depthbits 16` on a depth-24 screen changes
+nothing (32.0 fps): GLX has no 16-bit visual there, and the log says "Using 24
+color bits, 24 depth, 8 stencil display".
+
+The cause is visible in `PARHELIA_STATS=1` on the *same* demo frames (the
+hardware-transform counters line up exactly, so these are frame-for-frame
+comparisons):
+
+| | depth 24 | depth 16 |
+|---|---|---|
+| triangles per frame | 2046 – 4181 | 7509 – 9473 |
+| submits per frame | 8 – 12 | 22 – 30 |
+| fence wait per frame | 4.0 – 6.6 ms | 7.3 – 9.6 ms |
+
+Three to four times the geometry and three times the submissions.  Every
+measured alpha route in the driver — the native sampled-alpha path, the
+two-pass RGB route and the alpha-micro route — is gated on a
+`B8G8R8A8/B8G8R8X8_UNORM` colour target **and** a `Z24_UNORM_S8_UINT` depth
+buffer (`parhelia_context.c` around lines 1921, 2243 and 2346).  On a 5:6:5
+colour target with a Z16 depth buffer all three predicates fail and Quake 3's
+alpha surfaces fall back to the expanded software route, which costs far more
+than the fill rate saves.
+
+So the fill-rate win is real and the display path works, but it cannot reach a
+Quake 3 frame until those alpha routes are re-measured and opened for a 16 bpp
+colour target.  That is the next step, not a guess to enable.
+
 ## 6. What is implemented and what is not
 
 Implemented and validated end to end: `PIPE_FORMAT_B5G6R5_UNORM` render
@@ -174,14 +236,17 @@ precision, CPU transfer/readback and the `ph_blit` conversion path.
 `parhelia-gl-16bit-test` exercises all of that through GL renderbuffers in an
 FBO: 0 failing checks.
 
-Not implemented: a 16 bpp **scanout / display target / dma-buf** surface.  The
-display controller already takes `DC_FORMAT = 0x28000000` for RGB565, but the
-KMS plane, the dumb-buffer allocation, the linear companion and the Present
-BITBLT are all still 32-bit, so `ph_format_supported` refuses B5G6R5 for
-`SCANOUT`, `DISPLAY_TARGET` and `SHARED`.  Until that exists an X screen runs
-at depth 24 and a GLX client cannot be given a 5:6:5 *window*: ioquake3's
-`+set r_colorbits 16` falls back to the screen's 24-bit visual, which is why
-16-bit colour cannot yet reach a Quake 3 frame.
+Also implemented and validated: the 16 bpp scanout path of §5a — the KMS plane,
+the RGB565 framebuffer, the 16 bpp dumb buffer and its host aperture, the
+X server's native Present BITBLT, and B5G6R5 for `SCANOUT`,
+`DISPLAY_TARGET` and `SHARED` in `ph_format_supported`.
+
+Not implemented, and the reason a 16-bit Quake 3 frame is currently slower
+(§5b): the alpha routes are still gated to a 32-bit colour target and a Z24
+depth buffer.  A 16 bpp linear companion is also untested — a B5G6R5 resource
+that needs one (a sampled or CPU-mapped display target) still takes the 32-bit
+path, and `ph_copy_present_quad` refuses anything that is not four bytes per
+pixel.
 
 One resource cannot be both a 16 bpp sampler image and a 16 bpp render target:
 the two storage orders differ.  `ph_format_supported` refuses the combination,
