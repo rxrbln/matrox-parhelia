@@ -10,6 +10,17 @@ from the disassembly at the cited address; **[INFERRED]** = the most plausible
 reading of proven code, not yet confirmed on hardware; **[OPEN]** = not
 resolved.
 
+> **Superseded in part by `parhelia-p690-fast-depth-clear.md`.**  That document
+> measures the Z-init block on P690 silicon and corrects three readings below:
+> the coverage limit is **640 tiles of 4096 bytes (2 621 440 B)**, not the
+> vendor's software `0x3c0000`; the Z-init load writes no memory at all, so the
+> resolve of section 3.3 is mandatory for every consumer outside the Z unit;
+> and the reason the feature ships disabled is the per-chip default expression
+> alone (`mtx_drv.so` `RegistrySwitchManager` `0x6101f`, mask `0x3c0` =
+> PCI `102b:0528` only), with no erratum recorded anywhere in either package.
+> The `mtx_drv.so` `.dynsym` carries the real symbol names for the same
+> addresses `.symtab` obfuscates, which is how those defaults were read.
+
 ## Inputs
 
 | file | SHA-256 |
@@ -298,7 +309,9 @@ Z-init load: 0x12b4 = value; DWGCTL 0x008 (ZComp) or 0x208 (Z-init only)
 The Sundog-class coverage is `0x3c0000` bytes (983040 pixels of 32-bit Z) in
 32×16-pixel units; the Parhelia path `0xa0e90` uses `0x300000` bytes in 32×32
 units (`0xa105e`, `shl 0xa`).  Such a fixed byte limit, independent of surface
-count, points to fixed on-chip Z-init state [INFERRED].
+count, points to fixed on-chip Z-init state [INFERRED].  **Measured on P690
+the coverage is 640 tiles of 4096 bytes = `0x280000`, two thirds of the
+software limit; see `parhelia-p690-fast-depth-clear.md` section 4.**
 
 Leaving the Z-init surface (`0xa4640`, argument 1 = resolve):
 
@@ -362,7 +375,9 @@ decompressed surface. [INFERRED from the placement of the calls]
 ### 3.5 Is it on by default on P690?
 
 No.  Z compression needs `3D.EnableZCompSundog = 1`; Z-init needs
-`DirectX.EnableZinit = 1`; neither default is true for `caps = 0x10000..0x40000`,
+`3D.EnableZinit = 1` (the option lives in the `3D` section, not `DirectX`:
+the `DirectX` string at `mtxpserd.dll` `0x10ac64` belongs to the preceding
+`DirectX.HwPureDevice`); neither default is true for `caps = 0x10000..0x40000`,
 the INF does not set them, and the Linux vendor driver does not implement
 compression at all.  The vendor shipped both disabled on Sundog-class chips;
 treat them as experimental. [PROVEN]
