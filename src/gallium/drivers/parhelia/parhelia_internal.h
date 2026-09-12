@@ -45,6 +45,13 @@ struct parhelia_screen {
     * tile order plus a kernel that allocates two bytes per pixel. */
    bool narrow_targets;
    bool s3tc;
+   /* Volume and cube-map sampler targets: the texture-address unit's
+    * three-coordinate mode plus the measured slice addressing.  The two are
+    * separate flags because their storage is: a volume interleaves its
+    * slices inside the storage tile and a cube map stacks whole face
+    * images. */
+   bool volume_targets;
+   bool cube_targets;
    /* Zero means GET_PARAM was unavailable or returned an invalid value. */
    uint32_t kernel_max_packets;
    uint64_t vram_size;

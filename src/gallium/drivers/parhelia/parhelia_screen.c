@@ -245,7 +245,19 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
    if (samples <= 1 && storage_samples <= 1) {
       if (target == PIPE_BUFFER) {
          supported = true;
-      } else if (target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_RECT) {
+      } else if (target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_RECT ||
+                 target == PIPE_TEXTURE_1D ||
+                 ((target == PIPE_TEXTURE_3D ? ph_screen(s)->volume_targets :
+                   target == PIPE_TEXTURE_CUBE && ph_screen(s)->cube_targets) &&
+                  (bind & PIPE_BIND_SAMPLER_VIEW) &&
+                  !(bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL |
+                            PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
+                            PIPE_BIND_SHARED)))) {
+         /* A 1-D image is a one-row 2-D surface: the address unit's own mip
+          * chain for a height-1 base was measured level by level with
+          * --mip-address-probe W 1 and needs no descriptor of its own.  A
+          * volume or cube map is sampler-only: those descriptors exist for
+          * the texture unit alone. */
          switch (format) {
          case PIPE_FORMAT_B5G6R5_UNORM:
             /* Sampler code 0x28, and the same code as a render target: a
@@ -641,6 +653,11 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * rejected otherwise valid large textures and render targets. */
    const unsigned max_width = 2048;
    const unsigned max_height = 2048;
+   /* Slices of a volume, or the six faces of a cube map.  The address unit
+    * derives their addresses itself from 0x11e4[27:16]. */
+   const bool cube_target = templ->target == PIPE_TEXTURE_CUBE;
+   const unsigned slices = templ->target == PIPE_TEXTURE_3D ? templ->depth0 :
+                           cube_target ? 6u : 1u;
    unsigned mip_levels;
    if (!r)
       return NULL;
@@ -665,10 +682,18 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    }
    /* A compressed image only has a native block layout; there is no 32-bit
     * fallback storage for one. */
+   /* A volume or cube map needs the native sampler storage: its slices are
+    * interleaved inside the storage tile, which only the tiled texture
+    * classes have. */
    if (templ->width0 > max_width || templ->height0 > max_height ||
-       templ->depth0 != 1 ||
        (util_format_is_compressed(templ->format) && !block_bytes) ||
-       templ->array_size != 1) {
+       (slices > 1 && (!p690_native_texture32 || block_bytes ||
+                       slices > 64 ||
+                       (cube_target ? templ->width0 != templ->height0 :
+                        (templ->width0 < 64 ||
+                         !!(templ->depth0 & (templ->depth0 - 1)))))) ||
+       (templ->target != PIPE_TEXTURE_3D && templ->depth0 != 1) ||
+       templ->array_size != (cube_target ? 6u : 1u)) {
       fprintf(stderr,
               "parhelia: reject resource target=%u format=%u %ux%ux%u array=%u levels=%u bind=%#x\n",
               templ->target, templ->format, templ->width0, templ->height0,
@@ -680,7 +705,12 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * compact 32x32 child, and a shared <=16 native 64x16 tail.  The
     * texture-only upload BO is required: an ordinary mapped render BO
     * selects the wrong storage class for mip sampling. */
-   mip_levels = p690_native_texture32 &&
+   /* A volume, a cube map or a one-row image carries level 0 only: the
+    * address unit's own chain geometry for those shapes has not been
+    * measured, and a chain it derives differently from the driver's samples
+    * the wrong storage.  A 1-D texture's level 0 is an ordinary one-row 2-D
+    * surface in the measured order. */
+   mip_levels = p690_native_texture32 && slices == 1 && templ->height0 > 1 &&
                 !(templ->width0 & (templ->width0 - 1)) &&
                 !(templ->height0 & (templ->height0 - 1)) ?
                    templ->last_level + 1 : 1;
@@ -725,6 +755,18 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
                                    ph_mip_align(templ->height0, 32) * 4,
                                    0x2000);
    }
+   /* One level image per cube face, or one per volume slice; the chain above
+    * already describes a single image. */
+   if (slices > 1) {
+      r->mip.slices = slices;
+      r->mip.cube = cube_target;
+      /* The vendor's own level size, which is what the address unit derives
+       * a face stride from: the descriptor pitch by the tile-row-aligned
+       * height (mtx1444, .text+0x5b972). */
+      r->mip.level[0].bytes = (size_t)r->mip.level[0].pitch *
+                              ph_mip_align(templ->height0, 16) * 4;
+      r->mip.size = ph_mip_align(r->mip.level[0].bytes * slices, 0x2000);
+   }
    /* CREATE_RENDER has a bounded height.  Retain the historical level-zero
     * allocation for an unusually large chain rather than rejecting an
     * otherwise usable texture; transfer maps for its lower levels become
@@ -753,7 +795,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       .width = p690_native_texture32 ? MAX2(templ->width0, 64u) :
                cpp != 4 || block_bytes ? create_pitch : templ->width0,
       /* Rows of the (possibly wider) allocation that hold the chain. */
-      .height = mip_levels > 1 || cpp != 4 || block_bytes ?
+      .height = mip_levels > 1 || cpp != 4 || block_bytes || slices > 1 ?
          (r->mip.size + (size_t)create_pitch * 4 - 1) /
          ((size_t)create_pitch * 4) :
          templ->height0,
@@ -854,7 +896,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * storage the sampler decodes, and nothing detiles blocks.  Neither has a
     * 16 bpp render or depth surface: it is never shared or sampled, and its
     * CPU image is the byte-exact native shadow. */
-   if (!share_native && !block_bytes && r->cpp == 4 &&
+   if (!share_native && !block_bytes && r->cpp == 4 && slices == 1 &&
        (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
                        PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW))) {
       /* CREATE_DUMB is a modeset-only ioctl and is unavailable through a
@@ -1343,6 +1385,18 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
       p3d_texture_uses_p690_narrow(s->chip_id, s->tile_layout, 2) &&
       !ph_env("PARHELIA_NO_NARROW_FORMATS");
    s->s3tc = s->texture_upload && ph_env("PARHELIA_S3TC");
+   /* Volume and cube-map targets need the native 32-bit texture order, whose
+    * storage tile carries the volume slice interleave, and the address unit's
+    * three-coordinate mode.  The descriptor and the volume texel order are
+    * measured (--texture-volume-probe; docs/parhelia-p690-volume-cube-targets.md),
+    * but only for one image geometry and never yet through the GL path, so
+    * volumes wait behind PARHELIA_VOLUME_TARGETS=1.  The cube-map face stride
+    * is recovered from the vendor HAL and not measured at all on this
+    * silicon, so cube maps additionally need PARHELIA_CUBE_TARGETS=1. */
+   s->volume_targets = s->texture_upload &&
+      p3d_texture_uses_native_64x16(s->chip_id, s->tile_layout, 4) &&
+      ph_env("PARHELIA_VOLUME_TARGETS");
+   s->cube_targets = s->volume_targets && ph_env("PARHELIA_CUBE_TARGETS");
    /* 16-bit render targets: ask the kernel for a two-byte-per-pixel native
     * colour allocation.  Only a kernel that knows the 128-pixel tile row can
     * place one, and only the P690's measured order is implemented.
@@ -1397,6 +1451,16 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * either dimension exceeds this cap, so reporting 1024 prevented glamor
     * from creating a 1920x1200 front buffer despite that path being valid. */
    caps->max_texture_2d_size = 2048;
+   /* Volume and cube-map targets.  The chip advertises 2048 for both (vendor
+    * libGL 0x13bce0 and 0x13c539); this driver's tiled sampler storage stops
+    * at 512, and a volume also has to fit its slices in VRAM, so 512 faces
+    * and 256-cubed volumes are the honest limits.  The cap is a level count,
+    * so it bounds the extent; only level 0 is stored either way.  Array
+    * textures have no hardware target at all and stay at zero. */
+   if (s->volume_targets)
+      caps->max_texture_3d_levels = 9;
+   if (s->cube_targets)
+      caps->max_texture_cube_levels = 10;
    /* There is no pipe fence object yet.  Native window swaps are ordered by
     * the following Present blit, so the DRI frontend must not request a NULL
     * fence solely to throttle every swap in the client. */
