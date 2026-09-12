@@ -1520,25 +1520,15 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * surface extent.  DRI rejects a GBM image before resource_create() when
     * either dimension exceeds this cap, so reporting 1024 prevented glamor
     * from creating a 1920x1200 front buffer despite that path being valid. */
-   /* The texture unit wraps at 512 texels in *both* axes on the P690: a
-    * 1024x256 image loses x bit 9 and a 256x1024 image loses y bit 9, each
-    * with exactly half its texels reading the other half, and linear storage
-    * wraps identically - so it is the address unit's range, not the tile
-    * order (parhelia-drm-test --mip-address-probe 1024 256, and with
-    * PROBE_LINEAR=1).  Claiming 2048 made ioquake3 build 1024-square merged
-    * lightmap atlases and upload 640x480 cinematics that sample wrong.  The
-    * vendor's own GL advertises 2048, so a mechanism exists that we have not
-    * recovered; until then advertise what works.  The original boards have
-    * four texture units and their own pipe routing and are not measured yet,
-    * so they keep the old value rather than inherit an assumption. */
-   caps->max_texture_2d_size = s->chip_id == 0x2539 ? 512 : 2048;
-   /* Render targets, viewports and scanout surfaces reach the chip's full
-    * surface extent even where the sampler does not. */
-   caps->max_render_target_size = 2048;
+   /* The sampler reaches the same 2048 the vendor's GL advertises: every
+    * level of a 528-, 640-, 1024- and 2048-wide chain is byte exact
+    * (--mip-address-probe).  A 512 limit measured earlier was the probe's own
+    * fixed 512x512 clip window discarding the part of the quad past it, whose
+    * undrawn pixels the check then counted as texels the sampler got wrong. */
+   caps->max_texture_2d_size = 2048;
    /* Volume and cube-map targets.  The chip advertises 2048 for both (vendor
-    * libGL 0x13bce0 and 0x13c539); this driver's tiled sampler storage stops
-    * at 512, and a volume also has to fit its slices in VRAM, so 512 faces
-    * and 256-cubed volumes are the honest limits.  The cap is a level count,
+    * libGL 0x13bce0 and 0x13c539); a volume also has to fit its slices in
+    * VRAM, so 512 faces and 256-cubed volumes are the honest limits.  The cap is a level count,
     * so it bounds the extent; only level 0 is stored either way.  Array
     * textures have no hardware target at all and stay at zero. */
    if (s->volume_targets)
