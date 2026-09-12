@@ -1417,6 +1417,40 @@ ph_apply_fragment_state(struct ph_context *ctx, struct p3d_state *state,
  * deliberately narrower than GL's general blend model: every other blend,
  * texture, alpha-test, multi-texture, and shader form retains the existing
  * RGB vertex stream. */
+/* Colour targets the measured alpha routes may write.  Those routes drive the
+ * blend unit, the alpha comparator and the depth compare, and none of the
+ * three sees the target's format: parhelia-drm-test --narrow-alpha-probe
+ * reproduces all eight live forms -- vertex-alpha source-over with and
+ * without depth, vertex-alpha additive, the sampled-alpha companion in its
+ * source-over and its accepted and rejected cutout shapes, and the two passes
+ * of the RGB alpha two-pass route -- on a 5:6:5 target against a Z16 buffer,
+ * within one colour code of the same draw into a 32-bit target with Z24. */
+static bool
+ph_alpha_route_colour(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_B8G8R8A8_UNORM ||
+          format == PIPE_FORMAT_B8G8R8X8_UNORM ||
+          format == PIPE_FORMAT_B5G6R5_UNORM;
+}
+
+static bool
+ph_alpha_route_depth(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
+          format == PIPE_FORMAT_Z16_UNORM;
+}
+
+/* A target with no destination alpha.  The RGB alpha two-pass route's pair of
+ * hardware passes is then the complete visible source-over result for any
+ * RGBA texture, with no image fingerprint needed; 5:6:5 has no alpha channel
+ * at all, and p3d_colour_mask() already drops the route's mask_a for it. */
+static bool
+ph_target_no_dest_alpha(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_B8G8R8X8_UNORM ||
+          format == PIPE_FORMAT_B5G6R5_UNORM;
+}
+
 static bool
 ph_use_vertex_alpha(struct ph_context *ctx, bool textured,
 		    bool multitextured, bool depth, bool has_colour)
@@ -1918,10 +1952,9 @@ ph_use_native_sampled_alpha(struct ph_context *ctx, bool textured,
        ph_alpha_companion_extent(texture->base.width0) > 0x3fff ||
        ph_alpha_companion_extent(texture->base.height0) > 0x3fff ||
        !color->handle ||
-       (color->base.format != PIPE_FORMAT_B8G8R8A8_UNORM &&
-        color->base.format != PIPE_FORMAT_B8G8R8X8_UNORM) ||
+       !ph_alpha_route_colour(color->base.format) ||
        (depth && (!zs->handle ||
-                  ctx->fb.zsbuf.format != PIPE_FORMAT_Z24_UNORM_S8_UINT)) ||
+                  !ph_alpha_route_depth(ctx->fb.zsbuf.format))) ||
        !((sampler->min_img_filter == PIPE_TEX_FILTER_NEAREST ||
           sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR) &&
          (sampler->mag_img_filter == PIPE_TEX_FILTER_NEAREST ||
@@ -2240,6 +2273,11 @@ ph_use_cpu_alpha_cutout(struct ph_context *ctx, bool textured,
        texture->base.target != PIPE_TEXTURE_2D ||
        texture->base.format != PIPE_FORMAT_R8G8B8A8_UNORM ||
        !texture->upload_texture || !texture->map ||
+       /* This route rasterizes on the CPU into the linear companion images,
+        * reading and writing a 32-bit pixel and a 32-bit Z24 word directly
+        * (ph_cpu_linear_pixel(), ph_cpu_depth_pass()).  A 16 bpp target has
+        * neither a linear companion nor those word layouts, so it stays on
+        * the native sampled-alpha route above, which now covers 5:6:5. */
        (color->base.format != PIPE_FORMAT_B8G8R8A8_UNORM &&
         color->base.format != PIPE_FORMAT_B8G8R8X8_UNORM) || !color->linear_map ||
        !zs->linear_map || sampler->min_img_filter != PIPE_TEX_FILTER_LINEAR ||
@@ -2343,11 +2381,10 @@ ph_use_rgb_alpha_two_pass(struct ph_context *ctx, bool textured,
        texture->base.target != PIPE_TEXTURE_2D ||
        texture->base.format != PIPE_FORMAT_R8G8B8A8_UNORM ||
        !texture->upload_texture || !texture->handle || !texture->map ||
-       (color->base.format != PIPE_FORMAT_B8G8R8A8_UNORM &&
-        color->base.format != PIPE_FORMAT_B8G8R8X8_UNORM) || !color->handle ||
+       !ph_alpha_route_colour(color->base.format) || !color->handle ||
        (ctx->dsa->depth_enabled &&
         (!zs->handle ||
-         ctx->fb.zsbuf.format != PIPE_FORMAT_Z24_UNORM_S8_UINT)) ||
+         !ph_alpha_route_depth(ctx->fb.zsbuf.format))) ||
        sampler->min_img_filter != PIPE_TEX_FILTER_LINEAR ||
        sampler->mag_img_filter != PIPE_TEX_FILTER_LINEAR ||
        !(sampler->min_mip_filter == PIPE_TEX_MIPFILTER_NEAREST ||
@@ -2380,13 +2417,13 @@ ph_use_rgb_alpha_two_pass(struct ph_context *ctx, bool textured,
       ph_restore_rgba_tiled(texture);
    ph_resource_upload_tiled(texture);
 
-   /* XRGB has no destination alpha to preserve.  The two hardware passes
-    * therefore implement the complete visible source-over result for every
-    * RGBA texture accepted above; no application fingerprint or screen-space
-    * heuristic is needed.  Keep the image classification below only for a
-    * true ARGB target, whose alpha-channel equation P690 cannot reproduce
-    * from sampled RGB. */
-   if (color->base.format == PIPE_FORMAT_B8G8R8X8_UNORM)
+   /* A target without destination alpha has nothing to preserve.  The two
+    * hardware passes therefore implement the complete visible source-over
+    * result for every RGBA texture accepted above; no application fingerprint
+    * or screen-space heuristic is needed.  Keep the image classification
+    * below only for a true ARGB target, whose alpha-channel equation P690
+    * cannot reproduce from sampled RGB. */
+   if (ph_target_no_dest_alpha(color->base.format))
       return true;
 
    if (ctx->cpu_alpha_hash_resource != texture ||
@@ -2458,10 +2495,11 @@ ph_rgb_alpha_primitive(struct ph_context *ctx,
             return false;
    }
 
-   /* ph_use_rgb_alpha_two_pass() established the exact XRGB equation and all
-    * texture, blend, depth and stencil requirements.  Position and atlas size
-    * do not affect correctness on this framebuffer format. */
-   if (color->base.format == PIPE_FORMAT_B8G8R8X8_UNORM)
+   /* ph_use_rgb_alpha_two_pass() established the exact equation for a target
+    * without destination alpha and all texture, blend, depth and stencil
+    * requirements.  Position and atlas size do not affect correctness on such
+    * a framebuffer format. */
+   if (ph_target_no_dest_alpha(color->base.format))
       return true;
    /* The live q3dm1 fingerprint is the centered 24x24 reticle.  It lies
     * outside the HUD bands below and is the most visible sampled-alpha
