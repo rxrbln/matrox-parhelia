@@ -1410,7 +1410,12 @@ ph_apply_fragment_state(struct ph_context *ctx, struct p3d_state *state,
       struct p3d_blend_factor a_src = ph_blend_factor(blend->alpha_src_factor);
       struct p3d_blend_factor a_dst = ph_blend_factor(blend->alpha_dst_factor);
 
-      state->blend = blend->blend_enable;
+      /* An enabled logic op replaces blending, in GL and in the engine: the
+       * raster op lives in DWGCTL [7:4] and the back end honours blending
+       * only while that nibble is GXcopy. */
+      state->logicop_enable = ctx->blend->logicop_enable;
+      state->logicop = ctx->blend->logicop_func;
+      state->blend = blend->blend_enable && !ctx->blend->logicop_enable;
       state->blend_src = (struct p3d_blend_factor){rgb_src.rgb, a_src.a};
       state->blend_dst = (struct p3d_blend_factor){rgb_dst.rgb, a_dst.a};
       state->blend_eq = ph_blend_equation(blend->rgb_func);
@@ -5529,6 +5534,38 @@ ph_tcl_matrix(struct ph_context *ctx, float mvp[16])
  * in z, or outside the guard band in x and y, keeps the software clipper. */
 #define PH_TCL_GUARD_BAND 8160.0f
 
+/* The fragment colour when it is a plain constant: GL's current colour, set
+ * with glColor and not through a colour array, reaches the fragment stage as a
+ * uniform rather than a COL0 varying.  The vertex shader then writes no
+ * colour, and a draw that stages white into the colour slot renders white
+ * instead of the colour the application asked for.  The fragment compiler
+ * already resolves such a shader to one instruction moving a constant-buffer
+ * vec4, so read that vec4 and stage it. */
+static bool
+ph_fs_constant_colour(struct ph_context *ctx, float out[4])
+{
+   const struct ph_fs *fs = ctx->fs;
+   const uint8_t *base = NULL;
+   unsigned offset;
+
+   if (!fs || !fs->program.valid || fs->program.sampler_mask ||
+       fs->program.comb.count != 1 || fs->program.const_ref_count != 1)
+      return false;
+   if (ctx->user_constants[MESA_SHADER_FRAGMENT])
+      base = ctx->user_constants[MESA_SHADER_FRAGMENT];
+   else if (ctx->constants[MESA_SHADER_FRAGMENT])
+      base = ph_resource(ctx->constants[MESA_SHADER_FRAGMENT])->malloc_data;
+   if (!base)
+      return false;
+   base += ctx->constant_offset[MESA_SHADER_FRAGMENT];
+   offset = fs->program.const_ref[0].vec4_index * 4u * sizeof(float);
+   if (offset + 4u * sizeof(float) >
+       ctx->constant_size[MESA_SHADER_FRAGMENT])
+      return false;
+   memcpy(out, base + offset, 4 * sizeof(float));
+   return true;
+}
+
 static bool
 ph_tcl_vertices_fit(const struct ph_context *ctx, const float *vertices,
                     unsigned count, unsigned dpv)
@@ -5955,10 +5992,15 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
       if (lay.program ?
              !(ctx->vs->prog.input_mask & (1u << P3D_WARP_V_COLOUR)) :
              ctx->vs->colour_input < 0) {
+         float constant[4];
+         const bool have = ph_fs_constant_colour(ctx, constant);
+
          for (unsigned v = 0; v < chunk * 3; v++) {
             float *c = dst + v * lay.dpv + lay.colour_offset;
 
-            c[0] = c[1] = c[2] = 1.0f;
+            c[0] = have ? constant[0] : 1.0f;
+            c[1] = have ? constant[1] : 1.0f;
+            c[2] = have ? constant[2] : 1.0f;
          }
       }
       if (!ph_tcl_vertices_fit(ctx, dst, chunk * 3, lay.dpv)) {

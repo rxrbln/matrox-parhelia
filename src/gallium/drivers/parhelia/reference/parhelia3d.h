@@ -578,6 +578,14 @@ struct p3d_state {
 	 * RG in 0x12ec and BA in 0x12f0. */
 	uint32_t	   blend_const_rg, blend_const_ba;
 	int		   dither;
+	/* GL_COLOR_LOGIC_OP.  The raster op is DWGCTL bits [7:4], a 4-bit truth
+	 * table, and Gallium's pipe_logicop values already are that encoding:
+	 * PIPE_LOGICOP_COPY is 12, the 0xC the engine defaults to.  Blending is
+	 * honoured only at 0xC, which is also GL's rule that an enabled logic op
+	 * replaces blending (parhelia-accel.md "ROP encoding",
+	 * parhelia-blend-alpha-encoding.md section 198). */
+	int		   logicop_enable;
+	unsigned	   logicop;
 	/* 0x1324 colour write mask, one byte per channel in the render
 	 * target's own order: B [7:0], G [15:8], R [23:16], A [31:24].
 	 * glColorMask(1,0,1,1) was captured as 0xffff00ff.  All four clear

@@ -43,7 +43,12 @@ p3d_primword(enum p3d_prim prim)
 uint32_t
 p3d_dwgctl(const struct p3d_state *st)
 {
-	return (0x00a60ec4u & ~0xfu) | p3d_dwg_nibble[p3d_prim_class(st->prim)];
+	const uint32_t rop = st->logicop_enable ? st->logicop & 0xfu : 0xcu;
+
+	/* [7:4] is the raster op; 0xC is GXcopy, the engine's default and the
+	 * only code that leaves blending enabled. */
+	return (0x00a60ec4u & ~0xffu) | (rop << 4) |
+	       p3d_dwg_nibble[p3d_prim_class(st->prim)];
 }
 
 uint32_t
