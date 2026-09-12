@@ -1462,6 +1462,30 @@ ph_target_no_dest_alpha(enum pipe_format format)
           format == PIPE_FORMAT_B5G6R5_UNORM;
 }
 
+/* The alpha approximation routes, all off by default.
+ *
+ * Each of them replaces a texel's own alpha with something cheaper, and they
+ * exist because the texture-alpha path was believed broken on the P690.  It
+ * is not: with every route disabled, GL_SRC_ALPHA/GL_ONE_MINUS_SRC_ALPHA
+ * blending of a texture whose alpha steps per texel row reproduces the
+ * reference values to within one LSB, and GL_ALPHA_TEST GEQUAL 0.5 on the
+ * same texture discards exactly the rows below the reference
+ * (Q3FMT_GROUPS=bias, "blend ... over black" and "GL_ALPHA_TEST on a texel's
+ * own alpha").  With the micro route enabled the same blend returns roughly
+ * alpha squared, which is what put a dark line through every ioquake3 glyph.
+ *
+ * They are kept, selectable, because each was measured against a live game
+ * artefact: PARHELIA_ALPHA_ROUTES is a mask of vertex(1), micro(2),
+ * micro-cutout(4), cpu-cutout(8) and rgb-two-pass(16). */
+static bool ph_alpha_route_enabled(unsigned bit)
+{
+	const char *mask = getenv("PARHELIA_ALPHA_ROUTES");
+
+	if (!mask || ph_env("PARHELIA_PLAIN_ALPHA"))
+		return false;
+	return (strtoul(mask, NULL, 0) & bit) != 0;
+}
+
 static bool
 ph_use_vertex_alpha(struct ph_context *ctx, bool textured,
 		    bool multitextured, bool depth, bool has_colour)
@@ -1471,6 +1495,10 @@ ph_use_vertex_alpha(struct ph_context *ctx, bool textured,
 	const char *reason = "selected";
 	unsigned reason_bit = 0;
 
+	/* PARHELIA_NO_VERTEX_ALPHA=1 keeps every blended draw on the ordinary
+	 * route, so the approximation can be measured against the plain path. */
+	if (!ph_alpha_route_enabled(1))
+		return false;
 	if (!textured) {
 		reason = "no-texture"; reason_bit = 1;
 	} else if (multitextured) {
@@ -1544,6 +1572,8 @@ static bool
 ph_use_alpha_micro(struct ph_context *ctx, bool textured, bool multitextured,
                    bool depth, bool has_colour)
 {
+	if (!ph_alpha_route_enabled(2))
+		return false;
    const struct pipe_rt_blend_state *blend =
       ctx->blend ? &ctx->blend->rt[0] : NULL;
    const struct parhelia_resource *texture;
@@ -1603,6 +1633,8 @@ static bool
 ph_use_alpha_micro_cutout(struct ph_context *ctx, bool textured,
                           bool multitextured, bool depth, bool has_colour)
 {
+	if (!ph_alpha_route_enabled(4))
+		return false;
    const struct pipe_rt_blend_state *blend =
       ctx->blend ? &ctx->blend->rt[0] : NULL;
    const struct parhelia_resource *texture;
@@ -2389,6 +2421,8 @@ static bool
 ph_use_cpu_alpha_cutout(struct ph_context *ctx, bool textured,
                         bool multitextured, bool depth, bool has_colour)
 {
+	if (!ph_alpha_route_enabled(8))
+		return false;
    const struct pipe_rt_blend_state *blend =
       ctx->blend ? &ctx->blend->rt[0] : NULL;
    const struct pipe_sampler_state *sampler;
@@ -2468,6 +2502,8 @@ static bool
 ph_use_rgb_alpha_two_pass(struct ph_context *ctx, bool textured,
                           bool multitextured, bool has_colour)
 {
+	if (!ph_alpha_route_enabled(16))
+		return false;
    const struct pipe_rt_blend_state *blend =
       ctx->blend ? &ctx->blend->rt[0] : NULL;
    const struct pipe_sampler_state *sampler;
