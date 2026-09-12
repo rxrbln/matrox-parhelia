@@ -282,6 +282,9 @@ struct ph_context {
    bool aggregate_batches;
    bool aggregate_state_batches;
    bool aggregate_state_stream;
+   /* Primitives carried by one draw packet.  The vendor's own packets hold
+    * 24 vertices; one packet per primitive is the conservative fallback. */
+   unsigned prims_per_packet;
    /* Submission fallback is a property of this context.  One client's
     * transient DMA allocation failure must not change another context's
     * execution path through mutable pipe_screen state. */
@@ -381,6 +384,7 @@ struct ph_context {
    double stat_pixels;
    struct {
       unsigned frames, batches, draw_batches, triangles, submits, clears;
+      unsigned draw_packets;
       unsigned waits;
       uint64_t vertex_dwords, clear_pixels, wait_ns, start_ns;
       unsigned kind_count[PH_STAT_KINDS];
@@ -431,9 +435,12 @@ ph_triangle_batch_limit(const struct ph_context *ctx)
 {
    unsigned packets = ctx->batch_limits.packets;
 
-   /* Each triangle is one independently relocated 0x97/0x8f descriptor.
-    * Reserve room for the complete recovered state sequence; the builder's
-    * own bounds remain the final guard if a future state grows. */
+   /* Every draw packet is one independently relocated 0x97/0x8f descriptor,
+    * and one packet carries a run of triangles.  The limit stays at one
+    * packet per triangle: the CPU staging buffers are sized for exactly that
+    * many vertices.  Reserve room for the complete recovered state sequence;
+    * the builder's own bounds remain the final guard if a future state
+    * grows. */
    if (packets <= PH_BATCH_STATE_PACKET_RESERVE)
       return 1;
    return MIN2(PH_BATCH_MAX_DRAWS,
@@ -3011,6 +3018,32 @@ ph_pack_rgb_alpha_pass(struct ph_context *ctx, bool depth, bool attenuation,
    }
 }
 
+/* Build the state batch for a run of @primitives primitives of @state->prim,
+ * grouping them into as few draw packets as the tuned packet size allows.
+ * Either texture handle may be zero. */
+static int
+ph_batch_primitives(struct ph_context *ctx, struct parhelia_batch *batch,
+                    struct p3d_state *state, uint32_t colour_handle,
+                    uint32_t depth_handle, uint32_t texture0_handle,
+                    uint32_t texture1_handle, unsigned primitives)
+{
+   const unsigned per_prim = p3d_vertices_per_primitive(state->prim);
+   unsigned group = ctx->prims_per_packet;
+
+   if (!per_prim || !primitives)
+      return -EINVAL;
+   if (group > PH_BATCH_MAX_PACKET_VERTICES / per_prim)
+      group = PH_BATCH_MAX_PACKET_VERTICES / per_prim;
+   if (group > primitives)
+      group = primitives;
+   state->vertices_per_packet = group * per_prim;
+   if (ctx->stats)
+      ctx->stat.draw_packets += (primitives + group - 1) / group;
+   return parhelia_batch_state_run(batch, colour_handle, depth_handle,
+                                   texture0_handle, texture1_handle, state,
+                                   primitives * per_prim);
+}
+
 static int
 ph_submit_rgb_alpha_two_pass(struct ph_context *ctx,
                              struct parhelia_resource *color,
@@ -3064,15 +3097,14 @@ ph_submit_rgb_alpha_two_pass(struct ph_context *ctx,
    additive.blend_dst = P3D_BF_ONE;
    additive.depth_write = base_state->depth_write;
 
-   ret = parhelia_batch_state_textured(&attenuation_batch, color->handle,
-                                        depth ? depth->handle : 0,
-                                        texture->alpha_rgb_handle,
-                                        &attenuation, ctx->triangles);
+   ret = ph_batch_primitives(ctx, &attenuation_batch, &attenuation,
+                             color->handle, depth ? depth->handle : 0,
+                             texture->alpha_rgb_handle, 0, ctx->triangles);
    if (!ret)
-      ret = parhelia_batch_state_textured(&additive_batch, color->handle,
-                                           depth ? depth->handle : 0,
-                                           texture->premul_rgb_handle,
-                                           &additive, ctx->triangles);
+      ret = ph_batch_primitives(ctx, &additive_batch, &additive, color->handle,
+                                depth ? depth->handle : 0,
+                                texture->premul_rgb_handle, 0,
+                                ctx->triangles);
    if (ret)
       return ret;
 
@@ -3145,8 +3177,8 @@ ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
    }
    ph_apply_fragment_state(ctx, &state, depth != NULL);
 
-   ret = parhelia_batch_state(batch, color->handle,
-                              depth ? depth->handle : 0, &state, count);
+   ret = ph_batch_primitives(ctx, batch, &state, color->handle,
+                             depth ? depth->handle : 0, 0, 0, count);
    if (!ret)
       ret = ph_submit_batch(ctx, batch, ctx->vertices,
                             count * vertices_per_primitive *
@@ -5038,7 +5070,9 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
               rs->offset_point || rs->rasterizer_discard || rs->flatshade ||
               rs->clip_halfz || !rs->depth_clip_near || !rs->depth_clip_far ||
               rs->fill_front != PIPE_POLYGON_MODE_FILL ||
-              rs->fill_back != PIPE_POLYGON_MODE_FILL))
+              rs->fill_back != PIPE_POLYGON_MODE_FILL ||
+              /* no packet encoding culls both faces; the draw module does */
+              rs->cull_face == PIPE_FACE_FRONT_AND_BACK))
       return false;
    /* The alpha routes below re-shape or replace the vertex stream. */
    if (ph_use_vertex_alpha(ctx, textured, multitextured, depth, colour) ||
@@ -7242,6 +7276,14 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->aggregate_batches = ctx->aggregate_state_stream ||
                             ctx->aggregate_state_batches ||
                             ph_env("PARHELIA_BATCH_AGGREGATE");
+   /* One packet per primitive until the depth-interlock comparison of
+    * overlapping primitives inside one packet has run on this silicon.
+    * PARHELIA_PRIMS_PER_PACKET selects the run length; the vendor's own
+    * packets hold 24 vertices, i.e. eight triangles. */
+   ctx->prims_per_packet =
+      debug_get_num_option("PARHELIA_PRIMS_PER_PACKET", 1);
+   if (ctx->prims_per_packet < 1)
+      ctx->prims_per_packet = 1;
    if (ctx->aggregate_state_batches && ph_env("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: preserving per-state EOB/DWGSYNC boundaries inside aggregate submits\n");
