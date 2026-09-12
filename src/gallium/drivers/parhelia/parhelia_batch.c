@@ -279,6 +279,7 @@ static int batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
                         uint32_t source_handle,
                         unsigned triangle_count,
                         unsigned vertex_dwords,
+                        enum p3d_prim prim,
                         unsigned vertices_per_packet,
                         unsigned total_vertices,
                         bool bound_ranges);
@@ -348,8 +349,8 @@ parhelia_batch_clear_rect_surface(struct parhelia_batch *batch,
    p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_clear(&cs, &surface, value, write_mask, x, y, width, height);
-   return batch_finish(batch, &cs, calls, handle, 0, 0, 0, NULL, 0, 0, 0, 0, 0,
-                       false);
+   return batch_finish(batch, &cs, calls, handle, 0, 0, 0, NULL, 0, 0, 0,
+                       P3D_TRIANGLES, 0, 0, false);
 }
 
 int
@@ -383,7 +384,7 @@ parhelia_batch_blit(struct parhelia_batch *batch,
    p3d_emit_blit(&cs, &dst, dst_type, dst_x, dst_y,
                  &src, src_type, src_x, src_y, width, height);
    return batch_finish(batch, &cs, calls, dst_handle, 0, 0, 0, NULL,
-                       src_handle, 0, 0, 0, 0, false);
+                       src_handle, 0, 0, P3D_TRIANGLES, 0, 0, false);
 }
 
 int
@@ -426,6 +427,49 @@ packet_vertex_step(enum p3d_prim prim)
    }
 }
 
+/* Vertices the next packet of a run may consume.  A packet of exactly nine
+ * vertices is a P690 trap: --depth-interlock-probe renders a nine-vertex
+ * strip with 7186 wrong pixels and the engine then never retires the
+ * following draw, while every other count from three to sixty is byte-exact
+ * against one packet per primitive.  Such a run is split instead.
+ * PARHELIA_NINE_VERTEX_PACKETS=1 restores the unsplit form for probing. */
+static unsigned
+packet_run(enum p3d_prim prim, unsigned per_packet, unsigned left)
+{
+   const unsigned run = left < per_packet ? left : per_packet;
+   const char *allow = getenv("PARHELIA_NINE_VERTEX_PACKETS");
+
+   if (run != 9 || (allow && strcmp(allow, "0")))
+      return run;
+   return run - packet_vertex_step(prim);
+}
+
+/* Draw packets a run of @vertices needs, or zero when the run cannot be cut
+ * into packets: strips and fans share vertices with their neighbours, so they
+ * have to be consumed by a single packet. */
+static unsigned
+packet_count(enum p3d_prim prim, unsigned per_packet, unsigned vertices)
+{
+   const unsigned min = p3d_minimum_vertices(prim);
+   const bool shared = packet_vertex_step(prim) == 1 && min > 1;
+   unsigned packets = 0;
+
+   if (!per_packet || !vertices || vertices < min ||
+       vertices % packet_vertex_step(prim))
+      return 0;
+   while (vertices) {
+      const unsigned run = packet_run(prim, per_packet, vertices);
+
+      if (run < min || run > vertices || (shared && run != vertices))
+         return 0;
+      vertices -= run;
+      if (vertices && vertices < min)
+         return 0;
+      packets++;
+   }
+   return packets;
+}
+
 /* @vertices is the whole run consumed by the @triangle_count draw packets;
  * zero means every packet carries a full state.vertices_per_packet. */
 static int
@@ -439,7 +483,7 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
    uint32_t ring[PH_BATCH_PACKETS * 5];
    struct p3d_cs cs;
    struct p3d_state state;
-   unsigned per_packet, tail;
+   unsigned per_packet;
    int ret;
 
    if (!batch || !input || !colour_handle || !triangle_count ||
@@ -534,13 +578,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
       return -EINVAL;
    if (!vertices)
       vertices = triangle_count * per_packet;
-   /* Only the last packet of a run may be short, and it still has to carry
-    * whole primitives. */
-   if (vertices <= (triangle_count - 1) * per_packet)
-      return -EINVAL;
-   tail = vertices - (triangle_count - 1) * per_packet;
-   if (tail > per_packet || tail < p3d_minimum_vertices(input->prim) ||
-       tail % packet_vertex_step(input->prim))
+   /* The packet count has to match the run the builder will emit. */
+   if (packet_count(input->prim, per_packet, vertices) != triangle_count)
       return -EINVAL;
    state = *input;
    state.fence = 0; /* global counter and final drain remain kernel-owned */
@@ -562,8 +601,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
    ret = batch_finish(batch, &cs, calls, colour_handle,
                       state.has_depth ? depth_handle : 0,
                       texture0_handle, texture1_handle, texture_offsets, 0,
-                      triangle_count, state.dw_per_vertex, per_packet,
-                      vertices, !!state.bound_ranges);
+                      triangle_count, state.dw_per_vertex, state.prim,
+                      per_packet, vertices, !!state.bound_ranges);
    /* Q3 reaches this builder with already transformed window-space vertices.
     * Keep the constant-loader/WARP-transform packet cadence outside the first
     * hardware experiment; its exact CALL grouping has separate selftests. */
@@ -597,7 +636,8 @@ parhelia_batch_state_run(struct parhelia_batch *batch, uint32_t colour_handle,
       return -EINVAL;
    return batch_state(batch, colour_handle, depth_handle, texture0_handle,
                       texture1_handle, state,
-                      (vertices + per_packet - 1) / per_packet, vertices);
+                      packet_count(state->prim, per_packet, vertices),
+                      vertices);
 }
 
 int
@@ -633,6 +673,7 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
              uint32_t source_handle,
              unsigned triangle_count,
              unsigned vertex_dwords,
+             enum p3d_prim prim,
              unsigned vertices_per_packet,
              unsigned total_vertices,
              bool bound_ranges)
@@ -660,9 +701,8 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
              consumed >= total_vertices)
             return -EINVAL;
          /* The last packet of a run may be shorter than the rest. */
-         const unsigned left = total_vertices - consumed;
-         const unsigned run = left < vertices_per_packet ? left :
-                              vertices_per_packet;
+         const unsigned run = packet_run(prim, vertices_per_packet,
+                                         total_vertices - consumed);
 
          batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
             .packet = i,

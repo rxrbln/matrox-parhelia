@@ -106,10 +106,15 @@
 
 /* ------------------------------------------------------------------ primitives
  *
- * A draw packet is a byte range of consecutive vertices.  It can contain more
- * than one primitive (the vendor emits 24-vertex / eight-triangle packets),
- * but overlapping primitives must be split: depth interlock is absent within
- * one packet.  The submitter decides the safe range boundaries.
+ * A draw packet is a byte range of consecutive vertices and may carry a whole
+ * run of primitives; the vendor emits 24-vertex / eight-triangle packets.
+ * Measured on the P690 (--depth-interlock-probe): overlapping primitives in
+ * one packet keep both the depth interlock and their rasterisation order -
+ * triangle lists, strips, fans and quads at up to 20 primitives per packet
+ * are pixel-identical to one packet per primitive, with the depth test, with
+ * depth writes and under a non-commutative blend.  The one exception is a
+ * packet of exactly nine vertices, which renders wrong pixels and leaves the
+ * engine unable to retire the next draw.
  */
 enum p3d_prim {
 	P3D_POINTS = 0,

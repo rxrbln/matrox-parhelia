@@ -957,14 +957,11 @@ p3d_emit_draws(struct p3d_cs *cs, const struct p3d_state *st, unsigned nprim)
 	rw[1].reg = P3D_R_STRIDE0; rw[1].val = 4;
 	p3d_reglist(cs, rw, 2);
 
-	/* One draw packet per primitive by default, which is also what every
-	 * one of the 1235 draw packets in the vendor capture does.  Batching
-	 * several primitives into one packet is legal and much faster, but only
-	 * for triangles that do not OVERLAP each other on screen: within a
-	 * single packet there is no depth interlock between them, so a hidden
-	 * back face can win against the front face it sits behind - measured at
-	 * 11759 wrong pixels on one gear, falling to 29 when the same triangles
-	 * were split.  The caller decides, by how it groups nprim. */
+	/* One packet per group: the caller decides how many primitives share a
+	 * packet and the batch builder relocates one vertex range per packet.
+	 * Overlapping primitives may share one - the P690 keeps the depth
+	 * interlock and the rasterisation order inside a packet (see the
+	 * primitive notes in parhelia3d.h). */
 	for (k = 0; k < (nprim ? nprim : 1); k++)
 		p3d_drawpacket(cs, st->dw_per_vertex);
 

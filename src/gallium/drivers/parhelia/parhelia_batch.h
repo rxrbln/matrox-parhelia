@@ -98,8 +98,8 @@ int parhelia_batch_triangles(struct parhelia_batch *batch,
                             unsigned triangle_count);
 /* Reference fixed-function state, including the gears xyz/normal layout,
  * grouped constants and Z24. Surface bases must be zero; handles are resolved
- * by the kernel. One triangle per DRAW preserves the example's CALL boundaries
- * and keeps overlapping primitives in distinct depth-interlocked packets.
+ * by the kernel. One triangle per DRAW preserves the example's CALL
+ * boundaries; parhelia_batch_state_run() draws longer runs per packet.
  */
 int parhelia_batch_state(struct parhelia_batch *batch,
                         uint32_t colour_handle, uint32_t depth_handle,

@@ -3028,7 +3028,11 @@ ph_batch_primitives(struct ph_context *ctx, struct parhelia_batch *batch,
                     uint32_t texture1_handle, unsigned primitives)
 {
    const unsigned per_prim = p3d_vertices_per_primitive(state->prim);
-   unsigned group = ctx->prims_per_packet;
+   /* Only triangle lists are proven to carry a run of primitives in one
+    * packet.  A packet with eight lines locks the engine up on the first
+    * draw of parhelia-gl-prim-test, so points and lines keep one packet
+    * per primitive. */
+   unsigned group = state->prim == P3D_TRIANGLES ? ctx->prims_per_packet : 1;
 
    if (!per_prim || !primitives)
       return -EINVAL;
