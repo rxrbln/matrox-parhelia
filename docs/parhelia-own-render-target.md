@@ -322,8 +322,10 @@ code -> bpp table — `0x00,0x02,0x04,0x05` 1 bpp;
 `0x08` 4 bpp; `0x09,0x0a..0x0c,0x10,0x11,0x12` 8 bpp; `0x20..0x22,0x24..0x28,0x2a..0x2e` 16 bpp;
 `0x30,0x32,0x33,0x34,0x36,0x38,0x3a,0x3b` 32 bpp. Note it masks exactly
 `0x3f000000`, i.e. bits `[31:30]` are deliberately **not** part of the format
-field. Matching `src/parhelia_reg.h`: `0x11` 8 bpp, `0x28` 16 bpp, `0x30`
-X8R8G8B8, `0x32` A8R8G8B8, `0x34` X2R10G10B10, `0x36` A2R10G10B10.
+field. `0x30` is X8R8G8B8, `0x32` is A8R8G8B8 and `0x34` is the proven
+X2R10G10B10 GigaColor format. `0x36` must not be inferred to be A2R10G10B10:
+the later draw-time analysis proves it is the active S8Z24 depth/stencil format.
+See `parhelia-gigacolor-faa-hardware-status.md`.
 
 The vendor's own explicit cfg constructor, `mtx3388` `mtx_parhelia.o`
 `.text+0x4fff0` (the overlay/PutImage path), builds it exactly this way:

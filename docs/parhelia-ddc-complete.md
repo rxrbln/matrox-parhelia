@@ -18,13 +18,14 @@ Disassembly `scratchpad/full99.asm` (= `mtx_drv.so`, dynamic symbols present as
 |--------------------------------|----------|------|
 | `HSLPARI2COpenPort`            | 0xc1c30  | selects reg + masks per port id; fills the port object |
 | `HSLPIN60GetDDCIORegMasks`     | 0xda420  | pin-id → (data mask, OE mask) from the PInS table |
-| `HSLPARGetDDCIORegMasks`       | 0xda4d0  | DDC-line selector → SCL/SDA masks (uses PInS+0x1a8) |
+| `HSLPARGetDDCIORegMasks`       | 0xb8410  | DDC-line selector → fixed candidate pin-id pairs |
+| `HSLPARGetDDCIORegMasks_DDCID` | 0xb7e10  | tries one candidate SCL/SDA pin-id pair |
 | `HSLPARI2CGenericRead`         | 0xc2360  | release-OE + read-back one line |
 | `HSLPARI2CGenericWrite`        | 0xc24b0  | drive/release one line, SCL clock-stretch poll |
 | `HSLPARI2CGenericRead/WriteSCL/SDA` | 0xc2410/0xc2460/0xc25f0/0xc2640 | per-line thunks (pick mask pair from the port object) |
 | `HALPI2CStart` / `HALPI2CStop` / `HALPI2CWaitAck` | 0x99300/0x993f0/0x98e80 | start/stop/ack bit sequencing |
 | `HALGetEdidBlockContent`       | 0x94f80  | reads one 128-byte EDID block (base 256 B only) |
-| `HALPReadDDCByte`/`HALPReadSlowDDCByte` | 0x3b470/0x3a1b0 (plt) | fast vs slow EDID byte read |
+| `HALPReadDDCByte`/`HALPReadSlowDDCByte` | 0x94d60/0x94b40 | fast vs slow EDID byte read |
 | `HSLPAREnableCEMDDCSel2`        | 0xa6ef0  | external CEM/CPLD DDC mux (board-specific) |
 | VBIOS DDC bit-bang             | vbios 0x4dec–0x4eed | same 0x1c48 register, same OE<<16 |
 
@@ -86,18 +87,34 @@ Default table `0x05070608` unpacks (LSB byte0 first) to ids `{8,6,7,5}` at bits
 `{0,1,2,3}`. The driver reimplements this verbatim in `pins_id_to_bit()` /
 `ParheliaPinsDDC()` (`src/parhelia_pins.c`, reads `PInS+0x1b4`).
 
-The higher-level line→pin resolver `HSLPARGetDDCIORegMasks` (0xda4d0) additionally
-reads a **DDC-line assignment word `PInS[0x1a8]`** (gated on `pins_rev > 0x608`)
-and maps up to **four DDC lines** (selector bits `&1/&2/&4/&8`) to their SCL/SDA
-pin-ids. The driver does not consult 0x1a8 (it hardcodes the SCL/SDA candidate
-id pairs instead) — see §11.
+The higher-level resolver `HSLPARGetDDCIORegMasks` (0xb8410) initializes all four
+output masks to zero, checks that the requested line index is 0..3, and dispatches
+to one of four helpers. Each helper tries a fixed list of logical SCL/SDA pin-id
+pairs through `HSLPARGetDDCIORegMasks_DDCID` (0xb7e10):
 
-### Resolved pin pairs on known boards (CONFIRMED on HW)
+| DDC line | candidate logical `(SCL,SDA)` pin-id pairs, in vendor order |
+|----------|-------------------------------------------------------------|
+| 1 (index 0) | `(1,2)`, `(5,6)`, `(0xd,0xe)`, `(9,0xa)` |
+| 2 (index 1) | `(3,4)`, `(7,8)`, `(0xd,0xe)`, `(0xb,0xc)` |
+| 3 (index 2) | `(5,6)`, `(0xf,0x10)`, `(9,0xa)` |
+| 4 (index 3) | `(7,8)`, `(0xf,0x10)`, `(0xb,0xc)` |
 
-| board                 | DVI-1 (head 1)     | DVI-2 (head 0)     |
+The line helpers are at 0xb82b0, 0xb8150, 0xb8020, and 0xb7ef0 respectively.
+The Windows XDDM `MTXPARM.sys` independently contains the same four lists at
+0x413c0, 0x4147f, 0x4153e, and 0x415da. There is no read of `PInS+0x1a8` in
+this resolver. The previous attribution to 0xda4d0 was a disassembly-address
+mistake: 0xda4d0 is an unrelated local function immediately after
+`HSLPIN60GetDDCIORegMasks`.
+
+### Resolved pin pairs in the saved board ROMs
+
+| board                 | DDC line 1          | DDC line 2          |
 |-----------------------|--------------------|--------------------|
-| P690 / Parhelia-LX    | SCL pin 1, SDA pin 0 | SCL pin 3, SDA pin 2 |
-| original Parhelia-512/8x | SCL pin 3, SDA pin 1 | SCL pin 2, SDA pin 0 |
+| saved P690 ROM        | SCL pin 1, SDA pin 0 | SCL pin 3, SDA pin 2 |
+| saved original Parhelia ROM | SCL pin 3, SDA pin 1 | SCL pin 2, SDA pin 0 |
+
+Other LX/P650/P750/P690 boards must be resolved from their own PInS table;
+these GPIO positions are board wiring, not a PCI-device-ID invariant.
 
 ---
 
@@ -207,14 +224,14 @@ line timing holds — nothing extra to reverse for E-DDC.
 
 There is **no separate I2C register per connector** on the integrated boards: the
 second DVI and the analog VGA connector are additional **DDC lines on the same
-0x1c48**, distinguished only by their SCL/SDA pin pair (pin-id table §2, resolved
-per line by `PInS[0x1a8]`). This is why `ParheliaDetectOutputs()` iterates two pin
-pairs on one register. The analog VGA (DVI-I / HD15) monitor answers DDC on its
+0x1c48**, distinguished only by their SCL/SDA pin pair (pin-id table §2). This is
+why `ParheliaDetectOutputs()` iterates two pin pairs on one register. The analog
+VGA (DVI-I / HD15) monitor answers DDC on its
 line exactly like a DVI monitor; digital-vs-analog is then decided by the EDID
 Video-Input bit + RAMDAC load-sense, not by a different DDC bus.
 
 Register **0x1c4c** is the **CEM / CPLD 2-line I2C** (only `portId==1` under a
-board condition; masks: SCL `0x800`/OE `0x400`, SDA `0x2`/OE `0x1`). External CEM
+board condition; masks: SCL data `0x2`/OE `0x800`, SDA data `0x1`/OE `0x400`). External CEM
 boards additionally gate a DDC mux via `HSLPAREnableCEMDDCSel2` (drives the CPLD
 "special-purpose MISC-IO"). Neither is present on the tested integrated card —
 0x1c4c is *not* a second native DDC bus for these boards (it earlier looked like
@@ -256,9 +273,9 @@ reimplementation. Residual, low-risk robustness items:
    `PInS[0x1b4]` unconditionally. Harmless today (a bogus/zero table makes
    `ParheliaPinsDDC` return FALSE → falls back to the hardcoded pairs), but adding
    the `>0x609` gate would match the vendor exactly.
-2. **Line assignment word `PInS[0x1a8]` unused.** For full portability the
-   per-line SCL/SDA resolution could read 0x1a8 (rev `>0x608`) as the HAL does,
-   instead of the hardcoded candidate id pairs.
+2. **Keep the complete candidate lists.** The fixed pair lists in §2 are the
+   vendor algorithm and cover all four native DDC lines. `PInS+0x1a8` is not a
+   DDC assignment word and must not be used to select a bus.
 3. **SCL clock-stretch poll absent.** libI2C uses fixed rise/fall/hold delays
    (20/40 µs). For slow/marginal monitors, mirroring §5 — after releasing SCL,
    read 0x1c48 back and wait until the SCL data bit reads 1 (bounded loop) — would
@@ -277,7 +294,6 @@ reimplementation. Residual, low-risk robustness items:
 | reg     | meaning |
 |---------|---------|
 | 0x1c48  | native DDC/I2C GPIO — data `1<<pin`, OE `1<<(pin+16)`, readback `1<<pin` (all 4 lines) |
-| 0x1c4c  | CEM/CPLD 2-line I2C (board-specific): SCL 0x800/OE 0x400, SDA 0x2/OE 0x1 |
-| PInS+0x04  | PInS revision word (gates 0x1a8 @>0x608, 0x1b4 @>0x609) |
-| PInS+0x1a8 | DDC-line → pin-id assignment word |
+| 0x1c4c  | CEM/CPLD 2-line I2C (board-specific): SCL data 0x2/OE 0x800, SDA data 0x1/OE 0x400 |
+| PInS+0x04  | PInS revision word (gates 0x1b4 @>0x609) |
 | PInS+0x1b4 | 4-byte pin-id table (byte i → GPIO bit i); default `0x05070608` = ids {8,6,7,5} |

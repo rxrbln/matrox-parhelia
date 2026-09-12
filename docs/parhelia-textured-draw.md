@@ -461,11 +461,11 @@ which is precisely libGL's fixed-function lowering
 **[BIN]**. The untextured baseline is the same generator with zero units:
 `MOV_sat r0, v0` = `0x1264 = 0x00000200`, `0x126c = 0x01400400` **[HW]**.
 
-**Both modes depend on the texture's base format for the alpha half**
-(`GL 0x10d532`, `cmp eax,0x1908` = `GL_RGBA`) **[BIN]**. With `GL_RGBA` (and
-`GL_LUMINANCE_ALPHA`, `GL_INTENSITY`) the instruction is co-issued and the alpha
-pair mirrors the RGB pair, which is the case measured above. With `GL_RGB` or
-`GL_LUMINANCE`, `GL_REPLACE` emits a *separate* alpha instruction
+**The archived program differs by the texture's base format for the alpha
+half** **[CAP]**. With `GL_RGBA` (and `GL_LUMINANCE_ALPHA`, `GL_INTENSITY`) the
+instruction is co-issued and the alpha pair mirrors the RGB pair, which is the
+case measured above. With `GL_RGB` or `GL_LUMINANCE`, `GL_REPLACE` emits a
+*separate* alpha instruction
 `MOV r0.a, PREV`, giving
 
 ```
@@ -477,6 +477,11 @@ pair mirrors the RGB pair, which is the case measured above. With `GL_RGB` or
 `captures/glsweep-0528-raw.txt`, which used `GL_RGB`) **[HW]**. `GL_MODULATE`
 with `GL_ALPHA` splits the other way: RGB `MOV r0, PREV`, alpha
 `MUL r0.a, TEX, PREV`.
+
+The old static citation `MTXOGL.dll:0x1010d532` was incorrect: it is a scalar
+pixel conversion loop, not a `GL_RGBA` compare or fragment compiler.  See
+`parhelia-p690-native-alpha-static-recheck.md`; the packet observations above
+remain valid but do not establish the missing P690 sampler-alpha route.
 
 `docs/parhelia-gl-state-encoding.md` §4.8 predicted `0x1264 -> 0x08000000` and
 `0x126c -> 0x01400000` for MODULATE. The values are right; **the slot address is

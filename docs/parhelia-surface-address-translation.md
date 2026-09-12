@@ -147,8 +147,10 @@ Format field, from `GetBitsPerPixel` `.text+0x73e70` (32 bpp class:
 24/32 bpp -> 0x30), with `mtx1192` `.text+0x3dcb0` forcing `0x32` for a
 driver-owned colour target. Reading the low bits of the `0x3x` family as
 alpha (bit 1) and 10:10:10 (bit 2) gives `0x30` X8R8G8B8, `0x32` A8R8G8B8,
-`0x34` X2R10G10B10 (proven — the GigaColor code), `0x36` A2R10G10B10.
-[bit assignment INFERRED; `0x38/0x3a/0x3b` OPEN.]
+`0x34` X2R10G10B10 (proven — the GigaColor code).  `0x36` is no longer an
+open alpha-colour candidate: later vendor-draw evidence proves it is the active
+S8Z24 depth/stencil format.  See `parhelia-gigacolor-faa-hardware-status.md`.
+[`0x38/0x3a/0x3b` remain OPEN.]
 
 ---
 

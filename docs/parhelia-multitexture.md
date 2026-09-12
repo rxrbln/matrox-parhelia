@@ -39,9 +39,10 @@ the fragment-program blob verbatim), `captures/live-ring-0528/decoded.txt`.
 | WARP outputs | set *i* → output `o(3+i)`; `0x1118 = 0x00006543` already says so, unchanged [HW][BIN] |
 | diffuse x lightmap | 4 instructions in 5 slots: TA(u0) slot 0, TA(u1) slot 2, `MUL r0,t0,v0` slot 4, `MUL r0,t1,r0` slot 8, pad slot 10 |
 
-The one thing **not** settled is the exact bit layout of the *texture-address
-slot word* for a unit other than 0 — §4.3. Everything else below is either
-measured or derived from a named function.
+The P690 texture-address source selector is now settled by live hardware:
+logical unit 1 follows PARD's physical-pipe permutation and selects pipe 2 in
+`0x1264/0x1260` — §6.1. Everything else below is either measured or derived
+from a named function.
 
 ---
 
@@ -513,13 +514,18 @@ Field checks for the two new opcodes, by hand:
 which is the third independent confirmation of the LRP operand order
 (`docs/parhelia-fragment-isa.md` §7.4).
 
-**Format dependence** (`GL 0x10d532`, `cmp eax,0x1908`) **[BIN]**:
+**Format-dependent packet results** **[CAP]**:
 with `GL_RGB` / `GL_LUMINANCE` (no alpha channel) `GL_REPLACE` and
 `GL_MODULATE` stop co-issuing and emit a separate alpha `MOV r0.a, PREV`
 (`0x1260 = 0x00000200`, `0x1268 = 0x01400400`); `GL_ADD` and `GL_BLEND`
 co-issue only for `GL_INTENSITY`; `GL_DECAL` never co-issues. ioquake3's
 textures are `GL_RGBA`/`GL_RGB`, so the co-issued rows above apply to the RGBA
 case and the split ones to RGB.
+
+`MTXOGL.dll:0x1010d532` is not the claimed GL_RGBA compiler branch; it is a
+pixel conversion loop.  The distinction here is measured in archive packets,
+not inferred from that invalid location.  See
+`parhelia-p690-native-alpha-static-recheck.md`.
 
 ---
 
@@ -592,7 +598,7 @@ written before the doorbell.
 * the `GL_DECAL`/`GL_ADD` unit-1 variants, mechanical substitution of
   `TEX`/`PREV`.
 
-### 6.1 The one open item — the TA slot word for a unit other than 0
+### 6.1 P690 TA source follows the physical-pipe permutation
 
 For unit 0 the texture-address slot is the constant pair
 `0x1264 = 0x00004000`, `0x126c = 0x00000c00`, invariant across every textured
@@ -627,6 +633,61 @@ in the encoding.
 
 **Second hypothesis:** the coordinate set also rides in `Areg`, giving
 `0x1264 = 0x00004000 | (u << 5) | slot` as well.
+
+The destination-only hypothesis has now been exercised by the isolated P690
+DRM test.  With unit 0 a solid magenta texture, unit 1 a solid yellow texture,
+white vertex colour, `0x1200/0x1204 = 0x00040101/0x00040104`, and the second TA
+destination set to `t1` (`0x126c = 0x00100c00`), the fence completed but the
+centre sample was `0x00ff00ff` instead of the two-stage MODULATE result
+`0x00ff0000` (18,336 covered pixels, 18,384 mismatches) **[HW P690]**.  Thus
+the destination field alone is insufficient to make unit 1 contribute.  The
+first follow-up added the logical stage index to the second TA source words:
+
+```
+second TA RGB:    0x1264 = 0x00004022   /* unit 1 in Areg[9:5], slot 2 */
+second TA alpha:  0x1260 = 0x00004020   /* same source, no slot bits */
+second TA dst:    0x126c = 0x00100c00   /* unchanged t1 destination */
+                  0x1268 = 0x00100c00
+```
+
+This variant is CLI-only (`--p690-multitex-ta-unit-probe`) and patches the
+already-built test batch after checking the exact baseline words.  It does not
+change the reference emitter or advertise multitexture to Gallium.
+
+That source-1 probe also completed its fence and covered the same 18,336
+pixels, but returned **black** (`0x00000000`) throughout the triangle
+**[HW P690]**.  The pair of results strongly suggests that this repurposed
+field selects a physical texture pipe: source 0 reads the magenta unit on pipe
+0, while source 1 reads an unassigned pipe.  PARD's two-unit table routes the
+second logical unit to physical pipe 2 (`0x1204 = 0x00040104`), so the next
+evidence-backed variant keeps that vendor route and the `t1` destination but
+uses source 2:
+
+```
+second TA RGB:    0x1264 = 0x00004042   /* physical pipe 2, slot 2 */
+second TA alpha:  0x1260 = 0x00004040
+second TA dst:    0x126c = 0x00100c00   /* unchanged t1 destination */
+                  0x1268 = 0x00100c00
+```
+
+The `--p690-multitex-ta-pipe2-probe` result was exactly red (`0x00ff0000`),
+with the untouched sample still `0x00204060`, 18,336 covered pixels, only 96
+edge-convention mismatches, and a completed fence **[HW P690]**.  This confirms
+that TA source selection follows PARD's physical-pipe permutation.
+
+The reference emitter consequently uses source 2 for TA1 when
+`single_texture_pipe` selects the P690 route.  The same state was then tested
+in ioquake3 at 640x480 with vblank disabled.  Backend time fell from 134.15 ms
+(7.45 FPS) with serial lightmapping to 121.08 ms (8.26 FPS) in one pass.  A
+large static crop of matched window captures differed by only 0.15 levels per
+8-bit colour channel on average **[HW P690]**.
+
+Mesa therefore enables the one-pass path by default only on PCI ID `0x2539`,
+only when the kernel supplies the multitexture WARP entry, and only for the
+exact two-sample MODULATE shader shape already classified as
+`PH_SERIAL_MODULATE`.  `PARHELIA_P690_MULTITEXTURE=0` restores the serial path
+for diagnosis.  Other shader shapes and other chips retain their existing
+paths.
 
 **The experiment that settles it in one run** — no new instrumentation needed:
 run any GL program that enables two texture units on the vendor stack while

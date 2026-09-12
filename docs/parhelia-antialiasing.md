@@ -63,7 +63,9 @@ register that carries the fragment-buffer base address (§4.3).
 **Recommendation for an open driver: do not implement FAA.**  Advertise
 `GL_SAMPLE_BUFFERS = 0`, exactly as both vendor ICDs do.  The vendor's own Linux
 stack never enables it (§2.3), and the Windows XPDM driver ships with it **off by
-default** (`AAMode = 0x54`, §2.6).  Nothing else in the 3D pipeline depends on it.
+default** (`AAMode = 0x54`, §2.6).  The Windows binary does select its FAA path
+for P690-class devices (§8), but this is not a safe programming reference until
+the remaining opaque lower-level operation is captured.
 
 ---
 
@@ -514,6 +516,36 @@ Neither `ResolveAlphaBlendedFrags` (accessor `cache+0x2A0`) nor
 They document an earlier design (and the shape of the hardware's constraints)
 but do not act in driver 2.10.00.105.  `AdjustZ` *is* read, at 0xA05AE.
 
+### 5.4 The recovered resolve orchestration  [C]
+
+`sub_9E000` is the operation the driver invokes to retire an existing
+fragment-buffer target.  `sub_9E860` calls it at 0x9E8AC when the target being
+prepared differs from `pDev+0xA9E4`; the surrounding code then updates that slot
+to the new target at 0x9E8E1.  This closes the call-graph ambiguity in §5.1:
+`sub_9D560` and `sub_9D6E0` are fence/stamp helpers used *by* retirement, not
+standalone evidence of the fragment merge instruction.
+
+Before calling the still-opaque lower helpers (`sub_2E560` or `sub_2E360`),
+`sub_9E000` restores the ordinary colour/depth attachment state with two direct
+DMA packets:
+
+```
+count=4, indices 88 89 8c 8d:
+  0x1220 = fragctx+0x10c    0x1224 = fragctx+0x11c
+  0x1230 = fragctx+0x114    0x1234 = fragctx+0x124
+count=2, indices 8a 8b:
+  0x1228 = fragctx+0x110    0x122c = fragctx+0x120
+```
+
+It then emits the ordinary `DWGCTL=9` retirement fence, stamps the two attached
+surfaces through `sub_9D6E0` with flags `0x100` and `0x200`, and calls
+`sub_2CE60` with `0x2400000f`.  On an LX/P690-class capability word
+(`caps & 0x7fc00`) it additionally sets bit 28, yielding `0x3400000f`.
+The value is a helper argument, not yet an MMIO register value.  In particular,
+these packets restore render targets; they do **not** expose the fragment-buffer
+base register.  The merge remains somewhere inside `sub_2E560`/`sub_2E360` or
+`sub_2CE60` and cannot yet be replayed independently.
+
 ---
 
 ## 6. `GL_ARB_multisample` — how the ICDs map it  [C, cross-verified]
@@ -682,7 +714,7 @@ this touches the fragment buffer.
 | **AA level** | everything requires `(AAMode & 0x0E) == 2` | only the 16x mode ever allocates a fragment buffer; the 4x path never does |
 | **master enable** | `AAMode & 0x10` @0x9FBD6, overridable by `rt[0x360] & 0x40` | global on/off |
 | **global kill switch** | `ds:0x1D2048 == 0 ⇒ AAMode &= ~1` @0x139629, 0x13978F | demotes FAA to non-fragment AA driver-wide |
-| **silicon** | `test [pDev+0xAB50],0x0007FC00` @0x9DCC8, 0x2CF92, 0x2D299, 0x16FE01 | on non-matching parts the AA command packet is never emitted; `parhelia-variants.md` records FAA-16x on Parhelia-512 and "mode-gated" on the later P-series |
+| **silicon** | `test [pDev+0xAB50],0x0007FC00` @0x9DCC8, 0x2CF92, 0x2D299, 0x16FE01 | on non-matching parts the AA command packet is never emitted.  All P690 class bits are `0x10000`, `0x20000` or `0x40000`, so each passes this Windows-driver gate **[C]**.  This proves vendor-path eligibility on P690, not working FAA hardware on the test card. |
 | **memory** | §3.2 | 8 / 16 / 32 MiB cap by silicon, **6 MiB floor** with 2 MiB back-off retry, refusal if `ctx[0x28] >= 0x10`, plus the 3.75 MiB per-RT rule of §3.4 |
 | **plane write mask** | `ForcePLNWMASK4FAA` [V] | a PLNWT (`0x1324`) workaround must be suppressed in FAA mode [I] |
 | **stencil / blending** | `ResolveOnStencilOpChange`, `ResolveAlphaBlendedFrags` [V] | documented as resolve triggers, but **not implemented** in 2.10.00.105 (§5.3).  The comments still tell you the hardware cannot carry fragments across a stencil-op change, and that a blended scene cumulates no fragments — i.e. **blending defeats FAA** |
@@ -725,8 +757,10 @@ failure sets `fragbuf[0xC4] = 4` rather than degrading gracefully in software.
 3. **`ThresholdAA`'s units** — settled the moment (1) is: if it lands in a
    register beside an S8Z24 comparator it is a depth tolerance; if it is masked
    against a float it is a mantissa mask.
-4. **`FRAG_RESOLVE`'s exact opcode** — §5.1 gives two candidate emitters;
-   distinguishing them needs a trace with AA forced on.
+4. **`FRAG_RESOLVE`'s exact opcode** — the operation is reached through
+   `sub_9E000` (§5.4), but the actual merge remains inside `sub_2E560`,
+   `sub_2E360` or `sub_2CE60`; distinguishing those needs a trace with AA
+   forced on.
 5. **Live confirmation:** on Windows, set `HKR\3D.AAMode` to `0x53` (nibble 3 =
    16x + fragment buffer, flags 0x50 retained) and capture the command stream;
    every open item above falls out of one such capture.  On Linux this is

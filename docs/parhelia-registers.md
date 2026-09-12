@@ -197,7 +197,7 @@ against a working VBE register dump; validated on hardware.]
 
 How the connectors are wired differs across the family; most of it is **VBIOS
 (PInS)-driven**, not a device-ID branch. The one real device-ID split is the DVO
-register model.  [DRV: `HSLPARGetDDCIORegMasks`@0xb8420, `HSLPAREnableDVO`@0xb04f0,
+register model.  [DRV: `HSLPARGetDDCIORegMasks`@0xb8410, `HSLPAREnableDVO`@0xb04f0,
 `HSLPARGetDVOIndex`@0xe2b80, `HSLPIN60InitCEMStructure`@0xdaaa0.]
 
 **DDC — register `0x1C48` on every variant.** A logical DDC line is resolved to

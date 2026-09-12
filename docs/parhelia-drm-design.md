@@ -584,7 +584,7 @@ return IRQ_HANDLED;
 
 Mask register is `0x8FC` [CONF].
 
-**[INF] Bit assignments.** `OsSetVSyncInterruptState` accepts exactly three
+**[CONF] Bit assignments.** `OsSetVSyncInterruptState` accepts exactly three
 masks — `2`, `0x10000000`, `0x20000000` — for heads 0, 1 and 2, with head 2
 additionally gated on `0x1DC4 & 8` [CONF]. So `0x8F4` bit 1 is head-0 vblank,
 bit 28 head 1, bit 29 the second-head-capable variant. The arm sequence enables

@@ -591,3 +591,52 @@ The three things easiest to get wrong, in order of how quietly they fail:
   high half of the last dword garbage that the hardware must not read;
 - **`0x21` ends a packet, `0x20` pads inside one** — the wrong one produces a
   stream the engine mis-parses rather than an error.
+
+---
+
+## 9. What actually reaches the hardware — SOLVED [HW]
+
+The sections above decode the ICD's *own* buffers, where indices genuinely
+exist. This section answers the question those buffers cannot: **what the
+command ring receives.** It is the only thing an open driver has to reproduce.
+
+**There is no indexed draw in the ring. Every draw is a byte range of
+consecutive vertices, opcode `0x97`, with the memory class in `0x1000`.**
+
+Captured on the 0x0528 with the vendor MTX X driver, one variant per boot
+(`tools/capture-gl-matrix.sh <host>` with `ONLY=<variant> WARMUP=1`), reading
+the ring pages ending at `0x404` and every secondary section they call:
+
+| variant | GL call | draw packets found |
+|---|---|---|
+| `idx16` | `glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, …)` | 6 × `970a0001`, 6 dw/vertex, **3 vertices** |
+| `idx32` | `glDrawElements(…, GL_UNSIGNED_INT, …)` | 156 × `970a0001`, 6 dw/vertex, **3 vertices** |
+| `varray` | `glDrawArrays(GL_TRIANGLES, 0, 3)` | 158 × `970a0001`, 6 dw/vertex, **3 vertices** |
+| `idx16tri8` | `glDrawElements` over 8 triangles, 24 indices | 6 × `970a0001`, 6 dw/vertex, **24 vertices** |
+
+The 16-bit indexed, the 32-bit indexed and the non-indexed draw are
+**byte-identical on the wire** — same header, same operand shape, same vertex
+count. No `0x07`, `0x8f`, `0x9b` or `0x9f` packet appears in any of them, and
+no register carries an index base or an index count.
+
+Three earlier captures already implied this and were not read that way. The
+ICD decomposes `GL_QUADS` and `GL_QUAD_STRIP` into an **indexed** triangle list
+(§2.2) and appends `GL_LINE_LOOP`'s closing segment as a packed 16-bit index
+pair (§1.1), yet `quads-secs.txt`, `quadstrip-secs.txt`, `polygon-secs.txt` and
+`lineloop-secs.txt` contain `0x97` range draws and nothing else, at 1, 2, 3 and
+4 vertices per packet. The indices are resolved before the stream is built.
+
+**Retracted.** An earlier reading of the packet opcode bits proposed
+`0x9b`/`0x9f` as 16- and 32-bit indexed draw variants of `0x97`. That was
+inference from bit patterns alone; no binary emits either constant and no
+capture contains one. It is wrong.
+
+### 9.1 What an open driver does
+
+`glDrawElements` expands the indices into a linear vertex stream and draws that
+range — `p3d_deindex()` in `src/parhelia3d/p3d_index.c`. It costs one copy of
+the drawn vertices, which is what the vendor pays too.
+
+`idx16tri8` also settles the batching question: **8 triangles arrive as one
+24-vertex packet**, so a draw packet is not limited to a single primitive. The
+limit is overlap, not count (docs/parhelia-gears-test.md).
