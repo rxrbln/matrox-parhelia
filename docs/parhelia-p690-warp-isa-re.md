@@ -9,6 +9,13 @@ P690 hardware, or by a bit-exact re-encoding of such a program.  It
 consolidates and re-grounds `parhelia-warp-isa-complete.md` (which reverses
 the vendor D3D assembler statically) and `parhelia-vertex-isa.md`.
 
+> **A fact other drivers and agents will hit.**  The engine serves a
+> previously executed WARP entry from an **instruction cache**: re-uploading
+> different code to an address a program has already run from keeps running
+> the old program.  Draining the queue, waiting for the WARP gate and
+> toggling the program-source selector `0x920` bit 0 all fail to clear it.
+> Give every upload a fresh address.  Section 9.3.
+
 Evidence tags used throughout:
 
 * **PROVEN(hw)** — a program containing this construct is loaded by

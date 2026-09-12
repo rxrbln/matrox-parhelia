@@ -8,6 +8,13 @@ fragment pipeline.  This is the compiler-facing extract: the complete field
 layout, the register, modifier, replicate and opcode tables, the slot walk and
 the limits, with each fact tagged.
 
+> **Two facts other drivers and agents will hit.**
+> 1. A combiner constant is packed **(red, alpha)** in the first register and
+>    **(blue, green)** in the second - not (r, g) then (b, a).  Section 7.1.
+> 2. Saturate only the instruction that produces a result.  Saturating every
+>    instruction clamps negative intermediates and silently changes the
+>    algebra of anything NIR lowers into a difference.  Section 10.
+
 Evidence tags:
 
 * **PROVEN(hw)** — observed on our P690, or on the 0528 with a vendor ring
@@ -309,33 +316,49 @@ obvious next extension and is untested.
 
 ## 10. Measured coverage
 
-`tools/parhelia-gl-combiner-test` compares the rendered result of 21 shapes
+`tools/parhelia-gl-combiner-test` compares the rendered result of 26 shapes
 with the value the GL specification requires.  On the P690, with the driver's
-instruction-shape matcher (`PARHELIA_FS_COMPILER` unset) **18 of 21 fail**;
-with the data-flow compiler **9 fail**.
+instruction-shape matcher (`PARHELIA_FS_COMPILER` unset) **23 of 26 fail**;
+with the data-flow compiler **8 fail**.
 
-Exact with the compiler: GL_REPLACE, GL_MODULATE, GL_ADD, a two-unit
-MODULATE chain, an untextured constant colour, and seven GLSL 1.20 shaders -
-multiply, add, `1 - x`, an alpha replicate, an rgb/alpha split, a uniform
-constant and a multiply-add.
+Exact with the compiler: GL_REPLACE, GL_MODULATE, GL_ADD, GL_DECAL, a
+two-unit MODULATE chain, an untextured constant colour, and eleven GLSL 1.20
+shaders - multiply, add, `1 - x`, an alpha replicate, an rgb/alpha split, a
+uniform constant, a multiply-add, a texture squared, a texture used in two
+instructions, and `mix()` driven by a constant, by a per-channel register and
+by an alpha replicate.
 
-Still wrong, precisely characterised:
+**Withdrawn:** an earlier revision of this section reported that LRP loses
+the green lane of a replicated source.  That was a defect in the driver's own
+compiler, not in the hardware: it set the saturate bit on every instruction,
+so NIR's lowering of `mix(a, b, t)` into `a + t * (b - a)` clamped the
+negative difference to zero.  A texture read twice in one instruction and in
+two, and `mix()` with a constant, a per-channel and an alpha-replicated
+factor, are all exact once only the result saturates.  **Saturate the
+instruction that produces a result and no other.**
 
-* **LRP loses the green lane of a replicated source.**  `LRP r0, TEX, PREV,
-  TEX.a` returns `PREV.g`, i.e. the C operand's green reads as zero, while
-  its red and blue are exact.  The same alpha replicate is exact in a MUL, so
-  this is specific to LRP's use of C.  It costs GL_DECAL, GL_BLEND and
-  `mix()`.
-* **A second texture unit reads black** through a compiled program, although
-  the fixed-function two-unit path is exact.  The P690 places logical unit 1
-  on physical pipe 2 and the merge instruction in slot 2 leaves the result in
-  `t1`; the compiled program's register choice or its slot offset is wrong.
+Still wrong:
+
+* **GL_BLEND.**  Mesa's fixed-function shader for it compiles to
+  `add r0, c0, -c0` - two operands that resolve to the same constant
+  register - so the first term is zero and the result is the environment
+  colour.  Either the two uniforms really are the same vec4 and the shader is
+  being read wrong, or `ph_fs_place_constants` merges two distinct ones.
+* **Two live temporaries.**  `s * k + colour * k` allocates `r0` and `r1` and
+  adds them; red and green come back as roughly the constant itself.  Every
+  shape that uses only `r0` is exact, so either `r1` is not readable the way
+  the encoding assumes or the second write does not land.
+* **A second texture unit** through a compiled program: the draw path binds
+  unit 1 only for the shapes the matcher recognises, so a compiled program
+  that samples it reads zero.  The compiler now declines those draws; making
+  them work needs the draw path to bind by sampler use.
 * The vertex colour of an **untextured** draw comes out white.  That predates
   the compiler: the driver selects the WARP replace program, which forces the
   vertex colour to 1.
 * A shader the compiler cannot express still takes a hardware path and
-  renders the raw texture instead of falling back to the draw module.  The
-  fallback predicate has to consider the compiler's verdict.
+  renders the raw texture instead of falling back.  The fallback predicate
+  has to consider the compiler's verdict; until it does,
+  `glsl_feature_level` reports 1.10.
 
 ## 11. Still open
 
