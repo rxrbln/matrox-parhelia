@@ -158,11 +158,20 @@ void
 p3d_emit_constant_group(struct p3d_cs *cs, const struct p3d_state *st,
 			const float *vp)
 {
-	uint32_t buf[256];
+	/* Three loads: the program's own block, the viewport pair and the
+	 * raster block's copy of it. */
+	uint32_t buf[3 * 5 + (64 + 4) * 4];
 	unsigned m = st->const_mask ? st->const_mask : 7u;
 	size_t n = 0, cap = sizeof buf / sizeof buf[0];
 
-	if ((m & 1u) && st->mvp) {
+	if ((m & 1u) && st->vs_const && st->vs_const_vec4s &&
+	    st->vs_const_vec4s <= 63) {
+		/* A compiled vertex program's constants: the shader's own
+		 * uniform vec4s followed by the literals the compiler spelled
+		 * out, all at c0. */
+		n = blockload_into(buf, n, cap, 0, st->vs_const,
+				   st->vs_const_vec4s);
+	} else if ((m & 1u) && st->mvp) {
 		/* One block: c0..c3 the MVP rows, and when lighting is on c4/c5
 		 * carry the light direction and material.  They must ride in the
 		 * SAME load as the matrix - a separate load at a higher slot is
@@ -182,7 +191,8 @@ p3d_emit_constant_group(struct p3d_cs *cs, const struct p3d_state *st,
 		n = blockload_into(buf, n, cap, 0, blk, nv);
 	}
 	if (m & 2u)
-		n = blockload_into(buf, n, cap, 8, vp, 2);
+		n = blockload_into(buf, n, cap, st->vp_slot ? st->vp_slot : 8,
+				   vp, 2);
 	if (m & 4u)
 		n = blockload_into(buf, n, cap, 0x160, vp, 2);
 	if (n)

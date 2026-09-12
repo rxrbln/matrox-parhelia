@@ -60,6 +60,16 @@ struct ph_vs {
    int pos_input;               /* driver_location of the position input */
    int colour_input;            /* -1 when the program writes no colour */
    int texcoord_input[2];       /* -1 when the set is not written */
+   /* A shader the WARP compiler accepted: its position is still the matrix
+    * product above, so the CPU can keep bounding the clip volume, but every
+    * other output is compiled rather than pattern matched.  The program runs
+    * from a kernel instruction-store slot this context uploaded. */
+   bool hw_program;
+   struct ph_vs_program prog;
+   struct ph_vs_inputs prog_inputs;
+   unsigned prog_slot;          /* kernel WARP program slot, 0 = none yet */
+   uint32_t prog_entry;
+   bool prog_upload_failed;
 };
 
 /* P690 serializes fixed-function texture shapes without a proven native
@@ -258,9 +268,15 @@ struct ph_context {
    uint32_t warp_transform_textured;
    uint32_t warp_transform_multitex;
    uint32_t warp_constant_loader;
+   /* The WARP_PROGRAM upload ABI: instructions one slot holds and how many
+    * slots this file may hold.  Zero when the kernel has no upload path. */
+   unsigned warp_program_instructions;
+   unsigned warp_program_slots;
+   unsigned warp_programs_held;
    bool tcl_available;
    bool tcl_forced_off;
    bool tcl_multitexture;
+   bool tcl_programs;
    bool have_viewport;
    struct ph_vs *vs;
    struct pipe_viewport_state viewport;
@@ -268,10 +284,17 @@ struct ph_context {
     * the WARP c0..c3 rows, i.e. the transpose of the shader's matrix. */
    bool transform;
    float mvp[16];
+   /* Set while the pending batch runs a compiled vertex program: its entry and
+    * the constant block the loader has to publish before the draw. */
+   uint32_t warp_program_entry;
+   float *vs_const, *vs_const_pending;
+   unsigned vs_const_vec4s, vs_const_cap;
+   unsigned vp_slot;
    struct translate_cache *tcl_cache;
    uint32_t *tcl_elts;
    unsigned tcl_elts_cap;
    unsigned tcl_draws, tcl_fallbacks, tcl_clip_fallbacks;
+   unsigned tcl_program_draws;
    uint32_t fence;
    bool async_pending;
    int submit_error;
@@ -532,10 +555,11 @@ ph_stats_frame(struct ph_context *ctx)
               ctx->stat.waits / n, ctx->stat.wait_ns / n / 1e6);
    if (ctx->stat.start_ns && (ctx->tcl_draws || ctx->tcl_fallbacks))
       fprintf(stderr,
-              "parhelia stats/frame: %.1f hardware-transform draws, %.1f not expressible, %.1f handed back to the software clipper\n",
-              ctx->tcl_draws / n, ctx->tcl_fallbacks / n,
-              ctx->tcl_clip_fallbacks / n);
+              "parhelia stats/frame: %.1f hardware-transform draws (%.1f compiled vertex programs), %.1f not expressible, %.1f handed back to the software clipper\n",
+              ctx->tcl_draws / n, ctx->tcl_program_draws / n,
+              ctx->tcl_fallbacks / n, ctx->tcl_clip_fallbacks / n);
    ctx->tcl_draws = ctx->tcl_fallbacks = ctx->tcl_clip_fallbacks = 0;
+   ctx->tcl_program_draws = 0;
    for (unsigned k = 0; ctx->stats_sync && k < PH_STAT_KINDS; k++)
       if (ctx->stat.kind_count[k])
          fprintf(stderr,
@@ -3417,6 +3441,8 @@ static uint32_t
 ph_warp_entry(const struct ph_context *ctx, bool textured, bool two_sets,
               bool replace)
 {
+   if (ctx->transform && ctx->warp_program_entry)
+      return ctx->warp_program_entry;
    if (ctx->transform)
       return two_sets ? ctx->warp_transform_multitex :
              textured ? ctx->warp_transform_textured : ctx->warp_transform;
@@ -3676,7 +3702,15 @@ ph_submit_vertices(struct ph_context *ctx)
 	 * c0..c3 and the viewport in c8/c9, so its position always has z. */
 	state.transform = ctx->transform;
 	if (state.transform) {
-		state.mvp = ctx->mvp;
+		/* A compiled program brings its own block at c0 and names the
+		 * slots its viewport pair sits in. */
+		if (ctx->warp_program_entry) {
+			state.vs_const = ctx->vs_const;
+			state.vs_const_vec4s = ctx->vs_const_vec4s;
+			state.vp_slot = ctx->vp_slot;
+		} else {
+			state.mvp = ctx->mvp;
+		}
 		state.const_loader_entry = ctx->warp_constant_loader;
 		for (unsigned i = 0; i < 3; i++) {
 			state.vp_scale[i] = ctx->viewport.scale[i];
@@ -4020,6 +4054,8 @@ out:
 	ctx->rgb_alpha_two_pass = false;
 	ctx->native_sampled_alpha = false;
 	ctx->transform = false;
+	ctx->warp_program_entry = 0;
+	ctx->vs_const_vec4s = 0;
 }
 
 static float
@@ -5068,9 +5104,14 @@ ph_vs_analyze_alu(const nir_alu_instr *alu, struct ph_val *vals,
    }
 }
 
-/* True when @nir is the fixed-function shape the WARP transform expresses. */
+/* True when @nir is the fixed-function shape the WARP transform expresses.
+ *
+ * With @relaxed only the position store has to be that shape: the CPU bounds
+ * the hardware clip volume by evaluating the matrix product itself, so a
+ * compiled vertex program still needs the matrix, while everything else in the
+ * shader is the WARP compiler's business. */
 static bool
-ph_vs_analyze(nir_shader *nir, struct ph_vs *vs)
+ph_vs_analyze(nir_shader *nir, struct ph_vs *vs, bool relaxed)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    struct ph_val *vals;
@@ -5090,13 +5131,14 @@ ph_vs_analyze(nir_shader *nir, struct ph_vs *vs)
       nir_foreach_instr(instr, block) {
          struct ph_val val = {0};
          nir_def *def = NULL;
+         bool bad = false;
 
          switch (instr->type) {
          case nir_instr_type_load_const: {
             nir_load_const_instr *lc = nir_instr_as_load_const(instr);
 
             if (lc->def.num_components != 1 || lc->def.bit_size != 32) {
-               ok = false;
+               bad = true;
                break;
             }
             val.kind = PH_VAL_CONST;
@@ -5108,7 +5150,7 @@ ph_vs_analyze(nir_shader *nir, struct ph_vs *vs)
             nir_deref_instr *deref = nir_instr_as_deref(instr);
 
             if (deref->deref_type != nir_deref_type_var) {
-               ok = false;
+               bad = true;
                break;
             }
             val.kind = PH_VAL_DEREF;
@@ -5130,27 +5172,27 @@ ph_vs_analyze(nir_shader *nir, struct ph_vs *vs)
                if (in->def.num_components != 4 || !a || !b ||
                    a->kind != PH_VAL_CONST || a->value != 0 ||
                    b->kind != PH_VAL_CONST) {
-                  ok = false;
+                  bad = true;
                   break;
                }
                /* load_ubo counts bytes, load_ubo_vec4 counts vec4s and puts
                 * the constant part in its base index. */
                if (in->intrinsic == nir_intrinsic_load_ubo) {
                   if (b->value & 15u) {
-                     ok = false;
+                     bad = true;
                      break;
                   }
                   vec4 = b->value / 16u;
                } else {
                   if (b->value || nir_intrinsic_component(in)) {
-                     ok = false;
+                     bad = true;
                      break;
                   }
                   vec4 = nir_intrinsic_base(in);
                }
                /* Bound it: the row arithmetic below would otherwise wrap. */
                if (vec4 > (1u << 16)) {
-                  ok = false;
+                  bad = true;
                   break;
                }
                val.kind = PH_VAL_UBO;
@@ -5162,7 +5204,7 @@ ph_vs_analyze(nir_shader *nir, struct ph_vs *vs)
                a = ph_val_of(vals, impl->ssa_alloc, in->src[0].ssa);
                if (!a || a->kind != PH_VAL_DEREF ||
                    a->var->data.mode != nir_var_shader_in) {
-                  ok = false;
+                  bad = true;
                   break;
                }
                val.kind = PH_VAL_INPUT;
@@ -5178,7 +5220,7 @@ ph_vs_analyze(nir_shader *nir, struct ph_vs *vs)
                if (!a || a->kind != PH_VAL_DEREF ||
                    a->var->data.mode != nir_var_shader_out ||
                    nir_intrinsic_write_mask(in) != 0xf || !value) {
-                  ok = false;
+                  bad = true;
                   break;
                }
                if (a->var->data.location == VARYING_SLOT_POS) {
@@ -5200,18 +5242,18 @@ ph_vs_analyze(nir_shader *nir, struct ph_vs *vs)
                else if (a->var->data.location == VARYING_SLOT_TEX1)
                   slot = &vs->texcoord_input[1];
                else {
-                  ok = false;
+                  bad = true;
                   break;
                }
                if (value->kind != PH_VAL_INPUT || *slot >= 0) {
-                  ok = false;
+                  bad = true;
                   break;
                }
                *slot = value->input;
                break;
             }
             default:
-               ok = false;
+               bad = true;
                break;
             }
             break;
@@ -5219,7 +5261,7 @@ ph_vs_analyze(nir_shader *nir, struct ph_vs *vs)
          case nir_instr_type_alu:
             if (!ph_vs_analyze_alu(nir_instr_as_alu(instr), vals,
                                    impl->ssa_alloc, &val)) {
-               ok = false;
+               bad = true;
                break;
             }
             def = &nir_instr_as_alu(instr)->def;
@@ -5227,12 +5269,14 @@ ph_vs_analyze(nir_shader *nir, struct ph_vs *vs)
          case nir_instr_type_jump:
             break;
          default:
-            ok = false;
+            bad = true;
             break;
          }
+         if (bad && !relaxed)
+            ok = false;
          if (!ok)
             break;
-         if (def && def->index < impl->ssa_alloc)
+         if (!bad && def && def->index < impl->ssa_alloc)
             vals[def->index] = val;
       }
       if (!ok)
@@ -5240,6 +5284,171 @@ ph_vs_analyze(nir_shader *nir, struct ph_vs *vs)
    }
    free(vals);
    return ok && have_position;
+}
+
+/* ------------------------------------------------ compiled vertex programs
+ *
+ * The fetch slots the transforming attribute descriptors declare, with the
+ * dword each occupies in the object-space vertex stream.  A compiled program
+ * reads these and nothing else, so the stream layout and the fixed-function
+ * one stay identical.
+ */
+struct ph_tcl_slot {
+   uint8_t slot;                /* WARP v# */
+   uint8_t offset;              /* stream dword */
+   uint8_t max_components;      /* accepted in the vertex buffer */
+   enum pipe_format format;     /* what the stream carries */
+};
+
+/* The colour block takes an RGBA attribute and drops its alpha, exactly as the
+ * fixed-function route does; the transforming stream has no alpha dword. */
+static const struct ph_tcl_slot ph_tcl_slots[] = {
+   { P3D_WARP_V_POSITION,      0, 3, PIPE_FORMAT_R32G32B32_FLOAT },
+   { P3D_WARP_V_COLOUR,        3, 4, PIPE_FORMAT_R32G32B32_FLOAT },
+   { P3D_WARP_V_TEXCOORD0,     6, 2, PIPE_FORMAT_R32G32_FLOAT },
+   { P3D_WARP_V_TEXCOORD0 + 1, 8, 2, PIPE_FORMAT_R32G32_FLOAT },
+};
+
+static const struct ph_tcl_slot *
+ph_tcl_slot_of(unsigned slot)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(ph_tcl_slots); i++)
+      if (ph_tcl_slots[i].slot == slot)
+         return &ph_tcl_slots[i];
+   return NULL;
+}
+
+/* Assign the shader's vertex inputs to fetch slots.  The position drives v0
+ * because the clip-volume bound reads the stream's first three dwords; the
+ * remaining inputs follow the descriptor order in attribute order. */
+static bool
+ph_vs_assign_inputs(nir_shader *nir, struct ph_vs *vs)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool used[PIPE_MAX_ATTRIBS] = {0};
+   unsigned next = 1;
+
+   vs->prog_inputs.count = PIPE_MAX_ATTRIBS;
+   for (unsigned i = 0; i < PIPE_MAX_ATTRIBS; i++)
+      vs->prog_inputs.slot[i] = -1;
+   if (!impl || vs->pos_input < 0 || vs->pos_input >= PIPE_MAX_ATTRIBS)
+      return false;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         const nir_intrinsic_instr *load;
+         unsigned location;
+
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         load = nir_instr_as_intrinsic(instr);
+         if (load->intrinsic == nir_intrinsic_load_input) {
+            location = nir_intrinsic_base(load);
+         } else if (load->intrinsic == nir_intrinsic_load_deref) {
+            const nir_deref_instr *deref = nir_src_as_deref(load->src[0]);
+
+            if (!deref || deref->deref_type != nir_deref_type_var ||
+                deref->var->data.mode != nir_var_shader_in)
+               continue;
+            location = deref->var->data.driver_location;
+         } else {
+            continue;
+         }
+         if (location >= PIPE_MAX_ATTRIBS)
+            return false;
+         used[location] = true;
+      }
+   }
+   used[vs->pos_input] = false;
+   vs->prog_inputs.slot[vs->pos_input] = ph_tcl_slots[0].slot;
+   for (unsigned i = 0; i < PIPE_MAX_ATTRIBS; i++) {
+      if (!used[i])
+         continue;
+      if (next >= ARRAY_SIZE(ph_tcl_slots))
+         return false;          /* more attributes than the stream carries */
+      vs->prog_inputs.slot[i] = ph_tcl_slots[next++].slot;
+   }
+   return true;
+}
+
+/* Upload a compiled program into a kernel instruction-store slot.  The engine
+ * serves an already-executed entry from an instruction cache, so the kernel
+ * hands out a fresh entry per upload and only the value it returns may be
+ * bound (docs/parhelia-p690-warp-isa-re.md section 9.3). */
+static bool
+ph_vs_upload_program(struct ph_context *ctx, struct ph_vs *vs)
+{
+   struct drm_parhelia_warp_program program = {
+      .code = (uintptr_t)vs->prog.code,
+      .count = vs->prog.count,
+      .slot = vs->prog_slot,
+   };
+
+   if (vs->prog_entry)
+      return true;
+   if (vs->prog_upload_failed || !vs->prog.valid)
+      return false;
+   if (ioctl(ph_screen(ctx->base.screen)->fd,
+             DRM_IOCTL_PARHELIA_WARP_PROGRAM, &program) || !program.entry) {
+      vs->prog_upload_failed = true;
+      return false;
+   }
+   vs->prog_slot = program.slot;
+   vs->prog_entry = (uint32_t)program.entry;
+   ctx->warp_programs_held++;
+   if (ph_env("PARHELIA_TRACE_TCL"))
+      fprintf(stderr,
+              "parhelia: WARP program slot=%u entry=%#x instructions=%u "
+              "constants=%u+%u vp=c%u/c%u inputs=%#x outputs=%#x\n",
+              vs->prog_slot, vs->prog_entry, vs->prog.count,
+              vs->prog.constants.vec4s, vs->prog.literals,
+              vs->prog.vp_scale_slot, vs->prog.vp_offset_slot,
+              vs->prog.input_mask, vs->prog.output_mask);
+   return true;
+}
+
+/* The constant block a compiled program reads: the shader's own uniform
+ * vec4s followed by the literals the compiler spelled out.  Built into the
+ * candidate buffer so the caller can compare it against the pending batch's. */
+static bool
+ph_tcl_program_constants(struct ph_context *ctx, const struct ph_vs *vs,
+                         unsigned *vec4s)
+{
+   unsigned count = vs->prog.constants.vec4s + vs->prog.literals;
+   const uint8_t *base = NULL;
+   float *block;
+
+   /* One block load carries 1..63 vectors, and every accepted program reads at
+    * least the four matrix vec4s. */
+   if (!count || count > 63)
+      return false;
+   if (ctx->vs_const_cap < count * 4u) {
+      block = realloc(ctx->vs_const_pending, count * 4u * sizeof(*block));
+      if (!block)
+         return false;
+      ctx->vs_const_pending = block;
+      block = realloc(ctx->vs_const, count * 4u * sizeof(*block));
+      if (!block)
+         return false;
+      ctx->vs_const = block;
+      ctx->vs_const_cap = count * 4u;
+   }
+   block = ctx->vs_const_pending;
+   if (vs->prog.constants.vec4s) {
+      if (ctx->user_constants[MESA_SHADER_VERTEX])
+         base = ctx->user_constants[MESA_SHADER_VERTEX];
+      else if (ctx->constants[MESA_SHADER_VERTEX])
+         base = ph_resource(ctx->constants[MESA_SHADER_VERTEX])->malloc_data;
+      if (!base ||
+          ctx->constant_size[MESA_SHADER_VERTEX] <
+             vs->prog.constants.vec4s * 16u)
+         return false;
+      base += ctx->constant_offset[MESA_SHADER_VERTEX];
+      memcpy(block, base, vs->prog.constants.vec4s * 16u);
+   }
+   memcpy(block + vs->prog.constants.vec4s * 4u, vs->prog.literal,
+          vs->prog.literals * 16u);
+   *vec4s = count;
+   return true;
 }
 
 /* The shader's matrix rows are the rows of the transposed matrix, so
@@ -5305,6 +5514,7 @@ ph_tcl_vertices_fit(const struct ph_context *ctx, const float *vertices,
 
 struct ph_tcl_layout {
    bool textured, multitextured;
+   bool program;                /* a compiled vertex program, not the kernel's */
    unsigned dpv;
    unsigned colour_offset, tex_offset[2];
 };
@@ -5327,10 +5537,14 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
    bool colour;
 
    if (!ctx->tcl_available || ctx->tcl_forced_off || !ctx->vs ||
-       !ctx->vs->ff_transform || !ctx->velems || ctx->derived_triangles ||
+       (!ctx->vs->ff_transform && !ctx->vs->hw_program) || !ctx->velems ||
+       ctx->derived_triangles ||
        !ctx->have_viewport || !ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture)
       return false;
-   colour = ctx->vs->colour_input >= 0;
+   lay->program = !ctx->vs->ff_transform;
+   /* A compiled program always writes o1, so the fragment stage has an
+    * interpolated colour whether the shader computed one or not. */
+   colour = lay->program || ctx->vs->colour_input >= 0;
    if (rs && (rs->clip_plane_enable || rs->offset_tri || rs->offset_line ||
               rs->offset_point || rs->rasterizer_discard || rs->flatshade ||
               rs->clip_halfz || !rs->depth_clip_near || !rs->depth_clip_far ||
@@ -5347,18 +5561,36 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
        ph_use_rgb_alpha_two_pass(ctx, textured, multitextured, colour) ||
        ph_use_native_sampled_alpha(ctx, textured, multitextured, depth))
       return false;
-   if ((textured && ctx->vs->texcoord_input[0] < 0) ||
-       (multitextured && ctx->vs->texcoord_input[1] < 0))
+   if (lay->program) {
+      /* The program may only read fetch slots this stream declares, and the
+       * hardware drops coordinate set 1 unless o4 is written. */
+      unsigned available = (1u << P3D_WARP_V_POSITION) |
+                           (1u << P3D_WARP_V_COLOUR) |
+                           (textured ? 1u << P3D_WARP_V_TEXCOORD0 : 0) |
+                           (multitextured ? 1u << (P3D_WARP_V_TEXCOORD0 + 1) :
+                                            0);
+      unsigned needed = (textured ? 1u << 3 : 0) |
+                        (multitextured ? 1u << 4 : 0);
+
+      if ((ctx->vs->prog.input_mask & ~available) ||
+          (ctx->vs->prog.output_mask & needed) != needed)
+         return false;
+      if (!ph_vs_upload_program(ctx, ctx->vs))
+         return false;
+   } else if ((textured && ctx->vs->texcoord_input[0] < 0) ||
+              (multitextured && ctx->vs->texcoord_input[1] < 0)) {
       return false;
+   }
    /* A two-set transformed draw wedges the engine: the GL test's two-unit
     * scene stopped the pipeline dead on 2026-09-11 (async fence 0x180 made no
     * progress for 2001 ms) while the untextured and single-texture scenes
     * were pixel-identical to the software path.  Keep the route behind an
     * explicit opt-in until that is understood. */
-   if (multitextured &&
-       (!ctx->warp_transform_multitex || !ctx->tcl_multitexture))
+   if (multitextured && !ctx->tcl_multitexture)
       return false;
-   if (textured && !ctx->warp_transform_textured)
+   if (!lay->program &&
+       ((multitextured && !ctx->warp_transform_multitex) ||
+        (textured && !ctx->warp_transform_textured)))
       return false;
    /* A three-coordinate set does not fit the transform program's stream. */
    if (textured && ph_three_coord_texture(ctx))
@@ -5555,28 +5787,52 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    struct translate *translate;
    uint32_t *elts = NULL;
    unsigned ntri, done = 0, limit;
+   unsigned vs_const_vec4s = 0;
+   uint32_t entry = 0;
    float mvp[16];
 
    if (info->primitive_restart || info->instance_count != 1 ||
        !ph_tcl_layout(ctx, &lay) || !ph_tcl_matrix(ctx, mvp))
       goto fallback;
+   if (lay.program) {
+      entry = ctx->vs->prog_entry;
+      if (!ph_tcl_program_constants(ctx, ctx->vs, &vs_const_vec4s))
+         goto fallback;
+   }
 
    key.output_stride = lay.dpv * sizeof(float);
-   if (!ph_tcl_add_element(ctx, &key, ctx->vs->pos_input,
-                           PIPE_FORMAT_R32G32B32_FLOAT, 0, 3))
-      goto fallback;
-   if (ctx->vs->colour_input >= 0 &&
-       !ph_tcl_add_element(ctx, &key, ctx->vs->colour_input,
-                           PIPE_FORMAT_R32G32B32_FLOAT,
-                           lay.colour_offset * sizeof(float), 4))
-      goto fallback;
-   for (unsigned u = 0; u < 2; u++) {
-      if (!(u ? lay.multitextured : lay.textured))
-         continue;
-      if (!ph_tcl_add_element(ctx, &key, ctx->vs->texcoord_input[u],
-                              PIPE_FORMAT_R32G32_FLOAT,
-                              lay.tex_offset[u] * sizeof(float), 2))
+   if (lay.program) {
+      /* One element per fetch slot the compiled program reads. */
+      for (unsigned i = 0; i < PIPE_MAX_ATTRIBS; i++) {
+         int slot = ctx->vs->prog_inputs.slot[i];
+         const struct ph_tcl_slot *desc;
+
+         if (slot < 0 || !(ctx->vs->prog.input_mask & (1u << slot)))
+            continue;
+         desc = ph_tcl_slot_of((unsigned)slot);
+         if (!desc ||
+             !ph_tcl_add_element(ctx, &key, (int)i, desc->format,
+                                 desc->offset * sizeof(float),
+                                 desc->max_components))
+            goto fallback;
+      }
+   } else {
+      if (!ph_tcl_add_element(ctx, &key, ctx->vs->pos_input,
+                              PIPE_FORMAT_R32G32B32_FLOAT, 0, 3))
          goto fallback;
+      if (ctx->vs->colour_input >= 0 &&
+          !ph_tcl_add_element(ctx, &key, ctx->vs->colour_input,
+                              PIPE_FORMAT_R32G32B32_FLOAT,
+                              lay.colour_offset * sizeof(float), 4))
+         goto fallback;
+      for (unsigned u = 0; u < 2; u++) {
+         if (!(u ? lay.multitextured : lay.textured))
+            continue;
+         if (!ph_tcl_add_element(ctx, &key, ctx->vs->texcoord_input[u],
+                                 PIPE_FORMAT_R32G32_FLOAT,
+                                 lay.tex_offset[u] * sizeof(float), 2))
+            goto fallback;
+      }
    }
    ntri = ph_tcl_expand(ctx, info, draw, &elts);
    if (!ntri)
@@ -5607,15 +5863,34 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    }
 
    /* Mixed primitive kinds keep their order, and a batch carrying
-    * window-space or differently transformed vertices ends here. */
+    * window-space or differently transformed vertices ends here.  A batch
+    * binds one WARP program and publishes one constant block, so a change of
+    * either ends it too. */
    if (ctx->points || ctx->lines ||
-       (ctx->triangles && (!ctx->transform || memcmp(ctx->mvp, mvp, sizeof mvp))))
+       (ctx->triangles &&
+        (!ctx->transform || memcmp(ctx->mvp, mvp, sizeof mvp) ||
+         ctx->warp_program_entry != entry ||
+         ctx->vs_const_vec4s != vs_const_vec4s ||
+         (vs_const_vec4s &&
+          memcmp(ctx->vs_const, ctx->vs_const_pending,
+                 vs_const_vec4s * 16u)))))
       ph_submit_vertices(ctx);
    if (ctx->submit_error)
       return true;
    memcpy(ctx->mvp, mvp, sizeof mvp);
+   if (vs_const_vec4s) {
+      float *swap = ctx->vs_const;
+
+      ctx->vs_const = ctx->vs_const_pending;
+      ctx->vs_const_pending = swap;
+   }
+   ctx->vs_const_vec4s = vs_const_vec4s;
+   ctx->vp_slot = lay.program ? ctx->vs->prog.vp_scale_slot : 0;
+   ctx->warp_program_entry = entry;
    ctx->transform = true;
    ctx->tcl_draws++;
+   if (lay.program)
+      ctx->tcl_program_draws++;
 
    limit = ph_triangle_batch_limit(ctx);
    while (done < ntri) {
@@ -5634,7 +5909,9 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
       chunk = MIN2(ntri - done, space - ctx->triangles);
       dst = &ctx->vertices[ctx->triangles * 3 * lay.dpv];
       translate->run_elts(translate, elts + done * 3, chunk * 3, 0, 0, dst);
-      if (ctx->vs->colour_input < 0) {
+      if (lay.program ?
+             !(ctx->vs->prog.input_mask & (1u << P3D_WARP_V_COLOUR)) :
+             ctx->vs->colour_input < 0) {
          for (unsigned v = 0; v < chunk * 3; v++) {
             float *c = dst + v * lay.dpv + lay.colour_offset;
 
@@ -5898,17 +6175,31 @@ static void *ph_create_vs(struct pipe_context *p,
    vs->pos_input = vs->colour_input = -1;
    vs->texcoord_input[0] = vs->texcoord_input[1] = -1;
    if (s->type == PIPE_SHADER_IR_NIR) {
+      struct ph_context *ctx = ph_context(p);
+
       nir_shader_gather_info(s->ir.nir,
                              nir_shader_get_entrypoint(s->ir.nir));
       /* Analyse before handing the shader over: the draw module rewrites it. */
-      vs->ff_transform = ph_vs_analyze(s->ir.nir, vs);
+      vs->ff_transform = ph_vs_analyze(s->ir.nir, vs, false);
+      /* Not the fixed-function shape: the position still has to be the matrix
+       * product the CPU bounds the clip volume with, but every other output is
+       * compiled into a WARP program of this shader's own.  The transforming
+       * stream may sample a texture, so the program must never write T2 -
+       * ph_prime_warp() primes it at context creation instead. */
+      if (!vs->ff_transform && ctx->tcl_programs &&
+          ph_vs_analyze(s->ir.nir, vs, true) &&
+          ph_vs_assign_inputs(s->ir.nir, vs))
+         vs->hw_program = ph_vs_compile(s->ir.nir, &vs->prog_inputs, 0,
+                                        ctx->warp_program_instructions, false,
+                                        &vs->prog);
       if (ph_env("PARHELIA_TRACE_TCL") &&
           !strcmp(getenv("PARHELIA_TRACE_TCL"), "dump"))
          nir_print_shader(s->ir.nir, stderr);
       if (ph_env("PARHELIA_TRACE_TCL"))
          fprintf(stderr,
-                 "parhelia: vs hardware-transform=%u mvp=%#x pos=%d col=%d st=%d/%d\n",
-                 vs->ff_transform, vs->mvp_offset, vs->pos_input,
+                 "parhelia: vs hardware-transform=%u compiled=%u instructions=%u mvp=%#x pos=%d col=%d st=%d/%d\n",
+                 vs->ff_transform, vs->hw_program, vs->prog.count,
+                 vs->mvp_offset, vs->pos_input,
                  vs->colour_input, vs->texcoord_input[0],
                  vs->texcoord_input[1]);
    }
@@ -5925,7 +6216,7 @@ static void ph_bind_vs(struct pipe_context *p, void *s)
    struct ph_vs *vs = s;
 
    if (ctx->triangles && ctx->transform &&
-       (!vs || !vs->ff_transform || vs != ctx->vs))
+       (!vs || (!vs->ff_transform && !vs->hw_program) || vs != ctx->vs))
       ph_submit_vertices(ctx);
    ctx->vs = vs;
    draw_bind_vertex_shader(ctx->draw, vs ? vs->draw : NULL);
@@ -5935,6 +6226,21 @@ static void ph_delete_vs(struct pipe_context *p, void *s)
    struct ph_context *ctx = ph_context(p);
    struct ph_vs *vs = s;
 
+   if (vs->prog_slot) {
+      struct drm_parhelia_warp_program release = {
+         .slot = vs->prog_slot, .flags = PARHELIA_WARP_PROGRAM_FREE,
+      };
+
+      /* A queued draw may still name this entry, and the slot becomes
+       * available to another shader, so publish and drain first. */
+      if (ctx->triangles && ctx->warp_program_entry == vs->prog_entry)
+         ph_submit_vertices(ctx);
+      ph_drain_batch(ctx);
+      ioctl(ph_screen(ctx->base.screen)->fd,
+            DRM_IOCTL_PARHELIA_WARP_PROGRAM, &release);
+      if (ctx->warp_programs_held)
+         ctx->warp_programs_held--;
+   }
    if (ctx->vs == vs)
       ctx->vs = NULL;
    draw_delete_vertex_shader(ctx->draw, vs->draw);
@@ -7752,6 +8058,8 @@ ph_destroy_context(struct pipe_context *p)
    if (ctx->tcl_cache)
       translate_cache_destroy(ctx->tcl_cache);
    free(ctx->tcl_elts);
+   free(ctx->vs_const);
+   free(ctx->vs_const_pending);
    draw_destroy(ctx->draw);
    FREE(ctx);
 }
@@ -7784,6 +8092,12 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    };
    struct drm_parhelia_get_param constant_loader = {
       .param = PARHELIA_PARAM_WARP_CONSTANT_LOADER,
+   };
+   struct drm_parhelia_get_param program_instructions = {
+      .param = PARHELIA_PARAM_WARP_PROGRAM_INSTRUCTIONS,
+   };
+   struct drm_parhelia_get_param program_slots = {
+      .param = PARHELIA_PARAM_WARP_PROGRAM_SLOTS,
    };
    struct draw_stage *stage;
    (void)flags;
@@ -7831,6 +8145,23 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       ctx->tcl_available = debug_get_bool_option("PARHELIA_HW_TCL", true);
    }
    ctx->tcl_forced_off = ph_env("PARHELIA_NO_HW_TCL");
+   /* A vertex shader the WARP compiler accepts runs from an uploaded program
+    * slot.  It needs the same constant loader the fixed-function transform
+    * uses, plus the kernel's WARP_PROGRAM upload path. */
+   if (ctx->tcl_available &&
+       !ioctl(ph_screen(screen)->fd, DRM_IOCTL_PARHELIA_GET_PARAM,
+              &program_instructions) &&
+       !ioctl(ph_screen(screen)->fd, DRM_IOCTL_PARHELIA_GET_PARAM,
+              &program_slots) &&
+       program_instructions.value && program_slots.value) {
+      ctx->warp_program_instructions = program_instructions.value;
+      ctx->warp_program_slots = program_slots.value;
+      /* Default off until the GL comparison has run on hardware: the
+       * semantics of min, the two scalar divide opcodes and the secondary
+       * fract/floor are read out of a vendor binary, not executed. */
+      ctx->tcl_programs =
+         debug_get_bool_option("PARHELIA_HW_VS", false);
+   }
    /* The two-set transform was thought to hang the engine; with a reboot
     * between program edits (the WARP instruction cache serves an already
     * executed entry) the 2x2 experiment showed it renders correctly and

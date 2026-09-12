@@ -281,6 +281,7 @@ enum p3d_warp_dst_file {
 
 enum p3d_warp_op {
 	P3D_WARP_WRA = 0x60,	/* arithmetic no-op, carries a secondary op */
+	P3D_WARP_MIN = 0x61,
 	P3D_WARP_MAX = 0x62,
 	P3D_WARP_ADD = 0x71,
 	P3D_WARP_MUL = 0x75,
@@ -288,9 +289,12 @@ enum p3d_warp_op {
 	P3D_WARP_DP4 = 0x77,
 	P3D_WARP_DP3 = 0x78,
 	P3D_WARP_SMUL = 0x89,	/* dst.c = s1.c * (1 / s0.w): perspective divide */
+	P3D_WARP_RSQ = 0x8a,	/* dst.c = s1.c * rsq(s0.w) */
 };
 
 #define P3D_WARP_SOP_MOV 1
+#define P3D_WARP_SOP_FRC 4
+#define P3D_WARP_SOP_FLOOR 5
 
 /* Fixed-function vertex-fetch slots, in the classic D3D numbering the
  * attribute descriptors use. */
@@ -610,6 +614,12 @@ struct p3d_state {
 	const float	  *mvp;		/* c0..c3 as 16 floats, i.e. already
 					 * transposed from a GL column-major
 					 * matrix: c[r][k] = M[r + 4*k] */
+	/* A compiled vertex program brings its own constant block instead of
+	 * the fixed-function matrix: @vs_const_vec4s vectors loaded at c0, and
+	 * the viewport pair at @vp_slot / @vp_slot + 1 rather than c8/c9. */
+	const float	  *vs_const;
+	unsigned	   vs_const_vec4s;
+	unsigned	   vp_slot;
 	float		   vp_scale[4], vp_offset[4];
 	/* descriptor overrides, for probing the attribute port: 0 = use the
 	 * built-in encoding.  The component-count field is documented two ways
