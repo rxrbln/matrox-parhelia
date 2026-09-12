@@ -605,7 +605,146 @@ which the 3-D engine does not write on this kernel - the clear appeared but
 no triangle did.  `--p690-multitex-warp-probe` still fails for exactly that
 reason and needs the same conversion.
 
-## 11. Still open
+## 11. The NIR vertex compiler and the compiled-program draw path
+
+`parhelia_vs_compile.c` compiles a GL vertex shader into a program the
+WARP engine runs, and `ph_draw_tcl()` binds it.  This section is the
+driver-facing contract; the shapes that run on hardware are in §11.5.
+
+### 11.1 What the driver routes to a compiled program
+
+Two hardware vertex routes now exist and they do not overlap:
+
+1. **the kernel's resident transform programs** (§5.6) for the
+   fixed-function shape `ph_vs_analyze()` recognises — position is a matrix
+   product, every other output copies an attribute.  Unchanged.
+2. **a compiled program** for a shader that is *not* that shape.  The
+   position still has to be the matrix product, because the CPU evaluates it
+   per vertex to decide whether the geometry fits the hardware clip volume
+   (`ph_tcl_vertices_fit()`; the engine does not clip and the vendor never
+   asked it to survive `w <= 0`).  Everything else - colour, the texture
+   coordinate sets, fog - is compiled from its expression tree.
+
+`ph_vs_analyze(nir, vs, relaxed = true)` is the same matcher with every
+failure outside the position store demoted to "not a matrix term", which is
+what makes the position requirement separable from the rest of the shader.
+
+The matrix convention both routes share: constant-buffer vec4 *k*,
+component *i*, scales input component *k* into output component *i*.  That
+is GLSL's column-major `mat4 * vec4` and the fixed-function vertex program's
+`MUL/MAD` chain; a shader written as four `dp4`s against rows would need the
+transpose and is refused by the matcher, so `ph_tcl_matrix()` never sees the
+other layout.
+
+### 11.2 The expression set
+
+Accepted NIR operations and the bundles they become:
+
+| NIR | WARP | note |
+|---|---|---|
+| `mov`, `fneg` | folded into the operand | negate is an operand modifier |
+| `fabs` | `max x, -x` | the engine has no absolute modifier |
+| `fadd`, `fmul` | `add` 0x71, `mul` 0x75 | |
+| `fadd(fmul(a,b), c)` | `mad` 0x76 | single-use multiply only; this is what keeps a matrix product at four bundles, since the vertex NIR options do not fuse |
+| `fmin`, `fmax` | `min` 0x61, `max` 0x62 | `clamp()`/`fsat` lower to these |
+| `fdot2`, `fdot3`, `fdot4` | `dp3` 0x78 (z forced to the literal 0 for `fdot2`), `dp4` 0x77 | |
+| `frcp`, `fdiv` | `smul` 0x89 against the literal 1.0 | the divisor must be one broadcast component, because 0x89 reads `s0.w` |
+| `frsq` | 0x8a | same shape |
+| `ffloor`, `ffract` | secondary 5 and 4 on a `wra` bundle | one source, port A |
+| `vec2`/`vec3`/`vec4` | one temporary, one masked write per component; a component that is a single operation over leaves is written directly under its mask | |
+
+A varying whose expression is one operation wide is computed straight into
+its output register instead of into a temporary that is then copied, so the
+copy only remains for a plain attribute read or a deeper expression tree.
+
+Everything else is refused and the draw keeps Gallium's draw module.  There
+are no branches: the upload validator rejects the control class (§9.2), so a
+compiled program cannot loop.
+
+Two structural rules the encoder forces and the compiler has to respect:
+src1 and src2 share one swizzle field, and a bundle carries one
+index-extension field.  A second offender is moved into a temporary with a
+secondary `mov` first (`ph_vs_legalise()`).
+
+### 11.3 Constants
+
+The constant file is the engine's block-state file, so a program may read it
+but never write it.  A compiled program's block is laid out by the compiler
+and published by the ordinary constant loader (§7, route 1):
+
+```
+c0                              .. the shader's constant-buffer vec4s
+c[constants.vec4s]              .. the literals the compiler spelled out
+c[max(8, vec4s + literals)]     .. viewport scale  (W/2, -H/2, (zf-zn)/2, 1)
+c[max(8, vec4s + literals) + 1] .. viewport offset (x0+W/2, y0+H/2, (zn+zf)/2, H)
+```
+
+A component that is only 0.0 or 1.0 costs nothing - swizzle codes 4 and 5
+materialise both (§2) - so only genuinely arbitrary values consume a slot.
+The viewport pair keeps the proven c8/c9 slots whenever the shader's own
+constants leave room, and moves behind them when they do not; the raster
+block's own copy at `c[0x160]` is emitted unchanged.
+
+`p3d_state.vs_const` / `vs_const_vec4s` / `vp_slot` carry this to
+`p3d_emit_constant_group()`.  One block load carries at most 63 vectors,
+which is the driver's constant limit.
+
+### 11.4 T2, the program store and the draw
+
+* **T2 is never written by a compiled program.**  A transforming draw may
+  sample a texture, and a textured program that writes T2 locks the engine
+  (§3.3).  Mesa primes T2 once per context with `ph_prime_warp()`, exactly
+  as the resident transform programs rely on.
+* One program per shader, uploaded lazily on the first draw that would use
+  it through `DRM_IOCTL_PARHELIA_WARP_PROGRAM`, released when the shader is
+  deleted.  The entry the ioctl returns is the only one bound - the engine
+  serves an already-executed entry from an instruction cache (§9.3).
+* A slot holds `PARHELIA_PARAM_WARP_PROGRAM_INSTRUCTIONS` instructions and a
+  file may hold `PARHELIA_PARAM_WARP_PROGRAM_SLOTS` of them (8), so at most
+  eight distinct compiled shaders are resident at once; an upload that cannot
+  be satisfied falls back to the draw module for that shader.  Instruction
+  fetch is host DMA, so the image size is a driver policy choice: it was 32
+  bundles when only the probe used the path and is now **128**, which is also
+  the compiler's own `PH_VS_MAX_INSTRUCTIONS`.  The whole user heap is
+  32 slots x 256 bundles x 12 bytes = 96 KiB of coherent memory.
+* The vertex stream is the fixed-function transforming one, unchanged:
+  position at dwords 0..2 (`v0`, `w` defaulting to 1.0), colour at 3..5
+  (`v5`), coordinate set 0 at 6..7 (`v7`), set 1 at 8..9 (`v8`).  The
+  shader's position input takes `v0` - the clip-volume bound reads those
+  three dwords - and its remaining inputs take `v5`, `v7`, `v8` in attribute
+  order.  A program that reads a slot the draw does not declare, or that does
+  not write `o3`/`o4` when a coordinate set is advertised (§3.2), is refused
+  for that draw.
+* A program that writes no colour writes `o1 = 1,1,1,1` itself, so the
+  fixed-function fragment stage always has an interpolated colour.
+
+### 11.5 Verification
+
+`parhelia-drm-test --selftest` compiles eight shader shapes with
+`nir_builder` and checks each generated program against a reimplementation of
+the kernel's upload validator, so an illegal program fails on the host rather
+than at the ioctl.  It pins the constant layout, the folded matrix product
+(four bundles for both the `dp4` and the GLSL column form) and the two refusal
+cases (an operation with no opcode, a program that does not fit its slot).
+
+It then **executes** one program: an evaluator over the field map of §2 and
+the opcode semantics of §4 runs the bundles and compares `o0`, `o11`, `o1`
+and `o3` against the shader's algebra computed directly.  A mis-encoded
+swizzle, a source in the wrong operand slot or a wrong register allocation is
+therefore a host failure rather than wrong pixels on the target; what the
+evaluator cannot check is whether the *hardware* agrees with the documented
+semantics of the opcodes that are only BIN or INF, which is what the GL
+comparison below is for.
+
+`tools/parhelia-gl-vs-test.c` renders twelve scenes through GLSL 1.20 vertex
+shaders and `tools/parhelia-gl-vs-compare.sh` runs it twice - once with the
+compiled programs, once with `PARHELIA_HW_VS=0` - and compares the dumps.
+The scenes deliberately cover the opcodes whose semantics were only inferred
+or read out of a vendor table: `min`/`max` through `clamp()`, `smul` through a
+division by a uniform, 0x8a through `inversesqrt()` and the secondary
+`frc`/`floor` through `fract()` and `floor()`.
+
+## 12. Still open
 
 * The value of base registers `b1..b3` and how they are programmed.
 * Whether `o0` may carry clip space (would remove the divide/viewport tail).
