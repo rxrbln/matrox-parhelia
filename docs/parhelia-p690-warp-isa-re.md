@@ -618,7 +618,11 @@ Two hardware vertex routes now exist and they do not overlap:
 1. **the kernel's resident transform programs** (§5.6) for the
    fixed-function shape `ph_vs_analyze()` recognises — position is a matrix
    product, every other output copies an attribute.  Unchanged.
-2. **a compiled program** for a shader that is *not* that shape.  The
+2. **a compiled program** for a shader that is *not* that shape, behind
+   `PARHELIA_HW_VS=1`.  The route is default-off until the GL comparison of
+   §11.5 has run on hardware: half the opcodes it needs have BIN or INF
+   evidence only, and a default-on path whose semantics are merely inferred
+   is how an inferred field becomes a user-visible defect.  The
    position still has to be the matrix product, because the CPU evaluates it
    per vertex to decide whether the geometry fits the hardware clip volume
    (`ph_tcl_vertices_fit()`; the engine does not clip and the vendor never
@@ -737,12 +741,31 @@ semantics of the opcodes that are only BIN or INF, which is what the GL
 comparison below is for.
 
 `tools/parhelia-gl-vs-test.c` renders twelve scenes through GLSL 1.20 vertex
-shaders and `tools/parhelia-gl-vs-compare.sh` runs it twice - once with the
-compiled programs, once with `PARHELIA_HW_VS=0` - and compares the dumps.
-The scenes deliberately cover the opcodes whose semantics were only inferred
-or read out of a vendor table: `min`/`max` through `clamp()`, `smul` through a
-division by a uniform, 0x8a through `inversesqrt()` and the secondary
-`frc`/`floor` through `fract()` and `floor()`.
+shaders and `tools/parhelia-gl-vs-compare.sh` runs it twice - once with
+`PARHELIA_HW_VS=1`, once with `PARHELIA_HW_VS=0` - and compares the dumps.
+
+The scenes are **ordered by how well the opcodes they need are established**,
+so the first scene that differs names the construct that disagrees with this
+document rather than leaving a whole shader to bisect:
+
+| scene | adds | evidence before this test |
+|---|---|---|
+| 0 | transform and a colour copy: `mul`, `mad`, `add`, `smul`, the constant block, the entry binding, the stream | all PROVEN(hw) in the resident programs |
+| 1 | `mad` absorbing a literal multiply and add | PROVEN(enc), semantics from the viewport tail |
+| 2 | `min` 0x61 and `max` 0x62 through `clamp()` | BIN |
+| 3 | `dp3` 0x78, `max` as absolute value, a vec4 of scalars | PROVEN(enc) |
+| 4 | `smul` 0x89 reciprocal of an arbitrary scalar | INF, strong |
+| 5 | 0x8a through `inversesqrt()` | INF |
+| 6 | secondary `frc`/`floor` through `fract()`/`floor()` | BIN |
+| 7 | `o3` and a bound texture | PROVEN(hw) for the resident programs |
+| 8 | a refused shader: the draw module must still own it | - |
+| 9, 10 | a perspective cube, so `w` varies per vertex | |
+| 11 | fixed function again in the same context | |
+
+Each scene is flushed to the dump as it completes and its name is printed
+before it draws, and a scene range can be passed to both the test and the
+compare script, so a scene that locks the engine neither loses the earlier
+results nor has to be guessed at.
 
 ## 12. Still open
 
