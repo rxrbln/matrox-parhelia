@@ -33,9 +33,20 @@ explanations that measurement refuted.
   the companion was allocated with.  Mesa `276e6dd`.
 
 Hardware state after those: **121 of 121 probed mip levels byte exact** (68
-before), the whole `--mip-address-probe` battery clean over pitches 64..224 and
-heights 16..65, and a 640x480 texture - previously reported as failing every
-check - exact at **0 of 307200 texels**.
+before) and the whole `--mip-address-probe` battery clean over pitches 64..224
+and heights 16..65.
+
+A fourth cause was found after this document was first written, and it is the
+reason large images still looked wrong:
+
+* **The texture unit addresses at most 512 texels per axis.**  Bit 9 of both
+  the x and the y texel coordinate is dropped, so half of a 1024- or 640-wide
+  image reads the other half.  Linear storage wraps identically, so it is the
+  address unit and not the tile order.  The driver now advertises
+  `max_texture_2d_size = 512` on the P690, with render targets, viewports and
+  scanout still reaching 2048 through a new `max_render_target_size` pipe cap.
+  Mesa `eb2b7c3`, `mesa-max-render-target-size-cap.patch`,
+  `parhelia-texture-size-limit-re.md`.
 
 ## 2. The explanations that measurement refuted
 
@@ -63,10 +74,13 @@ too.
   takes mip filtering out of the picture: identical, in fact slightly stronger.
 * **The native sampled-alpha companion route.**  Ran with
   `PARHELIA_NATIVE_SAMPLED_ALPHA=0`: identical.
-* **Large textures.**  A 640x480 image is byte exact at 1:1 (section 1).  The
-  earlier report that it "fails everything" came from the GL harness coding x
-  and y in nine bits each, which wraps for any dimension above 512 - a limit of
-  the test, not of the driver.
+* ~~**Large textures.**  A 640x480 image is byte exact at 1:1.~~  **Wrong - it
+  was the real cause for large images.**  This bullet originally read that the
+  earlier "fails everything" report came from the GL harness coding x and y in
+  nine bits each.  The harness bug was real, but fixing it to ten bits per axis
+  did not make 640x480 pass: it exposed a genuine wrap at 512 texels in the
+  texture unit (section 1, fourth cause).  The lesson is that a test whose
+  coding range coincides with the limit under test cannot measure that limit.
 
 ## 3. What the game actually shows now
 
