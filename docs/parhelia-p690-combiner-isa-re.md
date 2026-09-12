@@ -14,6 +14,9 @@ the limits, with each fact tagged.
 > 2. Saturate only the instruction that produces a result.  Saturating every
 >    instruction clamps negative intermediates and silently changes the
 >    algebra of anything NIR lowers into a difference.  Section 10.
+> 3. A `load_ubo_vec4` carries the starting channel in its component index.
+>    Two loads of the same vec4 that differ only in it are different values.
+>    Section 10.
 
 Evidence tags:
 
@@ -316,42 +319,47 @@ obvious next extension and is untested.
 
 ## 10. Measured coverage
 
-`tools/parhelia-gl-combiner-test` compares the rendered result of 26 shapes
+`tools/parhelia-gl-combiner-test` compares the rendered result of 27 shapes
 with the value the GL specification requires.  On the P690, with the driver's
-instruction-shape matcher (`PARHELIA_FS_COMPILER` unset) **23 of 26 fail**;
-with the data-flow compiler **8 fail**.
+instruction-shape matcher (`PARHELIA_FS_COMPILER` unset) **24 of 27 fail**;
+with the data-flow compiler **7 fail**.
 
-Exact with the compiler: GL_REPLACE, GL_MODULATE, GL_ADD, GL_DECAL, a
-two-unit MODULATE chain, an untextured constant colour, and eleven GLSL 1.20
-shaders - multiply, add, `1 - x`, an alpha replicate, an rgb/alpha split, a
-uniform constant, a multiply-add, a texture squared, a texture used in two
-instructions, and `mix()` driven by a constant, by a per-channel register and
-by an alpha replicate.
+Exact with the compiler: **all five GL_TEXTURE_ENV modes** (REPLACE,
+MODULATE, ADD, DECAL, BLEND), a two-unit MODULATE chain, an untextured
+constant colour, and thirteen GLSL 1.20 shaders - multiply, add, `1 - x`, an
+alpha replicate, an rgb/alpha split, a uniform constant, a multiply-add, a
+texture squared, a texture used in two instructions, three instructions over
+two temporaries with literal constants, and `mix()` driven by a constant, by
+a per-channel register and by an alpha replicate.
 
-**Withdrawn:** an earlier revision of this section reported that LRP loses
-the green lane of a replicated source.  That was a defect in the driver's own
-compiler, not in the hardware: it set the saturate bit on every instruction,
-so NIR's lowering of `mix(a, b, t)` into `a + t * (b - a)` clamped the
-negative difference to zero.  A texture read twice in one instruction and in
-two, and `mix()` with a constant, a per-channel and an alpha-replicated
-factor, are all exact once only the result saturates.  **Saturate the
-instruction that produces a result and no other.**
+Two compiler defects were found and fixed by running this test, and both are
+worth knowing about because they are easy to repeat:
+
+* **Saturate only the instruction that produces a result.**  Saturating every
+  instruction clamped the negative difference in NIR's lowering of
+  `mix(a, b, t)` into `a + t * (b - a)`, so GL_DECAL and every `mix()`
+  returned `a` wherever `b < a`.  An earlier revision of this document read
+  that as "LRP loses the green lane of a replicated source"; **that claim is
+  withdrawn** - a texture read twice in one instruction and in two, and
+  `mix()` with a constant, a per-channel and an alpha-replicated factor, are
+  all exact once only the result saturates.
+* **`nir_lower_ubo_vec4` puts the starting channel in the intrinsic's
+  component index.**  Ignoring it made two loads that differ only in that
+  channel compare equal, so Mesa's GL_BLEND shader compiled to
+  `add r0, c0, -c0` and the draw returned the environment colour.
 
 Still wrong:
 
-* **GL_BLEND.**  Mesa's fixed-function shader for it compiles to
-  `add r0, c0, -c0` - two operands that resolve to the same constant
-  register - so the first term is zero and the result is the environment
-  colour.  Either the two uniforms really are the same vec4 and the shader is
-  being read wrong, or `ph_fs_place_constants` merges two distinct ones.
-* **Two live temporaries.**  `s * k + colour * k` allocates `r0` and `r1` and
-  adds them; red and green come back as roughly the constant itself.  Every
-  shape that uses only `r0` is exact, so either `r1` is not readable the way
-  the encoding assumes or the second write does not land.
+* **One compiled shape.**  `texture * k + colour * k` - three instructions
+  over two temporaries - is wrong in red and green.  The identical program
+  with literal constants is exact, and so is every other two-temporary
+  program here, so neither the shape nor the second temporary is at fault:
+  it is the runtime constant path, where one constant-buffer vec4 is
+  referenced from two instructions.
 * **A second texture unit** through a compiled program: the draw path binds
   unit 1 only for the shapes the matcher recognises, so a compiled program
-  that samples it reads zero.  The compiler now declines those draws; making
-  them work needs the draw path to bind by sampler use.
+  that samples it reads zero.  The compiler declines those draws; making them
+  work needs the draw path to bind by sampler use.
 * The vertex colour of an **untextured** draw comes out white.  That predates
   the compiler: the driver selects the WARP replace program, which forces the
   vertex colour to 1.
