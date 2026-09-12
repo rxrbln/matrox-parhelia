@@ -7635,7 +7635,7 @@ ph_copy_texel_to_gpu(uint8_t *dst, const uint8_t *src, bool swap_rb,
 static unsigned
 ph_sampler_tiled_pitch(unsigned width)
 {
-   return MAX2(32u, util_next_power_of_two(width));
+   return MAX2(32u, align(width, 32));
 }
 
 static unsigned

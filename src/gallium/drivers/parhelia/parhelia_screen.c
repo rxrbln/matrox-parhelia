@@ -831,9 +831,13 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * allocation for an unusually large chain rather than rejecting an
     * otherwise usable texture; transfer maps for its lower levels become
     * harmless staging-only fallbacks. */
+   /* Count the rows the allocation below really asks for: it uses a pitch of
+    * at least 64 texels, so measuring a 32-texel chain against its own pitch
+    * doubled the row count and silently dropped mipmapping for a tall narrow
+    * base (32x512 sampled level 0 at every level). */
    if (mip_levels > 1 &&
-       (r->mip.size + (size_t)r->mip.level[0].pitch * 4 - 1) /
-       ((size_t)r->mip.level[0].pitch * 4) > 768) {
+       (r->mip.size + (size_t)MAX2(r->mip.level[0].pitch, 64u) * 4 - 1) /
+       ((size_t)MAX2(r->mip.level[0].pitch, 64u) * 4) > 768) {
       mip_levels = 1;
       if (!ph_mip_layout_init_chip(&r->mip, templ->width0, templ->height0,
                                    mip_levels, true, p690_native_texture32))

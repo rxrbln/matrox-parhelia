@@ -116,6 +116,20 @@ ph_dxt_level_size(unsigned width, unsigned height, unsigned block_bytes)
                        (ph_mip_align(height, rows) / 4) * block_bytes, align);
 }
 
+/* Bytes a tiled level of @rows rows occupies.  Its tiles are the linear texel
+ * index over the pitch divided by the 64-texel tile width, so the level holds
+ * the tiles its last row reaches; a pitch that is not a multiple of 64 leaves
+ * the last tile of each row band shared with the next.  For a pitch that is a
+ * multiple of 64 this is exactly pitch * rows * cpp. */
+static inline size_t
+ph_tiled_level_bytes(unsigned pitch, unsigned rows, unsigned tile_h,
+                     size_t tile_bytes)
+{
+   const unsigned trows = rows >= tile_h ? rows / tile_h : 1u;
+
+   return (((size_t)trows * pitch + 63) / 64) * tile_bytes;
+}
+
 static inline unsigned
 ph_mip_max_levels(unsigned width, unsigned height)
 {
@@ -172,7 +186,11 @@ ph_mip_layout_init_cpp(struct ph_mip_layout *out, unsigned width,
 
       level->width = width;
       level->height = height;
-      pitch = tiled ? ph_mip_next_pot(width) : ph_mip_align(width, 32);
+      /* The address unit rounds the descriptor's width up to 32 texels, not
+       * to the next power of two: parhelia-drm-test --mip-address-probe 96 64
+       * and 129 65 fetch tile rows 96/64 and 160/64 apart.  Every earlier
+       * measurement used a power-of-two width, where the two agree. */
+      pitch = ph_mip_align(width, 32);
       pitch = pitch < 32 ? 32 : pitch;
       level->pitch = pitch;
       level_align = tiled ? 0x1000 : 0x40;
@@ -200,6 +218,13 @@ ph_mip_layout_init_cpp(struct ph_mip_layout *out, unsigned width,
                 p690 && pitch >= 64 ? ph_mip_align(height, 16) :
                 ph_mip_align(height, 32);
          bytes = (size_t)pitch * rows * cpp;
+         /* A 32-texel pitch addresses 32x16-texel 2 KiB blocks row-major and
+          * needs no such correction; the 64-wide tile orders do. */
+         if (tiled && pitch >= 64)
+            bytes = ph_tiled_level_bytes(pitch, rows,
+                                         p690 && cpp == 4 ? 16u : 32u,
+                                         p690 && cpp == 4 ? 4096u :
+                                                            2048u * cpp);
          level->offset = ph_mip_align((unsigned)next, level_align);
          next = level->offset + bytes;
       }

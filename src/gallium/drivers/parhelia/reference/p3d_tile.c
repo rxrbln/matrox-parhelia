@@ -243,7 +243,15 @@ p3d_texture_tile_offset_cpp(uint32_t x, uint32_t y, uint32_t pitch,
 uint32_t
 p3d_texture_tile_offset_64x16(uint32_t x, uint32_t y, uint32_t pitch)
 {
-	uint32_t tpr = pitch / P3D_TILE_W, tcol = x / P3D_TILE_W, trow = y / 16;
+	uint32_t trow = y / 16;
+	/* The tile index is the linear texel index over the descriptor's pitch
+	 * divided by the 64-texel tile width, the same shape the vendor's
+	 * 32x16-block order uses - not (trow * pitch / 64) + x / 64, which
+	 * aliases two tile rows onto one tile whenever the pitch is not a
+	 * multiple of 64.  Measured with --mip-address-probe 96 64 and 129 65:
+	 * tile rows land 96/64 and 160/64 texels on, and this form is the only
+	 * one of the two that also places every texel of the rows between. */
+	uint32_t tile = (trow * pitch + x) / P3D_TILE_W;
 	uint32_t ix = x % P3D_TILE_W, iy = y % 16;
 	uint32_t x5 = ((ix >> 5) & 1) ^ (trow & 1);
 	uint32_t i;
@@ -258,7 +266,7 @@ p3d_texture_tile_offset_64x16(uint32_t x, uint32_t y, uint32_t pitch)
 	     x5               << 7  |
 	     ((iy >> 2)  & 1) << 8  |
 	     ((iy >> 3)  & 1) << 9;
-	return (trow * tpr + tcol) * 4096 + i * 4;
+	return tile * 4096 + i * 4;
 }
 
 /* The P690 texture unit reads 8- and 16-bit textures in 64x32-texel tiles,
@@ -274,9 +282,11 @@ p3d_texture_tile_offset_p690_narrow(uint32_t x, uint32_t y, uint32_t pitch,
 {
 	/* A tile always spans 64x32 texels of storage, so at a 32-texel pitch
 	 * two consecutive 32-row bands share one tile and are told apart by
-	 * the parity bit alone; multiplying before dividing expresses both. */
+	 * the parity bit alone; the linear texel index over the pitch, divided
+	 * by the tile width, expresses that and keeps a pitch that is not a
+	 * multiple of 64 collision-free, as measured for the 32-bit order. */
 	uint32_t trow = y / 32;
-	uint32_t tile = ((trow * pitch) / P3D_TILE_W) + x / P3D_TILE_W;
+	uint32_t tile = (trow * pitch + x) / P3D_TILE_W;
 	uint32_t ix = x % P3D_TILE_W, iy = y % 32;
 	uint32_t x5 = ((ix >> 5) & 1) ^ (trow & 1);
 	uint32_t i;
