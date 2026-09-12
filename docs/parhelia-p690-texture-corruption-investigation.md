@@ -36,17 +36,28 @@ Hardware state after those: **121 of 121 probed mip levels byte exact** (68
 before) and the whole `--mip-address-probe` battery clean over pitches 64..224
 and heights 16..65.
 
-A fourth cause was found after this document was first written, and it is the
-reason large images still looked wrong:
+A fourth finding came after this document was first written, and it is why
+large images looked wrong for another round - it is a defect in the
+*measurement*, not in the driver:
 
-* **The texture unit addresses at most 512 texels per axis.**  Bit 9 of both
-  the x and the y texel coordinate is dropped, so half of a 1024- or 640-wide
-  image reads the other half.  Linear storage wraps identically, so it is the
-  address unit and not the tile order.  The driver now advertises
-  `max_texture_2d_size = 512` on the P690, with render targets, viewports and
-  scanout still reaching 2048 through a new `max_render_target_size` pipe cap.
-  Mesa `eb2b7c3`, `mesa-max-render-target-size-cap.patch`,
-  `parhelia-texture-size-limit-re.md`.
+* **The address probe clipped its own quad at 512 pixels.**  It programmed a
+  fixed `screen_w = screen_h = 512` clip window while its colour target
+  followed the image under test, so a 1:1 quad of anything wider or taller was
+  cut off there and the undrawn destination pixels were counted as texels the
+  sampler had fetched wrong - reported as "bit 9 of the texel coordinate
+  dropped".  The output said so all along: a 528-wide image gave
+  "256/8448 texels differ, 256 undrawn", exactly the 16 columns past 512.
+  With the clip window following the target, 512-, 528-, 640-, 1024- and
+  2048-wide chains are byte exact, and the GL harness passes 44 of 44 checks
+  at `GL_MAX_TEXTURE_SIZE 2048`.  Mesa `907e6fb`; the vendor binaries agree
+  (2048 on both families, plain 14-bit fields, no extra addressing register -
+  `parhelia-texture-size-limit-re.md`).
+
+  Between those two states the driver briefly advertised
+  `max_texture_2d_size = 512` with a `max_render_target_size` pipe cap to keep
+  X at 1920x1200; both are reverted.  The lesson is the one below in a
+  different costume: a test whose own geometry stops at the limit under test
+  cannot measure that limit.
 
 ## 2. The explanations that measurement refuted
 
@@ -74,13 +85,13 @@ too.
   takes mip filtering out of the picture: identical, in fact slightly stronger.
 * **The native sampled-alpha companion route.**  Ran with
   `PARHELIA_NATIVE_SAMPLED_ALPHA=0`: identical.
-* ~~**Large textures.**  A 640x480 image is byte exact at 1:1.~~  **Wrong - it
-  was the real cause for large images.**  This bullet originally read that the
-  earlier "fails everything" report came from the GL harness coding x and y in
-  nine bits each.  The harness bug was real, but fixing it to ten bits per axis
-  did not make 640x480 pass: it exposed a genuine wrap at 512 texels in the
-  texture unit (section 1, fourth cause).  The lesson is that a test whose
-  coding range coincides with the limit under test cannot measure that limit.
+* **Large textures.**  Two *test* defects, one after the other, both of which
+  stopped at 512 and both of which looked like hardware.  First the GL harness
+  coded x and y in nine bits each, so any coordinate above 512 wrapped in the
+  *expectation*; widening it to ten bits per axis left 640x480 failing, which
+  looked like confirmation.  It was the address probe's fixed 512x512 clip
+  window (section 1).  With both fixed, 640x480 and 1024x1024 are exact and
+  the GL harness passes 44 of 44 checks at `GL_MAX_TEXTURE_SIZE 2048`.
 
 ## 3. What the game actually shows now
 
@@ -109,8 +120,9 @@ Measured on the current build, P690 at 1280x1024, depth 24, trilinear:
   carries one base address, and a tail level's texels start at an x/y offset
   inside a 64x16 block, so a base address cannot name one.  Needs a different
   strategy rather than a layout tweak.
-* The GL harness cannot code coordinates above 512 (nine bits per axis), so
-  sizes beyond that are only checked at 1:1, where the coding cancels.
+* The GL harness codes ten bits per axis, so coordinates up to 1023 identify
+  themselves; a 2048-wide image is still only checked at 1:1, where the coding
+  cancels.
 
 ## 5. How to re-measure quickly
 
