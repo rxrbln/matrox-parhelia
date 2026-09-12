@@ -182,8 +182,30 @@ struct p3d_surface {
 	uint32_t base;		/* surface register value; a POOL OFFSET under a
 				 * live vendor context, a raw address cold */
 	uint32_t pitch;		/* pixels */
-	uint32_t fmt;		/* 0x32 = A8R8G8B8, 0x36 = S8Z24 */
+	uint32_t fmt;		/* 0x32 = A8R8G8B8, 0x36 = S8Z24,
+				 * 0x28 = R5G6B5, 0x2a = D16 */
 };
+
+/* Bytes per pixel of a surface format code, zero when the code is not one
+ * this driver drives.  The vendor's depth codes are in
+ * docs/parhelia-p690-zcompression-clear-banks-re.md §6. */
+static inline unsigned p3d_surface_format_bytes(uint32_t fmt)
+{
+	switch (fmt) {
+	case 0x32: return 4;	/* A8R8G8B8 colour */
+	case 0x36: return 4;	/* S8Z24 depth */
+	case 0x28: return 2;	/* R5G6B5 colour */
+	case 0x2a: return 2;	/* D16 depth */
+	default:   return 0;
+	}
+}
+
+/* Stencil bit count for 0x12c8[20:17]; only D16 has none.  The baseline S8Z24
+ * value stands for every other code, including an unbound depth surface. */
+static inline uint32_t p3d_depth_stencil_bits(uint32_t fmt)
+{
+	return fmt == 0x2a ? 0u : 8u;
+}
 
 /* 0x11c0 FILTER: MIN [1:0], MAG [4:3], MIP [7:6], bit 12 always set,
  * LOD bias [24:16] signed 4.4 biased -4.0.  0x01c01000 = nearest, no mip.
@@ -714,6 +736,15 @@ uint32_t p3d_tile_offset_layout(uint32_t x, uint32_t y, uint32_t pitch,
 				uint32_t layout);
 void	 p3d_tile_position_layout(uint32_t offset, uint32_t pitch,
 			  uint32_t layout, uint32_t *x, uint32_t *y);
+/* The measured 16 bpp render-target order: 128x16 pixels per 4 KiB tile. */
+uint32_t p3d_tile_offset_16bpp(uint32_t x, uint32_t y, uint32_t pitch);
+void	 p3d_tile_position_16bpp(uint32_t offset, uint32_t pitch,
+				 uint32_t *x, uint32_t *y);
+uint32_t p3d_tile_offset_layout_cpp(uint32_t x, uint32_t y, uint32_t pitch,
+				    uint32_t layout, unsigned cpp);
+void	 p3d_tile_position_layout_cpp(uint32_t offset, uint32_t pitch,
+				      uint32_t layout, unsigned cpp,
+				      uint32_t *x, uint32_t *y);
 /* Texture layout code 2: 32x16 texels per 2 KiB block at 32 bpp.  This is
  * deliberately not p3d_tile_offset(): texture and render-target swizzles are
  * different on Parhelia. @pitch is the padded texture width in texels.

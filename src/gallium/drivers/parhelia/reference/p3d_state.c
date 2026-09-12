@@ -551,7 +551,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	 * The stencil masks/reference occupy 0x12cc/0x12d0; depth write remains
 	 * independent in 0x12d0 bit 8. */
 	rw[0].reg = P3D_R_ZFUNC;
-	rw[0].val  = st->depth_raw ? st->depth_raw : 0x00100000u |
+	rw[0].val  = st->depth_raw ? st->depth_raw :
+		     p3d_depth_stencil_bits(st->depth.fmt) << 17 |
 		     ((uint32_t)(st->depth_test ? st->depth_func
 					        : P3D_CMP_LESS) << 1) |
 		     (st->depth_test ? 1u : 0u) |

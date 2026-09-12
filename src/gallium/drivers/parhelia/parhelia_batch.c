@@ -341,7 +341,7 @@ parhelia_batch_clear_rect_surface(struct parhelia_batch *batch,
        !width || !height || x > surface_width || width > surface_width - x ||
        y > surface_height || height > surface_height - y)
       return -EINVAL;
-   if (format != 0x32 && format != 0x36)
+   if (!p3d_surface_format_bytes(format))
       return -EINVAL;
    batch->command_count = 0;
    batch->packet_count = 0;
@@ -500,7 +500,7 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
        !input->screen_w || !input->screen_h || input->screen_h > 0xffff ||
        input->screen_w > input->colour.pitch || (input->colour.pitch & 63) ||
        input->colour.pitch > 0x3fff || input->colour.base ||
-       input->colour.fmt != 0x32 ||
+       (input->colour.fmt != 0x32 && input->colour.fmt != 0x28) ||
        (!!input->tex != !!texture0_handle) ||
        (!!input->tex1 != !!texture1_handle) ||
        (!input->tex && input->tex1) ||
@@ -569,7 +569,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
        input->base_reg_entry ||
        (input->bound_ranges && input->prim != P3D_TRIANGLES) ||
        (input->has_depth && (!depth_handle || input->depth.base ||
-         input->depth.fmt != 0x36 || input->depth.pitch != input->colour.pitch ||
+         (input->depth.fmt != 0x36 && input->depth.fmt != 0x2a) ||
+         input->depth.pitch != input->colour.pitch ||
          input->depth_slot > 1)))
       return -EINVAL;
    per_packet = input->vertices_per_packet ? input->vertices_per_packet :

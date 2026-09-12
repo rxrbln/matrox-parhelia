@@ -106,6 +106,72 @@ p3d_tile_offset_layout(uint32_t x, uint32_t y, uint32_t pitch,
 	return (trow * tpr + tcol) * 4096 + i * 4;
 }
 
+/* A 16 bpp render target on the LX/P690 keeps the same 4096-byte, 16-row tile
+ * and doubles its width: 128x16 pixels.  Measured exhaustively over two tile
+ * columns and four tile rows with parhelia-drm-test --narrow-target-probe;
+ * x bit 5 still carries the tile-row parity, as every Parhelia surface order
+ * does.  The bit assignment is not the 32 bpp one shifted down. */
+uint32_t
+p3d_tile_offset_16bpp(uint32_t x, uint32_t y, uint32_t pitch)
+{
+	uint32_t tpr = pitch / 128u, tcol = x / 128u, trow = y / 16u;
+	uint32_t ix = x % 128u, iy = y % 16u;
+	uint32_t x5 = ((ix >> 5) & 1) ^ (trow & 1);
+
+	return (trow * tpr + tcol) * 4096u |
+	       ( ix        & 1) << 1  |
+	       ((ix >> 1)  & 1) << 2  |
+	       ((ix >> 2)  & 1) << 3  |
+	       ((ix >> 3)  & 1) << 4  |
+	       ( iy        & 1) << 5  |
+	       ((ix >> 4)  & 1) << 6  |
+	       ((iy >> 1)  & 1) << 7  |
+	       ((iy >> 2)  & 1) << 8  |
+	       x5               << 9  |
+	       ((iy >> 3)  & 1) << 10 |
+	       ((ix >> 6)  & 1) << 11;
+}
+
+void
+p3d_tile_position_16bpp(uint32_t offset, uint32_t pitch, uint32_t *x,
+			uint32_t *y)
+{
+	uint32_t tpr = pitch / 128u;
+	uint32_t t = offset / 4096u, i = offset % 4096u;
+	uint32_t trow = t / tpr, tcol = t % tpr;
+	uint32_t b[12], k;
+
+	for (k = 0; k < 12; k++)
+		b[k] = (i >> k) & 1;
+	*x = tcol * 128u + (b[1] | b[2] << 1 | b[3] << 2 | b[4] << 3 |
+			    b[6] << 4 | (b[9] ^ (trow & 1)) << 5 | b[11] << 6);
+	*y = trow * 16u + (b[5] | b[7] << 1 | b[8] << 2 | b[10] << 3);
+}
+
+/* Byte offset of a pixel in a native render target of @cpp bytes per pixel. */
+uint32_t
+p3d_tile_offset_layout_cpp(uint32_t x, uint32_t y, uint32_t pitch,
+			   uint32_t layout, unsigned cpp)
+{
+	if (cpp == 4)
+		return p3d_tile_offset_layout(x, y, pitch, layout);
+	if (cpp == 2 && layout == PARHELIA_TILE_64X16_4K)
+		return p3d_tile_offset_16bpp(x, y, pitch);
+	return UINT32_MAX;
+}
+
+void
+p3d_tile_position_layout_cpp(uint32_t offset, uint32_t pitch, uint32_t layout,
+			     unsigned cpp, uint32_t *x, uint32_t *y)
+{
+	if (cpp == 4)
+		p3d_tile_position_layout(offset, pitch, layout, x, y);
+	else if (cpp == 2 && layout == PARHELIA_TILE_64X16_4K)
+		p3d_tile_position_16bpp(offset, pitch, x, y);
+	else
+		*x = *y = UINT32_MAX;
+}
+
 void
 p3d_tile_position_layout(uint32_t offset, uint32_t pitch, uint32_t layout,
 			 uint32_t *x, uint32_t *y)
