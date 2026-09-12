@@ -227,7 +227,9 @@ struct parhelia_bios {
 #define PARHELIA_MAX_COMMAND_DWORDS	(64u * 1024u)
 /* Five-dword CALL plus optional three-dword diagnostic writeback marker. */
 #define PARHELIA_PRIMARY_DWORDS		(PARHELIA_CALL_CAPACITY * 8u + 16u)
-#define PARHELIA_ASYNC_SLOTS		8u
+/* Queue depth.  ioquake3 at 1280x1024 spent 4.3 ms of a 19.3 ms frame
+ * waiting for a slot to retire with eight. */
+#define PARHELIA_ASYNC_SLOTS		16u
 /* The primary always remains bounded by the hardware CALL capacity, even
  * when one secondary CALL contains several validated packet descriptors.
  */
