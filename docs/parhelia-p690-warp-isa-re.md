@@ -650,7 +650,8 @@ Accepted NIR operations and the bundles they become:
 | `fabs` | `max x, -x` | the engine has no absolute modifier |
 | `fadd`, `fmul` | `add` 0x71, `mul` 0x75 | |
 | `fadd(fmul(a,b), c)` | `mad` 0x76 | single-use multiply only; this is what keeps a matrix product at four bundles, since the vertex NIR options do not fuse |
-| `fmin`, `fmax` | `min` 0x61, `max` 0x62 | `clamp()`/`fsat` lower to these |
+| `fmax` | `max` 0x62 | PROVEN(hw) here: scene 3 uses it for `abs` and is bit-identical |
+| `fmin` | — | **refuted**: 0x61 is not a componentwise minimum (§11.6), so `clamp()` and `min()` keep the draw module |
 | `fdot2`, `fdot3`, `fdot4` | `dp3` 0x78 (z forced to the literal 0 for `fdot2`), `dp4` 0x77 | |
 | `frcp`, `fdiv` | `smul` 0x89 against the literal 1.0 | the divisor must be one broadcast component, because 0x89 reads `s0.w` |
 | `frsq` | 0x8a | same shape |
@@ -766,6 +767,64 @@ Each scene is flushed to the dump as it completes and its name is printed
 before it draws, and a scene range can be passed to both the test and the
 compare script, so a scene that locks the engine neither loses the earlier
 results nor has to be guessed at.
+
+### 11.6 Hardware results
+
+Measured on the P690 (`192.168.1.111`) with the 128-bundle module of §11.4
+loaded, X at depth 16, `PARHELIA_HW_VS=1`, and the engine primed by an
+untextured draw first.
+
+`parhelia-gl-vs-compare.sh` renders all twelve scenes twice and diffs:
+
+| check | result |
+|---|---|
+| scene 0, the plumbing: upload, constant block at c0, viewport tail, entry binding, stream, one swizzled move | **0/65536 differing pixels**, identical hash |
+| scenes 1, 3, 4, 5, 6, 7, 9, 10, 11 | 0/65536 differing pixels each |
+| scene 2, `clamp()` | **36864/65536 differing pixels, worst delta 255** |
+| scene 8, the refused shader | 0-8 pixels, varying run to run on the draw-module path in both runs; readback noise, not a vertex difference |
+| every scene after `fmin` was removed | 0/65536 differing pixels |
+
+**0x61 is not a componentwise minimum.**  Scene 2 was the only scene that
+differed, and it differed on every pixel of the quad; scene 3 uses 0x62 for
+`abs` as `max(x, -x)` and is bit-identical, so `max` is confirmed and the
+refutation is specific to `min`.  The opcode is no longer emitted - a guessed
+re-encoding is how an inferred field becomes a defect that surfaces in
+someone's game hours later - and `clamp()`/`min()` keep the draw module.
+
+Everything else the compiler emits is now PROVEN(hw): `mul`, `add`, the
+folded `mad`, `max`, `dp3`, `dp4`, `smul` both in the viewport tail and as a
+reciprocal of an arbitrary scalar, 0x8a through `inversesqrt()`, and the
+secondary `frc`/`floor`.  The perspective cube scenes prove the divide and
+the viewport tail with `w` varying per vertex.
+
+Per-draw routing, counted from the bound entry in `PARHELIA_TRACE=1`:
+
+| run | draws on compiled programs | draws on resident programs |
+|---|---|---|
+| `PARHELIA_HW_VS=1` | **8**, each its own user-slot entry | 4 |
+| `PARHELIA_HW_VS=0` | 0 | 12 |
+
+The four that fall back are the two refused shaders and the two draws that
+arrive after the file's eight program slots are all taken - this test links a
+fresh program object per scene, so it reaches
+`PARHELIA_PARAM_WARP_PROGRAM_SLOTS` and the rest fall back.  That path is
+therefore exercised too, and it renders identically.
+
+The upload ABI with the enlarged image passes `--warp-program-probe`
+(kernel, uploaded, rotated-swizzle and builder-generated draws all correct,
+zero validator misses, alien and released entries `-EACCES`), and
+`parhelia-gl-tcl-compare.sh` is 13/13 scenes at 0 differing pixels, so the
+fixed-function transform route is undisturbed.
+
+ioquake3 is unaffected by construction and by measurement: its stats line
+reads `31.0 hardware-transform draws (0.0 compiled vertex programs)`, because
+the game uses fixed-function GL and never presents a shader to the compiler.
+
+**The route still defaults off.**  The one GLSL client not covered above is
+the X server itself: glamor's vertex shaders are expected to be refused
+because their position is not a matrix product, but that has not been
+observed on hardware, and Xorg is the wrong place to discover otherwise.
+Verifying glamor with the route on is what the default flip waits for.
 
 ## 12. Still open
 
