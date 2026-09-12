@@ -76,11 +76,30 @@ parhelia_connector_detect(struct drm_connector *connector,
 	return output->analog_sensed ? connector_status_connected : status;
 }
 
+/* The output whose connector an atomic commit has attached to this CRTC.  The
+ * single pipe has one encoder shared by every connector, so the commit's
+ * connector is what says which physical output to program. */
+static struct parhelia_output *
+parhelia_commit_output(struct parhelia_device *pdev,
+		       struct drm_crtc_state *crtc_state)
+{
+	struct drm_connector *connector = NULL;
+
+	if (crtc_state->state)
+		connector = drm_atomic_get_new_connector_for_encoder(
+			crtc_state->state, &pdev->pipe.encoder);
+	if (connector)
+		return to_parhelia_output(connector);
+	return pdev->num_outputs ? &pdev->outputs[0] : NULL;
+}
+
 static unsigned int parhelia_kms_head(struct parhelia_device *pdev)
 {
 	/* Keep the current single pipe on the connector descriptor's preferred
 	 * controller.  On the tested P690, physical DVI-1 is DVO2 fed by
 	 * controller B/head 1; DVI-2 is DVO1 fed by controller A/head 0. */
+	if (pdev->active_output && pdev->active_output->desc)
+		return pdev->active_output->desc->preferred_head;
 	if (pdev->num_outputs && pdev->outputs[0].desc)
 		return pdev->outputs[0].desc->preferred_head;
 	return PARHELIA_DC_HEAD0;
@@ -144,7 +163,13 @@ static int parhelia_connector_get_modes(struct drm_connector *connector)
 			drm_object_property_set_value(&connector->base,
 				connector->dev->mode_config.dvi_i_subconnector_property,
 				DRM_MODE_SUBCONNECTOR_Unknown);
-		if (!output->analog_sensed)
+		/* Without EDID, offer the standard list when the board senses
+		 * an analog load or when userspace forced the connector on.
+		 * This board answers DDC on neither line - its SCL pin reads
+		 * stuck low - so forcing is the only way to light it up. */
+		if (!output->analog_sensed &&
+		    connector->force != DRM_FORCE_ON &&
+		    connector->force != DRM_FORCE_ON_DIGITAL)
 			return 0;
 		ret = drm_add_modes_noedid(connector, 2048, 2048);
 		drm_set_preferred_mode(connector, 1024, 768);
@@ -198,45 +223,80 @@ parhelia_mode_valid(struct drm_simple_display_pipe *pipe,
 	return MODE_OK;
 }
 
-/* HSLPAR PLL2 feeds native display-controller A on 0527/0528 and LX/Sunex.
- * The four negated divider fields and limits are recovered from the VBIOS.
+/* HSLPAR: the display controller's own PLL2 word.  This is the divider model
+ * our userspace driver has working on this board (xf86-video-parhelia
+ * src/parhelia_mode.c parhelia_program_dc_clock): a four-field negated word
+ * N[5:0] P[10:6] X[15:11] B3[21:16] with the stage-1 divider X fixed at 3, as
+ * in both VBIOS golden words - 108 MHz is N24/P3/X3/B3=6 and 65 MHz is
+ * N23/P5/X3/B3=16 - and B3 the even output post-divider.  Above 135 MHz head 0
+ * runs at the VCO1/X tap rather than through B3, so that case is solved
+ * directly; a numerically correct VCO2/B3 word comes out at twice the wanted
+ * frequency there.
+ *
+ * The system-clock synthesisers use the same silicon fields but are searched
+ * differently (parhelia_fs_solve(), docs/parhelia-cold-post-bringup-re.md
+ * §4.4); this keeps the pixel path on the values proven on this hardware.
  */
-static bool parhelia_hslpar_clock_solve(u32 clock, u32 *word_out, u32 *actual_out)
+static bool parhelia_hslpar_clock_solve(u32 clock, u32 *word_out,
+					u32 *actual_out)
 {
-	u32 best_error = ~0u, best_n = 0, best_p = 0, best_b3 = 0;
-	u32 best_actual = 0, n, p, b3, word;
+	const u32 ref = 27000;
+	u32 best = ~0u, out = 0, word;
+	u32 n, p, b3, n_b = 0, p_b = 0, x_b = 0, b3_b = 0;
 
-	for (n = 22; n <= 45; n++) {
-		u32 vco1 = 27000 * n;
+	if (!clock)
+		return false;
+	if (clock > 135000) {
+		u32 x;
+
+		for (x = 2; x <= 12 && best; x++)
+			for (n = 22; n <= 45; n++) {
+				u32 vco1 = ref * n;
+
+				if (vco1 < 600000 || vco1 > 1200000)
+					continue;
+				if (vco1 / x == clock) {
+					n_b = n; x_b = x; p_b = 3; b3_b = 6;
+					out = clock;
+					best = 0;
+					break;
+				}
+			}
+	}
+	for (n = 22; n <= 45 && best; n++) {
+		u32 vco1 = ref * n, tap;
 
 		if (vco1 < 600000 || vco1 > 1200000)
 			continue;
+		tap = vco1 / 3;
+		if (tap < 50000 || tap > 400000)
+			continue;
 		for (p = 1; p <= 31; p++) {
-			u32 vco2 = vco1 * p / 3;
+			u32 vco2 = (ref * n * p) / 3;
 
 			if (vco2 < 600000 || vco2 > 1200000)
 				continue;
 			for (b3 = 2; b3 <= 62; b3 += 2) {
-				u32 out = vco2 / b3;
-				u32 error = out > clock ? out - clock : clock - out;
+				u32 fout = vco2 / b3;
+				u32 err = abs_diff(fout, clock);
 
-				if (error < best_error) {
-					best_error = error;
-					best_actual = out;
-					best_n = n; best_p = p; best_b3 = b3;
-				}
+				if (err >= best)
+					continue;
+				best = err;
+				n_b = n; p_b = p; x_b = 3; b3_b = b3;
+				out = fout;
 			}
 		}
 	}
-	if (best_error == ~0u || (u64)best_error * 100 > clock)
+	if (best == ~0u)
 		return false;
 
-	word = ((best_n - 1) & 0x20) | ((-best_n) & 0x1f);
-	word |= ((-best_p) & 0x1f) << 6;
-	word |= ((-3) & 0x1f) << 11;
-	word |= ((-best_b3) & 0x3f) << 16;
+	word = ((n_b - 1) & 0x20) | ((-n_b) & 0x1f);
+	word |= ((-p_b) & 0x1f) << 6;
+	word |= ((-x_b) & 0x1f) << 11;
+	word |= ((-b3_b) & 0x3f) << 16;
 	*word_out = word;
-	*actual_out = best_actual;
+	*actual_out = out;
 	return true;
 }
 
@@ -300,19 +360,23 @@ static bool parhelia_clock_solve(struct parhelia_device *pdev, u32 clock,
 	}
 }
 
-static void parhelia_route_dcm_a(struct parhelia_device *pdev, u32 clksel)
+/* Point one display controller's clock mux at a synthesiser: controller A
+ * (0x1c00) feeds head 0 and controller B (0x1c04) feeds head 1, so a driver
+ * that only ever wrote A could only ever light up head 0. */
+static void parhelia_route_dcm(struct parhelia_device *pdev, unsigned int head,
+			       u32 clksel)
 {
-	u32 ctl = parhelia_read(pdev, PARHELIA_DCM_CLKCTL_A);
+	u32 reg = head ? PARHELIA_DCM_CLKCTL_B : PARHELIA_DCM_CLKCTL_A;
+	u32 ctl = parhelia_read(pdev, reg);
 
 	ctl = (ctl & ~PARHELIA_DCM_CLKCTL_MUX_MASK) |
 	      PARHELIA_DCM_CLKCTL_MUX_PLL | PARHELIA_DCM_CLKCTL_HOLD;
-	parhelia_write(pdev, PARHELIA_DCM_CLKCTL_A, ctl);
+	parhelia_write(pdev, reg, ctl);
 	udelay(10);
 	ctl &= ~(PARHELIA_DCM_CLKCTL_BIT10 | PARHELIA_DCM_CLKCTL_SEL_MASK);
 	ctl |= clksel << PARHELIA_DCM_CLKCTL_SEL_SHIFT;
-	parhelia_write(pdev, PARHELIA_DCM_CLKCTL_A, ctl);
-	parhelia_write(pdev, PARHELIA_DCM_CLKCTL_A,
-		       ctl & ~PARHELIA_DCM_CLKCTL_HOLD);
+	parhelia_write(pdev, reg, ctl);
+	parhelia_write(pdev, reg, ctl & ~PARHELIA_DCM_CLKCTL_HOLD);
 }
 
 static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
@@ -327,11 +391,24 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 
 	switch (pdev->chip->clock_family) {
 	case PARHELIA_CLOCK_HSLPAR:
-		parhelia_write(pdev, 0x0e18, word | BIT(31));
+		/* Preserve the bits neither vendor writer ever sets. */
+		ctl = parhelia_read(pdev, 0x0e18) &
+		      (BIT(22) | BIT(23) | BIT(29));
+		parhelia_write(pdev, 0x0e18, ctl | word | BIT(31));
 		udelay(100);
-		parhelia_write(pdev, 0x0e18, word);
+		parhelia_write(pdev, 0x0e18, ctl | word);
 		udelay(200);
-		parhelia_route_dcm_a(pdev, 3);
+		if (!parhelia_fs_locked(pdev, 0x0e18, 90))
+			dev_warn(&pdev->pdev->dev,
+				 "pixel synthesiser reports no lock at %u kHz (word %#010x)\n",
+				 actual, word);
+		/* Route this head's own controller, then select the DC head's
+		 * clock source: without this write head 1's clock never
+		 * engaged on hardware. */
+		parhelia_route_dcm(pdev, head, 3);
+		parhelia_write(pdev, PARHELIA_DCM_CLKCTL_HEAD,
+			       PARHELIA_DCM_MODE_HIRES);
+		udelay(200);
 		break;
 	case PARHELIA_CLOCK_SUN90:
 		/* Head 0 uses FS2; P690 DVI-1/head 1 uses FS3.  FS0 is the system
@@ -348,7 +425,7 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 		if (i == 100)
 			return -ETIMEDOUT;
 		if (head) {
-			parhelia_route_dcm_a(pdev, 4);
+			parhelia_route_dcm(pdev, 0, 4);
 			/* Controller B feeds head 1; route it to the same FS3. */
 			ctl = parhelia_read(pdev, PARHELIA_DCM_CLKCTL_B);
 			ctl = (ctl & ~PARHELIA_DCM_CLKCTL_MUX_MASK) |
@@ -363,7 +440,7 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 			parhelia_write(pdev, PARHELIA_DCM_CLKCTL_B,
 				       ctl & ~PARHELIA_DCM_CLKCTL_HOLD);
 		} else {
-			parhelia_route_dcm_a(pdev, 3);
+			parhelia_route_dcm(pdev, head, 3);
 		}
 		parhelia_write(pdev, PARHELIA_DCM_PRIORITY_A,
 			       PARHELIA_DCM_PRIORITY_ON);
@@ -398,11 +475,33 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 	return 0;
 }
 
+/* A POSTed board hands the driver a VGA sequencer that may still be blanked,
+ * and an attribute controller whose palette-address-source bit decides whether
+ * the DAC sees pixels at all.  The native display controller does not override
+ * either, so a mode can be programmed and locked with the screen still dark.
+ * This is what the X driver's parhelia_display_enable() has always done. */
+static void parhelia_vga_unblank(struct parhelia_device *pdev)
+{
+	u8 seq1;
+
+	parhelia_write8(pdev, PARHELIA_VGA_SEQ_INDEX, PARHELIA_VGA_SEQ_RESET);
+	parhelia_write8(pdev, PARHELIA_VGA_SEQ_DATA,
+			PARHELIA_VGA_SEQ_RESET_NORMAL);
+	parhelia_write8(pdev, PARHELIA_VGA_SEQ_INDEX, PARHELIA_VGA_SEQ_CLKMODE);
+	seq1 = parhelia_read8(pdev, PARHELIA_VGA_SEQ_DATA);
+	parhelia_write8(pdev, PARHELIA_VGA_SEQ_DATA,
+			seq1 & ~PARHELIA_VGA_SEQ_SCREEN_OFF);
+	/* Reading the input-status register resets the attribute controller's
+	 * index/data flip-flop before the palette-address-source write. */
+	parhelia_read8(pdev, PARHELIA_VGA_INSTAT1);
+	parhelia_write8(pdev, PARHELIA_VGA_ATTR_INDEX, PARHELIA_VGA_ATTR_PAS);
+}
+
 static void parhelia_program_output(struct parhelia_device *pdev,
+				    struct parhelia_output *output,
 				    const struct drm_display_mode *mode,
 				    unsigned int head)
 {
-	struct parhelia_output *output = &pdev->outputs[0];
 	u32 dac_reg, power_mask, v, fmt;
 
 	if (pdev->chip->output_family == PARHELIA_OUTPUT_P690 &&
@@ -575,9 +674,13 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	u32 dc;
 	u32 dct;
 	u32 format;
-	unsigned int head = parhelia_kms_head(pdev);
+	unsigned int head;
 	u32 pitch;
 
+	/* Drive the connector this commit enabled, not whichever one happens
+	 * to be first in the descriptor table. */
+	pdev->active_output = parhelia_commit_output(pdev, crtc_state);
+	head = parhelia_kms_head(pdev);
 	dc = PARHELIA_DC(head);
 	dct = PARHELIA_DCT(head);
 
@@ -634,7 +737,12 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	/* Do not mirror this into MMIO 0x0004/0x0008.  The complete engine
 	 * initializer proves those words are host-aperture descriptors; changing
 	 * them after engine ownership redirects 3D writes outside the surface. */
-	parhelia_program_output(pdev, m, head);
+	parhelia_program_output(pdev, pdev->active_output, m, head);
+	/* Only the original boards need this: the P690 path has been driving a
+	 * display for months without it, and our userspace driver does not
+	 * unblank the sequencer on its native path either. */
+	if (pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL)
+		parhelia_vga_unblank(pdev);
 	if (pdev->chip->clock_family == PARHELIA_CLOCK_SUN90) {
 		u32 params = parhelia_read(pdev, dc + PARHELIA_DC_PARAMS);
 
@@ -1052,7 +1160,7 @@ static const struct parhelia_output_desc parhelia_original_outputs[] = {
 		.digital_route = PARHELIA_ROUTE_DVO1,
 		.analog_route = PARHELIA_ROUTE_DAC1,
 		.expose = true,
-		.ready = false,
+		.ready = true,
 	},
 };
 
