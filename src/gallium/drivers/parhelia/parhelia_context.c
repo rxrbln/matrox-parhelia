@@ -114,7 +114,8 @@ static int ph_prepare_alpha_companions(struct ph_context *ctx,
 static uint64_t ph_texture_base_hash(const struct parhelia_resource *texture,
                                      bool tiled, unsigned *alpha_zero,
                                      unsigned *alpha_nonzero);
-static const struct p3d_comb_program *ph_compiled_combiner(struct ph_context *ctx);
+static const struct p3d_comb_program *ph_compiled_combiner(struct ph_context *ctx,
+                                                          bool two_units);
 static bool ph_copy_texture_box(struct ph_context *ctx,
                                 struct pipe_resource *dst, unsigned dst_level,
                                 int dstx, int dsty,
@@ -3491,7 +3492,9 @@ ph_submit_vertices(struct ph_context *ctx)
       tex.filter = ph_sampler_filter_word(&tex, sampler);
       tex.wrap = ph_sampler_wrap_word(&tex, sampler);
       tex.env = ctx->fs->texenv;
-      state.comb = ph_compiled_combiner(ctx);
+      state.comb = ph_compiled_combiner(ctx, texture1 != NULL);
+      state.comb_slot_base = ph_env("PARHELIA_COMB_SLOT_BASE") ?
+         (unsigned)atoi(getenv("PARHELIA_COMB_SLOT_BASE")) : 0;
       state.tex = &tex;
       state.warp_entry =
          ph_warp_entry(ctx, true, texture1 || ctx->native_sampled_alpha,
@@ -5761,12 +5764,18 @@ ph_nir_texenv(nir_shader *nir, enum p3d_texenv fallback)
  * passes rewrite the environment per pass, so they keep the fixed-function
  * emission.  Opt-in until the compiler has been through the GL tests. */
 static const struct p3d_comb_program *
-ph_compiled_combiner(struct ph_context *ctx)
+ph_compiled_combiner(struct ph_context *ctx, bool two_units)
 {
    struct ph_fs *fs = ctx->fs;
    const uint8_t *base = NULL;
 
    if (!fs || !fs->program.valid || !ph_env("PARHELIA_FS_COMPILER"))
+      return NULL;
+   /* The draw binds a second texture unit only for the shapes the
+    * instruction-shape matcher recognises.  A program that samples unit 1
+    * when the draw has not bound it reads zero and renders black, so leave
+    * those to the matcher until the draw path binds by sampler use. */
+   if (!two_units && (fs->program.sampler_mask & BITFIELD_BIT(1)))
       return NULL;
    if (ctx->native_sampled_alpha || ctx->vertex_alpha || ctx->alpha_micro ||
        ctx->alpha_micro_cutout || ctx->cpu_alpha_cutout ||

@@ -455,7 +455,7 @@ p3d_emit_texenv(struct p3d_cs *cs, uint32_t slot, unsigned unit, int first,
 	struct p3d_rw rw[8];
 	uint32_t tex = unit << 5;
 	uint32_t prev = first ? 0x10u : 4u;
-	uint32_t rgb, alpha, rgbop, alphaop, c0rg = 0, c0ba = 0;
+	uint32_t rgb, alpha, rgbop, alphaop, c0ra = 0, c0bg = 0;
 
 	switch (t->env) {
 	case P3D_TEXENV_REPLACE:
@@ -483,8 +483,8 @@ p3d_emit_texenv(struct p3d_cs *cs, uint32_t slot, unsigned unit, int first,
 		alpha = tex | (prev << 23);
 		rgbop = 0x01400a00u;
 		alphaop = 0x01400000u;
-		c0rg = t->env_colour_rg;
-		c0ba = t->env_colour_ba;
+		c0ra = t->env_colour_ra;
+		c0bg = t->env_colour_bg;
 		break;
 	case P3D_TEXENV_MODULATE:
 	default:
@@ -498,8 +498,8 @@ p3d_emit_texenv(struct p3d_cs *cs, uint32_t slot, unsigned unit, int first,
 	rw[1].reg = P3D_R_COMB_ALPHA; rw[1].val = alpha;
 	rw[2].reg = 0x126c;           rw[2].val = rgbop | comb_op;
 	rw[3].reg = 0x1268;           rw[3].val = alphaop | comb_op;
-	rw[4].reg = 0x1278;           rw[4].val = c0rg;
-	rw[5].reg = 0x127c;           rw[5].val = c0ba;
+	rw[4].reg = 0x1278;           rw[4].val = c0ra;
+	rw[5].reg = 0x127c;           rw[5].val = c0bg;
 	rw[6].reg = 0x1280;           rw[6].val = 0;
 	rw[7].reg = 0x1284;           rw[7].val = 0;
 	p3d_reglist(cs, rw, 8);
@@ -878,7 +878,10 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			p3d_reglist(cs, rw, 8);
 		}
 		if (st->comb && !st->sampled_alpha_companion) {
-			p3d_emit_comb_program(cs, st->comb, nunit > 1 ? 2u : 1u);
+			p3d_emit_comb_program(cs, st->comb,
+					      st->comb_slot_base ?
+					      st->comb_slot_base :
+					      (nunit > 1 ? 2u : 1u));
 			return;
 		}
 		p3d_emit_texenv(cs, nunit > 1 ? 4u : 2u, 0, 1, t,

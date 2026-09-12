@@ -201,9 +201,12 @@ enum p3d_texenv { P3D_TEXENV_MODULATE = 0, P3D_TEXENV_REPLACE = 1,
 		  P3D_TEXENV_BLEND = 4 };
 
 /* A combiner constant register holds two signed Q1.10 values in bits [10:0]
- * and [26:16].  GL_TEXTURE_ENV_COLOR for P3D_TEXENV_BLEND is c0, packed as
- * RG and BA.  Mesa converts/clamps floats to [-1024, 1023] before using this
- * macro; keeping the builder integer-only makes it usable in a kernel too. */
+ * and [26:16].  The components are NOT (r, g) then (b, a): the first register
+ * carries red and ALPHA, the second blue and GREEN.  Packing them the obvious
+ * way made a constant's green read back as its alpha on the P690, with red and
+ * blue exact - see docs/parhelia-p690-combiner-isa-re.md section 7.1.  Mesa
+ * converts/clamps floats to [-1024, 1023] before using this macro; keeping the
+ * builder integer-only makes it usable in a kernel too. */
 #define P3D_COMBINER_CONST(lo, hi) \
 	(((uint32_t)(lo) & 0x7ffu) | (((uint32_t)(hi) & 0x7ffu) << 16))
 
@@ -403,7 +406,9 @@ struct p3d_texture {
 	enum p3d_wrap	wrap_s, wrap_t;
 	unsigned	max_level;	/* 0x11e4[31:28] */
 	enum p3d_texenv	env;
-	uint32_t	env_colour_rg, env_colour_ba;	/* P3D_COMBINER_CONST pairs */
+	/* GL_TEXTURE_ENV_COLOR for P3D_TEXENV_BLEND, in the hardware's own
+	 * component pairing: (red, alpha) and (blue, green). */
+	uint32_t	env_colour_ra, env_colour_bg;	/* P3D_COMBINER_CONST pairs */
 	uint32_t	reloc_offset;	/* base level byte offset, relocated */
 	/* Diagnostic override of the per-unit auxiliary window
 	 * 0x11cc, 0x11d0, 0x11c8, 0x11d4, 0x11d8; NULL keeps the defaults. */
@@ -575,6 +580,10 @@ struct p3d_state {
 	 * are unchanged.  Ignored for the sampled-alpha companion and RGBA
 	 * vertex-alpha shapes, which own their own combiner words. */
 	const struct p3d_comb_program *comb;
+	/* Diagnostic: first instruction index of the compiled program in the
+	 * slot walk.  Zero uses the default, which is right after the pipe
+	 * merges. */
+	unsigned	   comb_slot_base;
 	const struct p3d_texture *tex;	/* unit 0 */
 	const struct p3d_texture *tex1;	/* unit 1; NULL = single unit */	/* NULL = untextured */
 	/* P690 workaround proven by the RGB-companion cutout probe: preserve

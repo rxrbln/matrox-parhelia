@@ -297,7 +297,10 @@ ph_fs_emit(struct ph_fs_ctx *ctx, uint8_t op, struct ph_fs_value *src,
    inst->used = 1;
    inst->op = op;
    inst->dst = dst;
-   inst->sat = 1;
+   /* Only the result saturates.  Saturating every instruction clamped a
+    * negative intermediate to zero, which turned mix(a, b, t) - lowered by
+    * NIR to a + t * (b - a) - into a wherever b < a. */
+   inst->sat = 0;
    inst->scale = P3D_COMB_SCALE_1;
    for (unsigned i = 0; i < count; i++) {
       inst->src[i].reg = src[i].reg;
@@ -406,8 +409,10 @@ ph_fs_alu(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, bool alpha,
       /* Every instruction this compiler emits already saturates. */
       if (!ph_fs_operand(ctx, alu, 0, alpha, out))
          return false;
-      if (out->is_register)
+      if (out->is_register) {
+         ctx->half->inst[ctx->half->count - 1].sat = 1;
          return true;
+      }
       src[0] = *out;
       src[1] = src[2] = (struct ph_fs_value){ .reg = P3D_COMB_T0 };
       return ph_fs_emit(ctx, P3D_COMB_MOV, src, 1, out);
@@ -469,11 +474,29 @@ ph_fs_alu(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, bool alpha,
       return ph_fs_emit(ctx, op, ordered, 3, out);
    }
    case P3D_COMB_LRP: {
-      /* NIR flrp(a, b, t) = a * (1 - t) + b * t; the hardware computes
-       * A * C + B * (1 - C), so A = b, B = a, C = t. */
-      struct ph_fs_value ordered[3] = { src[1], src[0], src[2] };
+      /* NIR flrp(a, b, t) = a * (1 - t) + b * t.  The hardware LRP
+       * (A * C + B * (1 - C)) loses the green lane of its C operand unless C
+       * is a constant register: mix(colour, tex, tex.a) and
+       * mix(colour, tex, tex) both returned colour.g with their red and blue
+       * exact, while mix(colour, tex, 0.25) was exact everywhere.  Build the
+       * interpolation out of the primitives that are proven instead - a
+       * multiply by the inverted factor and a multiply-add - which costs one
+       * extra slot and no accuracy.  See
+       * docs/parhelia-p690-combiner-isa-re.md section 10. */
+      struct ph_fs_value inverted = src[2], scaled;
+      struct ph_fs_value ordered[3];
 
-      return ph_fs_emit(ctx, op, ordered, 3, out);
+      if (!ph_fs_apply_mod(&inverted, P3D_COMB_MOD_INVERT))
+         return false;
+      ordered[0] = src[0];
+      ordered[1] = (struct ph_fs_value){ .reg = P3D_COMB_T0 };
+      ordered[2] = inverted;
+      if (!ph_fs_emit(ctx, P3D_COMB_MUL, ordered, 3, &scaled))
+         return false;
+      ordered[0] = src[1];
+      ordered[1] = scaled;
+      ordered[2] = src[2];
+      return ph_fs_emit(ctx, P3D_COMB_MAD, ordered, 3, out);
    }
    default:
       return false;
@@ -509,8 +532,10 @@ ph_fs_compile_half(struct ph_fs_ctx *ctx, nir_def *def, bool alpha,
    if (!ph_fs_value(ctx, def, alpha, &value) || ctx->failed)
       return false;
    if (value.is_register && value.reg == P3D_COMB_R0 &&
-       value.mod == P3D_COMB_MOD_NONE && value.rep == P3D_COMB_REP_NONE)
+       value.mod == P3D_COMB_MOD_NONE && value.rep == P3D_COMB_REP_NONE) {
+      half->inst[half->count - 1].sat = 1;
       return true;
+   }
    move[0] = value;
    move[1] = move[2] = (struct ph_fs_value){ .reg = P3D_COMB_T0 };
    if (!ph_fs_emit(ctx, P3D_COMB_MOV, move, 1, &value) || ctx->failed)
@@ -519,6 +544,7 @@ ph_fs_compile_half(struct ph_fs_ctx *ctx, nir_def *def, bool alpha,
       /* The allocator reused r1; force the result register. */
       half->inst[half->count - 1].dst = P3D_COMB_R0;
    }
+   half->inst[half->count - 1].sat = 1;
    return true;
 }
 
