@@ -254,13 +254,11 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
              * hold both the sampler's and the render target's storage order,
              * and display or dma-buf sharing still needs the 32-bit linear
              * companion path. */
-            if (bind & PIPE_BIND_RENDER_TARGET)
+            if (bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SCANOUT |
+                        PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SHARED))
                supported = ph_screen(s)->narrow_targets &&
                            !(bind & (PIPE_BIND_SAMPLER_VIEW |
-                                     PIPE_BIND_DEPTH_STENCIL |
-                                     PIPE_BIND_SCANOUT |
-                                     PIPE_BIND_DISPLAY_TARGET |
-                                     PIPE_BIND_SHARED));
+                                     PIPE_BIND_DEPTH_STENCIL));
             else
                supported = ph_screen(s)->narrow_formats &&
                            (bind & PIPE_BIND_SAMPLER_VIEW) &&
@@ -651,7 +649,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    r->base.screen = pscreen;
    r->tile_layout = screen->tile_layout;
    r->native_shared = share_native;
-   if (!sampler_storage && !share_native)
+   if (!sampler_storage)
       ph_target_format(templ->format, &target_code, &target_cpp);
    /* Sampler storage keeps its own 32-bit row ABI and mip.cpp; only a
     * render or depth surface changes the meaning of r->stride. */
@@ -975,8 +973,14 @@ ph_resource_from_handle(struct pipe_screen *pscreen,
       }
       if (imported_handle && ph_query_bo(screen, imported_handle, &info) &&
           ph_bo_layout_native(screen, info.layout)) {
+         unsigned import_cpp = 4;
+
+         ph_target_format(templ->format, NULL, &import_cpp);
          if (!info.pitch || (info.pitch & 255) ||
-             info.pitch < (uint64_t)ALIGN_POT(templ->width0, 64) * 4 ||
+             info.pitch % import_cpp ||
+             info.pitch < (uint64_t)ALIGN_POT(templ->width0,
+                                              64 * 4 / import_cpp) *
+                          import_cpp ||
              info.width < templ->width0 || info.height < templ->height0) {
             if (imported_owned) {
                struct drm_gem_close close = {.handle = imported_handle};
@@ -998,11 +1002,10 @@ ph_resource_from_handle(struct pipe_screen *pscreen,
          r->handle = imported_handle;
          r->handle_owned = imported_owned;
          r->size = info.size;
-         /* GET_BO_INFO reports no pixel size; every shared native surface
-          * is 32-bit, which ph_format_supported also enforces. */
-         r->cpp = 4;
-         r->surf_fmt = 0x32;
-         r->stride = info.pitch / 4;
+         /* GET_BO_INFO reports no pixel size; the importer's own format
+          * decides how many bytes a pixel of this surface has. */
+         ph_target_format(templ->format, &r->surf_fmt, &r->cpp);
+         r->stride = info.pitch / r->cpp;
          r->tile_layout = screen->tile_layout;
          r->native_shared = true;
          pipe_reference_init(&r->base.reference, 1);
