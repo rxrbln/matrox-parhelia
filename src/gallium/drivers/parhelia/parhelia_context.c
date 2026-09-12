@@ -6204,8 +6204,8 @@ ph_zinit_resolve(struct ph_context *ctx, struct parhelia_resource *r)
    struct parhelia_batch *batch = &ctx->build_batch;
    struct parhelia_resource *colour;
    struct p3d_state state;
-   const unsigned height = ph_zinit_alloc_height(r);
    float quad[6][6];
+   unsigned height;
    float depth;
    int ret;
 
@@ -6214,7 +6214,14 @@ ph_zinit_resolve(struct ph_context *ctx, struct parhelia_resource *r)
    r->zinit_pending = false;
    if (ctx->zinit_res == r)
       ctx->zinit_res = NULL;
+   /* The clear takes its reference before arming, so the pair cannot come
+    * apart; refuse rather than render from a surface that is not there. */
+   if (!r->zinit_colour) {
+      ctx->submit_error = -EINVAL;
+      return;
+   }
    colour = ph_resource(r->zinit_colour);
+   height = ph_zinit_alloc_height(r);
    depth = ph_zinit_depth(r, r->zinit_value);
    state = (struct p3d_state){
       .colour = {.pitch = colour->stride, .fmt = colour->surf_fmt},
