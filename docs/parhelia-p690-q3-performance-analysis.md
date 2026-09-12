@@ -240,6 +240,27 @@ before that, the same clear ran at first submit.
 per-level `glGetTexImage`, `GL_TEXTURE_BASE_LEVEL` 2/3/5, scaled and flipped
 blits): 0 failing checks with Mesa `4a8f9bc`.
 
+## What the GPU feature work bought (2026-09-12)
+
+Each of these was implemented and measured on the P690; the frame rate is the
+ioquake3 `bench` timedemo at 1280x1024 with `GL_LINEAR_MIPMAP_NEAREST`.
+
+| change | result |
+|---|---|
+| hardware transform on WARP, two-set route enabled | 30.1 -> **31.9 fps** (+6%); 37.2 hardware-transform draws, 15.4 not expressible and 12.1 software-clipper draws per frame |
+| multi-primitive packets, 2 triangles per packet | 27.9 -> **29.6 fps** (+6%), draw packets per frame 2858 -> 1434 |
+| multi-primitive packets, 8 triangles per packet | every GL test passes, but Q3 wedges during the level load: default stays at one primitive per packet |
+| S3TC compressed textures (`r_ext_compressed_textures 1`) | **30.3 fps, no gain**; DXT3 and DXT5 sample exactly, two checks still fail |
+| narrow texture formats (L8, 4:4:4:4, 1:5:5:5, 5:6:5) | sampled exactly; no frame-rate change |
+| page flips, synchronised and asynchronous | work (75 flips/s and 5 us each); default off, see `parhelia-p690-page-flipping.md` |
+
+The two CPU-side levers each return about 6%, and the texture-side levers
+return nothing measurable.  That is consistent with the fill measurements:
+a textured, depth-writing pixel runs at ~230 Mpixel/s while a colour-only
+pixel runs at 655, so the frame is bound by the colour and depth traffic,
+not by texture reads.  **Cutting bytes per pixel is the only remaining
+route**: 16-bit colour and a 16-bit depth buffer halve both streams.
+
 ## Assessment of the 60 fps goal
 
 A textured, depth-writing pixel costs ~16 bytes of memory traffic split over
