@@ -18,6 +18,13 @@
 #include "parhelia_drv.h"
 
 #define PARHELIA_HOST_FORMAT_XRGB8888	0x30
+/* The vendor's "2-D view" code for every 16 bpp surface (mtxpserd.dll format
+ * record table, usage 0).  PARHELIA_HOST_FORMAT_RGB565=code overrides it. */
+#define PARHELIA_HOST_FORMAT_RGB565	0x20
+static unsigned int host_format_rgb565 = PARHELIA_HOST_FORMAT_RGB565;
+module_param(host_format_rgb565, uint, 0644);
+MODULE_PARM_DESC(host_format_rgb565,
+		 "host-aperture format code for 16 bpp surfaces");
 
 static const struct drm_gem_object_funcs parhelia_host_object_funcs;
 static const struct drm_gem_object_funcs parhelia_raw_object_funcs;
@@ -749,23 +756,31 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	struct drm_gem_vram_object *gbo;
 	struct parhelia_bo *bo;
 	unsigned long native_align_pages;
-	u32 gpu_pitch_pixels, host_pitch_pixels, alloc_height;
+	u32 gpu_pitch_pixels, host_pitch_pixels, alloc_height, cpp, tile_width;
 	u32 surface_address;
 	size_t host_size, native_size, size;
 	u32 handle;
 	int ret;
 
 	if (!args->width || !args->height || args->width > 2048 ||
-	    args->height > 2048 || args->bpp != 32 || !pdev->raw_aperture_owned)
+	    args->height > 2048 || !pdev->raw_aperture_owned)
 		return -EINVAL;
-	gpu_pitch_pixels = ALIGN(args->width, 64);
-	host_pitch_pixels = roundup_pow_of_two(max_t(u32, args->width, 64));
+	/* 16 bpp keeps the same tile bytes and rows over twice the width. */
+	if (args->bpp != 32 &&
+	    (args->bpp != 16 ||
+	     pdev->chip->tile_layout != PARHELIA_TILE_64X16_4K))
+		return -EINVAL;
+	cpp = args->bpp / 8;
+	tile_width = 64 * 4 / cpp;
+	gpu_pitch_pixels = ALIGN(args->width, tile_width);
+	host_pitch_pixels = roundup_pow_of_two(max_t(u32, args->width,
+						     tile_width));
 	alloc_height = ALIGN(args->height,
 			     pdev->chip->tile_layout == PARHELIA_TILE_64X16_4K ?
 			     16 : 32);
-	if (check_mul_overflow((size_t)host_pitch_pixels * 4,
+	if (check_mul_overflow((size_t)host_pitch_pixels * cpp,
 			       (size_t)alloc_height, &host_size) ||
-	    check_mul_overflow((size_t)gpu_pitch_pixels * 4,
+	    check_mul_overflow((size_t)gpu_pitch_pixels * cpp,
 			       (size_t)alloc_height, &native_size))
 		return -EOVERFLOW;
 	host_size = PAGE_ALIGN(host_size);
@@ -796,8 +811,8 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 
 	bo->width = args->width;
 	bo->height = args->height;
-	bo->gpu_pitch = gpu_pitch_pixels * 4;
-	bo->host_pitch = host_pitch_pixels * 4;
+	bo->gpu_pitch = gpu_pitch_pixels * cpp;
+	bo->host_pitch = host_pitch_pixels * cpp;
 	bo->alloc_height = alloc_height;
 	bo->aperture_offset = bo->aperture.node.start;
 	bo->host_size = host_size;
@@ -806,8 +821,9 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	bo->host_aperture = true;
 	gbo->bo.base.funcs = &parhelia_host_object_funcs;
 	parhelia_aperture_publish_locked(pdev, &bo->aperture, surface_address,
-		(PARHELIA_HOST_FORMAT_XRGB8888 << 24) | (3u << 16) |
-		(bo->gpu_pitch / 4), BIT(16) | bo->alloc_height, bo);
+		((cpp == 2 ? host_format_rgb565 :
+		  PARHELIA_HOST_FORMAT_XRGB8888) << 24) | (3u << 16) |
+		(bo->gpu_pitch / cpp), BIT(16) | bo->alloc_height, bo);
 	/* TTM no longer clears new P690 objects; use the object's own view. */
 	memset_io((u8 __iomem *)pdev->vram + bo->aperture.node.start, 0,
 		  host_size);
@@ -821,7 +837,7 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 		return ret;
 	}
 	args->handle = handle;
-	args->pitch = host_pitch_pixels * 4;
+	args->pitch = host_pitch_pixels * cpp;
 	args->size = host_size;
 	drm_gem_object_put(&gbo->bo.base);
 	return 0;

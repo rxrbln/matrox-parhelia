@@ -576,7 +576,7 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	bo = to_parhelia_bo(gem);
 	if (parhelia_scanout_address(pdev, gem, &address))
 		return;
-	pitch = bo->gpu_pitch / 4;
+	pitch = bo->gpu_pitch / fb->format->cpp[0];
 
 	format = fb->format->format == DRM_FORMAT_RGB565 ? 0x28000000 : 0x32000000;
 	/* Type 3 is the native display/render-target layout. */
@@ -663,8 +663,11 @@ static void parhelia_pipe_update(struct drm_simple_display_pipe *pipe,
 
 			if (gem && !parhelia_scanout_address(pdev, gem, &address)) {
 				u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
-				u32 format = 0x32030000 |
-					     (bo->gpu_pitch / 4);
+				u32 cpp = state->fb->format->cpp[0];
+				u32 format = (state->fb->format->format ==
+					      DRM_FORMAT_RGB565 ? 0x28030000u :
+					      0x32030000u) |
+					     (bo->gpu_pitch / cpp);
 
 				parhelia_write(pdev, dc + PARHELIA_DC_START,
 					       address & 0x0ffffc00);
@@ -763,11 +766,12 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	if (!parhelia_bo_is_native(bo))
 		return -EINVAL;
 	cpp = fb->format->cpp[0];
-	if (cpp != 4 || fb->pitches[0] % cpp)
+	/* A 16 bpp surface tiles 128 pixels wide; 32 bpp tiles 64. */
+	if ((cpp != 4 && cpp != 2) || fb->pitches[0] % cpp)
 		return -EINVAL;
 	pitch_pixels = fb->pitches[0] / cpp;
 	if (pitch_pixels != (bo->host_aperture ? bo->host_pitch : bo->gpu_pitch) / cpp ||
-	    bo->gpu_pitch / cpp != ALIGN(fb->width, 64) ||
+	    bo->gpu_pitch / cpp != ALIGN(fb->width, 64 * 4 / cpp) ||
 	    bo->gpu_pitch / cpp > 0x3fff)
 		return -EINVAL;
 	/* Atomic check runs before begin_fb_access() pins the new framebuffer.
@@ -896,6 +900,7 @@ static const struct drm_simple_display_pipe_funcs parhelia_pipe_funcs = {
 
 static const uint32_t parhelia_formats[] = {
 	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_RGB565,
 };
 
 static int parhelia_fb_dirty(struct drm_framebuffer *fb,
@@ -926,7 +931,8 @@ parhelia_fb_create(struct drm_device *drm, struct drm_file *file,
 	struct drm_framebuffer *fb;
 
 	if ((info->format != DRM_FORMAT_XRGB8888 &&
-	     info->format != DRM_FORMAT_ARGB8888) || mode_cmd->offsets[0])
+	     info->format != DRM_FORMAT_ARGB8888 &&
+	     info->format != DRM_FORMAT_RGB565) || mode_cmd->offsets[0])
 		return ERR_PTR(-EINVAL);
 	gem = drm_gem_object_lookup(file, mode_cmd->handles[0]);
 	if (!gem)
