@@ -198,3 +198,37 @@ colour target and a 1024x768 native depth target in one file and then issuing a
 at both 32 and 16 bits per pixel.  The same probe with 256x256 targets is
 clean.  That is a separate allocator or placement defect, not part of this
 bisect, and it is why the probe keeps its 256x256 targets.
+
+## 8. Two candidate fixes tested on hardware, both refuted (2026-09-12)
+
+The section 7 inference - a vertex-fetch read stalling the bus-master engine -
+suggested two concrete causes named by the vendor RE.  Both were implemented
+and measured; neither makes a larger packet safe.
+
+| candidate | evidence for it | result at grouping 7 |
+|---|---|---|
+| `0x1064` (bound-range high) written as `0xffffffff`, the value in every vendor capture, instead of our `0` | `parhelia-p690-multi-primitive-packets-re.md` section 2.3 | still wedges |
+| Guard band `0x12f4` clamped to 31.0f, which the vendor does on the LX family and we did not | same document, section 4.1, PROVEN vendor behaviour | still wedges |
+
+The guard-band value is otherwise harmless - a full timedemo at the shipped
+grouping runs at the usual 29.2 fps with it - and is kept behind
+`PARHELIA_LX_GUARD_BAND=1` rather than enabled, since it buys nothing measured
+and the vendor sets it together with other state in the same branch.
+
+**A measurement trap worth stating plainly:** a wedged engine stays wedged
+until the machine reboots.  Reloading the module does not recover it - the
+device fails to re-probe, `/dev/dri` disappears entirely, and every later run
+reports an engine hang that has nothing to do with the change under test.  Two
+conclusions in this investigation were drawn from runs on an already-wedged
+engine and were wrong: the guard band appeared to break rendering at every
+grouping, including the working default, and appeared not to be recovered by
+reverting it.  Reboot between variants, and treat a timedemo that finishes
+early at an implausible frame rate (791 frames in 0.8 s, "998 fps") as a
+failure to draw, not a result.
+
+What remains untried is the structural difference section 5 of the sibling
+document names: the vendor copies the vertices *into the command buffer*
+immediately before the packet, so `end` is the address of the draw packet
+itself, while this driver points `start`/`end` at a separate pinned vertex
+object.  That is a kernel ABI change, and the measured value of a larger
+packet is still 0.1-0.2 fps.
