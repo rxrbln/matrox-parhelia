@@ -7332,8 +7332,12 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       ctx->tcl_available = debug_get_bool_option("PARHELIA_HW_TCL", true);
    }
    ctx->tcl_forced_off = ph_env("PARHELIA_NO_HW_TCL");
+   /* The two-set transform was thought to hang the engine; with a reboot
+    * between program edits (the WARP instruction cache serves an already
+    * executed entry) the 2x2 experiment showed it renders correctly and
+    * never hangs, at transform_multitex_ops 0 and 2. */
    ctx->tcl_multitexture =
-      debug_get_bool_option("PARHELIA_HW_TCL_MULTITEX", false);
+      debug_get_bool_option("PARHELIA_HW_TCL_MULTITEX", true);
    ctx->viewport.scale[0] = ctx->viewport.scale[1] = 1.0f;
    ctx->async_submit = ph_screen(screen)->async_submit;
    ctx->stats_sync = getenv("PARHELIA_STATS") &&
@@ -7355,8 +7359,11 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
     * overlapping primitives inside one packet has run on this silicon.
     * PARHELIA_PRIMS_PER_PACKET selects the run length; the vendor's own
     * packets hold 24 vertices, i.e. eight triangles. */
+   /* Two is measured stable over repeated timedemo runs and every GL test
+    * (+6% at 24 bpp, +2.5% at 16 bpp, half the draw packets); four and eight
+    * render correctly in the probes but hang ioquake3 in its level load. */
    ctx->prims_per_packet =
-      debug_get_num_option("PARHELIA_PRIMS_PER_PACKET", 1);
+      debug_get_num_option("PARHELIA_PRIMS_PER_PACKET", 2);
    if (ctx->prims_per_packet < 1)
       ctx->prims_per_packet = 1;
    if (ctx->aggregate_state_batches && ph_env("PARHELIA_TRACE_BATCH"))

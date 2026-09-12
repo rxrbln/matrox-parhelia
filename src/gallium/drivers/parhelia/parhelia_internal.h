@@ -20,7 +20,7 @@
    ph_env_cached_ != 0; })
 
 #define PH_VRAM_VERTEX_LEGACY_SLOTS 3
-#define PH_VRAM_VERTEX_SLOTS_MAX 8
+#define PH_VRAM_VERTEX_SLOTS_MAX 16
 
 struct parhelia_screen {
    struct pipe_screen base;
