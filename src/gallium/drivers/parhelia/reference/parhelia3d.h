@@ -690,6 +690,11 @@ struct p3d_state {
 	 * and merged in combiner slot 0, leftover pipes parked on the next
 	 * unit, 0x11e8 written per unit bank.  Needs single_texture_pipe. */
 	int		   lx_pipe_route;
+	/* The LX family (0x2537, 0x2538, 0x2539).  The vendor clamps the raster
+	 * guard band one unit below the value every other part uses on exactly
+	 * this family (KRN mtx2572: 32.0f -> 31.0f, 16.0f -> 15.0f), which is
+	 * the one proven LX-only value in the geometry path. */
+	int		   lx_family;
 	/* Select the P690 mode-3 frontend.  It retains one packet per triangle;
 	 * hardware testing proved that the packet boundary supplies the depth
 	 * interlock which a second range in the same packet does not. */

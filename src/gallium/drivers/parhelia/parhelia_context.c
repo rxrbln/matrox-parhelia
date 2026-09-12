@@ -50,6 +50,13 @@ struct ph_velems {
    struct pipe_vertex_element elem[PIPE_MAX_ATTRIBS];
 };
 
+/* 0x2537, 0x2538 and 0x2539 are the LX/P650/P750/P690 family: the vendor's
+ * class mask 0x7fc00 covers exactly these three device ids. */
+static inline bool ph_lx_family(uint32_t chip_id)
+{
+   return chip_id == 0x2537 || chip_id == 0x2538 || chip_id == 0x2539;
+}
+
 /* Fixed-function vertex program recognised for hardware transform: the only
  * computed output is POSITION = MVP * input, every other output copies an
  * input attribute verbatim.  The WARP transform programs express exactly that
@@ -3740,6 +3747,11 @@ ph_submit_vertices(struct ph_context *ctx)
 	}
    state.single_texture_pipe = ph_screen(ctx->base.screen)->single_texture_pipe;
    /* One texture ganged on pipes 0+2: +25% on trilinear minification. */
+   /* The LX guard-band clamp is not on by default: it is a proven vendor
+    * value whose effect on this driver's state stream is still being
+    * measured (PARHELIA_LX_GUARD_BAND=1). */
+   state.lx_family = ph_env("PARHELIA_LX_GUARD_BAND") &&
+      ph_lx_family(ph_screen(ctx->base.screen)->chip_id);
    state.lx_pipe_route = ph_screen(ctx->base.screen)->chip_id == 0x2539 &&
                          !ph_env("PARHELIA_NO_LX_PIPES");
    /* The kernel advertises this only under its independent default-off
@@ -6198,9 +6210,17 @@ static void *ph_create_vs(struct pipe_context *p,
        * compiled into a WARP program of this shader's own.  The transforming
        * stream may sample a texture, so the program must never write T2 -
        * ph_prime_warp() primes it at context creation instead. */
-      if (!vs->ff_transform && ctx->tcl_programs &&
-          ph_vs_analyze(s->ir.nir, vs, true) &&
-          ph_vs_assign_inputs(s->ir.nir, vs))
+      const bool analyzed = !vs->ff_transform && ctx->tcl_programs &&
+         ph_vs_analyze(s->ir.nir, vs, true);
+      const bool inputs_ok = analyzed && ph_vs_assign_inputs(s->ir.nir, vs);
+
+      if (ph_env("PARHELIA_TRACE_TCL"))
+         fprintf(stderr,
+                 "parhelia: vs gates ff=%u programs=%u analyze=%u inputs=%u slots=%u instructions=%u\n",
+                 vs->ff_transform, ctx->tcl_programs, analyzed, inputs_ok,
+                 ctx->warp_program_slots, ctx->warp_program_instructions);
+
+      if (inputs_ok)
          vs->hw_program = ph_vs_compile(s->ir.nir, &vs->prog_inputs, 0,
                                         ctx->warp_program_instructions, false,
                                         &vs->prog);
@@ -8177,8 +8197,13 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       /* Default off until the GL comparison has run on hardware: the
        * semantics of min, the two scalar divide opcodes and the secondary
        * fract/floor are read out of a vendor binary, not executed. */
+      /* On by default since the GL comparison this route was gated behind
+       * runs clean on hardware: every scene of parhelia-gl-vs-test matches
+       * the software vertex pipeline pixel for pixel, repeatedly, including
+       * the fixed-function lighting shader.  PARHELIA_HW_VS=0 restores the
+       * software path. */
       ctx->tcl_programs =
-         debug_get_bool_option("PARHELIA_HW_VS", false);
+         debug_get_bool_option("PARHELIA_HW_VS", true);
    }
    /* The two-set transform was thought to hang the engine; with a reboot
     * between program edits (the WARP instruction cache serves an already

@@ -803,7 +803,11 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	p3d_reglist(cs, rw, 1);
 	rw[0].reg = P3D_R_DWGCTL; rw[0].val = dwgctl;
 	p3d_reglist(cs, rw, 1);
-	rw[0].reg = P3D_R_GUARDBAND; rw[0].val = 0x42000000u;	/* 32.0f */
+	/* 32.0f, or the LX family's 31.0f when the caller asks for it: the
+	 * vendor clamps this shadow one unit down on exactly that family
+	 * (KRN mtx2572, emitted by mtx2393). */
+	rw[0].reg = P3D_R_GUARDBAND;
+	rw[0].val = st->lx_family ? 0x41f80000u : 0x42000000u;
 	p3d_reglist(cs, rw, 1);
 
 	rw[0].reg = 0x121c;             rw[0].val = 0;

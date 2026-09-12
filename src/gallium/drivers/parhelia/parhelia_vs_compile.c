@@ -27,6 +27,15 @@
 
 #include "parhelia_vs_compile.h"
 
+/* Why a shader was refused, when PARHELIA_TRACE_TCL is set.  A rejection is
+ * silent otherwise: the draw simply keeps the software vertex pipeline. */
+#define PH_VS_REJECT(reason) do { \
+   if (getenv("PARHELIA_TRACE_TCL")) \
+      fprintf(stderr, "parhelia: vs refused at %s:%d: %s\n", \
+              __func__, __LINE__, (reason)); \
+} while (0)
+
+
 /* r0..r13 are free; the vendor epilogue owns r14/r15.  T0 latches the fetched
  * position, T1 the viewport offset and T2 is the temporary every draw depends
  * on, so none of the three may be allocated. */
@@ -572,6 +581,68 @@ ph_vs_alu(struct ph_vs_ctx *ctx, const nir_alu_instr *alu,
          return false;
       ph_vs_defer_free(ctx, &src[1]);
       return true;
+   /* GL's fixed-function lighting gates the specular term on "is the light
+    * in front of the surface", which the state tracker spells as
+    * b2f32(flt(0.0, N.L)).  The WARP unit has no comparison, no saturating
+    * modifier and no component-wise minimum (0x61 is hardware-refuted), so
+    * the step is built from the three operations it does have:
+    *
+    *    d = b - a              the comparison's difference, positive when true
+    *    s = max(d * 2^60, 0)   the negative half becomes exactly zero
+    *    step = s / (s + 1)     the positive half is pulled down to one
+    *
+    * That is exactly 0.0 for d <= 0, and within a part in a million of 1.0
+    * for any d above 1e-12 - far below the smallest N.L a light contributes.
+    * The scale stays at 2^60 so d = 1 cannot overflow the addition. */
+   case nir_op_b2f32: {
+      static const float scale[4] = {
+         1152921504606846976.0f, 1152921504606846976.0f,
+         1152921504606846976.0f, 1152921504606846976.0f,
+      };
+      static const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+      static const float one[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+      static const unsigned broadcast_x[4] = { 0, 0, 0, 0 };
+      const nir_instr *cmp_instr = nir_def_instr(alu->src[0].src.ssa);
+      const nir_alu_instr *cmp;
+      struct ph_vs_value d, run, sum;
+
+      if (cmp_instr->type != nir_instr_type_alu)
+         return false;
+      cmp = nir_instr_as_alu(cmp_instr);
+      /* Only the strict comparison: a step built this way answers 0 at
+       * d == 0, which is what flt means and is not what fge means. */
+      if (cmp->op != nir_op_flt || cmp->def.num_components != 1)
+         return false;
+      if (!ph_vs_operand(ctx, cmp, 1, &src[0]) ||
+          !ph_vs_operand(ctx, cmp, 0, &src[1]))
+         return false;
+      src[1].neg = !src[1].neg;
+      if (!ph_vs_issue(ctx, P3D_WARP_ADD, src, 2, 0, 0, 0, &d))
+         return false;
+      src[0] = d;
+      if (!ph_vs_literal(ctx, scale, &src[1]) ||
+          !ph_vs_issue(ctx, P3D_WARP_MUL, src, 2, 0, 0, 0, &run))
+         return false;
+      ph_vs_defer_free(ctx, &d);
+      src[0] = run;
+      src[1] = ph_vs_swizzled_literal(zero);
+      if (!ph_vs_issue(ctx, P3D_WARP_MAX, src, 2, 0, 0, 0, &run))
+         return false;
+      src[0] = run;
+      src[1] = ph_vs_swizzled_literal(one);
+      if (!ph_vs_issue(ctx, P3D_WARP_ADD, src, 2, 0, 0, 0, &sum))
+         return false;
+      /* SMUL divides by source 0's .w, and every value in this chain carries
+       * the same scalar in each component, so read x into w. */
+      ph_vs_swizzle(&sum, broadcast_x);
+      src[0] = sum;
+      src[1] = run;
+      if (!ph_vs_issue(ctx, P3D_WARP_SMUL, src, 2, 0, 0, 0, out))
+         return false;
+      ph_vs_defer_free(ctx, &sum);
+      ph_vs_defer_free(ctx, &run);
+      return true;
+   }
    case nir_op_fmul: op = P3D_WARP_MUL; count = 2; break;
    case nir_op_fadd: {
       unsigned fold = ph_vs_fold_multiply(alu);
@@ -732,8 +803,19 @@ ph_vs_value(struct ph_vs_ctx *ctx, nir_def *def, struct ph_vs_value *out)
 
 /* ---- program assembly ------------------------------------------------- */
 
+/* An output slot, and the stores that fill it.  A shader may write one slot
+ * in several partial stores - the fixed-function lighting shader writes the
+ * colour's alpha from the scene colour and its rgb from the light sum - so
+ * every store is kept with the components it covers, and the components must
+ * together cover the slot exactly once. */
 struct ph_vs_output {
-   nir_def *value;
+   nir_def *value;      /* the single full-mask store, when there is one */
+   struct {
+      nir_def *value;
+      unsigned mask;
+   } part[4];
+   unsigned parts;
+   unsigned covered;    /* components written so far */
    unsigned slot;       /* WARP output index */
    bool present;
 };
@@ -785,7 +867,7 @@ ph_vs_collect(nir_shader *nir, struct ph_vs_output *position,
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
 
    if (!impl || exec_list_length(&impl->body) != 1)
-      return false;
+      { PH_VS_REJECT("collect"); return false; }
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          const nir_intrinsic_instr *store;
@@ -802,13 +884,13 @@ ph_vs_collect(nir_shader *nir, struct ph_vs_output *position,
             nir_deref_type type = nir_instr_as_deref(instr)->deref_type;
 
             if (type != nir_deref_type_var && type != nir_deref_type_array)
-               return false;
+               { PH_VS_REJECT("collect"); return false; }
             continue;
          }
          case nir_instr_type_intrinsic:
             break;
          default:
-            return false;
+            { PH_VS_REJECT("collect"); return false; }
          }
          store = nir_instr_as_intrinsic(instr);
          switch (store->intrinsic) {
@@ -821,7 +903,7 @@ ph_vs_collect(nir_shader *nir, struct ph_vs_output *position,
          case nir_intrinsic_store_deref:
             if (!ph_vs_deref_location(nir_src_as_deref(store->src[0]),
                                       &location))
-               return false;
+               { PH_VS_REJECT("collect"); return false; }
             value = store->src[1].ssa;
             break;
          case nir_intrinsic_store_output:
@@ -829,35 +911,55 @@ ph_vs_collect(nir_shader *nir, struct ph_vs_output *position,
             value = store->src[0].ssa;
             break;
          default:
-            return false;
+            { PH_VS_REJECT("collect"); return false; }
          }
-         if (nir_intrinsic_write_mask(store) != 0xf || value->num_components != 4)
-            return false;
+         if (value->num_components != 4)
+            { PH_VS_REJECT("collect"); return false; }
          if (location == VARYING_SLOT_POS) {
             out = position;
             slot = 0;
          } else {
             if (!ph_vs_output_slot(location, &slot))
-               return false;
+               { PH_VS_REJECT("collect"); return false; }
             for (unsigned i = 0; i < varyings; i++) {
-               if (varying[i].present && varying[i].slot == slot)
-                  return false;
+               if (varying[i].present && varying[i].slot == slot) {
+                  out = &varying[i];   /* another part of the same slot */
+                  break;
+               }
                if (!varying[i].present) {
                   out = &varying[i];
                   break;
                }
             }
             if (!out)
-               return false;
+               { PH_VS_REJECT("collect"); return false; }
          }
-         if (out->present)
-            return false;
-         out->value = value;
-         out->slot = slot;
-         out->present = true;
+         {
+            const unsigned mask = nir_intrinsic_write_mask(store) & 0xf;
+
+            /* A component written twice would need the stores ordered, which
+             * this compiler does not model. */
+            if (!mask || (out->covered & mask) ||
+                out->parts >= ARRAY_SIZE(out->part))
+               { PH_VS_REJECT("collect"); return false; }
+            out->part[out->parts].value = value;
+            out->part[out->parts].mask = mask;
+            out->parts++;
+            out->covered |= mask;
+            out->value = mask == 0xf ? value : NULL;
+            out->slot = slot;
+            out->present = true;
+         }
       }
    }
-   return position->present;
+   /* Every slot has to end up completely written: a component left out would
+    * read whatever the previous vertex put there. */
+   if (position->present && position->covered != 0xf)
+      { PH_VS_REJECT("collect"); return false; }
+   for (unsigned i = 0; i < varyings; i++)
+      if (varying[i].present && varying[i].covered != 0xf)
+         { PH_VS_REJECT("collect"); return false; }
+   return position->present && position->value;
 }
 
 /* How many constant-buffer vec4s the shader reads, so the literals behind them
@@ -952,6 +1054,20 @@ ph_vs_output_direct(struct ph_vs_ctx *ctx, nir_def *def, unsigned slot)
       return false;
    ctx->program->output_mask |= 1u << slot;
    return true;
+}
+
+/* Copy a value into some components of an output slot. */
+static bool
+ph_vs_write_output_masked(struct ph_vs_ctx *ctx, unsigned slot,
+                          const struct ph_vs_value *value, unsigned mask)
+{
+   static const float zeros[4] = {0};
+   struct ph_vs_value src[2];
+
+   src[0] = *value;
+   src[1] = ph_vs_swizzled_literal(zeros);
+   return ph_vs_issue(ctx, P3D_WARP_ADD, src, 2, P3D_WARP_FILE_DST_O,
+                      (uint8_t)slot, (uint8_t)mask, NULL);
 }
 
 /* Copy a value into an output slot through an add with a zero operand. */
@@ -1060,38 +1176,50 @@ ph_vs_compile(nir_shader *nir, const struct ph_vs_inputs *inputs,
 
    memset(out, 0, sizeof(*out));
    if (!impl || ctx.max_instructions < 4)
-      return false;
+      { PH_VS_REJECT("compile-early"); return false; }
    if (!ph_vs_collect(nir, &position, varying, ARRAY_SIZE(varying)) ||
        !ph_vs_scan_constants(nir, &ctx.constant_vec4s))
-      return false;
+      { PH_VS_REJECT("compile-early"); return false; }
    if (constant_first + ctx.constant_vec4s > PH_VS_MAX_CONSTANT)
-      return false;
+      { PH_VS_REJECT("compile-early"); return false; }
 
    nir_index_ssa_defs(impl);
    ctx.cache_size = impl->ssa_alloc;
    ctx.cache = calloc(ctx.cache_size, sizeof(*ctx.cache));
    if (!ctx.cache)
-      return false;
+      { PH_VS_REJECT("compile-early"); return false; }
 
    /* The clip-space position first: the viewport tail consumes it, and the
     * remaining outputs may then reuse its temporaries. */
    if (!ph_vs_value(&ctx, position.value, &clip))
-      goto done;
+      do { PH_VS_REJECT("compile"); goto done; } while (0);
    if (!clip.is_temp || clip.neg || clip.swizzle != P3D_WARP_SWZ_IDENTITY) {
       /* A position that is a plain read still has to live in a temporary: the
        * tail reads it three times. */
       if (!ph_vs_materialise(&ctx, &clip))
-         goto done;
+         do { PH_VS_REJECT("compile"); goto done; } while (0);
    }
    ph_vs_retain(&ctx, &clip);
    ph_vs_flush_free(&ctx);
 
    for (unsigned i = 0; i < ARRAY_SIZE(varying) && varying[i].present; i++) {
+      if (varying[i].parts > 1) {
+         /* Several partial stores: each one writes its own components. */
+         for (unsigned p = 0; p < varying[i].parts; p++) {
+            if (!ph_vs_value(&ctx, varying[i].part[p].value, &value) ||
+                !ph_vs_write_output_masked(&ctx, varying[i].slot, &value,
+                                           varying[i].part[p].mask))
+               do { PH_VS_REJECT("compile"); goto done; } while (0);
+            ph_vs_flush_free(&ctx);
+         }
+         ctx.program->output_mask |= 1u << varying[i].slot;
+         continue;
+      }
       if (!ph_vs_output_direct(&ctx, varying[i].value, varying[i].slot)) {
          if (ctx.failed ||
              !ph_vs_value(&ctx, varying[i].value, &value) ||
              !ph_vs_write_output(&ctx, varying[i].slot, &value))
-            goto done;
+            do { PH_VS_REJECT("compile"); goto done; } while (0);
       }
       ph_vs_flush_free(&ctx);
    }
@@ -1102,7 +1230,7 @@ ph_vs_compile(nir_shader *nir, const struct ph_vs_inputs *inputs,
       struct ph_vs_value white = ph_vs_swizzled_literal(ones);
 
       if (!ph_vs_write_output(&ctx, 1, &white))
-         goto done;
+         do { PH_VS_REJECT("compile"); goto done; } while (0);
    }
 
    /* The viewport pair goes behind the shader's constants and its literals,
@@ -1112,7 +1240,7 @@ ph_vs_compile(nir_shader *nir, const struct ph_vs_inputs *inputs,
    out->vp_offset_slot = out->vp_scale_slot + 1;
    if (out->vp_offset_slot > PH_VS_MAX_CONSTANT ||
        !ph_vs_viewport_tail(&ctx, &clip))
-      goto done;
+      do { PH_VS_REJECT("compile"); goto done; } while (0);
 
    /* Prime the temporary every draw depends on, unless this draw samples a
     * texture - then writing it locks the engine. */
@@ -1123,12 +1251,12 @@ ph_vs_compile(nir_shader *nir, const struct ph_vs_inputs *inputs,
       zero[0] = zero[1] = ph_vs_swizzled_literal(zeros);
       if (!ph_vs_issue(&ctx, P3D_WARP_MUL, zero, 2, P3D_WARP_FILE_DST_T, 2,
                        0xf, NULL))
-         goto done;
+         do { PH_VS_REJECT("compile"); goto done; } while (0);
       out->writes_t2 = true;
    }
 
    if (ctx.failed || out->count + 2 > ctx.max_instructions)
-      goto done;
+      do { PH_VS_REJECT("compile"); goto done; } while (0);
    {
       static const uint32_t end[3] = { 0x00000200u, 0x00040000u, 0x14c00000u };
       static const uint32_t tail[3] = { 0x00080200u, 0x00440000u, 0x301a21a2u };
