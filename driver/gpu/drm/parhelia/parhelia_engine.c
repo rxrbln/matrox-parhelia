@@ -76,18 +76,52 @@ int parhelia_engine_init(struct parhelia_device *pdev)
 	parhelia_apply_vid_reset(pdev, 0);
 	parhelia_apply_vid_reset(pdev, 1);
 	parhelia_root_trace_check(pdev, "engine_init:video_reset", 0, 0, 0);
-	parhelia_rmw(pdev, 0x1c00, ~0u, 0x00808020u);
+	/* Both vendor initializers OR 0x00809020 here, ours dropped bit 12 -
+	 * DVO1's clock gate - leaving that serializer's clock running on a board
+	 * whose picture leaves through the other one. */
+	parhelia_rmw(pdev, 0x1c00, ~0u, 0x00809020u);
 	parhelia_rmw(pdev, 0x1c04, ~0u, 0x00000020u);
 	udelay(10);
 	parhelia_write(pdev, 0x1c08, 2);
 	parhelia_write(pdev, 0x1c24, 7);
 	parhelia_write(pdev, 0x08fc, 0);
-	if (pdev->pdev->device == PARHELIA_512 || pdev->pdev->device == PARHELIA_8X)
+	/* 0x1c50 and 0x1c58 per family, from HSLS90InitializeHardware (SUN90) and
+	 * HSLPARInitializeHardware (original).  SUN90 takes PInS[0x19c]
+	 * unconditionally; the original substitutes 0x606 for a structure older
+	 * than 0x608.  0x1c58 is 0x40 on the original boards, but on SUN90 only
+	 * when the board byte PInS[0x90] is 9 or 2 - it is 0x42 on this P690, so
+	 * the vendor writes zero, which is also the register's reset value. */
+	switch (pdev->chip->clock_family) {
+	case PARHELIA_CLOCK_SUN90: {
+		const u32 board = parhelia_pins_u32(&pdev->bios, 0x90) & 0xffu;
+
+		parhelia_write(pdev, 0x1c50, parhelia_pins_u32(&pdev->bios, 0x19c));
+		/* The vendor's else-branch writes 0, which is this register's reset
+		 * value; on a POSTed board it holds firmware-programmed serializer
+		 * bits (0x48000000 read on the P690 here), and clobbering those
+		 * would take the picture with it.  So only the positive case is
+		 * written, and a cold board arrives at zero by reset. */
+		if (board == 9 || board == 2)
+			parhelia_write(pdev, 0x1c58, 0x40);
+		break;
+	}
+	case PARHELIA_CLOCK_HSLPAR:
+		parhelia_write(pdev, 0x1c50,
+			       parhelia_pins_u16(&pdev->bios, 0x04) <= 0x607 ?
+			       0x606u : parhelia_pins_u32(&pdev->bios, 0x19c));
 		parhelia_write(pdev, 0x1c58, 0x40);
+		break;
+	}
 	parhelia_rmw(pdev, 0x0920, 0x7fffffffu, 0);
 	parhelia_write(pdev, 0x10b0, 0x40);
 	parhelia_rmw(pdev, 0x1c0c, ~0u, 0x0808u);
 	parhelia_rmw(pdev, 0x1c10, ~0u, 0x0808u);
+	/* Revision-0 P690 erratum: HSLS90InitializeHardware sets 0x03a8 bit 5 for
+	 * device 0x2539 at PCI revision 0 only, and the Windows miniport does the
+	 * same bit (parhelia-engine-and-context-init-complete.md 283). */
+	if (pdev->pdev->device == PARHELIA_P690 &&
+	    pdev->pdev->revision == 0)
+		parhelia_rmw(pdev, 0x03a8, ~0u, BIT(5));
 	parhelia_write(pdev, P3D_R_EOBTAG, 0x00070601u);
 	parhelia_write(pdev, P3D_R_WATERMARK, 0);
 	if (tedlf_counters) {
