@@ -401,6 +401,14 @@ The `A[31:30] = 3` case of the channel-identity phase measures it.
   results do not.  Until they do, the only ten-bit claim this driver makes to
   applications is none: the Gallium sampler cap needs `PARHELIA_GIGACOLOR=1`,
   and no ten-bit render target is offered at all.
+* **The one default-path behaviour change still needs a regression run.**
+  Refusing `R10G10B10A2`, `R10G10B10X2`, `A2R10G10B10` and `A2B10G10R10` (§4)
+  means `GL_RGB10_A2` and `GL_RGB10` now resolve to eight-bit storage instead of
+  to a ten-bit-labelled buffer whose contents the hardware read as 8:8:8:8.
+  That is a correctness fix and GL lets the implementation pick the internal
+  format, but the X server, glamor and the GL regression suite have not been run
+  against it yet.  Nothing in `glxgears`, `ioquake3` or the existing GL tests
+  asks for those formats, so the expected result is no change at all.
 * **Storage order 0 (linear) with code `0x34` wedges the engine.** MEASURED: the
   first sweep pass, `--gigacolor-texture-probe` with `texelcode = 0`, never
   retired — `asynchronous submit fence 00000048 made no progress for 2002 ms
