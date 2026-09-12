@@ -527,7 +527,26 @@ Constant *reads* are allowed.  They can observe another context's
 constants, which is the same exposure the shared engine state already has;
 they cannot be used to fetch memory.
 
-### 9.3 The encoder in the driver
+### 9.3 The engine caches instructions per entry  [PROVEN(hw)]
+
+Re-uploading different code to an address a program has already executed
+from keeps running the **old** program.  Measured with
+`parhelia-drm-test --warp-program-probe`: uploading the passthrough program,
+drawing, then re-uploading the same slot with one swizzle changed
+(`add o1, v5.yzxw` instead of `add o1, v5`) still drew red; the same changed
+code uploaded to a fresh slot drew the blue it should.  Draining the queue
+and waiting for the WARP gate does not help, and neither does toggling the
+program-source selector `0x920` bit 0 around the write.
+
+The vendor avoids the problem structurally: its heap is carved into 682
+single-use slots of 128 instructions.  This driver does the same in
+miniature - a slot holds two program images and an upload always lands on
+the one the slot did not last use, so `WARP_PROGRAM` returns a different
+entry every time and callers must use the value it returns.  Both images
+stay accepted by the submit validator, because a client may still have draws
+queued against the previous entry.
+
+### 9.4 The encoder in the driver
 
 `reference/p3d_warp.c` implements the encoder of section 2 and a builder for
 the fixed-function shapes.  `warp_build_selftest` in `parhelia_drm_test.c`
@@ -539,7 +558,7 @@ confirmed by construction, not only by reading.
 
 `parhelia_vs_compile.c` is the NIR front end on top of it.
 
-### 9.4 Entry-register enforcement
+### 9.5 Entry-register enforcement
 
 Independently of the upload path, `parhelia_validate_reglist()` now rejects
 writes to reglist index 0x40 / 0x41 (`0x1100` / `0x1104`) whose value is not
@@ -551,7 +570,27 @@ the resulting "program" write the surface-base block.
 
 ---
 
-## 10. Still open
+## 10. Hardware results
+
+`parhelia-drm-test --warp-program-probe /dev/dri/card0` on the P690:
+
+| check | result |
+|---|---|
+| draw with the kernel's passthrough entry | red, as expected |
+| draw with a userspace copy of it uploaded through the ioctl | red |
+| re-upload with a rotated colour swizzle | blue |
+| draw with a program `p3d_warp_build()` generated | red |
+| six malformed programs (constant destination, branch, relative addressing, output index out of range, missing END, END without its padding word) | all rejected with -EINVAL |
+| an entry the kernel never handed out | -EACCES |
+| a released slot's entry | -EACCES |
+
+The probe renders into a `PARHELIA_CREATE_RENDER_NATIVE_COLOR` allocation
+and reads it back through `DOWNLOAD_RENDER`.  It first used a dumb buffer,
+which the 3-D engine does not write on this kernel - the clear appeared but
+no triangle did.  `--p690-multitex-warp-probe` still fails for exactly that
+reason and needs the same conversion.
+
+## 11. Still open
 
 * The value of base registers `b1..b3` and how they are programmed.
 * Whether `o0` may carry clip space (would remove the divide/viewport tail).

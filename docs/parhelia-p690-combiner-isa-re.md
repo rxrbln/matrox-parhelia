@@ -251,11 +251,28 @@ pixels).
 | Packing | two signed 11-bit values per dword, at bits [10:0] and [26:16] | PROVEN(enc) |
 | Format | signed **Q1.10**, range [-1.0, +0.999] | BIN + the D3D cap `MaxPixelShaderValue = 1.0` |
 | Host conversion | `v = (int)truncf(f * 1024); clamp to [-1024, 1023]` — round **toward zero** | [BIN `KRN mtx2132`]; PROVEN(enc) |
-| Component order | 0x1278 = R \| G<<16, 0x127c = B \| A<<16 | PROVEN(enc) through GL_BLEND |
+| Component order | **0x1278 = R \| A<<16, 0x127c = B \| G<<16** | **PROVEN(hw)**, see below |
 | Total | two vec4s per slot; an API-level constant file of up to 32 `def c#` is folded down at compile time.  **There is no other constant path to the chip.** | [BIN `PARD 0x180770`] |
 
 A compiler must therefore treat constants as a per-instruction resource, and
 a value outside [-1, 1) cannot be expressed at all.
+
+### 7.1 The component order is not (r, g) then (b, a)  [PROVEN(hw)]
+
+The natural reading of the two registers is red and green in the first,
+blue and alpha in the second.  That is wrong.  Compiling the GLSL shader
+`gl_FragColor = texture2D(s, c) * constant` and rendering it on the P690
+returned the constant's **alpha** in the green lane, with red and blue exact
+to the last bit.  Swapping the two high halves - red and alpha in 0x1278,
+blue and green in 0x127c - makes that shader and
+`texture2D(s, c) * gl_Color + constant` match the GL specification exactly.
+
+This also means the fixed-function `GL_TEXTURE_ENV_COLOR` packing in the
+Gallium driver (`env_colour_rg` / `env_colour_ba`) has the same swap to make:
+GL_BLEND has never rendered correctly on this hardware.
+
+Test: `tools/parhelia-gl-combiner-test.c`, checks "glsl uniform constant
+times texture" and "glsl mad: texture * colour + constant".
 
 ---
 
@@ -290,7 +307,37 @@ merges taken off the top:
 Going to ten needs `0x1300` bit 19 and costs half the fill rate; it is the
 obvious next extension and is untested.
 
-## 10. Still open
+## 10. Measured coverage
+
+`tools/parhelia-gl-combiner-test` compares the rendered result of 21 shapes
+with the value the GL specification requires.  On the P690, with the driver's
+instruction-shape matcher (`PARHELIA_FS_COMPILER` unset) **18 of 21 fail**;
+with the data-flow compiler **9 fail**.
+
+Exact with the compiler: GL_REPLACE, GL_MODULATE, GL_ADD, a two-unit
+MODULATE chain, an untextured constant colour, and seven GLSL 1.20 shaders -
+multiply, add, `1 - x`, an alpha replicate, an rgb/alpha split, a uniform
+constant and a multiply-add.
+
+Still wrong, precisely characterised:
+
+* **LRP loses the green lane of a replicated source.**  `LRP r0, TEX, PREV,
+  TEX.a` returns `PREV.g`, i.e. the C operand's green reads as zero, while
+  its red and blue are exact.  The same alpha replicate is exact in a MUL, so
+  this is specific to LRP's use of C.  It costs GL_DECAL, GL_BLEND and
+  `mix()`.
+* **A second texture unit reads black** through a compiled program, although
+  the fixed-function two-unit path is exact.  The P690 places logical unit 1
+  on physical pipe 2 and the merge instruction in slot 2 leaves the result in
+  `t1`; the compiled program's register choice or its slot offset is wrong.
+* The vertex colour of an **untextured** draw comes out white.  That predates
+  the compiler: the driver selects the WARP replace program, which forces the
+  vertex colour to 1.
+* A shader the compiler cannot express still takes a hardware path and
+  renders the raw texture instead of falling back to the draw module.  The
+  fallback predicate has to consider the compiler's verdict.
+
+## 11. Still open
 
 * `0x126c` bits 15, 16 and 25..31: real fields, no writer found.
 * Modifier codes 6..0x0e, replicate codes 5..7, opcode bits[11:9] values 1
