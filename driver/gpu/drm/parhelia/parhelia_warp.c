@@ -262,7 +262,7 @@ static bool warp_destination_ok(u32 file, u32 index, u32 mask)
 static int warp_validate_program(struct parhelia_device *pdev, const u32 *code,
 				 u32 count)
 {
-	bool ended = false;
+	u32 ended = 0;
 	u32 i;
 
 	for (i = 0; i < count; i++) {
@@ -273,7 +273,8 @@ static int warp_validate_program(struct parhelia_device *pdev, const u32 *code,
 		u32 n;
 
 		if (!memcmp(ins, warp_end, sizeof(warp_end))) {
-			ended = true;
+			if (!ended)
+				ended = i + 1;	/* index of the first END, + 1 */
 			continue;
 		}
 		if (!memcmp(ins, warp_nop, sizeof(warp_nop)) ||
@@ -306,7 +307,11 @@ static int warp_validate_program(struct parhelia_device *pdev, const u32 *code,
 				goto reject;
 		}
 	}
-	if (!ended)
+	/* The fetch unit reads bundles in pairs, so every program the vendor and
+	 * the kernel store follows END with one padding word.  Require it: a
+	 * program ending exactly at the slot boundary would otherwise execute
+	 * whatever the previous tenant left. */
+	if (!ended || ended >= count)
 		goto reject;
 	return 0;
 
@@ -452,6 +457,11 @@ int parhelia_warp_program_ioctl(struct drm_device *drm, void *data,
 	slot = args->slot;
 	ret = warp_user_claim(pdev, file, &slot);
 	if (!ret) {
+		/* Clear the rest of the slot so a shorter program cannot leave
+		 * the previous tenant's instructions reachable. */
+		memset(pdev->warp_user_cpu +
+		       (slot - 1) * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS * 12, 0,
+		       PARHELIA_WARP_USER_SLOT_INSTRUCTIONS * 12);
 		memcpy(pdev->warp_user_cpu +
 		       (slot - 1) * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS * 12,
 		       code, args->count * 12);
