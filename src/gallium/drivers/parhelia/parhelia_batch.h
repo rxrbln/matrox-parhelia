@@ -92,6 +92,16 @@ int parhelia_batch_blit(struct parhelia_batch *batch,
                         uint32_t src_handle, unsigned src_pitch,
                         unsigned src_type, unsigned src_x, unsigned src_y,
                         unsigned width, unsigned height);
+/* The same copy with explicit surface format codes; the pitches are in
+ * pixels of that format and both ends must be the same size. */
+int parhelia_batch_blit_format(struct parhelia_batch *batch,
+                               uint32_t dst_handle, unsigned dst_pitch,
+                               unsigned dst_format, unsigned dst_type,
+                               unsigned dst_x, unsigned dst_y,
+                               uint32_t src_handle, unsigned src_pitch,
+                               unsigned src_format, unsigned src_type,
+                               unsigned src_x, unsigned src_y,
+                               unsigned width, unsigned height);
 int parhelia_batch_triangles(struct parhelia_batch *batch,
                             uint32_t colour_handle, uint32_t warp_entry,
                             unsigned width, unsigned height, unsigned pitch,

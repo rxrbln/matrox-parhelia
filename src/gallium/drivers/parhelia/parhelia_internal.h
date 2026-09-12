@@ -41,6 +41,9 @@ struct parhelia_screen {
    /* Native 8- and 16-bit sampler storage, and native S3TC.  Both stay
     * gated until they retire on this silicon. */
    bool narrow_formats;
+   /* Native R5G6B5 colour and D16 depth render targets: the measured 128x16
+    * tile order plus a kernel that allocates two bytes per pixel. */
+   bool narrow_targets;
    bool s3tc;
    /* Zero means GET_PARAM was unavailable or returned an invalid value. */
    uint32_t kernel_max_packets;
@@ -56,7 +59,14 @@ struct parhelia_resource {
    uint32_t handle;
    bool handle_owned;
    uint64_t size, mmap_offset;
+   /* Pitch in PIXELS, as the surface descriptor and the tile-offset helpers
+    * consume it, with @cpp bytes each.  R5G6B5 colour and Z16 depth targets
+    * are two bytes; everything else is four. */
    unsigned stride;
+   unsigned cpp;
+   /* Surface descriptor format code: 0x32 A8R8G8B8, 0x28 R5G6B5, 0x36 S8Z24,
+    * 0x2a D16.  Meaningless for sampler-only storage. */
+   uint32_t surf_fmt;
    uint32_t tile_layout;
    void *map;
    void *malloc_data;
@@ -135,6 +145,14 @@ struct ph_sampler_format {
 };
 
 bool ph_sampler_format(enum pipe_format format, struct ph_sampler_format *out);
+
+/* Native render-target or depth storage of a Gallium format: its surface
+ * descriptor code and bytes per pixel.  False when the hardware has no such
+ * surface and the format may only be sampled or converted. */
+bool ph_target_format(enum pipe_format format, uint32_t *code, unsigned *cpp);
+/* True for the two-byte render and depth surfaces, whose storage order is not
+ * the sampler's. */
+bool ph_narrow_target_format(enum pipe_format format);
 
 void ph_resource_resolve_linear(struct parhelia_resource *r);
 void ph_resource_upload_tiled(struct parhelia_resource *r);

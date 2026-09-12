@@ -182,6 +182,49 @@ ph_sampler_format(enum pipe_format format, struct ph_sampler_format *out)
    return true;
 }
 
+/* Render-target and depth surface descriptors.  The 16-bit codes and the
+ * 128x16 storage order they select are measured in
+ * docs/parhelia-p690-16-bit-render-targets.md; every other renderable format
+ * goes through the 32-bit A8R8G8B8 surface. */
+bool
+ph_narrow_target_format(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_B5G6R5_UNORM ||
+          format == PIPE_FORMAT_Z16_UNORM;
+}
+
+bool
+ph_target_format(enum pipe_format format, uint32_t *code, unsigned *cpp)
+{
+   uint32_t c = 0x32;
+   unsigned b = 4;
+   bool native = true;
+
+   switch (format) {
+   case PIPE_FORMAT_B5G6R5_UNORM:
+      c = 0x28; b = 2;
+      break;
+   case PIPE_FORMAT_Z16_UNORM:
+      c = 0x2a; b = 2;
+      break;
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+      c = 0x36;
+      break;
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      break;
+   default:
+      native = util_format_get_blocksize(format) == 4 &&
+               !util_format_is_depth_or_stencil(format);
+      break;
+   }
+   if (code)
+      *code = c;
+   if (cpp)
+      *cpp = b;
+   return native;
+}
+
 static bool
 ph_format_supported(struct pipe_screen *s, enum pipe_format format,
                     enum pipe_texture_target target, unsigned samples,
@@ -204,12 +247,44 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
          supported = true;
       } else if (target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_RECT) {
          switch (format) {
-         case PIPE_FORMAT_B5G5R5A1_UNORM:
          case PIPE_FORMAT_B5G6R5_UNORM:
+            /* Sampler code 0x28, and the same code as a render target: a
+             * 3-D draw into one writes exact 5:6:5 and the 2-D fill clears
+             * it, measured by --narrow-target-probe.  One resource cannot
+             * hold both the sampler's and the render target's storage order,
+             * and display or dma-buf sharing still needs the 32-bit linear
+             * companion path. */
+            if (bind & PIPE_BIND_RENDER_TARGET)
+               supported = ph_screen(s)->narrow_targets &&
+                           !(bind & (PIPE_BIND_SAMPLER_VIEW |
+                                     PIPE_BIND_DEPTH_STENCIL |
+                                     PIPE_BIND_SCANOUT |
+                                     PIPE_BIND_DISPLAY_TARGET |
+                                     PIPE_BIND_SHARED));
+            else
+               supported = ph_screen(s)->narrow_formats &&
+                           (bind & PIPE_BIND_SAMPLER_VIEW) &&
+                           !(bind & (PIPE_BIND_DEPTH_STENCIL |
+                                     PIPE_BIND_SCANOUT |
+                                     PIPE_BIND_DISPLAY_TARGET |
+                                     PIPE_BIND_SHARED));
+            break;
+         case PIPE_FORMAT_Z16_UNORM:
+            /* Native D16, code 0x2a: the depth test, rejection and write
+             * were measured exact, and the stored value is round(d*65536). */
+            supported = ph_screen(s)->narrow_targets &&
+                        (bind & PIPE_BIND_DEPTH_STENCIL) &&
+                        !(bind & (PIPE_BIND_RENDER_TARGET |
+                                  PIPE_BIND_SAMPLER_VIEW |
+                                  PIPE_BIND_SCANOUT |
+                                  PIPE_BIND_DISPLAY_TARGET |
+                                  PIPE_BIND_SHARED));
+            break;
+         case PIPE_FORMAT_B5G5R5A1_UNORM:
          case PIPE_FORMAT_B4G4R4A4_UNORM:
          case PIPE_FORMAT_L8_UNORM:
-            /* Native 8- and 16-bit sampler storage (codes 0x26, 0x28, 0x24,
-             * 0x11).  There is no recovered render-target, depth or display
+            /* Native 8- and 16-bit sampler storage (codes 0x26, 0x24, 0x11).
+             * There is no recovered render-target, depth or display
              * descriptor at these texel sizes, so they stay sampler-only.
              * Their alpha is no worse off than the 32-bit formats': this
              * texture unit emits none for any of them. */
@@ -279,14 +354,14 @@ ph_resource_resolve_linear(struct parhelia_resource *r)
    if (!r || !r->tiled_dirty || !r->linear_map)
       return;
    if (!ph_env("PARHELIA_CPU_BLIT") &&
-       r->handle && r->linear_handle && !(r->linear_stride & 3) &&
-       r->linear_stride / 4 <= 0x3fff) {
+       r->handle && r->linear_handle && !(r->linear_stride % r->cpp) &&
+       r->linear_stride / r->cpp <= 0x3fff) {
       batch = calloc(1, sizeof(*batch));
       if (batch)
-         ret = parhelia_batch_blit(batch,
-                                r->linear_handle, r->linear_stride / 4,
-                                1, 0, 0,
-                                r->handle, r->stride, 2, 0, 0,
+         ret = parhelia_batch_blit_format(batch,
+                                r->linear_handle, r->linear_stride / r->cpp,
+                                r->surf_fmt, 1, 0, 0,
+                                r->handle, r->stride, r->surf_fmt, 2, 0, 0,
                                 r->base.width0, r->base.height0);
       if (!ret)
          ret = parhelia_batch_submit(ph_screen(r->base.screen)->fd, batch,
@@ -313,9 +388,10 @@ ph_resource_resolve_linear(struct parhelia_resource *r)
               r->base.width0, r->base.height0, ret);
    for (unsigned y = 0; y < r->base.height0; y++)
       for (unsigned x = 0; x < r->base.width0; x++)
-         memcpy((uint8_t *)r->linear_map + y * r->linear_stride + x * 4,
+         memcpy((uint8_t *)r->linear_map + y * r->linear_stride + x * r->cpp,
                 (uint8_t *)r->map +
-                   p3d_tile_offset_layout(x, y, r->stride, r->tile_layout), 4);
+                   p3d_tile_offset_layout_cpp(x, y, r->stride, r->tile_layout,
+                                              r->cpp), r->cpp);
    r->tiled_dirty = false;
    r->linear_dirty = false;
 }
@@ -330,15 +406,18 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
 
    if (!r || !r->linear_dirty || r->tiled_dirty || !r->linear_map)
       return;
-   /* The 2D engine copies 32-bit pixels; a narrower texel needs the CPU. */
-   if (cpp == 4 && !ph_env("PARHELIA_CPU_BLIT") &&
-       r->handle && r->linear_handle && !(r->linear_stride & 3) &&
-       r->linear_stride / 4 <= 0x3fff) {
+   /* A sampler image with a narrower texel has its own storage order and
+    * needs the CPU; a 16 bpp render target does not. */
+   if (cpp == r->cpp && !ph_env("PARHELIA_CPU_BLIT") &&
+       r->handle && r->linear_handle && !(r->linear_stride % r->cpp) &&
+       r->linear_stride / r->cpp <= 0x3fff) {
       batch = calloc(1, sizeof(*batch));
       if (batch)
-         ret = parhelia_batch_blit(batch, r->handle, r->stride, 2, 0, 0,
-                                r->linear_handle, r->linear_stride / 4,
-                                1, 0, 0, r->base.width0, r->base.height0);
+         ret = parhelia_batch_blit_format(batch, r->handle, r->stride,
+                                r->surf_fmt, 2, 0, 0,
+                                r->linear_handle, r->linear_stride / r->cpp,
+                                r->surf_fmt, 1, 0, 0,
+                                r->base.width0, r->base.height0);
       if (!ret)
          ret = parhelia_batch_submit(ph_screen(r->base.screen)->fd, batch,
                                      NULL, 0, &fence);
@@ -361,6 +440,10 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
               "parhelia: CPU upload resource=%p linear=%u tiled=%u %ux%u layout=%u gpu_error=%d\n",
               (void *)r, r->linear_handle, r->handle,
               r->base.width0, r->base.height0, r->tile_layout, ret);
+   /* A sampler image moves texels of its own size; a render target moves
+    * the surface's. */
+   const unsigned texel = r->upload_texture ? cpp : r->cpp;
+
    for (unsigned y = 0; y < r->base.height0; y++)
       for (unsigned x = 0; x < r->base.width0; x++)
          memcpy((uint8_t *)r->map +
@@ -370,9 +453,10 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
                                                    r->mip.level[0].pitch) :
                      p3d_texture_tile_offset_cpp(x, y,
                                                  r->mip.level[0].pitch, cpp)) :
-                    p3d_tile_offset_layout(x, y, r->stride, r->tile_layout)),
+                    p3d_tile_offset_layout_cpp(x, y, r->stride,
+                                               r->tile_layout, r->cpp)),
                 (uint8_t *)r->linear_map +
-                   (size_t)y * r->linear_stride + x * cpp, cpp);
+                   (size_t)y * r->linear_stride + x * texel, texel);
    if (r->transfer_shadow && ph_resource_upload_shadow(r))
       return;
    r->upload_dirty |= r->upload_texture;
@@ -472,7 +556,7 @@ ph_shadow_row_range(const struct parhelia_resource *r, unsigned y0,
                     unsigned y1, uint64_t *offset, uint64_t *size)
 {
    const unsigned th = r->tile_layout == PARHELIA_TILE_64X16_4K ? 16 : 32;
-   const uint64_t tile_row = (uint64_t)r->stride * th * 4;
+   const uint64_t tile_row = (uint64_t)r->stride * th * MAX2(r->cpp, 1u);
    uint64_t end = MIN2(((uint64_t)y1 + th - 1) / th * tile_row, r->size);
 
    *offset = MIN2((uint64_t)(y0 / th) * tile_row, end);
@@ -525,10 +609,17 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    const bool share_native = screen->native_share &&
       (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
                       PIPE_BIND_SHARED));
+   /* Bytes per pixel of the render/depth surface this format would use. */
+   const bool narrow_target = ph_narrow_target_format(templ->format);
+   /* Mesa puts PIPE_BIND_SAMPLER_VIEW on every renderbuffer.  A two-byte
+    * surface has different sampler and render-target storage orders, so a
+    * render target has to take the render one; ph_format_supported refuses
+    * the ambiguous sampler+target combination outright. */
    const bool sampler_storage = !share_native &&
       (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
       templ->width0 <= 512 && templ->height0 <= 512 &&
-      !(templ->bind & PIPE_BIND_DEPTH_STENCIL);
+      !(templ->bind & PIPE_BIND_DEPTH_STENCIL) &&
+      !(narrow_target && (templ->bind & PIPE_BIND_RENDER_TARGET));
    struct ph_sampler_format native_format = { 0x32, 4, 0 };
    const bool native_storage = sampler_storage &&
       ph_sampler_format(templ->format, &native_format);
@@ -542,6 +633,10 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       (templ->bind & PIPE_BIND_DEPTH_STENCIL);
    const bool native_color = screen->native_rt_classes && !sampler_storage &&
       (templ->bind & PIPE_BIND_RENDER_TARGET);
+   /* Bytes per pixel of the render/depth surface.  A sampler-only image keeps
+    * its texel size; everything else follows the surface descriptor. */
+   uint32_t target_code = 0x32;
+   unsigned target_cpp = 4;
    /* CREATE_RENDER and the surface/texture descriptors all accept 2048 in
     * either dimension.  Keep resource creation consistent with the advertised
     * GL/DRI limit; the old 1024x768 userspace guard was a bring-up limit and
@@ -556,6 +651,12 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    r->base.screen = pscreen;
    r->tile_layout = screen->tile_layout;
    r->native_shared = share_native;
+   if (!sampler_storage && !share_native)
+      ph_target_format(templ->format, &target_code, &target_cpp);
+   /* Sampler storage keeps its own 32-bit row ABI and mip.cpp; only a
+    * render or depth surface changes the meaning of r->stride. */
+   r->cpp = sampler_storage ? 4 : target_cpp;
+   r->surf_fmt = target_code;
    pipe_reference_init(&r->base.reference, 1);
    if (templ->target == PIPE_BUFFER) {
       r->size = templ->width0;
@@ -658,6 +759,10 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
          (r->mip.size + (size_t)create_pitch * 4 - 1) /
          ((size_t)create_pitch * 4) :
          templ->height0,
+      /* The sampler classes keep their own 32-bit row ABI; only a native
+       * render or depth surface allocates at two bytes per pixel.  Zero is
+       * the 32-bit default, which an older kernel also accepts. */
+      .cpp = !sampler_storage && target_cpp == 2 ? 2 : 0,
    };
    /* A tiled sampler uses the texture-unit address path.  Keeping the 32 MiB
     * SUN90 placement rule for it leaves only four possible origins in the
@@ -702,7 +807,8 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    r->size = create.size;
    /* The DRM allocation ABI reports byte pitch, while the recovered surface
     * descriptor and p3d_tile_offset_layout() both consume pitch in pixels. */
-   if ((create.pitch & 3) || create.pitch < templ->width0 * 4)
+   if ((create.pitch & 3) || create.pitch < templ->width0 * r->cpp ||
+       create.pitch % r->cpp)
       goto fail;
    /* Layout 2 uses a power-of-two texel pitch, which can exceed the current
     * allocation ABI's 64-pixel pitch for NPOT images.  Reject any object
@@ -710,7 +816,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    if ((create.flags & PARHELIA_CREATE_RENDER_TEXTURE) &&
        create.size < r->mip.size)
       goto fail;
-   r->stride = create.pitch / 4;
+   r->stride = create.pitch / r->cpp;
    r->mmap_offset = create.mmap_offset;
    r->upload_texture = screen->texture_upload &&
                        create.flags == PARHELIA_CREATE_RENDER_TEXTURE;
@@ -747,8 +853,10 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       }
    }
    /* A compressed image has no linear companion: layout 5 is the only
-    * storage the sampler decodes, and nothing detiles blocks. */
-   if (!share_native && !block_bytes &&
+    * storage the sampler decodes, and nothing detiles blocks.  Neither has a
+    * 16 bpp render or depth surface: it is never shared or sampled, and its
+    * CPU image is the byte-exact native shadow. */
+   if (!share_native && !block_bytes && r->cpp == 4 &&
        (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
                        PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW))) {
       /* CREATE_DUMB is a modeset-only ioctl and is unavailable through a
@@ -890,6 +998,10 @@ ph_resource_from_handle(struct pipe_screen *pscreen,
          r->handle = imported_handle;
          r->handle_owned = imported_owned;
          r->size = info.size;
+         /* GET_BO_INFO reports no pixel size; every shared native surface
+          * is 32-bit, which ph_format_supported also enforces. */
+         r->cpp = 4;
+         r->surf_fmt = 0x32;
          r->stride = info.pitch / 4;
          r->tile_layout = screen->tile_layout;
          r->native_shared = true;
@@ -1029,7 +1141,7 @@ ph_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *ctx,
          fprintf(stderr,
                  "parhelia: export native resource=%p handle=%u type=%u pitch_B=%u\n",
                  (void *)r, r->handle, whandle->type, r->stride * 4);
-      whandle->stride = r->stride * 4;
+      whandle->stride = r->stride * r->cpp;
       whandle->offset = 0;
       /* The matching KMS and Xorg driver query the GEM layout explicitly.
        * INVALID must never be inferred as LINEAR for a Parhelia dma-buf. */
@@ -1223,6 +1335,26 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
       p3d_texture_uses_p690_narrow(s->chip_id, s->tile_layout, 2) &&
       !ph_env("PARHELIA_NO_NARROW_FORMATS");
    s->s3tc = s->texture_upload && ph_env("PARHELIA_S3TC");
+   /* 16-bit render targets: ask the kernel for a two-byte-per-pixel native
+    * colour allocation.  Only a kernel that knows the 128-pixel tile row can
+    * place one, and only the P690's measured order is implemented.
+    * PARHELIA_NO_NARROW_TARGETS=1 opts out. */
+   if (s->native_rt_classes && s->render_transfer &&
+       s->tile_layout == PARHELIA_TILE_64X16_4K &&
+       !ph_env("PARHELIA_NO_NARROW_TARGETS")) {
+      struct drm_parhelia_create_render probe = {
+         .flags = PARHELIA_CREATE_RENDER_NATIVE_COLOR,
+         .width = 128, .height = 16, .cpp = 2,
+      };
+
+      if (!ioctl(s->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &probe) &&
+          probe.pitch == 256) {
+         struct drm_gem_close close_bo = {.handle = probe.handle};
+
+         s->narrow_targets = true;
+         ioctl(s->fd, DRM_IOCTL_GEM_CLOSE, &close_bo);
+      }
+   }
    if (!ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &max_packets) &&
        max_packets.value && max_packets.value <= PH_BATCH_PACKETS)
       s->kernel_max_packets = max_packets.value;

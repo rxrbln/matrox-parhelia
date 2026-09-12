@@ -1600,6 +1600,7 @@ ph_copy_present_quad(struct ph_context *ctx,
     * through the recovered hardware sampler path. */
    if (ctx->triangles != 2 || !ctx->fs || ctx->fs->uses_color ||
        !(dst->base.bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET)) ||
+       dst->cpp != 4 || src->cpp != 4 ||
        !src->linear_map || (!dst->map && !dst->linear_map))
       return false;
    /* Only the plain 7-dword XY/RGB/ST stream, and no fragment state which
@@ -2006,8 +2007,9 @@ ph_texture_base_hash(const struct parhelia_resource *texture, bool tiled,
                ph_mip_texel_offset(&texture->linear_mip, 0, x, y, true) :
                (size_t)y * texture->linear_stride + x * 4;
          } else {
-            off = p3d_tile_offset_layout(x, y, texture->stride,
-                                         texture->tile_layout);
+            off = p3d_tile_offset_layout_cpp(x, y, texture->stride,
+                                             texture->tile_layout,
+                                             texture->cpp);
          }
          pixel = base + off;
          for (unsigned c = 0; c < 4; c++)
@@ -3165,7 +3167,7 @@ ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
    ph_resource_upload_tiled(color);
 
    state.colour.pitch = color->stride;
-   state.colour.fmt = 0x32;
+   state.colour.fmt = color->surf_fmt;
    state.screen_w = ctx->fb.width;
    state.screen_h = ctx->fb.height;
    state.prim = prim;
@@ -3176,7 +3178,7 @@ ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
    state.dw_per_vertex = depth ? 6 : 5;
    if (depth) {
       state.depth.pitch = depth->stride;
-      state.depth.fmt = 0x36;
+      state.depth.fmt = depth->surf_fmt;
       state.depth_slot = 1;
    }
    ph_apply_fragment_state(ctx, &state, depth != NULL);
@@ -3458,7 +3460,7 @@ ph_submit_vertices(struct ph_context *ctx)
    ph_resource_upload_tiled(color);
 
    state.colour.pitch = color->stride;
-   state.colour.fmt = 0x32;
+   state.colour.fmt = color->surf_fmt;
    state.screen_w = ctx->fb.width;
    state.screen_h = ctx->fb.height;
    state.prim = P3D_TRIANGLES;
@@ -3582,7 +3584,7 @@ ph_submit_vertices(struct ph_context *ctx)
    }
    if (depth) {
       state.depth.pitch = depth->stride;
-      state.depth.fmt = 0x36;
+      state.depth.fmt = depth->surf_fmt;
       state.depth_slot = 1;
       state.depth_test = ctx->dsa && ctx->dsa->depth_enabled;
       state.depth_write = ctx->dsa && ctx->dsa->depth_writemask;
@@ -6062,7 +6064,9 @@ ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *
       draw_set_zs_format(ctx->draw, fb->zsbuf.format);
 }
 
-/* PLNWT bit planes of the colour components enabled in @colormask. */
+/* PLNWT bit planes of the colour components enabled in @colormask.  The fill
+ * and the pixel pipeline both mask a 32-bit word, so a 16 bpp mask is
+ * replicated into both halves. */
 static uint32_t
 ph_colour_write_mask(enum pipe_format format, unsigned colormask)
 {
@@ -6079,13 +6083,19 @@ ph_colour_write_mask(enum pipe_format format, unsigned colormask)
          continue;
       mask |= BITFIELD_MASK(desc->channel[s].size) << desc->channel[s].shift;
    }
+   if (util_format_get_blocksize(format) == 2)
+      mask |= mask << 16;
    return mask;
 }
 
-/* Native format 0x36 keeps Z24 in [23:0] and stencil in [31:24]. */
+/* Native format 0x36 keeps Z24 in [23:0] and stencil in [31:24]; 0x2a is a
+ * bare 16-bit depth with no stencil. */
 static uint32_t
-ph_zs_write_mask(unsigned buffers, uint8_t stencil_mask)
+ph_zs_write_mask(enum pipe_format format, unsigned buffers,
+                 uint8_t stencil_mask)
 {
+   if (format == PIPE_FORMAT_Z16_UNORM)
+      return (buffers & PIPE_CLEAR_DEPTH) ? 0xffffffffu : 0;
    return ((buffers & PIPE_CLEAR_DEPTH) ? 0x00ffffffu : 0) |
           ((buffers & PIPE_CLEAR_STENCIL) ? (uint32_t)stencil_mask << 24 : 0);
 }
@@ -6130,12 +6140,13 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
       for (unsigned j = y; j < y + height; j++)
          for (unsigned i = x; i < x + width; i++) {
             uint8_t *texel = (uint8_t *)r->map +
-               p3d_tile_offset_layout(i, j, r->stride, r->tile_layout);
-            uint32_t old;
+               p3d_tile_offset_layout_cpp(i, j, r->stride, r->tile_layout,
+                                          r->cpp);
+            uint32_t old = 0;
 
-            memcpy(&old, texel, sizeof(old));
+            memcpy(&old, texel, r->cpp);
             old = (old & ~write_mask) | (value & write_mask);
-            memcpy(texel, &old, sizeof(old));
+            memcpy(texel, &old, r->cpp);
          }
       r->upload_dirty |= r->upload_texture;
       r->tiled_dirty = true;
@@ -6191,14 +6202,18 @@ ph_clear_colour(struct ph_context *ctx, const struct pipe_surface *surf,
                 const union pipe_color_union *color, unsigned colormask,
                 unsigned x, unsigned y, unsigned width, unsigned height)
 {
+   struct parhelia_resource *r = ph_resource(surf->texture);
    const uint32_t mask = ph_colour_write_mask(surf->format, colormask);
    union util_color packed;
+   uint32_t value;
 
    if (!mask)
       return;
    util_pack_color(color->f, surf->format, &packed);
-   ph_clear_surface(ctx, ph_resource(surf->texture), 0x32, packed.ui[0],
-                    mask, x, y, width, height);
+   /* The 2-D fill writes whole dwords, so a 16 bpp value has to appear in
+    * both halves; the rectangle itself is honoured at pixel granularity. */
+   value = r->cpp == 2 ? (packed.ui[0] & 0xffffu) * 0x10001u : packed.ui[0];
+   ph_clear_surface(ctx, r, r->surf_fmt, value, mask, x, y, width, height);
 }
 
 static void
@@ -6207,17 +6222,24 @@ ph_clear_zs(struct ph_context *ctx, const struct pipe_surface *surf,
             unsigned stencil, unsigned x, unsigned y, unsigned width,
             unsigned height)
 {
-   const uint32_t mask = ph_zs_write_mask(buffers, stencil_mask);
+   struct parhelia_resource *r = ph_resource(surf->texture);
+   const uint32_t mask = ph_zs_write_mask(surf->format, buffers, stencil_mask);
+   uint32_t value;
 
    if (!mask)
       return;
-   if (surf->format != PIPE_FORMAT_Z24_UNORM_S8_UINT) {
+   if (surf->format != PIPE_FORMAT_Z24_UNORM_S8_UINT &&
+       surf->format != PIPE_FORMAT_Z16_UNORM) {
       ctx->submit_error = -EOPNOTSUPP;
       return;
    }
-   ph_clear_surface(ctx, ph_resource(surf->texture), 0x36,
-                    util_pack_z_stencil(surf->format, depth, stencil), mask,
-                    x, y, width, height);
+   /* The vendor packs D16 as min(d * 65536, 0xffff), replicated for the
+    * dword fill (docs/parhelia-p690-zcompression-clear-banks-re.md 4.3). */
+   if (surf->format == PIPE_FORMAT_Z16_UNORM)
+      value = (uint32_t)MIN2(depth * 65536.0, 65535.0) * 0x10001u;
+   else
+      value = util_pack_z_stencil(surf->format, depth, stencil);
+   ph_clear_surface(ctx, r, r->surf_fmt, value, mask, x, y, width, height);
 }
 
 static void
@@ -6379,7 +6401,7 @@ ph_texel_offset(const struct parhelia_resource *r, unsigned level,
             x, y, ph_sampler_storage_pitch(r->base.screen, r->base.width0,
                                            cpp),
             cpp, ph_screen(r->base.screen)->chip_id, r->tile_layout);
-   return p3d_tile_offset_layout(x, y, r->stride, r->tile_layout);
+   return p3d_tile_offset_layout_cpp(x, y, r->stride, r->tile_layout, r->cpp);
 }
 
 /* Levels above zero exist only in the sampler mip chain or a linear chain. */
@@ -6603,7 +6625,9 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
    ph_normalize_box(&info->dst.box, &db);
    if (!mask || !sb.width || !sb.height || !db.width || !db.height ||
        sb.depth != 1 || db.depth != 1 ||
-       (zs && (sf != df || util_format_get_blocksize(sf) != 4)))
+       (zs && (sf != df ||
+               (util_format_get_blocksize(sf) != 4 &&
+                util_format_get_blocksize(sf) != 2))))
       return !mask;
    src = p->texture_map(p, info->src.resource, info->src.level,
                         PIPE_MAP_READ, &sb, &st);
@@ -6612,8 +6636,13 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
                         &dt);
    pixels = MALLOC((size_t)sb.width * sb.height * 4 * sizeof(float));
    row = MALLOC((size_t)db.width * 4 * sizeof(float));
-   if (!src || !dst || !pixels || !row)
+   if (!src || !dst || !pixels || !row) {
+      if (ph_env("PARHELIA_TRACE") || ph_env("PARHELIA_DEBUG"))
+         fprintf(stderr,
+                 "parhelia: blit CPU fallback could not map src=%p dst=%p\n",
+                 (void *)src, (void *)dst);
       goto out;
+   }
    if (!zs)
       for (int y = 0; y < sb.height; y++)
          util_format_unpack_rgba(sf, pixels + (size_t)y * sb.width * 4,
@@ -6625,22 +6654,27 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
       const int wy = db.y + y;
 
       if (zs) {
+         /* A D16 word carries no stencil, so the Z/S split does not apply. */
+         const unsigned zcpp = util_format_get_blocksize(sf);
+
          for (int x = 0; x < db.width; x++) {
             const float fx = ((flip_x ? db.width - 1 - x : x) + 0.5f) *
                              sb.width / db.width - 0.5f;
             const int sx = CLAMP((int)lroundf(fx), 0, sb.width - 1);
             const int sy = CLAMP((int)lroundf(fy), 0, sb.height - 1);
-            uint32_t in, old;
+            uint32_t in = 0, old = 0;
 
-            memcpy(&in, src + (size_t)sy * st->stride + sx * 4, 4);
-            memcpy(&old, out + x * 4, 4);
-            if (mask != PIPE_MASK_ZS)
+            memcpy(&in, src + (size_t)sy * st->stride + sx * zcpp, zcpp);
+            memcpy(&old, out + x * zcpp, zcpp);
+            if (zcpp == 4 && mask != PIPE_MASK_ZS)
                in = (mask & PIPE_MASK_Z) ? (in & 0x00ffffffu) | (old & 0xff000000u) :
                                            (in & 0xff000000u) | (old & 0x00ffffffu);
+            else if (zcpp == 2 && !(mask & PIPE_MASK_Z))
+               in = old;
             if (!info->scissor_enable ||
                 (db.x + x >= info->scissor.minx && db.x + x < info->scissor.maxx &&
                  wy >= info->scissor.miny && wy < info->scissor.maxy))
-               memcpy(out + x * 4, &in, 4);
+               memcpy(out + x * zcpp, &in, zcpp);
          }
          continue;
       }
@@ -7040,10 +7074,9 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
                                           cpp,
                                           ph_screen(r->base.screen)->chip_id,
                                           r->tile_layout) :
-                                       p3d_tile_offset_layout(box->x + x,
-                                                              box->y + y,
-                                                              r->stride,
-                                                              r->tile_layout)),
+                                       p3d_tile_offset_layout_cpp(
+                                          box->x + x, box->y + y, r->stride,
+                                          r->tile_layout, r->cpp)),
                                       swap_rb, cpp);
       }
    } else if (usage & PIPE_MAP_READ) {
@@ -7111,10 +7144,10 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
                                           r->base.width0, cpp), cpp,
                                        ph_screen(r->base.screen)->chip_id,
                                        r->tile_layout)) :
-                                   p3d_tile_offset_layout(transfer->box.x + x,
-                                                          transfer->box.y + y,
-                                                          r->stride,
-                                                          r->tile_layout)),
+                                   p3d_tile_offset_layout_cpp(
+                                      transfer->box.x + x,
+                                      transfer->box.y + y, r->stride,
+                                      r->tile_layout, r->cpp)),
                                     (uint8_t *)t->staging +
                                        y * transfer->stride + x * cpp, swap_rb, cpp);
       }

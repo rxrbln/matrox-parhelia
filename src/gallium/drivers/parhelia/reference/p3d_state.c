@@ -209,13 +209,22 @@ p3d_tex_wrap(const struct p3d_texture *t)
 	       (((uint32_t)t->wrap_t & 7u) << 3);
 }
 
-/* one byte per channel; a disabled channel is zero */
+/* One byte per channel, or the 5:6:5 fields of a 16 bpp target replicated
+ * into both halves of the masked word; a disabled channel is zero. */
 static uint32_t
 p3d_colour_mask(const struct p3d_state *st)
 {
+	uint32_t mask;
+
 	if (!st->mask_explicit &&
 	    !st->mask_r && !st->mask_g && !st->mask_b && !st->mask_a)
 		return 0xffffffffu;	/* nothing set = all channels on */
+	if (st->colour.fmt == 0x28) {
+		mask = (st->mask_b ? 0x001fu : 0u) |
+		       (st->mask_g ? 0x07e0u : 0u) |
+		       (st->mask_r ? 0xf800u : 0u);
+		return mask | mask << 16;
+	}
 	return (st->mask_b ? 0x000000ffu : 0u) |
 	       (st->mask_g ? 0x0000ff00u : 0u) |
 	       (st->mask_r ? 0x00ff0000u : 0u) |

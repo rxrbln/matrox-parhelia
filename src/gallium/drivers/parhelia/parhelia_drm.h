@@ -85,7 +85,10 @@ struct drm_parhelia_create_render {
 	__u32 flags;
 	__u32 handle; /* out */
 	__u32 pitch; /* out: bytes, tile width aligned */
-	__u32 pad;
+	/* Bytes per pixel: 0 and 4 are the 32-bit formats, 2 selects R5G6B5
+	 * colour or D16 depth.  A 4096-byte tile holds 128x16 pixels at two
+	 * bytes instead of 64x16, so the pitch aligns to 128 pixels. */
+	__u32 cpp;
 	__u64 size;  /* out: allocation bytes */
 	__u64 mmap_offset; /* out: DRM file mmap offset, NOT a GPU address */
 };

@@ -361,12 +361,33 @@ parhelia_batch_blit(struct parhelia_batch *batch,
                     unsigned src_type, unsigned src_x, unsigned src_y,
                     unsigned width, unsigned height)
 {
+   return parhelia_batch_blit_format(batch, dst_handle, dst_pitch, 0x32,
+                                     dst_type, dst_x, dst_y, src_handle,
+                                     src_pitch, 0x32, src_type, src_x, src_y,
+                                     width, height);
+}
+
+int
+parhelia_batch_blit_format(struct parhelia_batch *batch,
+                           uint32_t dst_handle, unsigned dst_pitch,
+                           unsigned dst_format, unsigned dst_type,
+                           unsigned dst_x, unsigned dst_y,
+                           uint32_t src_handle, unsigned src_pitch,
+                           unsigned src_format, unsigned src_type,
+                           unsigned src_x, unsigned src_y,
+                           unsigned width, unsigned height)
+{
    struct p3d_reloc calls[PH_BATCH_PACKETS];
    uint32_t ring[PH_BATCH_PACKETS * 5];
    struct p3d_cs cs;
-   struct p3d_surface dst = {.pitch = dst_pitch, .fmt = 0x32};
-   struct p3d_surface src = {.pitch = src_pitch, .fmt = 0x32};
+   struct p3d_surface dst = {.pitch = dst_pitch, .fmt = dst_format};
+   struct p3d_surface src = {.pitch = src_pitch, .fmt = src_format};
 
+   /* Both ends move the same bytes per pixel; the BITBLT does not convert. */
+   if (!p3d_surface_format_bytes(dst_format) ||
+       p3d_surface_format_bytes(dst_format) !=
+       p3d_surface_format_bytes(src_format))
+      return -EINVAL;
    if (!batch || !dst_handle || !src_handle || !width || !height ||
        dst_type < 1 || dst_type > 2 || src_type < 1 || src_type > 2 ||
        !dst_pitch || dst_pitch > 0x3fff ||
@@ -568,9 +589,13 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
        (input->transform && (!input->mvp || !input->const_loader_entry)) ||
        input->base_reg_entry ||
        (input->bound_ranges && input->prim != P3D_TRIANGLES) ||
+       /* The two surface slots carry independent pitches; a 16 bpp colour
+        * target aligns to 128 pixels where a 32 bpp depth one aligns to 64,
+        * so they need not agree. */
        (input->has_depth && (!depth_handle || input->depth.base ||
          (input->depth.fmt != 0x36 && input->depth.fmt != 0x2a) ||
-         input->depth.pitch != input->colour.pitch ||
+         input->depth.pitch < input->screen_w ||
+         (input->depth.pitch & 63) || input->depth.pitch > 0x3fff ||
          input->depth_slot > 1)))
       return -EINVAL;
    per_packet = input->vertices_per_packet ? input->vertices_per_packet :
