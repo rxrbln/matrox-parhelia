@@ -184,7 +184,8 @@ struct p3d_surface {
 				 * live vendor context, a raw address cold */
 	uint32_t pitch;		/* pixels */
 	uint32_t fmt;		/* 0x32 = A8R8G8B8, 0x36 = S8Z24,
-				 * 0x28 = R5G6B5, 0x2a = D16 */
+				 * 0x28 = R5G6B5, 0x2a = D16,
+				 * 0x34 = A2R10G10B10 (GigaColor) */
 };
 
 /* Bytes per pixel of a surface format code, zero when the code is not one
@@ -194,6 +195,7 @@ static inline unsigned p3d_surface_format_bytes(uint32_t fmt)
 {
 	switch (fmt) {
 	case 0x32: return 4;	/* A8R8G8B8 colour */
+	case 0x34: return 4;	/* A2R10G10B10 colour, GigaColor */
 	case 0x36: return 4;	/* S8Z24 depth */
 	case 0x28: return 2;	/* R5G6B5 colour */
 	case 0x2a: return 2;	/* D16 depth */

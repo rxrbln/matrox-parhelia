@@ -100,6 +100,20 @@ p3d_blendctl(const struct p3d_state *st)
 	if (st->blend && (eq == P3D_BEQ_MIN || eq == P3D_BEQ_MAX))
 		s = d = P3D_BF_ONE;
 
+	/* A target with more than eight bits per component takes BOTH dither bits
+	 * low, which is a third state distinct from "dither off".  The vendor
+	 * gate is mtx2480 .text+0x12a67: internal render-target formats 0x0f
+	 * (A2B10G10R10), 0x10 (A2R10G10B10) and 0x1e (L16) jump to 0x137a0,
+	 * which clears bit 23 and falls into the bit-24 clear; every other format
+	 * sets bit 23 and lets the request choose bit 24. */
+	if (st->colour.fmt == 0x34)
+		return (st->blend ? 1u : 0u) |
+		       ((uint32_t)(s.rgb & 0xf) << 1) |
+		       ((uint32_t)(d.rgb & 0xf) << 5) |
+		       ((uint32_t)(s.a   & 0xf) << 9) |
+		       ((uint32_t)(d.a   & 0xf) << 13) |
+		       (eq << 17) | (eq << 20);
+
 	return (st->blend ? 1u : 0u) |
 	       ((uint32_t)(s.rgb & 0xf) << 1) | ((uint32_t)(d.rgb & 0xf) << 5) |
 	       ((uint32_t)(s.a   & 0xf) << 9) | ((uint32_t)(d.a   & 0xf) << 13) |
@@ -226,8 +240,13 @@ p3d_tex_wrap(const struct p3d_texture *t)
 	       (((uint32_t)t->wrap_r & 7u) << 6);
 }
 
-/* One byte per channel, or the 5:6:5 fields of a 16 bpp target replicated
- * into both halves of the masked word; a disabled channel is zero. */
+/* One byte per channel, the 5:6:5 fields of a 16 bpp target replicated into
+ * both halves of the masked word, or the 2:10:10:10 fields of a GigaColor
+ * target; a disabled channel is zero.  PLNWT masks the stored word, so the
+ * field boundaries are the surface format's, not the 8-bit ones: the vendor's
+ * own replicate helper (MTXPARD 0x9b320, Linux mtx3347 @0xffc0) passes a
+ * four-byte surface's mask through verbatim and leaves the channel split to
+ * the caller. */
 static uint32_t
 p3d_colour_mask(const struct p3d_state *st)
 {
@@ -236,6 +255,11 @@ p3d_colour_mask(const struct p3d_state *st)
 	if (!st->mask_explicit &&
 	    !st->mask_r && !st->mask_g && !st->mask_b && !st->mask_a)
 		return 0xffffffffu;	/* nothing set = all channels on */
+	if (st->colour.fmt == 0x34)
+		return (st->mask_a ? 0xc0000000u : 0u) |
+		       (st->mask_r ? 0x3ff00000u : 0u) |
+		       (st->mask_g ? 0x000ffc00u : 0u) |
+		       (st->mask_b ? 0x000003ffu : 0u);
 	if (st->colour.fmt == 0x28) {
 		mask = (st->mask_b ? 0x001fu : 0u) |
 		       (st->mask_g ? 0x07e0u : 0u) |

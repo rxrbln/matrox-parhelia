@@ -161,6 +161,14 @@ ph_sampler_format(enum pipe_format format, struct ph_sampler_format *out)
    case PIPE_FORMAT_L8_UNORM:
       native = (struct ph_sampler_format){ 0x11, 1 };
       break;
+   /* GigaColor, 2:10:10:10.  The record table gives internal formats 0x0f and
+    * 0x10 the same hardware code 0x34 for the sampler variants (usage 2 and 3)
+    * and for the render target (usage 1); the two differ only in the channel
+    * order the vendor's converter produces, not in the descriptor.  See
+    * docs/parhelia-p690-gigacolor-10bit.md. */
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+      native = (struct ph_sampler_format){ 0x34, 4 };
+      break;
    /* S3TC: DXT1 RGB and RGBA share code 0x08, the endpoint order inside each
     * BC1 block selects punch-through alpha (MTXPARD.dll 0x83f80 maps the
     * FOURCCs, mtx1646 builds the records at .text+0x7e813 and following). */
@@ -204,6 +212,9 @@ ph_target_format(enum pipe_format format, uint32_t *code, unsigned *cpp)
    case PIPE_FORMAT_B5G6R5_UNORM:
       c = 0x28; b = 2;
       break;
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+      c = 0x34;
+      break;
    case PIPE_FORMAT_Z16_UNORM:
       c = 0x2a; b = 2;
       break;
@@ -223,6 +234,29 @@ ph_target_format(enum pipe_format format, uint32_t *code, unsigned *cpp)
    if (cpp)
       *cpp = b;
    return native;
+}
+
+/* Native 2:10:10:10 sampling.  A ten-bit texel is four bytes, so the image
+ * would share the measured 32-bit storage order and the kernel's ordinary
+ * texture allocation; only the descriptor's format field differs, and the
+ * vendor record table gives sampler and render target the same code 0x34
+ * (docs/parhelia-p690-gigacolor-10bit.md §1).
+ *
+ * It stays OFF by default: the address unit's acceptance of code 0x34 has not
+ * been read back from this silicon, and a descriptor it rejects stops the
+ * engine retiring rather than failing the draw - storage order 0 with code
+ * 0x34 wedged the P690 and cost a reboot.  PARHELIA_GIGACOLOR=1 opts in for
+ * `parhelia-drm-test --gigacolor-texture-probe` follow-up work.  There is no
+ * screen flag because nothing but the format field is negotiated with the
+ * kernel. */
+static bool
+ph_gigacolor_sampler(const struct pipe_screen *s)
+{
+   const struct parhelia_screen *ps = ph_screen((struct pipe_screen *)s);
+
+   return ps->texture_upload &&
+          p3d_texture_uses_native_64x16(ps->chip_id, ps->tile_layout, 4) &&
+          ph_env("PARHELIA_GIGACOLOR");
 }
 
 static bool
@@ -289,6 +323,32 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
                                   PIPE_BIND_SCANOUT |
                                   PIPE_BIND_DISPLAY_TARGET |
                                   PIPE_BIND_SHARED));
+            break;
+         case PIPE_FORMAT_B10G10R10A2_UNORM:
+            /* GigaColor as a sampler image, code 0x34 in the ordinary 32-bit
+             * storage order; opt-in only, see ph_gigacolor_sampler().  It is
+             * never a render target: the shared batch builder validates the
+             * colour surface code against the two formats it drives, so a
+             * ten-bit colour slot has no production path. */
+            supported = ph_gigacolor_sampler(s) &&
+                        (bind & PIPE_BIND_SAMPLER_VIEW) &&
+                        !(bind & (PIPE_BIND_RENDER_TARGET |
+                                  PIPE_BIND_DEPTH_STENCIL |
+                                  PIPE_BIND_SCANOUT |
+                                  PIPE_BIND_DISPLAY_TARGET |
+                                  PIPE_BIND_SHARED));
+            break;
+         case PIPE_FORMAT_R10G10B10A2_UNORM:
+         case PIPE_FORMAT_R10G10B10X2_UNORM:
+         case PIPE_FORMAT_A2R10G10B10_UNORM:
+         case PIPE_FORMAT_A2B10G10R10_UNORM:
+            /* The other 10-bit packings are four bytes wide, so the default
+             * arm below used to accept them, and both the sampler and the
+             * colour output then read the word as 8:8:8:8 and delivered the
+             * wrong channels.  The hardware has one 10-bit word,
+             * A[31:30] R[29:20] G[19:10] B[9:0], which is
+             * B10G10R10A2_UNORM; refusing the rest makes the state tracker
+             * choose that one for GL_RGB10_A2 and GL_RGB10. */
             break;
          case PIPE_FORMAT_B5G5R5A1_UNORM:
          case PIPE_FORMAT_B4G4R4A4_UNORM:
