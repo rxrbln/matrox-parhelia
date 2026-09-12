@@ -261,6 +261,44 @@ pixel runs at 655, so the frame is bound by the colour and depth traffic,
 not by texture reads.  **Cutting bytes per pixel is the only remaining
 route**: 16-bit colour and a 16-bit depth buffer halve both streams.
 
+## 16-bit rendering is what moved the frame (2026-09-12)
+
+The frame is bound by colour and depth traffic, so halving both is the only
+change that attacked the real constraint.  Fill rates, 1280x1024:
+
+| case | 32-bit | 16-bit |
+|---|---:|---:|
+| 2-D fill | 479.5 | **771.3** Mpixel/s |
+| Z LEQUAL + write | 304.8 | **516.7** |
+| blend | 302.5 | **503.4** |
+| textured bilinear, depth test and write | 262.1 | **343.9** |
+
+Colour `R5G6B5` is surface code `0x28` and depth `D16` is `0x2a`; a 16 bpp
+target keeps the 4 KiB tile and doubles it to 128x16 pixels, with a bit
+assignment that is not the 32 bpp one shifted down.
+
+A 16-bit visual at first ran *slower* than 24-bit (29.0 against 31.9 fps)
+because every alpha route was gated on a 32-bit colour target and Z24, so
+Quake 3's alpha surfaces fell back and the triangle count tripled.  With
+each route re-measured at 5:6:5/Z16 against its 32-bit reference and the
+gates opened, the same demo frames run through the same routes on half the
+traffic: **55.1 fps with glamor, 50.1 without**, against 35.3 and 32.0 at
+depth 24.
+
+The **hardware depth clear** (`PARHELIA_ZINIT_CLEAR=1`) then removed the
+per-frame clear: a 1280x1024 Z16 clear costs 0.01 ms instead of 1.69 ms, and
+per-frame clear coverage falls from 1.34 Mpixel to 0.03.  Quake 3 reached
+**62.7 fps (15.9 ms)** in that agent's configuration - 1280x1024 display,
+CPU governor `performance`.  Small scissored depth clears have to go through
+the depth pipe as well, or an armed surface forces a full resolve every
+frame and gives most of the gain back.
+
+**Caution on all figures of that day:** independent runs reported 47 to
+57 fps for the same tree depending on the display mode, the X depth, the CPU
+governor and whether another agent was rebooting the target.  Measure
+single-occupant, state the configuration, and prefer an A/B inside one
+window over comparing numbers across runs.
+
 ## Assessment of the 60 fps goal
 
 A textured, depth-writing pixel costs ~16 bytes of memory traffic split over
