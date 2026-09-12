@@ -37,6 +37,7 @@ Evidence tags used throughout:
 | program store, entry token, load sequence | PROVEN(hw) |
 | constant upload via the loader program | PROVEN(hw) — the kernel reads all 11 vectors back |
 | branch / control class (0x23, 0x46, imm32) | PROVEN(hw) inside the loader only; not re-encodable yet |
+| the C encoder and program builder | PROVEN(enc): reproduces six kernel programs dword for dword |
 | relative addressing (`a0`, base registers b0..b3) | PROVEN(hw) inside the loader; base register *values* OPEN |
 
 ---
@@ -502,8 +503,10 @@ tokens are computed exactly as in §1.
 A render-node client's program executes on the vertex engine with full
 access to the constant/block-state file, so the validator is a whitelist:
 
-* the program must contain `END` within its word count, and nothing after
-  the `END`+1 padding word is executed;
+* the program must contain `END` **and at least one word after it**: the
+  fetch unit reads bundles in pairs, so a program ending exactly at the slot
+  boundary would execute whatever the previous tenant left.  The rest of the
+  slot is cleared on every upload for the same reason;
 * primary opcode must be one of the arithmetic opcodes of §4.1 with
   `f2b = 1`, or the exact `END`/`NOP`/`wra` templates.  **The control class
   (`op < 0x60`) is rejected**: no branches, hence no loops, hence no way to
@@ -524,7 +527,19 @@ Constant *reads* are allowed.  They can observe another context's
 constants, which is the same exposure the shared engine state already has;
 they cannot be used to fetch memory.
 
-### 9.3 Entry-register enforcement
+### 9.3 The encoder in the driver
+
+`reference/p3d_warp.c` implements the encoder of section 2 and a builder for
+the fixed-function shapes.  `warp_build_selftest` in `parhelia_drm_test.c`
+requires it to reproduce six of the programs above **dword for dword**:
+passthrough, textured, textured multitexture, replace, transform and
+transform-with-lighting.  All six match, so the field assignment, the opcode
+values, the literal swizzle codes and the shared-swizzle ownership rule are
+confirmed by construction, not only by reading.
+
+`parhelia_vs_compile.c` is the NIR front end on top of it.
+
+### 9.4 Entry-register enforcement
 
 Independently of the upload path, `parhelia_validate_reglist()` now rejects
 writes to reglist index 0x40 / 0x41 (`0x1100` / `0x1104`) whose value is not
