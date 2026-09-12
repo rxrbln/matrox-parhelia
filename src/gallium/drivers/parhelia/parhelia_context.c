@@ -3704,13 +3704,16 @@ ph_submit_vertices(struct ph_context *ctx)
 	state.transform = ctx->transform;
 	if (state.transform) {
 		/* A compiled program brings its own block at c0 and names the
-		 * slots its viewport pair sits in. */
+		 * slots its viewport pair sits in.  mvp stays set either way:
+		 * the batch does transform with that matrix, the builder
+		 * requires a transforming batch to name one, and
+		 * p3d_emit_constant_group() emits the program's own block in
+		 * preference to it. */
+		state.mvp = ctx->mvp;
 		if (ctx->warp_program_entry) {
 			state.vs_const = ctx->vs_const;
 			state.vs_const_vec4s = ctx->vs_const_vec4s;
 			state.vp_slot = ctx->vp_slot;
-		} else {
-			state.mvp = ctx->mvp;
 		}
 		state.const_loader_entry = ctx->warp_constant_loader;
 		for (unsigned i = 0; i < 3; i++) {
@@ -5185,11 +5188,15 @@ ph_vs_analyze(nir_shader *nir, struct ph_vs *vs, bool relaxed)
                   }
                   vec4 = b->value / 16u;
                } else {
-                  if (b->value || nir_intrinsic_component(in)) {
+                  /* load_ubo_vec4's index is base plus the offset source.
+                   * GLSL puts it in the source and leaves the base zero, so
+                   * reading only the base refuses every GLSL shader. */
+                  if (nir_intrinsic_component(in) ||
+                      b->value > (1u << 16)) {
                      bad = true;
                      break;
                   }
-                  vec4 = nir_intrinsic_base(in);
+                  vec4 = nir_intrinsic_base(in) + b->value;
                }
                /* Bound it: the row arithmetic below would otherwise wrap. */
                if (vec4 > (1u << 16)) {

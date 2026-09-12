@@ -273,11 +273,14 @@ ph_vs_uniform_slot(const nir_intrinsic_instr *load, unsigned *vec4,
       offset = nir_intrinsic_base(load) + nir_src_as_uint(load->src[0]) * 16u;
       break;
    case nir_intrinsic_load_ubo_vec4:
+      /* The vec4 index is the sum of the base and the offset source: GLSL
+       * puts it in the source with base zero, so reading only the base
+       * refuses every real shader. */
       if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
-          !nir_src_is_const(load->src[1]) || nir_src_as_uint(load->src[1]))
+          !nir_src_is_const(load->src[1]))
          return false;
-      offset = nir_intrinsic_base(load) * 16u +
-               nir_intrinsic_component(load) * 4u;
+      offset = (nir_intrinsic_base(load) + nir_src_as_uint(load->src[1])) *
+                  16u + nir_intrinsic_component(load) * 4u;
       break;
    default:
       return false;
@@ -587,7 +590,10 @@ ph_vs_alu(struct ph_vs_ctx *ctx, const nir_alu_instr *alu,
       count = 2;
       break;
    }
-   case nir_op_fmin: op = P3D_WARP_MIN; count = 2; break;
+   /* fmin is deliberately absent: hardware refutes 0x61 as a componentwise
+    * minimum (scene 2 of parhelia-gl-vs-test differed on every pixel of the
+    * quad while every other scene was bit-identical, and scene 3 proves 0x62
+    * is a real maximum).  clamp() and min() therefore keep the draw module. */
    case nir_op_fmax: op = P3D_WARP_MAX; count = 2; break;
    case nir_op_ffma: op = P3D_WARP_MAD; count = 3; break;
    case nir_op_fdot2:
@@ -625,7 +631,6 @@ ph_vs_component_op(const nir_def *def, uint8_t *op, unsigned *count)
    case nir_op_fdot3: *op = P3D_WARP_DP3; *count = 2; break;
    case nir_op_fmul:  *op = P3D_WARP_MUL; *count = 2; break;
    case nir_op_fadd:  *op = P3D_WARP_ADD; *count = 2; break;
-   case nir_op_fmin:  *op = P3D_WARP_MIN; *count = 2; break;
    case nir_op_fmax:  *op = P3D_WARP_MAX; *count = 2; break;
    default:
       return false;
@@ -911,7 +916,10 @@ ph_vs_output_direct(struct ph_vs_ctx *ctx, nir_def *def, unsigned slot)
       return false;
    switch (alu->op) {
    case nir_op_fmul: op = P3D_WARP_MUL; count = 2; break;
-   case nir_op_fmin: op = P3D_WARP_MIN; count = 2; break;
+   /* fmin is deliberately absent: hardware refutes 0x61 as a componentwise
+    * minimum (scene 2 of parhelia-gl-vs-test differed on every pixel of the
+    * quad while every other scene was bit-identical, and scene 3 proves 0x62
+    * is a real maximum).  clamp() and min() therefore keep the draw module. */
    case nir_op_fmax: op = P3D_WARP_MAX; count = 2; break;
    case nir_op_ffma: op = P3D_WARP_MAD; count = 3; break;
    case nir_op_fadd:
