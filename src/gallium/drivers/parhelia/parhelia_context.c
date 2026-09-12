@@ -4437,12 +4437,18 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 			const struct parhelia_resource *texture =
 			   ph_resource(ctx->sampler_views[0]->texture);
 			const float *tc = prim->v[v]->data[texcoord];
+			/* Scale by the companion actually allocated, not by a
+			 * recomputed padding extent: the two disagree whenever
+			 * the companion was built unpadded, and the alpha is
+			 * then sampled over the wrong extent - which reads as
+			 * half a sprite missing rather than as a wrong
+			 * texture. */
 			float scale_s = ph_alpha_companion_scale(
 			   texture->base.width0,
-			   ph_alpha_companion_extent(texture->base.width0));
+			   texture->alpha_companion_width);
 			float scale_t = ph_alpha_companion_scale(
 			   texture->base.height0,
-			   ph_alpha_companion_extent(texture->base.height0));
+			   texture->alpha_companion_height);
 
 			*dst++ = p[0];
 			*dst++ = p[1];
