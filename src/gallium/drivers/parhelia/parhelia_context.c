@@ -3762,6 +3762,13 @@ ph_submit_vertices(struct ph_context *ctx)
    /* The LX guard-band clamp is not on by default: it is a proven vendor
     * value whose effect on this driver's state stream is still being
     * measured (PARHELIA_LX_GUARD_BAND=1). */
+   /* 0x11e8, the global texture-cache partition latch.  The production path
+    * writes zero while the fill probes use 0x00500000 and the vendor writes
+    * 0x100000; measured in the ioquake3 timedemo, all three are within noise
+    * of each other (66.5 / 66.6 / 66.9 fps), so zero stays and the knob is
+    * here for the next attempt at decoding the register. */
+   state.texture_cache_probe = ph_env("PARHELIA_TEX_CACHE") ?
+      (uint32_t)strtoul(getenv("PARHELIA_TEX_CACHE"), NULL, 0) : 0;
    state.lx_family = ph_env("PARHELIA_LX_GUARD_BAND") &&
       ph_lx_family(ph_screen(ctx->base.screen)->chip_id);
    state.lx_pipe_route = ph_screen(ctx->base.screen)->chip_id == 0x2539 &&
