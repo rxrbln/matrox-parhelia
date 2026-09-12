@@ -545,6 +545,14 @@ code uploaded to a fresh slot drew the blue it should.  Draining the queue
 and waiting for the WARP gate does not help, and neither does toggling the
 program-source selector `0x920` bit 0 around the write.
 
+**This bites anyone editing a kernel WARP program.**  The resident heap is a
+`dmam_alloc_coherent()` allocation, and a module reload can land it at the
+same bus address, which makes the entry tokens identical.  Change a program,
+rebuild, reload without rebooting, and the engine may keep executing the
+previous image - an experiment that looks like the edit had no effect, or
+like the hardware behaves inconsistently between runs.  Reboot between
+program edits, or check that the entry the kernel prints has changed.
+
 The vendor avoids the problem structurally: its heap is carved into 682
 single-use slots of 128 instructions.  This driver does the same in
 miniature - a slot holds two program images and an upload always lands on
