@@ -116,13 +116,46 @@ ph_dxt_level_size(unsigned width, unsigned height, unsigned block_bytes)
                        (ph_mip_align(height, rows) / 4) * block_bytes, align);
 }
 
-/* Bytes a tiled level of @rows rows occupies.  Its tiles are the linear texel
- * index over the pitch divided by the 64-texel tile width, so the level holds
- * the tiles its last row reaches; a pitch that is not a multiple of 64 leaves
- * the last tile of each row band shared with the next.  For a pitch that is a
- * multiple of 64 this is exactly pitch * rows * cpp. */
+/* Bytes a tiled level of @rows rows occupies, that is where the hardware puts
+ * the next level: the descriptor carries one base and derives every level
+ * itself.  A level ends where its next row band would start - whole tiles
+ * plus, when that band begins mid-tile, only the 512-byte granule the x5
+ * parity bit leaves free there, because the following level's own parity puts
+ * it in the half-tile this level does not use.  Rounding up to a whole tile
+ * instead displaces every level from 1 on whenever the pitch is not a
+ * multiple of 64.  Measured with parhelia-drm-test --mip-address-probe over
+ * pitches 64/96/128/160/224 and heights 16/32/40/48/64: all 25 agree.  For a
+ * pitch that is a multiple of 64 this is exactly pitch * rows * cpp. */
 static inline size_t
 ph_tiled_level_bytes(unsigned pitch, unsigned rows, unsigned tile_h,
+                     size_t tile_bytes)
+{
+   const unsigned trows = rows >= tile_h ? rows / tile_h : 1u;
+   const size_t texels = (size_t)trows * pitch;
+
+   return texels / 64 * tile_bytes + (texels % 64 ? tile_bytes / 8 : 0);
+}
+
+/* Byte offset of half tile @h and back.  The two 32-column halves of a 64x16
+ * tile interleave every 512 bytes, so a half tile is not contiguous and only
+ * this index advances linearly across a chain. */
+static inline size_t
+ph_half_to_byte(size_t h)
+{
+   return (h >> 1) * 4096 + (h & 1) * 512;
+}
+
+static inline size_t
+ph_byte_to_half(size_t bytes)
+{
+   return (bytes >> 12) * 2 + ((bytes >> 9) & 1);
+}
+
+/* Storage a tiled level actually reaches.  Its last band spills into the
+ * half-tile the next level occupies, so the allocation must cover whole tiles
+ * even though the next level starts earlier. */
+static inline size_t
+ph_tiled_level_reach(unsigned pitch, unsigned rows, unsigned tile_h,
                      size_t tile_bytes)
 {
    const unsigned trows = rows >= tile_h ? rows / tile_h : 1u;
@@ -167,7 +200,12 @@ ph_mip_layout_init_cpp(struct ph_mip_layout *out, unsigned width,
                        unsigned height, unsigned requested_levels, bool tiled,
                        bool p690, unsigned cpp)
 {
-   size_t next = 0, tail_base = 0;
+   size_t next = 0, tail_base = 0, reach = 0, next_half = 0;
+   /* The P690 32-bit chain advances in half tiles: a level begins where the
+    * previous one ends, which is a whole tile only when its row bands happen
+    * to end on one.  Measured over pitches 64..224 and heights 16..65 with
+    * parhelia-drm-test --mip-address-probe. */
+   const bool halves = p690 && tiled && cpp == 4;
    unsigned tail = 0, tail_shift = 0;
    bool tail_started = false;
 
@@ -181,7 +219,7 @@ ph_mip_layout_init_cpp(struct ph_mip_layout *out, unsigned width,
 
    for (unsigned i = 0; i < requested_levels; i++) {
       struct ph_mip_level *level = &out->level[i];
-      unsigned pitch, rows, level_align;
+      unsigned pitch, rows, level_align, pack_align;
       size_t bytes = (size_t)32 * (tiled ? 32 : 16) * cpp;
 
       level->width = width;
@@ -194,12 +232,21 @@ ph_mip_layout_init_cpp(struct ph_mip_layout *out, unsigned width,
       pitch = pitch < 32 ? 32 : pitch;
       level->pitch = pitch;
       level_align = tiled ? 0x1000 : 0x40;
+      /* A level begins exactly where the previous one ends: the measured
+       * bases of 96x40 and 129x65 advance by the level size alone, with no
+       * tile rounding, which would swallow the 512-byte granule a mid-tile
+       * row band leaves.  Only the shared tail block starts on a whole
+       * tile. */
+      pack_align = p690 && tiled && cpp == 4 ? 0x200u : level_align;
 
       if ((width <= 16 || (p690 && tiled && width <= 32)) && height <= 16) {
          unsigned x = 0, y = 0;
 
          if (!tail_started) {
-            tail_base = ph_mip_align((unsigned)next, level_align);
+            tail_base = halves ? ph_half_to_byte(next_half) :
+                        ph_mip_align((unsigned)next, level_align);
+            /* The shared tail block is one whole 64x16 tile. */
+            next_half += 2;
             next = tail_base + bytes;
             tail_started = true;
          }
@@ -214,26 +261,37 @@ ph_mip_layout_init_cpp(struct ph_mip_layout *out, unsigned width,
          level->tail_x = width > 16 ? 0 : x + tail_shift;
          level->tail_y = y;
       } else {
+         /* Every P690 level quantises to 16 rows, at a 32-texel pitch too:
+          * the 24x10 level of 96x40 is followed 0x800 bytes on, one 32x16
+          * block, not the 32-row 0x1000 the 64x32 orders reserve. */
          rows = !tiled ? height :
-                p690 && pitch >= 64 ? ph_mip_align(height, 16) :
-                ph_mip_align(height, 32);
+                p690 ? ph_mip_align(height, 16) : ph_mip_align(height, 32);
          bytes = (size_t)pitch * rows * cpp;
          /* A 32-texel pitch addresses 32x16-texel 2 KiB blocks row-major and
           * needs no such correction; the 64-wide tile orders do. */
-         if (tiled && pitch >= 64)
-            bytes = ph_tiled_level_bytes(pitch, rows,
-                                         p690 && cpp == 4 ? 16u : 32u,
-                                         p690 && cpp == 4 ? 4096u :
-                                                            2048u * cpp);
-         level->offset = ph_mip_align((unsigned)next, level_align);
+         if (tiled && !halves && pitch >= 64)
+            bytes = ph_tiled_level_bytes(pitch, rows, 32u, 2048u * cpp);
+         if (halves) {
+            level->offset = ph_half_to_byte(next_half);
+            next_half += (size_t)(rows / 16) * (pitch / 32);
+            bytes = ph_half_to_byte(next_half) - level->offset;
+         } else {
+            level->offset = ph_mip_align((unsigned)next, pack_align);
+         }
          next = level->offset + bytes;
       }
       level->bytes = bytes;
+      /* A level's last band spills into the half tile the next level starts
+       * in, so the allocation covers whole tiles either way. */
+      if (halves && (next_half + 1) / 2 * 4096 > reach)
+         reach = (next_half + 1) / 2 * 4096;
+      if (next > reach)
+         reach = next;
 
       width = width > 1 ? width >> 1 : 1;
       height = height > 1 ? height >> 1 : 1;
    }
-   out->size = ph_mip_align((unsigned)next, tiled ? 0x2000 : 0x200);
+   out->size = ph_mip_align((unsigned)reach, tiled ? 0x2000 : 0x200);
    return out->size != 0;
 }
 

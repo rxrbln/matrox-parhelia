@@ -833,6 +833,8 @@ uint32_t p3d_texture_tile_offset_cpp(uint32_t x, uint32_t y, uint32_t pitch,
 /* P690 32-bit texture sampling order; differs from the 64x16 render-target
  * order in y bits 0 and 1. */
 uint32_t p3d_texture_tile_offset_64x16(uint32_t x, uint32_t y, uint32_t pitch);
+uint32_t p3d_texture_tile_offset_64x16_at(uint32_t base, uint32_t x, uint32_t y,
+					  uint32_t pitch);
 /* The measured P690 order for 8- and 16-bit textures. */
 uint32_t p3d_texture_tile_offset_p690_narrow(uint32_t x, uint32_t y,
 					     uint32_t pitch, unsigned cpp);

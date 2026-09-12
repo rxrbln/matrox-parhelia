@@ -240,6 +240,37 @@ p3d_texture_tile_offset_cpp(uint32_t x, uint32_t y, uint32_t pitch,
  * dword-index bit 6 and y bit 1 in bit 3: the render-target order with
  * those two bits exchanged.  Sampling tests validated this order; the
  * 3-D and 2D engines write the one in p3d_tile_offset_layout(). */
+/* A 64x16 tile is two 32-column halves that interleave every 512 bytes, and
+ * the x5 parity bit selects between them, so the natural unit of the chain is
+ * the 32x16-texel half tile: level N+1 begins at the half tile where level N
+ * ends, which need not be a whole tile.  @base is the level's byte offset and
+ * carries its half index in bit 9; adding it to a tile offset that has its own
+ * half bit instead carries into the tile field and collides two texels.
+ * Measured with --mip-address-probe: the level 1 of 96x40 lands at 0x4200 and
+ * its texels (32,0) and (0,16) at 0x5000 and 0x6000, three half tiles on. */
+uint32_t
+p3d_texture_tile_offset_64x16_at(uint32_t base, uint32_t x, uint32_t y,
+				 uint32_t pitch)
+{
+	uint32_t trow = y / 16;
+	uint32_t half = ((base >> 12) << 1) + ((base >> 9) & 1) +
+			(((trow * pitch + x) >> 6) << 1) +
+			(((x >> 5) ^ trow) & 1);
+	uint32_t ix = x % 32u, iy = y % 16;
+	uint32_t i;
+
+	i =  ( ix        & 1)       |
+	     ((ix >> 1)  & 1) << 1  |
+	     ((ix >> 2)  & 1) << 2  |
+	     ((iy >> 1)  & 1) << 3  |
+	     ((ix >> 3)  & 1) << 4  |
+	     ((ix >> 4)  & 1) << 5  |
+	     ( iy        & 1) << 6  |
+	     ((iy >> 2)  & 1) << 8  |
+	     ((iy >> 3)  & 1) << 9;
+	return (half >> 1) * 4096 + (half & 1) * 512 + i * 4;
+}
+
 uint32_t
 p3d_texture_tile_offset_64x16(uint32_t x, uint32_t y, uint32_t pitch)
 {

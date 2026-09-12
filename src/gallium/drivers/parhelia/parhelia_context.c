@@ -144,11 +144,12 @@ ph_mip_texel_offset(const struct ph_mip_layout *mip, unsigned level,
 
    native = ph_mip_physical_coords(mip, level, 4, &x, &y,
                                    &physical_pitch);
+   if (native)
+      return p3d_texture_tile_offset_64x16_at(image->offset, x, y,
+                                              physical_pitch);
    return image->offset + (linear ?
           ((size_t)y * image->pitch + x) * 4 :
-          (native ?
-           p3d_texture_tile_offset_64x16(x, y, physical_pitch) :
-           p3d_texture_tile_offset(x, y, image->pitch)));
+          p3d_texture_tile_offset(x, y, image->pitch));
 }
 
 static size_t
@@ -164,8 +165,8 @@ ph_mip_texel_offset_cpp(const struct ph_mip_layout *mip, unsigned level,
    if (linear)
       return image->offset + ((size_t)y * image->pitch + x) * cpp;
    if (native)
-      return image->offset + p3d_texture_tile_offset_64x16(x, y,
-                                                           physical_pitch);
+      return p3d_texture_tile_offset_64x16_at(image->offset, x, y,
+                                              physical_pitch);
    if (mip->p690_narrow)
       return image->offset +
          p3d_texture_tile_offset_p690_narrow(x, y, image->pitch, cpp);
