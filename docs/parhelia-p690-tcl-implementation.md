@@ -76,6 +76,23 @@ The constants the program reads:
   The same pair is written again at `c[0x160]/c[0x161]`, which is where the
   resident clipper program reads it through base register `b1`.
 
+## 2a. The rule that governs every experiment below
+
+The engine serves a WARP entry it has already executed out of an instruction
+cache.  Re-uploading different code to that address keeps running the **old**
+program; draining the queue, waiting for the WARP gate and toggling `0x920`
+bit 0 all fail to clear it (`docs/parhelia-p690-warp-isa-re.md`, header and
+section 9.3).  The resident instruction heap is a `dmam_alloc_coherent()`
+allocation, and a module reload can hand it back the same bus address, so
+editing a kernel WARP program, rebuilding and reloading **without a reboot**
+looks exactly as if the edit had no effect - or as if the hardware behaved
+differently between two otherwise identical runs.
+
+Every program comparison in this document therefore reboots the target
+between variants, and `parhelia-drm-test --transform-textured-probe` prints
+the entry addresses (`warp=` and `multitex=`) so a run served from a stale
+cache is visible rather than believed.
+
 ## 3. Kernel: two new programs
 
 `parhelia_warp.c` gains `warp_transform_textured` and
