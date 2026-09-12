@@ -38,6 +38,7 @@ struct ph_fs_value {
    bool constant_is_literal;
    float literal[4];
    uint16_t vec4_index; /* constant buffer offset when not a literal */
+   uint8_t component;   /* first component of the vec4 this value starts at */
 };
 
 struct ph_fs_half {
@@ -173,13 +174,18 @@ ph_fs_leaf(struct ph_fs_ctx *ctx, nir_def *def, struct ph_fs_value *out)
          return true;
       }
       case nir_intrinsic_load_ubo_vec4:
-         /* Constant buffer 0 addressed in vec4s rather than bytes. */
+         /* Constant buffer 0 addressed in vec4s rather than bytes.  The
+          * component says which channel of the vec4 the load starts at, so
+          * two loads of the same vec4 are different values unless it
+          * matches - ignoring it made GL_BLEND compile to "k - k". */
          if (!nir_src_is_const(load->src[0]) ||
              nir_src_as_uint(load->src[0]) != 0 ||
              !nir_src_is_const(load->src[1]))
             return false;
          out->is_constant = true;
-         out->vec4_index = nir_src_as_uint(load->src[1]);
+         out->vec4_index = nir_intrinsic_base(load) +
+                           nir_src_as_uint(load->src[1]);
+         out->component = nir_intrinsic_component(load);
          out->reg = P3D_COMB_C0;
          return true;
       case nir_intrinsic_load_input:
@@ -235,7 +241,7 @@ ph_fs_same_constant(const struct ph_fs_value *a, const struct ph_fs_value *b)
    if (a->constant_is_literal != b->constant_is_literal)
       return false;
    if (!a->constant_is_literal)
-      return a->vec4_index == b->vec4_index;
+      return a->vec4_index == b->vec4_index && a->component == b->component;
    return !memcmp(a->literal, b->literal, sizeof(a->literal));
 }
 
@@ -341,23 +347,29 @@ ph_fs_operand(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, unsigned index,
    if (alpha) {
       /* The alpha pipe reads component 3, or the only component of a scalar
        * alpha expression. */
-      channel = src->swizzle[components >= 4 ? 3 : components - 1];
-      if (channel == 3)
+      channel = src->swizzle[components >= 4 ? 3 : components - 1] +
+                out->component;
+      if (channel > 3)
+         return false;
+      if (channel == 3 && !out->component)
          return true;
       if (out->rep != P3D_COMB_REP_NONE)
          return false;
       out->rep = ph_fs_replicate(channel);
+      if (out->rep == P3D_COMB_REP_A)
+         out->rep = P3D_COMB_REP_NONE;
       return true;
    }
 
    if (components >= 3 && src->swizzle[0] == 0 && src->swizzle[1] == 1 &&
        src->swizzle[2] == 2)
-      return true;                       /* natural rgb read */
+      return !out->component;            /* natural rgb read */
    channel = src->swizzle[0];
    for (unsigned i = 1; i < components && i < 3; i++)
       if (src->swizzle[i] != channel)
          return false;
-   if (out->rep != P3D_COMB_REP_NONE)
+   channel += out->component;
+   if (channel > 3 || out->rep != P3D_COMB_REP_NONE)
       return false;
    out->rep = ph_fs_replicate(channel);
    return true;
@@ -793,10 +805,21 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
                     reg[half[h]->src[2].reg & 0x1f] ?: "?", half[h]->src[2].rep,
                     half[h]->src[2].mod ? "!" : "");
          for (unsigned k = 0; k < 2; k++)
-            if (in->has_const[k])
-               fprintf(stderr, "  fs %u c%u = %g %g %g %g\n", i, k,
-                       in->constant[k][0], in->constant[k][1],
-                       in->constant[k][2], in->constant[k][3]);
+            if (in->has_const[k]) {
+               unsigned ref;
+
+               for (ref = 0; ref < out->const_ref_count; ref++)
+                  if (out->const_ref[ref].instruction == i &&
+                      out->const_ref[ref].slot == k)
+                     break;
+               if (ref < out->const_ref_count)
+                  fprintf(stderr, "  fs %u c%u = constant buffer vec4 %u\n",
+                          i, k, out->const_ref[ref].vec4_index);
+               else
+                  fprintf(stderr, "  fs %u c%u = %g %g %g %g\n", i, k,
+                          in->constant[k][0], in->constant[k][1],
+                          in->constant[k][2], in->constant[k][3]);
+            }
       }
    }
    out->sampler_mask = ctx.sampler_mask;
