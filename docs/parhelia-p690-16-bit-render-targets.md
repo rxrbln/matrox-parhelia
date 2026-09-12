@@ -190,42 +190,81 @@ With those in place an X server starts at **depth 16** with DRI3 and direct
 rendering, glxgears runs, and ioquake3 gets a real
 `color(16-bits) Z(16-bit) stencil(0-bits)` visual.
 
-## 5b. ioquake3 in a 16-bit visual: SLOWER, and why (MEASURED)
+## 5b. The alpha routes at 16 bits (MEASURED)
 
-The 1280x1024 `bench` timedemo, `GL_LINEAR_MIPMAP_NEAREST`, same build, same
-machine, same session:
+Every alpha route in the Gallium driver was gated on a `B8G8R8A8/X8` colour
+target **and** a `Z24_UNORM_S8_UINT` depth buffer.  Nothing in them looks at
+the target's format: they drive the blend unit, the alpha comparator and the
+depth compare, all of which sit behind the fragment pipeline.
+`--narrow-alpha-probe` runs each live form into a 32-bit target with Z24 and
+into a 5:6:5 target with Z16 and compares, taking the 32-bit result as the
+reference:
 
-| screen | ioquake3 visual | fps | frame times min/avg/max |
-|---|---|---|---|
-| depth 24 | color 24, Z 24, stencil 8 | **31.9** | 17.0 / 31.3 / 58.0 ms |
-| depth 16 | color 16, Z 16, stencil 0 | **29.0** | 24.0 / 34.4 / 92.0 ms |
+| form | agreement |
+|---|---|
+| vertex alpha source-over, no depth | 0/36864 pixels off by more than one code |
+| vertex alpha source-over, depth | 0/36864 |
+| vertex alpha additive, depth | 0/36864 |
+| sampled-alpha companion source-over | 0/36864 |
+| sampled-alpha companion cutout, depth test + write | 0/36864 |
+| sampled-alpha companion cutout, rejected | 0/36864, coverage 0 on both |
+| two-pass attenuation `ZERO`/`1-SRC_COLOR`, alpha plane masked | 0/36864 |
+| two-pass additive `ONE`/`ONE`, depth | 0/36864 |
 
-`+set r_colorbits 16 +set r_depthbits 16` on a depth-24 screen changes
-nothing (32.0 fps): GLX has no 16-bit visual there, and the log says "Using 24
-color bits, 24 depth, 8 stencil display".
+Coverage is identical in every case.  The gates therefore became
+`ph_alpha_route_colour()` (B8G8R8A8, B8G8R8X8 or B5G6R5) and
+`ph_alpha_route_depth()` (Z24S8 or Z16), and the two-pass route's "a target
+without destination alpha makes the two passes exact" shortcut became
+`ph_target_no_dest_alpha()`, which 5:6:5 satisfies: it has no alpha channel,
+and `p3d_colour_mask()` already drops that route's `mask_a` for it.
 
-The cause is visible in `PARHELIA_STATS=1` on the *same* demo frames (the
-hardware-transform counters line up exactly, so these are frame-for-frame
-comparisons):
+`ph_use_cpu_alpha_cutout()` stays gated to the 32-bit formats **on purpose**:
+it rasterizes on the CPU into the linear companion images and reads and writes
+a 32-bit pixel and a 32-bit Z24 word directly (`ph_cpu_linear_pixel()`,
+`ph_cpu_depth_pass()`), neither of which a 16 bpp target has.  It is only a
+fallback under the native sampled-alpha route, which now covers 5:6:5.
 
-| | depth 24 | depth 16 |
+## 5c. ioquake3 at 16 bits (MEASURED)
+
+1280x1024 `bench` timedemo, `GL_LINEAR_MIPMAP_NEAREST`, same build, same
+session, ioquake3 reporting `color(16-bits) Z(16-bit) stencil(0-bits)` on the
+depth-16 screen and `color(24-bits) Z(24-bit) stencil(8-bits)` on the other:
+
+| X screen | without glamor | with glamor |
 |---|---|---|
-| triangles per frame | 2046 – 4181 | 7509 – 9473 |
-| submits per frame | 8 – 12 | 22 – 30 |
-| fence wait per frame | 4.0 – 6.6 ms | 7.3 – 9.6 ms |
+| depth 24 | 32.0 fps | 35.3 fps |
+| depth 16 | **50.1 fps** | **55.1 fps** |
+| gain | **+57%** | **+56%** |
 
-Three to four times the geometry and three times the submissions.  Every
-measured alpha route in the driver — the native sampled-alpha path, the
-two-pass RGB route and the alpha-micro route — is gated on a
-`B8G8R8A8/B8G8R8X8_UNORM` colour target **and** a `Z24_UNORM_S8_UINT` depth
-buffer (`parhelia_context.c` around lines 1921, 2243 and 2346).  On a 5:6:5
-colour target with a Z16 depth buffer all three predicates fail and Quake 3's
-alpha surfaces fall back to the expanded software route, which costs far more
-than the fill rate saves.
+(50.0 / 50.2 / 50.1 over three depth-16 runs.)  Before the gates were opened
+the same 16-bit visual ran 29.0 fps, *slower* than 24-bit.
 
-So the fill-rate win is real and the display path works, but it cannot reach a
-Quake 3 frame until those alpha routes are re-measured and opened for a 16 bpp
-colour target.  That is the next step, not a guess to enable.
+`PARHELIA_STATS=1` shows the fallbacks are gone.  On frame-for-frame identical
+demo frames (the hardware-transform counters line up exactly):
+
+| | depth 24 | depth 16, gates closed | depth 16, gates open |
+|---|---|---|---|
+| triangles per frame | 2046 / 2593 | 7509 – 9473 | **2046 / 2593** |
+| submits per frame | 8 / 10 | 22 – 30 | **8 / 10** |
+| frame time | 28.45 / 32.90 ms | 33 – 38 ms | **18.43 / 21.38 ms** |
+| fence wait | 3.87 / 6.62 ms | 7.3 – 9.6 ms | **2.11 / 3.80 ms** |
+
+The geometry and submission counts at depth 16 are now exactly those at depth
+24: the same draws, through the same routes, on half the memory traffic.  A
+scanout dump of a live 16-bit frame (GPU copy of what the CRTC scans) shows a
+correct picture with the alpha-blended HUD, crosshair and weapon intact, both
+with and without glamor.
+
+### glamor
+
+glamor had been failing to start, which is why the first measurements ran
+without it.  It is **not** related to the pixel depth: it fails identically at
+depth 24 and depth 16 with "Failed to get GLSL version", because the driver
+reports GL 1.5 and no GLSL version at all, while glamor needs a 2.1 context.
+`MESA_GL_VERSION_OVERRIDE=2.1 MESA_GLSL_VERSION_OVERRIDE=120` brings it up at
+both depths (`restart-xg.sh`, `restart-x16g.sh` on the target); the driver's
+own caps still advertise only what it can lower.  The 16-bit gain is the same
+either way.
 
 ## 6. What is implemented and what is not
 
@@ -241,12 +280,21 @@ the RGB565 framebuffer, the 16 bpp dumb buffer and its host aperture, the
 X server's native Present BITBLT, and B5G6R5 for `SCANOUT`,
 `DISPLAY_TARGET` and `SHARED` in `ph_format_supported`.
 
-Not implemented, and the reason a 16-bit Quake 3 frame is currently slower
-(§5b): the alpha routes are still gated to a 32-bit colour target and a Z24
-depth buffer.  A 16 bpp linear companion is also untested — a B5G6R5 resource
-that needs one (a sampled or CPU-mapped display target) still takes the 32-bit
-path, and `ph_copy_present_quad` refuses anything that is not four bytes per
-pixel.
+Also implemented and validated: the hardware alpha routes on a 5:6:5 target
+with a Z16 buffer (§5b), which is what turns the fill-rate win into 50.1 fps
+in Quake 3 (§5c).
+
+Not implemented, and not currently needed: a 16 bpp **linear companion**.  A
+resource that is shared, scanned out or a display target takes the
+`native_share` path, which allocates no companion at any pixel size, so a
+depth-16 GLX window's colour buffer is a plain native B5G6R5 surface and its
+depth buffer a native Z16 one (traced: `bind=0x18000a`, `create_flags=0x8`,
+`tiled_pitch_px=256`).  `ph_copy_present_quad()` needs a companion on the
+source and therefore never runs on this configuration — traced over a live
+glxgears at both depths, zero hits — so its four-byte guard is not what keeps
+it off, and widening it would be untested code with no measured effect.
+
+`ph_use_cpu_alpha_cutout()` remains 32-bit only, by design (§5b).
 
 One resource cannot be both a 16 bpp sampler image and a 16 bpp render target:
 the two storage orders differ.  `ph_format_supported` refuses the combination,
