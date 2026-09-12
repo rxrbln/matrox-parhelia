@@ -360,6 +360,19 @@ static bool parhelia_clock_solve(struct parhelia_device *pdev, u32 clock,
 	}
 }
 
+/* The controller enable word and the scanout-base field are per family. */
+static u32 parhelia_dc_ctrl_on(struct parhelia_device *pdev)
+{
+	return pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL ?
+		PARHELIA_DC_CTRL_ON_ORIGINAL : PARHELIA_DC_CTRL_ON;
+}
+
+static u32 parhelia_dc_start_mask(struct parhelia_device *pdev)
+{
+	return pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL ?
+		PARHELIA_DC_START_MASK_ORIGINAL : PARHELIA_DC_START_MASK;
+}
+
 /* Point one display controller's clock mux at a synthesiser: controller A
  * (0x1c00) feeds head 0 and controller B (0x1c04) feeds head 1, so a driver
  * that only ever wrote A could only ever light up head 0. */
@@ -406,6 +419,13 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 		 * clock source: without this write head 1's clock never
 		 * engaged on hardware. */
 		parhelia_route_dcm(pdev, head, 3);
+		/* Controller A, and only controller A, additionally takes the
+		 * VGA MISC clock-select byte: HSLPARSelectDisplayControllerClock
+		 * writes 0x68 there on that branch, and a head left on the
+		 * legacy clock explains a locked synthesiser with a dark
+		 * monitor.  Controller B gets no MISC write at all. */
+		if (!head)
+			parhelia_write8(pdev, PARHELIA_VGA_MISC_W, 0x68);
 		parhelia_write(pdev, PARHELIA_DCM_CLKCTL_HEAD,
 			       PARHELIA_DCM_MODE_HIRES);
 		udelay(200);
@@ -473,28 +493,6 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 		pdev->chip->name, clock, actual, word);
 	pdev->last_clock_khz = actual;
 	return 0;
-}
-
-/* A POSTed board hands the driver a VGA sequencer that may still be blanked,
- * and an attribute controller whose palette-address-source bit decides whether
- * the DAC sees pixels at all.  The native display controller does not override
- * either, so a mode can be programmed and locked with the screen still dark.
- * This is what the X driver's parhelia_display_enable() has always done. */
-static void parhelia_vga_unblank(struct parhelia_device *pdev)
-{
-	u8 seq1;
-
-	parhelia_write8(pdev, PARHELIA_VGA_SEQ_INDEX, PARHELIA_VGA_SEQ_RESET);
-	parhelia_write8(pdev, PARHELIA_VGA_SEQ_DATA,
-			PARHELIA_VGA_SEQ_RESET_NORMAL);
-	parhelia_write8(pdev, PARHELIA_VGA_SEQ_INDEX, PARHELIA_VGA_SEQ_CLKMODE);
-	seq1 = parhelia_read8(pdev, PARHELIA_VGA_SEQ_DATA);
-	parhelia_write8(pdev, PARHELIA_VGA_SEQ_DATA,
-			seq1 & ~PARHELIA_VGA_SEQ_SCREEN_OFF);
-	/* Reading the input-status register resets the attribute controller's
-	 * index/data flip-flop before the palette-address-source write. */
-	parhelia_read8(pdev, PARHELIA_VGA_INSTAT1);
-	parhelia_write8(pdev, PARHELIA_VGA_ATTR_INDEX, PARHELIA_VGA_ATTR_PAS);
 }
 
 static void parhelia_program_output(struct parhelia_device *pdev,
@@ -581,6 +579,12 @@ static void parhelia_program_output(struct parhelia_device *pdev,
 	v = parhelia_read(pdev, dac_reg);
 	v &= ~(PARHELIA_DAC_ROUTE_DCMB | PARHELIA_DAC_HSYNC_NEG |
 	       PARHELIA_DAC_VSYNC_NEG | power_mask);
+	/* DAC1 selects its display controller with bit 14 alone; DAC2 uses the
+	 * two bits [15:14], where bit 15 set alone would select the TV clock
+	 * source instead.  Heads 0 and 1 are modules 0 and 1, so the low bit
+	 * carries the head and the high bit must be clear. */
+	if (output->desc->analog_route == PARHELIA_ROUTE_DAC2)
+		v &= ~(u32)PARHELIA_DAC2_MODULE_MASK;
 	if (head)
 		v |= PARHELIA_DAC_ROUTE_DCMB;
 	if (mode->flags & DRM_MODE_FLAG_NHSYNC)
@@ -636,7 +640,8 @@ static int parhelia_scanout_address(struct parhelia_device *pdev,
 
 	ret = parhelia_vram_gpu_addr(pdev, drm_gem_vram_of_gem(gem), 0,
 				     gem->size, address);
-	if (!ret && (*address > 0x0ffffc00 || !IS_ALIGNED(*address, 1024)))
+	if (!ret && (*address > parhelia_dc_start_mask(pdev) ||
+		     !IS_ALIGNED(*address, 1024)))
 		ret = -ERANGE;
 	if (ret)
 		dev_warn_ratelimited(&pdev->pdev->dev,
@@ -731,28 +736,46 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	parhelia_write(pdev, dc + PARHELIA_DC_HDISP, (m->hdisplay - 1) << 16);
 	parhelia_write(pdev, dc + PARHELIA_DC_YPAN, 0);
 	parhelia_write(pdev, dc + PARHELIA_DC_VDISP, m->vdisplay - 1);
-	parhelia_write(pdev, dc + PARHELIA_DC_START, address & 0x0ffffc00);
+	parhelia_write(pdev, dc + PARHELIA_DC_START,
+		       address & parhelia_dc_start_mask(pdev));
 	parhelia_write(pdev, dc + PARHELIA_DC_FORMAT, format);
 	parhelia_pipe_load_gamma(pipe, crtc_state->gamma_lut);
 	/* Do not mirror this into MMIO 0x0004/0x0008.  The complete engine
 	 * initializer proves those words are host-aperture descriptors; changing
 	 * them after engine ownership redirects 3D writes outside the surface. */
+	/* Both request-level fields of this head's DEMREQCTL carry 3 at every
+	 * vendor mode set; SwitchToHIRES parks head A at zero, and a
+	 * controller with no memory request level never fetches a scanline. */
+	if (pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL) {
+		u32 reg = head ? PARHELIA_DCM_PRIORITY_B :
+				 PARHELIA_DCM_PRIORITY_A;
+		u32 v = parhelia_read(pdev, reg);
+
+		v = (v & ~PARHELIA_DCM_PRIORITY_MASK) |
+		    PARHELIA_DCM_PRIORITY_LEVELS;
+		parhelia_write(pdev, reg, v);
+	}
 	parhelia_program_output(pdev, pdev->active_output, m, head);
-	/* Only the original boards need this: the P690 path has been driving a
-	 * display for months without it, and our userspace driver does not
-	 * unblank the sequencer on its native path either. */
-	if (pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL)
-		parhelia_vga_unblank(pdev);
+	/* Release the dim/fade blank this family asserts around the timing
+	 * writes; POST can leave it asserted, which is a black picture with a
+	 * running raster. */
+	if (pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL) {
+		u32 dim = PARHELIA_DC_DIM + head * PARHELIA_DC_STRIDE;
+
+		parhelia_write(pdev, dim,
+			       parhelia_read(pdev, dim) &
+			       ~(u32)PARHELIA_DC_DIM_ASSERT);
+	}
 	if (pdev->chip->clock_family == PARHELIA_CLOCK_SUN90) {
 		u32 params = parhelia_read(pdev, dc + PARHELIA_DC_PARAMS);
 
 		params = (params & ~PARHELIA_DC_DIM_EN) | PARHELIA_DC_VIDEO_EN;
 		parhelia_write(pdev, dc + PARHELIA_DC_PARAMS, params);
 	}
-	parhelia_write(pdev, dc + PARHELIA_DC_CTRL, PARHELIA_DC_CTRL_ON);
+	parhelia_write(pdev, dc + PARHELIA_DC_CTRL, parhelia_dc_ctrl_on(pdev));
 	parhelia_apply_vid_reset(pdev, head);
 	/* The P690 reset transient can clear DC_CTRL's enable bit. */
-	parhelia_write(pdev, dc + PARHELIA_DC_CTRL, PARHELIA_DC_CTRL_ON);
+	parhelia_write(pdev, dc + PARHELIA_DC_CTRL, parhelia_dc_ctrl_on(pdev));
 	/* DRM's simple KMS helper delegates this lifecycle transition to drivers. */
 	drm_crtc_vblank_on(&pipe->crtc);
 }
@@ -793,7 +816,8 @@ static void parhelia_pipe_update(struct drm_simple_display_pipe *pipe,
 					0x00030000u | (bo->gpu_pitch / cpp);
 
 				parhelia_write(pdev, dc + PARHELIA_DC_START,
-					       address & 0x0ffffc00);
+					       address &
+					       parhelia_dc_start_mask(pdev));
 				parhelia_write(pdev, dc + PARHELIA_DC_FORMAT, format);
 			}
 		}

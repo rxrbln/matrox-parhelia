@@ -194,6 +194,15 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 #define PARHELIA_DC_LUT_LATCH		BIT(31)
 #define PARHELIA_DC_LUT_COMPONENT_MASK	0x0000ffc0
 #define PARHELIA_DC_CTRL_ON		0x00040201
+/* The original boards' vendor path enables the controller with the enable bit
+ * alone.  The P690 value additionally sets bit 9, the primary-LUT bypass, and
+ * bit 18, a sticky bandwidth-fault flag; it stays as it is because that is
+ * what has been driving a P690 display. */
+#define PARHELIA_DC_CTRL_ON_ORIGINAL	0x00000001
+/* The original family latches the scanout base from bits [26:11], so an
+ * address carrying bit 10 would be truncated; the P690 latches [27:10]. */
+#define PARHELIA_DC_START_MASK_ORIGINAL	0x07fff800u
+#define PARHELIA_DC_START_MASK		0x0ffffc00u
 #define PARHELIA_DC_VIDEO_EN		0x0030
 #define PARHELIA_DC_DIM_EN		0x0082
 #define PARHELIA_DCT_MISC		0x000
@@ -223,6 +232,22 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 #define PARHELIA_DCM_PRIORITY_A		0x1c0c
 #define PARHELIA_DCM_PRIORITY_B		0x1c10
 #define PARHELIA_DCM_PRIORITY_ON	0x0b0b
+/* Each DEMREQCTL register carries two 3-bit request levels, [2:0] and [10:8];
+ * the vendor writes 3 into both at every mode set.  0x0b0b sets bits 3 and 11
+ * instead, which are outside either field. */
+#define PARHELIA_DCM_PRIORITY_LEVELS	0x00000303
+#define PARHELIA_DCM_PRIORITY_MASK	0x00000707
+/* DC+0x88: bit 1 and bit 7 assert the dim/fade blank.  POST can leave them
+ * set, which keeps the picture black with the timing running. */
+#define PARHELIA_DC_DIM			0x1888
+#define PARHELIA_DC_DIM_ASSERT		0x0082
+/* DAC2's DC-module select is the two bits [15:14]; bit 15 alone selects the
+ * TV clock source instead, so it must not be left behind. */
+#define PARHELIA_DAC2_MODULE_MASK	(BIT(15) | BIT(14))
+/* DDC channel select: the board's VBIOS drives this before every 0x1c48
+ * transaction, and the P690's default pin table does not declare it. */
+#define PARHELIA_DDC_CHANNEL		0x1c4c
+#define PARHELIA_DDC_CHANNEL_ON		0x00040100
 /* The VGA register window lives at MMIO 0x1c00 + port. */
 #define PARHELIA_VGA_SEQ_INDEX		0x1fc4
 #define PARHELIA_VGA_SEQ_DATA		0x1fc5

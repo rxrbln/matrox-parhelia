@@ -104,6 +104,16 @@ int parhelia_ddc_init(struct parhelia_output *output)
 	 * interrupted probe which left another connector's line asserted. */
 	value = parhelia_read(pdev, PARHELIA_REG_DDC);
 	parhelia_write(pdev, PARHELIA_REG_DDC, value & ~GENMASK(19, 16));
+	/* The original boards gate the DDC lines behind a channel select that
+	 * their own VBIOS drives before every transaction; without it the
+	 * clock line of connector 0 reads permanently low and nothing
+	 * acknowledges.  The P690's pin table does not declare it, which is
+	 * why the same code reads EDID there and not here. */
+	if (pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL) {
+		value = parhelia_read(pdev, PARHELIA_DDC_CHANNEL);
+		parhelia_write(pdev, PARHELIA_DDC_CHANNEL,
+			       value | PARHELIA_DDC_CHANNEL_ON);
+	}
 
 	ret = i2c_bit_add_bus(adapter);
 	if (ret)
