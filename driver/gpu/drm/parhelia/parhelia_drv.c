@@ -45,6 +45,26 @@ static bool reset_on_probe;
 module_param(reset_on_probe, bool, 0400);
 MODULE_PARM_DESC(reset_on_probe, "Reset PCI function before initialization (bring-up only)");
 
+static bool bind_uninitialized;
+module_param(bind_uninitialized, bool, 0400);
+MODULE_PARM_DESC(bind_uninitialized,
+		 "Bind even when firmware never initialized the device (can reset the machine)");
+
+/* Firmware that POSTs a display device leaves its memory decode enabled; the
+ * PCI core turns that bit on itself, so it has to be sampled before
+ * pcim_enable_device().  A card the firmware skipped has no PLL or
+ * memory-controller programming and its frame-buffer aperture aborts on the
+ * first access: one dword written to BAR0 of an un-POSTed 0528 resets the
+ * machine, and so did binding this driver to it.  Refuse instead, until the
+ * cold bring-up sequence is implemented. */
+static bool parhelia_firmware_initialized(struct pci_dev *pci)
+{
+	u16 command = 0;
+
+	pci_read_config_word(pci, PCI_COMMAND, &command);
+	return command & PCI_COMMAND_MEMORY;
+}
+
 DEFINE_DRM_GEM_FOPS(parhelia_fops);
 
 static void parhelia_debugfs_init(struct drm_minor *minor)
@@ -274,7 +294,13 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	struct parhelia_device *pdev;
 	struct drm_device *drm;
 	unsigned int mmio_bar;
+	bool posted;
 	int ret;
+
+	posted = parhelia_firmware_initialized(pci);
+	if (!posted && !bind_uninitialized)
+		return dev_err_probe(&pci->dev, -ENODEV,
+			"firmware left this device uninitialized (PCI memory decode off): its memory controller and clocks are unprogrammed and any frame-buffer access resets the machine, so cold bring-up is required; override with bind_uninitialized=1\n");
 
 	ret = aperture_remove_conflicting_pci_devices(pci, DRIVER_NAME);
 	if (ret)
@@ -283,6 +309,9 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	ret = pcim_enable_device(pci);
 	if (ret)
 		return ret;
+	if (!posted)
+		dev_warn(&pci->dev,
+			 "binding an uninitialized device on request: expect a machine reset on the first frame-buffer access\n");
 	pci_clear_master(pci);
 
 	ret = dma_set_mask_and_coherent(&pci->dev, DMA_BIT_MASK(32));
