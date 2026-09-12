@@ -320,9 +320,16 @@ reject:
 	return -EINVAL;
 }
 
-static u32 warp_user_entry(struct parhelia_device *pdev, u32 slot)
+/* A slot holds two program images.  The engine keeps serving a previously
+ * executed entry from an instruction cache, so overwriting the address a
+ * program has already run from renders the old code; hardware-proven with
+ * --warp-program-probe, where a re-upload to the same entry kept drawing the
+ * previous program and the same code at a fresh entry did not.  Every upload
+ * therefore lands on the image the slot did not last use. */
+static u32 warp_user_entry(struct parhelia_device *pdev, u32 slot, u32 image)
 {
-	u32 instruction = (slot - 1) * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS;
+	u32 instruction = (slot - 1) * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS +
+			  image * PARHELIA_WARP_USER_IMAGE_INSTRUCTIONS;
 
 	return ((u32)(pdev->warp_user_bus / 12) * 4 + instruction * 4) | 3u;
 }
@@ -354,11 +361,17 @@ bool parhelia_warp_entry_allowed(struct parhelia_device *pdev,
 		return false;
 	mutex_lock(&pdev->warp_user_lock);
 	for (i = 0; i < PARHELIA_WARP_USER_SLOTS; i++) {
-		if (pdev->warp_user_owner[i] == file &&
-		    entry == warp_user_entry(pdev, i + 1)) {
-			mutex_unlock(&pdev->warp_user_lock);
-			return true;
-		}
+		u32 image;
+
+		if (pdev->warp_user_owner[i] != file)
+			continue;
+		/* Both images stay valid: a client may still have draws queued
+		 * against the entry the previous upload returned. */
+		for (image = 0; image < 2; image++)
+			if (entry == warp_user_entry(pdev, i + 1, image)) {
+				mutex_unlock(&pdev->warp_user_lock);
+				return true;
+			}
 	}
 	mutex_unlock(&pdev->warp_user_lock);
 	return false;
@@ -372,8 +385,10 @@ void parhelia_warp_postclose(struct parhelia_device *pdev, struct drm_file *file
 		return;
 	mutex_lock(&pdev->warp_user_lock);
 	for (i = 0; i < PARHELIA_WARP_USER_SLOTS; i++)
-		if (pdev->warp_user_owner[i] == file)
+		if (pdev->warp_user_owner[i] == file) {
 			pdev->warp_user_owner[i] = NULL;
+			pdev->warp_user_image[i] = 0;
+		}
 	mutex_unlock(&pdev->warp_user_lock);
 }
 
@@ -428,12 +443,13 @@ int parhelia_warp_program_ioctl(struct drm_device *drm, void *data,
 			return -EINVAL;
 		}
 		pdev->warp_user_owner[args->slot - 1] = NULL;
+		pdev->warp_user_image[args->slot - 1] = 0;
 		mutex_unlock(&pdev->warp_user_lock);
 		args->entry = 0;
 		return 0;
 	}
 
-	if (!args->count || args->count > PARHELIA_WARP_USER_SLOT_INSTRUCTIONS)
+	if (!args->count || args->count > PARHELIA_WARP_USER_IMAGE_INSTRUCTIONS)
 		return -EINVAL;
 	code = memdup_user(u64_to_user_ptr(args->code),
 			   array_size(args->count, 12));
@@ -457,17 +473,19 @@ int parhelia_warp_program_ioctl(struct drm_device *drm, void *data,
 	slot = args->slot;
 	ret = warp_user_claim(pdev, file, &slot);
 	if (!ret) {
-		/* Clear the rest of the slot so a shorter program cannot leave
+		u32 image = pdev->warp_user_image[slot - 1] ^ 1u;
+		size_t offset = ((slot - 1) * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS +
+				 image * PARHELIA_WARP_USER_IMAGE_INSTRUCTIONS) * 12;
+
+		/* Clear the rest of the image so a shorter program cannot leave
 		 * the previous tenant's instructions reachable. */
-		memset(pdev->warp_user_cpu +
-		       (slot - 1) * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS * 12, 0,
-		       PARHELIA_WARP_USER_SLOT_INSTRUCTIONS * 12);
-		memcpy(pdev->warp_user_cpu +
-		       (slot - 1) * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS * 12,
-		       code, args->count * 12);
+		memset(pdev->warp_user_cpu + offset, 0,
+		       PARHELIA_WARP_USER_IMAGE_INSTRUCTIONS * 12);
+		memcpy(pdev->warp_user_cpu + offset, code, args->count * 12);
 		dma_wmb();
+		pdev->warp_user_image[slot - 1] = image;
 		args->slot = slot;
-		args->entry = warp_user_entry(pdev, slot);
+		args->entry = warp_user_entry(pdev, slot, image);
 	}
 	mutex_unlock(&pdev->warp_user_lock);
 	mutex_unlock(&pdev->submit_lock);

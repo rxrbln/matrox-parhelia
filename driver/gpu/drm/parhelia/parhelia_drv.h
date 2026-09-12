@@ -261,6 +261,9 @@ struct parhelia_bios {
  * trailing padding bundle. */
 #define PARHELIA_WARP_USER_SLOTS		32u
 #define PARHELIA_WARP_USER_SLOT_INSTRUCTIONS	64u
+/* Two program images per slot; an upload never lands on the address the
+ * engine most recently fetched from.  See warp_user_entry(). */
+#define PARHELIA_WARP_USER_IMAGE_INSTRUCTIONS	32u
 #define PARHELIA_WARP_USER_FILE_SLOTS		8u
 #define PARHELIA_WARP_USER_INSTRUCTIONS \
 	(PARHELIA_WARP_USER_SLOTS * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS)
@@ -508,6 +511,7 @@ struct parhelia_device {
 	dma_addr_t warp_user_bus;
 	struct mutex warp_user_lock;
 	struct drm_file *warp_user_owner[PARHELIA_WARP_USER_SLOTS];
+	u8 warp_user_image[PARHELIA_WARP_USER_SLOTS];
 	bool engine_initialized;
 	bool raw_aperture_owned;
 	bool wedged;

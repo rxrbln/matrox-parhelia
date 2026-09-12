@@ -3239,7 +3239,7 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		break;
 	case PARHELIA_PARAM_WARP_PROGRAM_INSTRUCTIONS:
 		args->value = pdev->warp_user_cpu ?
-			PARHELIA_WARP_USER_SLOT_INSTRUCTIONS : 0;
+			PARHELIA_WARP_USER_IMAGE_INSTRUCTIONS : 0;
 		break;
 	case PARHELIA_PARAM_WARP_PROGRAM_SLOTS:
 		args->value = pdev->warp_user_cpu ?
