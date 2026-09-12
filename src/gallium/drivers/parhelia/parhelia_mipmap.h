@@ -177,7 +177,11 @@ ph_mip_max_levels(unsigned width, unsigned height)
 }
 
 /* The tail table is the kernel HAL's mtx3067/mtx516/mtx1834 data: all
- * levels from 16x16 through 1x1 share one 32x16 block. */
+ * levels from 16x16 through 1x1 share one 32x16 block.  The slot is a plain
+ * count of tail levels, not a function of the level's size: the vendor chain
+ * builder mtx325 records the first level with w <= 16, h <= 16 and d <= 31 at
+ * .text+0x28c43 and indexes the three tables with level - that index at
+ * .text+0x28a6d..0x28aad. */
 static inline void
 ph_mip_tail_position(unsigned tail, unsigned *x, unsigned *y)
 {
