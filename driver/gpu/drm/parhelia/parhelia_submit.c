@@ -3080,17 +3080,32 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	else
 		allocation_height = ALIGN(args->height,
 			pdev->chip->tile_layout == PARHELIA_TILE_64X16_4K ? 16 : 32);
-	/* Layout 2 addresses 32x16 texture blocks with a power-of-two row
-	 * pitch.  Returning the render-target ALIGN(width, 64) pitch here
-	 * underallocated NPOT images such as 300x300 before the transient upload
-	 * path made that mismatch observable without a raw BAR mapping. */
+	/* The texture address unit rounds the descriptor's width up to 32
+	 * texels, not to the next power of two: parhelia-drm-test
+	 * --mip-address-probe measures tile rows 96/64 and 160/64 texels apart
+	 * for widths 96 and 129.  Every earlier measurement used a
+	 * power-of-two width, where the two rules agree. */
 	tile_width = 64 * 4 / cpp;
 	if (args->flags & PARHELIA_CREATE_RENDER_TEXTURE)
-		pitch_pixels = roundup_pow_of_two(max_t(u32, args->width, 32));
+		pitch_pixels = max_t(u32, ALIGN(args->width, 32), 32);
 	else
 		pitch_pixels = ALIGN(args->width, tile_width);
 	pitch = pitch_pixels * cpp;
-	bo_size = ALIGN((size_t)pitch * allocation_height, 8192);
+	bo_size = (size_t)pitch * allocation_height;
+	/* A tiled texture indexes its tiles by the linear texel index over the
+	 * pitch, so a pitch that is not a multiple of 64 lets a row band cross
+	 * a tile boundary and pitch * height stops covering the last tile. */
+	if (args->flags & PARHELIA_CREATE_RENDER_TEXTURE &&
+	    pitch_pixels % 64) {
+		u32 tile_h = cpp == 4 ? 16 : 32;
+		size_t tile_bytes = cpp == 1 ? SZ_2K : SZ_4K;
+		u32 bands = max_t(u32, 1, ALIGN(args->height, tile_h) / tile_h);
+		size_t tiled = DIV_ROUND_UP((size_t)bands * pitch_pixels, 64) *
+			       tile_bytes;
+
+		bo_size = max(bo_size, tiled);
+	}
+	bo_size = ALIGN(bo_size, 8192);
 	bo = drm_gem_vram_create(drm, bo_size, align_pages);
 	if (IS_ERR(bo))
 		return PTR_ERR(bo);
