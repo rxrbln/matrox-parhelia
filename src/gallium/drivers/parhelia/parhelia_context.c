@@ -2026,8 +2026,6 @@ ph_auto_tiled_texture(const struct ph_context *ctx,
                                PIPE_BIND_SHARED));
 }
 
-/* P690 can recover RGBA sampled alpha in one draw by binding the original
- * image on unit 0 and an opaque (A,A,A,1) companion on unit 1.  The final
 /* Unit 0 samples a volume or a cube map, so the draw needs a three-component
  * coordinate set.  That set replaces the vertex colour: the attribute port
  * carries 7 dwords per vertex (8 with a depth position) and position plus
@@ -2061,6 +2059,8 @@ ph_primitive_colour_is_white(const struct prim_header *prim, int col)
    return true;
 }
 
+/* P690 can recover RGBA sampled alpha in one draw by binding the original
+ * image on unit 0 and an opaque (A,A,A,1) companion on unit 1.  The final
  * combiner moves unit-0 RGB and takes fragment alpha from unit-1 red.  Keep
  * this to the two live Q3 fixed-function equations and base-level sampling;
  * the companion does not carry a mip chain. */
@@ -3490,8 +3490,6 @@ ph_submit_vertices(struct ph_context *ctx)
       if (ctx->num_samplers > 1)
          sampler1 = ctx->samplers[1];
    }
-   /* An explicit env setting remains a force-enable for the established Q3
-    * launch. Without it, use only the P690 base-level format/dimension shape
    /* A three-coordinate unit-0 texture owns the whole coordinate stream, so
     * there is no room for a second coordinate set and none for the
     * transform program's object-space position. */
@@ -3500,6 +3498,8 @@ ph_submit_vertices(struct ph_context *ctx)
       sampler1 = NULL;
       ctx->transform = false;
    }
+   /* An explicit env setting remains a force-enable for the established Q3
+    * launch. Without it, use only the P690 base-level format/dimension shape
     * recovered for layout 2; all small, mip-described and unusual textures
     * retain the conservative linear sampler backing. */
    /* A compressed image exists only in layout 5; it has no linear shadow. */
@@ -3714,8 +3714,6 @@ ph_submit_vertices(struct ph_context *ctx)
       tex.height = texture->base.height0;
       ph_texture_descriptor_format(texture, rgb5a1_texture, texture_tiled,
                                    &tex);
-      tex.min_filter = ph_sampler_image_filter(
-         sampler && sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR,
       /* A volume or cube map samples with three coordinates: 0x11e0[20:19]
        * names the target, 0x1200+4u[18:16] switches the address unit to three
        * coordinates and 0x11e4[27:16] carries the slice count, which for a
@@ -3729,6 +3727,8 @@ ph_submit_vertices(struct ph_context *ctx)
          tex.coord_mode = P3D_TEX_COORD_3D;
          state.texcoord3 = 1;
       }
+      tex.min_filter = ph_sampler_image_filter(
+         sampler && sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR,
          sampler ? sampler->max_anisotropy : 0);
       tex.mag_filter = ph_sampler_image_filter(
          sampler && sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR,
@@ -4213,11 +4213,11 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
                         ctx->sampler_views[1] &&
                         ctx->sampler_views[1]->texture;
    bool depth = ctx->fb.zsbuf.texture != NULL;
-	bool vertex_alpha;
-	bool alpha_micro;
    /* A volume or cube map needs a third coordinate, which costs the colour
     * attribute and every alpha route that re-shapes the vertex stream. */
    bool three_coord = textured && ph_three_coord_texture(ctx);
+	bool vertex_alpha;
+	bool alpha_micro;
 	bool alpha_micro_cutout;
 	bool alpha_micro_depth;
 	bool cpu_alpha_cutout;
@@ -4267,8 +4267,6 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	                                            depth, col >= 0);
 	if (alpha_micro || alpha_micro_cutout)
 	   cpu_alpha_cutout = rgb_alpha_two_pass = false;
-	alpha_micro_depth = depth && ctx->dsa && ctx->dsa->depth_enabled;
-	if (alpha_micro)
 	if (three_coord) {
 	   multitextured = false;
 	   vertex_alpha = alpha_micro = alpha_micro_cutout = false;
@@ -4287,6 +4285,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	      return;
 	   }
 	}
+	alpha_micro_depth = depth && ctx->dsa && ctx->dsa->depth_enabled;
+	if (alpha_micro)
 	   depth = alpha_micro_depth;
 	if (ph_env("PARHELIA_TRACE_CPU_ALPHA") && textured && ctx->blend &&
 	    ctx->blend->rt[0].blend_enable && ctx->num_sampler_views &&
@@ -4451,8 +4451,6 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 			*dst++ = tc[1] * scale_t;
 			continue;
 		}
-      *dst++ = p[0];
-      *dst++ = p[1];
 		if (three_coord) {
 			const float *tc = prim->v[v]->data[texcoord];
 
@@ -4469,6 +4467,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 			*dst++ = 0.0f;
 			continue;
 		}
+      *dst++ = p[0];
+      *dst++ = p[1];
       if (depth)
          *dst++ = CLAMP(p[2], 0.0f, 1.0f);
 		*dst++ = c[0];
@@ -5356,11 +5356,11 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
       return false;
    if (textured && !ctx->warp_transform_textured)
       return false;
-
-   lay->textured = textured;
    /* A three-coordinate set does not fit the transform program's stream. */
    if (textured && ph_three_coord_texture(ctx))
       return false;
+
+   lay->textured = textured;
    lay->multitextured = multitextured;
    lay->colour_offset = 3;
    lay->tex_offset[0] = 6;
@@ -5798,7 +5798,13 @@ ph_create_sampler_view(struct pipe_context *p, struct pipe_resource *texture,
                        const struct pipe_sampler_view *templ)
 {
    struct ph_sampler_view *view;
-   if (!templ || !texture || templ->target != PIPE_TEXTURE_2D ||
+   /* The view's target is the GL target, which need not be the resource's:
+    * a 1-D view reads a one-row 2-D image, and a volume or cube-map view
+    * reads the slices or faces of one. */
+   if (!templ || !texture ||
+       (templ->target != PIPE_TEXTURE_2D && templ->target != PIPE_TEXTURE_RECT &&
+        templ->target != PIPE_TEXTURE_1D && templ->target != PIPE_TEXTURE_3D &&
+        templ->target != PIPE_TEXTURE_CUBE) ||
        templ->u.tex.first_level > templ->u.tex.last_level ||
        templ->u.tex.last_level > texture->last_level)
       return NULL;
@@ -7519,12 +7525,12 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
       *out = &t->base;
       return t->staging;
    }
-   if ((cpp != 4 && cpp != 2 && cpp != 1) || level > res->last_level ||
-       (!r->map && !r->linear_map) || box->x < 0 || box->y < 0 ||
    /* Volume slices and cube faces are addressed by the box's z range. */
    const unsigned layers = MAX2(box->depth, 1);
    const unsigned slices = MAX2(r->mip.slices, 1u);
 
+   if ((cpp != 4 && cpp != 2 && cpp != 1) || level > res->last_level ||
+       (!r->map && !r->linear_map) || box->x < 0 || box->y < 0 ||
        box->width < 0 || box->height < 0 || box->z < 0 ||
        (unsigned)box->z + layers > slices ||
        (unsigned)box->x + (unsigned)box->width > image_width ||
@@ -7576,13 +7582,13 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
                                        (size_t)(box->y + y) * r->linear_stride +
                                        (box->x + x) * cpp), swap_rb, cpp);
       } else {
+         for (unsigned z = 0; z < layers; z++)
          for (int y = 0; y < box->height; y++)
             for (int x = 0; x < box->width; x++)
-         for (unsigned z = 0; z < layers; z++)
                ph_copy_texel_from_gpu((uint8_t *)t->staging +
+                                          z * t->base.layer_stride +
                                           y * t->base.stride + x * cpp,
                                       (uint8_t *)r->map +
-                                          z * t->base.layer_stride +
                                       (ph_resource_uses_sampler_layout(r) &&
                                        r->mip.levels ?
                                        ph_mip_layer_texel_offset(&r->mip, level,
@@ -7652,9 +7658,9 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
                                        y * transfer->stride + x * cpp, swap_rb, cpp);
       }
       if (r->map) {
+         for (unsigned z = 0; z < MAX2(transfer->box.depth, 1); z++)
          for (int y = 0; y < transfer->box.height; y++)
             for (int x = 0; x < transfer->box.width; x++)
-         for (unsigned z = 0; z < MAX2(transfer->box.depth, 1); z++)
             ph_copy_texel_to_gpu((uint8_t *)r->map +
                                   (ph_resource_uses_sampler_layout(r) ?
                                    (r->mip.levels ?
@@ -7675,9 +7681,9 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
                                       transfer->box.y + y, r->stride,
                                       r->tile_layout, r->cpp)),
                                     (uint8_t *)t->staging +
+                                       z * transfer->layer_stride +
                                        y * transfer->stride + x * cpp, swap_rb, cpp);
       }
-                                       z * transfer->layer_stride +
       /* Both representations were updated when a presentation/sampler
        * backing exists; otherwise the tiled render image is authoritative.
        */

@@ -705,12 +705,12 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * compact 32x32 child, and a shared <=16 native 64x16 tail.  The
     * texture-only upload BO is required: an ordinary mapped render BO
     * selects the wrong storage class for mip sampling. */
-   /* A volume, a cube map or a one-row image carries level 0 only: the
-    * address unit's own chain geometry for those shapes has not been
-    * measured, and a chain it derives differently from the driver's samples
-    * the wrong storage.  A 1-D texture's level 0 is an ordinary one-row 2-D
-    * surface in the measured order. */
-   mip_levels = p690_native_texture32 && slices == 1 && templ->height0 > 1 &&
+   /* A volume or a cube map carries level 0 only: the address unit's own
+    * chain geometry for those targets has not been measured, and a chain it
+    * derives differently from the driver's samples the wrong storage.  A 1-D
+    * chain needs no exception: --mip-address-probe W 1 walks every level of a
+    * 64x1 and a 256x1 base, tail included, with no differing texel. */
+   mip_levels = p690_native_texture32 && slices == 1 &&
                 !(templ->width0 & (templ->width0 - 1)) &&
                 !(templ->height0 & (templ->height0 - 1)) ?
                    templ->last_level + 1 : 1;
@@ -794,8 +794,12 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    struct drm_parhelia_create_render create = {
       .width = p690_native_texture32 ? MAX2(templ->width0, 64u) :
                cpp != 4 || block_bytes ? create_pitch : templ->width0,
-      /* Rows of the (possibly wider) allocation that hold the chain. */
-      .height = mip_levels > 1 || cpp != 4 || block_bytes || slices > 1 ?
+      /* Rows of the (possibly wider) allocation that hold the chain.  A
+       * single-level native image also needs them whenever its layout
+       * reserves more rows than it has, which a one-row 1-D image always
+       * does: the P690 order quantises the base level to 32 rows. */
+      .height = mip_levels > 1 || cpp != 4 || block_bytes || slices > 1 ||
+                r->mip.size > (size_t)create_pitch * 4 * templ->height0 ?
          (r->mip.size + (size_t)create_pitch * 4 - 1) /
          ((size_t)create_pitch * 4) :
          templ->height0,
@@ -1387,16 +1391,16 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->s3tc = s->texture_upload && ph_env("PARHELIA_S3TC");
    /* Volume and cube-map targets need the native 32-bit texture order, whose
     * storage tile carries the volume slice interleave, and the address unit's
-    * three-coordinate mode.  The descriptor and the volume texel order are
-    * measured (--texture-volume-probe; docs/parhelia-p690-volume-cube-targets.md),
-    * but only for one image geometry and never yet through the GL path, so
-    * volumes wait behind PARHELIA_VOLUME_TARGETS=1.  The cube-map face stride
-    * is recovered from the vendor HAL and not measured at all on this
-    * silicon, so cube maps additionally need PARHELIA_CUBE_TARGETS=1. */
+    * three-coordinate mode.  Both are measured: --texture-volume-probe
+    * reproduces every texel of four volume geometries, and
+    * tools/parhelia-gl-texture-target-test compares every texel of every
+    * slice and of all six cube faces at the GL level.  See
+    * docs/parhelia-p690-volume-cube-targets.md.  PARHELIA_NO_VOLUME_TARGETS=1
+    * returns the driver to 2-D and 1-D only. */
    s->volume_targets = s->texture_upload &&
       p3d_texture_uses_native_64x16(s->chip_id, s->tile_layout, 4) &&
-      ph_env("PARHELIA_VOLUME_TARGETS");
-   s->cube_targets = s->volume_targets && ph_env("PARHELIA_CUBE_TARGETS");
+      !ph_env("PARHELIA_NO_VOLUME_TARGETS");
+   s->cube_targets = s->volume_targets;
    /* 16-bit render targets: ask the kernel for a two-byte-per-pixel native
     * colour allocation.  Only a kernel that knows the 128-pixel tile row can
     * place one, and only the P690's measured order is implemented.

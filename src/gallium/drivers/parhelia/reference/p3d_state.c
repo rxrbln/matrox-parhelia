@@ -279,7 +279,6 @@ p3d_descriptors(struct p3d_rw *out, int textured, int with_z,
 		out[n].reg = P3D_R_DESC; out[n].val = 0; n++;
 		return n;
 	}
-	if (with_z) {
 	/* A three-component coordinate set takes the dwords the colour would
 	 * occupy, so the stream is position then S,T,R and nothing else.  That
 	 * keeps dw_per_vertex at the two-component figure: 7 without a depth or
@@ -294,6 +293,7 @@ p3d_descriptors(struct p3d_rw *out, int textured, int with_z,
 		out[n].reg = P3D_R_DESC; out[n].val = 0; n++;
 		return n;
 	}
+	if (with_z) {
 		/* a THREE-component position: mask 7 in [25:22] instead of 3,
 		 * so z reaches the setup unit, and the colour moves to dword 3.
 		 * When the isolated depth-RGBA probe is selected, colour expands
@@ -822,16 +822,16 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			else if (st->single_texture_pipe && u == 1)
 				/* SUN90/P690 allocates units 0/1 to pipes 0/2. */
 				rw[0].val = 0x00040104u;
-			rw[1].reg = P3D_R_TEX_SURF_BASE; rw[1].val = tu->base;
-			rw[2].reg = P3D_R_TEX_SURF_W;
-			rw[2].val = (tu->width & 0x3fff) |
-				    ((tu->texelcode & 7) << 16) |
-				    ((tu->type & 3u) << 19) | (tu->fmt << 24);
 			/* [18:16] is the coordinate mode: the default 4 feeds
 			 * the address unit two coordinates, 6 three. */
 			if (tu->coord_mode)
 				rw[0].val = (rw[0].val & ~0x00070000u) |
 					    ((tu->coord_mode & 7u) << 16);
+			rw[1].reg = P3D_R_TEX_SURF_BASE; rw[1].val = tu->base;
+			rw[2].reg = P3D_R_TEX_SURF_W;
+			rw[2].val = (tu->width & 0x3fff) |
+				    ((tu->texelcode & 7) << 16) |
+				    ((tu->type & 3u) << 19) | (tu->fmt << 24);
 			rw[3].reg = P3D_R_TEX_SURF_H;
 			rw[3].val = (tu->height & 0x3fff) |
 				    ((tu->depth ? tu->depth & 0xfffu : 1u) << 16) |
