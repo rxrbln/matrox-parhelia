@@ -8235,10 +8235,26 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    /* Two is measured stable over repeated timedemo runs and every GL test
     * (+6% at 24 bpp, +2.5% at 16 bpp, half the draw packets); four and eight
     * render correctly in the probes but hang ioquake3 in its level load. */
+   /* Two triangles per packet is the largest shape that has never produced
+    * the P690's probabilistic command-fetcher stall, over every probe run,
+    * every GL test and repeated timedemos; three and more wedge the engine
+    * within a few thousand packets and need a machine reboot to recover.
+    * Raising it buys 0.1-0.2 fps, which is inside run-to-run noise, so the
+    * knob exists for experiments and the shipped value stays at the proven
+    * shape.  parhelia-p690-multi-primitive-packet-hang.md carries the bisect,
+    * the two vendor candidates that were tested and refuted, and what is
+    * still unexplained. */
    ctx->prims_per_packet =
       debug_get_num_option("PARHELIA_PRIMS_PER_PACKET", 2);
    if (ctx->prims_per_packet < 1)
       ctx->prims_per_packet = 1;
+   if (ctx->prims_per_packet > 2 && !ph_env("PARHELIA_PRIMS_PER_PACKET_UNSAFE")) {
+      fprintf(stderr,
+              "parhelia: %u primitives per packet wedges this chip; using 2. "
+              "Set PARHELIA_PRIMS_PER_PACKET_UNSAFE=1 to measure it anyway.\n",
+              ctx->prims_per_packet);
+      ctx->prims_per_packet = 2;
+   }
    if (ctx->aggregate_state_batches && ph_env("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: preserving per-state EOB/DWGSYNC boundaries inside aggregate submits\n");
