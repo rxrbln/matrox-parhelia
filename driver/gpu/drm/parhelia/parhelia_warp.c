@@ -126,6 +126,46 @@ static const u32 warp_transform[] = {
 	0x00080200, 0x00440000, 0x301a21a2,
 };
 
+/* Assembled from warp/transform-textured.wasm and warp/transform-multitex.wasm:
+ * warp_transform plus the o3/o4 texture-coordinate copies of the textured
+ * programs.  Like warp_textured they must not write temporary T2.
+ */
+static const u32 warp_transform_textured[] = {
+	0x00003e00, 0x00440000, 0xb89a2249,
+	0x1804a200, 0x00440103, 0xbb9a21a2,
+	0x10049200, 0x00440103, 0xbb9a21a2,
+	0x08048a00, 0x00440103, 0xbb9a21a2,
+	0x00048600, 0x00440103, 0xbb9a21a2,
+	0x0e987c1f, 0x00440215, 0xb89a2249,
+	0x12257ebf, 0x00440289, 0xc49a22a2,
+	0x2c105e00, 0x004401a1, 0xbb6a2222,
+	0x08083e00, 0x00440105, 0xb89a2249,
+	0x0078023f, 0x00440200, 0xb01a21a2,
+	0x00000200, 0x00040000, 0x14c00000,
+	0x00080200, 0x00440000, 0x301a21a2,
+};
+
+/* Unlike the single-texture variant this one initializes temporary T2, as
+ * warp_textured_multitex does: a fresh engine rejects or locks up on a draw
+ * that depends on an unwritten T2, and this is the program a two-set
+ * transformed draw binds first. */
+static const u32 warp_transform_multitex[] = {
+	0x00003e00, 0x00440000, 0xb89a2249,
+	0x0800be00, 0x00440015, 0xba9a2249,
+	0x1804a200, 0x00440103, 0xbb9a21a2,
+	0x10049200, 0x00440103, 0xbb9a21a2,
+	0x08048a00, 0x00440103, 0xbb9a21a2,
+	0x00048600, 0x00440103, 0xbb9a21a2,
+	0x0e987c1f, 0x00440215, 0xb89a2249,
+	0x12257ebf, 0x00440289, 0xc49a22a2,
+	0x2c105e00, 0x004401a1, 0xbb6a2222,
+	0x08083e00, 0x00440105, 0xb89a2249,
+	0x0078023f, 0x00440200, 0xb01a21a2,
+	0x0088024f, 0x00440200, 0xb01a21a2,
+	0x00000200, 0x00040000, 0x14c00000,
+	0x00080200, 0x00440000, 0x301a21a2,
+};
+
 /* Assembled from warp/lighting.wasm: reference lighting plus c6 ambient. */
 static const u32 warp_lighting[] = {
 	0x00003e00, 0x00440000, 0xb89a2249,
@@ -340,7 +380,10 @@ bool parhelia_warp_entry_allowed(struct parhelia_device *pdev,
 	static const u32 driver_entries[] = {
 		PARHELIA_WARP_PASSTHROUGH_ENTRY, PARHELIA_WARP_TEXTURED_ENTRY,
 		PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY,
-		PARHELIA_WARP_TRANSFORM_ENTRY, PARHELIA_WARP_LIGHTING_ENTRY,
+		PARHELIA_WARP_TRANSFORM_ENTRY,
+		PARHELIA_WARP_TRANSFORM_TEXTURED_ENTRY,
+		PARHELIA_WARP_TRANSFORM_MULTITEX_ENTRY,
+		PARHELIA_WARP_LIGHTING_ENTRY,
 		PARHELIA_WARP_REPLACE_ENTRY,
 		PARHELIA_WARP_CONSTANT_LOADER_ENTRY, PARHELIA_WARP_PROBE_ENTRY,
 		PARHELIA_WARP_KIND6_ENTRY, PARHELIA_WARP_KIND12_ENTRY,
@@ -817,7 +860,12 @@ int parhelia_warp_init(struct parhelia_device *pdev)
 	WARP_FITS(PARHELIA_WARP_LIGHTING_ENTRY, warp_lighting, PARHELIA_WARP_REPLACE_ENTRY);
 	WARP_FITS(PARHELIA_WARP_REPLACE_ENTRY, warp_replace, PARHELIA_WARP_CONSTANT_LOADER_ENTRY);
 	WARP_FITS(PARHELIA_WARP_CONSTANT_LOADER_ENTRY, warp_constant_loader, PARHELIA_WARP_PROBE_ENTRY);
-	WARP_FITS(PARHELIA_WARP_PROBE_ENTRY, warp_constant_probe, PARHELIA_WARP_STORE_INSTRUCTIONS * 4);
+	WARP_FITS(PARHELIA_WARP_PROBE_ENTRY, warp_constant_probe,
+		  PARHELIA_WARP_TRANSFORM_TEXTURED_ENTRY);
+	WARP_FITS(PARHELIA_WARP_TRANSFORM_TEXTURED_ENTRY, warp_transform_textured,
+		  PARHELIA_WARP_TRANSFORM_MULTITEX_ENTRY);
+	WARP_FITS(PARHELIA_WARP_TRANSFORM_MULTITEX_ENTRY, warp_transform_multitex,
+		  PARHELIA_WARP_STORE_INSTRUCTIONS * 4);
 #undef WARP_FITS
 
 	if (ret)
@@ -858,6 +906,10 @@ int parhelia_warp_init(struct parhelia_device *pdev)
 	warp_upload(pdev, PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY / 4,
 		    warp_textured_multitex, ARRAY_SIZE(warp_textured_multitex));
 	warp_upload(pdev, PARHELIA_WARP_TRANSFORM_ENTRY / 4, warp_transform, ARRAY_SIZE(warp_transform));
+	warp_upload(pdev, PARHELIA_WARP_TRANSFORM_TEXTURED_ENTRY / 4,
+		    warp_transform_textured, ARRAY_SIZE(warp_transform_textured));
+	warp_upload(pdev, PARHELIA_WARP_TRANSFORM_MULTITEX_ENTRY / 4,
+		    warp_transform_multitex, ARRAY_SIZE(warp_transform_multitex));
 	warp_upload(pdev, PARHELIA_WARP_LIGHTING_ENTRY / 4, warp_lighting, ARRAY_SIZE(warp_lighting));
 	warp_upload(pdev, PARHELIA_WARP_REPLACE_ENTRY / 4, warp_replace, ARRAY_SIZE(warp_replace));
 	warp_upload(pdev, PARHELIA_WARP_CONSTANT_LOADER_ENTRY / 4,

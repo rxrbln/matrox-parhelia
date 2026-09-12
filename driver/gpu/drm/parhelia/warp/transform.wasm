@@ -1,0 +1,16 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; Copyright 2026 René Rebe <rene@exactco.de>
+; The fixed-function transform program already resident in parhelia_warp.c,
+; kept as source so the textured variants stay in step with it: object-space
+; xyz in v0, colour in v5, MVP in c0..c3, viewport scale/offset in c8/c9.
+add T0, v0, v0.0000
+dp4 r2.w, T0, c3
+dp4 r2.z, T0, c2
+dp4 r2.y, T0, c1
+dp4 r2.x, T0, c0
+add o1, v5, r1.0000 | mov T1, c9
+smul r5, r2, r2.xyz1 | mov o11, r2
+mad T1.xyz, c8.xyz1, r5, T1.xyz0
+add o0, T1, r1.0000
+end
+wra

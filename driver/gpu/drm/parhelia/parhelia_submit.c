@@ -3231,6 +3231,14 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 	case PARHELIA_PARAM_WARP_TRANSFORM:
 		args->value = parhelia_warp_entry(pdev, PARHELIA_WARP_TRANSFORM_ENTRY);
 		break;
+	case PARHELIA_PARAM_WARP_TRANSFORM_TEXTURED:
+		args->value = parhelia_warp_entry(pdev,
+					 PARHELIA_WARP_TRANSFORM_TEXTURED_ENTRY);
+		break;
+	case PARHELIA_PARAM_WARP_TRANSFORM_MULTITEX:
+		args->value = parhelia_warp_entry(pdev,
+					 PARHELIA_WARP_TRANSFORM_MULTITEX_ENTRY);
+		break;
 	case PARHELIA_PARAM_WARP_LIGHTING:
 		args->value = parhelia_warp_entry(pdev, PARHELIA_WARP_LIGHTING_ENTRY);
 		break;

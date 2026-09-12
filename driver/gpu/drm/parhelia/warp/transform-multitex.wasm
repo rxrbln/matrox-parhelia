@@ -1,0 +1,22 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; Copyright 2026 René Rebe <rene@exactco.de>
+; warp_transform plus the two-set texture-coordinate pass-through of
+; warp_textured_multitex: object-space xyz in v0, colour in v5, texcoord sets 0 and 1 in v7 and v8,
+; MVP in c0..c3, viewport scale/offset in c8/c9.  Like warp_textured this
+; program must NOT write temporary T2.
+add T0, v0, v0.0000
+; Initialize WARP temporary T2 the way warp_textured_multitex does: a fresh
+; engine rejects or locks up on a draw that depends on an unwritten T2.
+mul T2, v5, r1.0000
+dp4 r2.w, T0, c3
+dp4 r2.z, T0, c2
+dp4 r2.y, T0, c1
+dp4 r2.x, T0, c0
+add o1, v5, r1.0000 | mov T1, c9
+smul r5, r2, r2.xyz1 | mov o11, r2
+mad T1.xyz, c8.xyz1, r5, T1.xyz0
+add o0, T1, r1.0000
+wra | mov o3, v7
+wra | mov o4, v8
+end
+wra

@@ -267,6 +267,10 @@ struct parhelia_bios {
 #define PARHELIA_WARP_USER_FILE_SLOTS		8u
 #define PARHELIA_WARP_USER_INSTRUCTIONS \
 	(PARHELIA_WARP_USER_SLOTS * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS)
+/* warp_transform with the texture-coordinate pass-through of the textured
+ * programs, so a hardware-transformed draw can also be textured. */
+#define PARHELIA_WARP_TRANSFORM_TEXTURED_ENTRY	(2656u * 4)
+#define PARHELIA_WARP_TRANSFORM_MULTITEX_ENTRY	(2784u * 4)
 
 struct parhelia_dma_block {
 	void *cpu;
