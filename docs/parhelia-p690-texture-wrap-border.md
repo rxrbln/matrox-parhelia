@@ -64,9 +64,25 @@ exactly `GL_CLAMP` with a zero-width texture border, while **code 7 returns the
 border colour outside `[0,1]`**.  Both load `0x11c8` — the vendor gates the
 register write on `field >= 6` on all three axes (MTXPARD `0x17a691`, kernel
 `0x71f88`) — so code 6 differs from code 1 only in the outermost half texel,
-where a linear footprint reaches the border.  `--wrap-probe`'s phase 5 shifts
-the coordinates half a texel with `GL_LINEAR` and reads the three columns
-either side of `s = 0` to separate codes 1, 6 and 7 directly.
+where a linear footprint reaches the border.
+
+Phase 5 measures that difference directly: with `GL_LINEAR` and the
+coordinates shifted half a texel, so pixel centres land on texel boundaries,
+the columns either side of `s = 0` read (texel `(0,32)` is `002000` and the
+border is `c0ffee`):
+
+| S code | boundary -2/-1 | boundary -1/0 | boundary 0/1 |
+|---|---|---|---|
+| 1 clamp-to-edge | `002000` | `002000` | `002001` |
+| 6 `GL_CLAMP` | `608f77` | `608f77` | `002001` |
+| 7 clamp-to-border | `c0ffee` | `619078` | `002001` |
+
+`608f77` is the half-and-half mix of the border and texel `(0,32)`.  Code 1
+never touches the border; **code 6 clamps the coordinate, so the border stays
+confined to that outermost half texel however far outside the coordinate
+goes**; **code 7 lets the footprint leave and returns pure border**.  That is
+`GL_CLAMP` and `GL_CLAMP_TO_BORDER` respectively, now measured rather than
+inferred. **PROVEN [HW]**
 
 Codes 2 and 3 sample as plain repeat.  Neither vendor stack can emit them —
 the shared table never produces them and the D3D path clamps an out-of-range
@@ -92,8 +108,10 @@ independent vendor binaries — kernel `mtx1723` `0x72744`-`0x72776` masks
 `0xfe3f` and shifts the table result left 6, and the Windows ICD encodes
 `GL_TEXTURE_WRAP_R` into `texObj+0x08[14:12]` with the same five GL enums as S
 and T (MTXOGL `0x103b6e90`, `0x103b7b9c`; readback table `0x103b8d0c`).  Its
-**behaviour** needs a volume or cube sampler and is validated at GL level by
-`parhelia-gl-wrap-test`'s `GL_TEXTURE_WRAP_R` check once those targets land.
+**behaviour** needs a volume or cube sampler; `parhelia-gl-wrap-test`'s
+`GL_TEXTURE_WRAP_R` check drives it, and as of this measurement it still
+skips because a 3-D texture does not yet sample its own slices (§6.1).  **The
+R axis is therefore INFERRED, not measured.**
 
 ## 3. The border colour  **PROVEN [HW]**
 
@@ -251,6 +269,64 @@ end of the range and none coincidable with a texel code.  It also checks the
 linear border blend at the `s = 0` boundary and `GL_TEXTURE_WRAP_R` on a 3-D
 texture, skipping the latter where the implementation has no 3-D target.
 `WRAPTEST_ONLY=N` runs one mode.
+
+### 6.1 GL result on the P690, depth 24, glamor
+
+```
+renderer: Matrox P690 (SUN90)
+border colour e59933
+PASS: GL_REPEAT both axes: 0/102400 pixels differ
+PASS: GL_CLAMP_TO_EDGE both axes / on S / on T: 0/102400
+INFO: GL_CLAMP behaves as the clamp-to-edge interpretation
+PASS: GL_CLAMP both axes / on S / on T: 0/102400
+PASS: GL_CLAMP_TO_BORDER both axes / on S / on T: 0/102400
+PASS: GL_MIRRORED_REPEAT both axes / on S / on T: 0/102400
+PASS: GL_MIRROR_CLAMP_TO_EDGE both axes / on S / on T: 0/102400
+SKIP: GL_MIRROR_CLAMP: rejected by the implementation
+SKIP: GL_MIRROR_CLAMP_TO_BORDER: rejected by the implementation
+PASS: GL_CLAMP_TO_BORDER linear boundary is half border, half texel 0: 0/24
+SKIP: GL_TEXTURE_WRAP_R: no usable 3-D texture
+PASS: 0 failing checks, 3 skipped
+```
+
+Every mode the hardware has is exact over all 102400 pixels on both axes and
+independently per axis, with a non-trivial border colour; the two
+mirror-into-border forms are refused by the caps rather than substituted.
+`GL_CLAMP` matching clamp-to-edge under `GL_NEAREST` is the correct behaviour
+for a zero-width texture border and agrees with the register measurement of
+code 6.
+
+`GL_TEXTURE_WRAP_R` needs a 3-D texture.  With `PARHELIA_VOLUME_TARGETS=1` one
+can now be created, but the test's control draw — each slice sampled at its
+own centre with clamp-to-edge on R — does not return the slice's colour, so
+the R axis is still skipped rather than reported either way:
+
+```
+SKIP: GL_TEXTURE_WRAP_R: a 3-D texture does not sample its own slices yet
+      (slice 0 read ff, wanted 20)
+```
+
+### 6.2 What the old mapping did, measured
+
+`PARHELIA_LEGACY_WRAP=1` restores the previous builder, which sent every
+non-repeat mode to code 6.  The same test then reports **9 failing checks**:
+
+```
+FAIL: GL_CLAMP_TO_BORDER both axes: 98304/102400 pixels differ
+FAIL: GL_MIRRORED_REPEAT both axes: 97216/102400 pixels differ
+FAIL: GL_MIRROR_CLAMP_TO_EDGE both axes: 64764/102400 pixels differ
+```
+
+`GL_CLAMP_TO_EDGE` still passes under the old mapping because code 6 point-
+samples the edge exactly like code 1; its error only showed in the outermost
+half texel under linear filtering, which is why it went unnoticed.
+
+### 6.3 Cost
+
+None.  The Quake 3 `bench` timedemo at 1280x1024 in a depth-16 glamor screen
+measures **47.1 fps with the measured mapping and 47.0 with the legacy one**
+(791 frames, 16.8 s).  The mapping changes a field value, not the number of
+register writes.
 
 ## 7. Corrections this work makes to earlier documents
 
