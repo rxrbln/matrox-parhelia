@@ -235,8 +235,9 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 #define PARHELIA_DCM_PRIORITY_B		0x1c10
 #define PARHELIA_DCM_PRIORITY_ON	0x0b0b
 /* Each DEMREQCTL register carries two 3-bit request levels, [2:0] and [10:8];
- * the vendor writes 3 into both at every mode set.  0x0b0b sets bits 3 and 11
- * instead, which are outside either field. */
+ * 3 in both is the vendor's default, replaced at the end of every mode set by
+ * the computed levels (parhelia_update_priority_levels).  0x0b0b sets bits 3
+ * and 11 instead, which are outside either field. */
 #define PARHELIA_DCM_PRIORITY_LEVELS	0x00000303
 #define PARHELIA_DCM_PRIORITY_MASK	0x00000707
 /* DC+0x88: bit 1 and bit 7 assert the dim/fade blank.  POST can leave them

@@ -149,6 +149,33 @@ static void parhelia_pipe_load_gamma(struct drm_simple_display_pipe *pipe,
 	}
 }
 
+/* HSLPARUpdatePriorityLevels, the last call of the vendor's mode set.  Each
+ * DEMREQCTL carries two 3-bit request levels, [2:0] for the head's primary
+ * controller and [10:8] for its second one.  HSLPARGetPriorityLevels derives
+ * them from the heads' bit rates: every level starts at 1, and a head whose
+ * rate is the maximum gets 70000 / ((max * 100) / rate) / 100 = 7.  This
+ * driver lights one head at a time, so the active head's primary field is 7
+ * and every other field keeps the default 1 - where the code wrote a flat 3,
+ * the vendor's own default before the update, and only on the original
+ * family.  The display block is the same silicon on both families (the P690
+ * runs the 0528's display code in the vendor binary), so both take this path.
+ */
+static void parhelia_update_priority_levels(struct parhelia_device *pdev,
+					    unsigned int head)
+{
+	const u32 active = 7u | 1u << 8, idle = 1u | 1u << 8;
+	const u32 level[2] = {head ? idle : active, head ? active : idle};
+	const u32 reg[2] = {PARHELIA_DCM_PRIORITY_A, PARHELIA_DCM_PRIORITY_B};
+	unsigned int i;
+
+	for (i = 0; i < 2; i++) {
+		u32 v = parhelia_read(pdev, reg[i]);
+
+		v = (v & ~(u32)PARHELIA_DCM_PRIORITY_MASK) | level[i];
+		parhelia_write(pdev, reg[i], v);
+	}
+}
+
 static int parhelia_connector_get_modes(struct drm_connector *connector)
 {
 	struct parhelia_output *output = to_parhelia_output(connector);
@@ -745,18 +772,7 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	/* Do not mirror this into MMIO 0x0004/0x0008.  The complete engine
 	 * initializer proves those words are host-aperture descriptors; changing
 	 * them after engine ownership redirects 3D writes outside the surface. */
-	/* Both request-level fields of this head's DEMREQCTL carry 3 at every
-	 * vendor mode set; SwitchToHIRES parks head A at zero, and a
-	 * controller with no memory request level never fetches a scanline. */
-	if (pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL) {
-		u32 reg = head ? PARHELIA_DCM_PRIORITY_B :
-				 PARHELIA_DCM_PRIORITY_A;
-		u32 v = parhelia_read(pdev, reg);
-
-		v = (v & ~PARHELIA_DCM_PRIORITY_MASK) |
-		    PARHELIA_DCM_PRIORITY_LEVELS;
-		parhelia_write(pdev, reg, v);
-	}
+	parhelia_update_priority_levels(pdev, head);
 	parhelia_program_output(pdev, pdev->active_output, m, head);
 	/* Release the dim/fade blank this family asserts around the timing
 	 * writes; POST can leave it asserted, which is a black picture with a
