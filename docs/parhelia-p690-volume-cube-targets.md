@@ -137,36 +137,46 @@ type 2 coord 6 slice 1: (0,0) dword 0x80, delta 0x80 (0x200 bytes)
   z 1             -> 0x80
 ```
 
-Reading the bit positions off that table, the dword address is
+One geometry is not enough: at 64x32x2 two different tile-index encodings
+coincide.  Four more settle it — 64x16x2, 64x32x4, 128x32x2 and 128x64x8, each
+with **0 of its texels disagreeing with the XOR-linear form**, which is what
+makes the solution a proof rather than a fit:
+
+| geometry | x5 | x6 | y4 | y5 | z0 | z1 | z2 |
+|---|---|---|---|---|---|---|---|
+| 64x16x2 | 0x480 | – | – | – | 0x80 | – | – |
+| 64x32x2 | 0x480 | – | 0xc80 | – | 0x80 | – | – |
+| 64x32x4 | 0x880 | – | 0x1880 | – | 0x80 | 0x400 | – |
+| 128x32x2 | 0x480 | 0x800 | 0x1480 | – | 0x80 | – | – |
+| 128x64x8 | 0x1080 | 0x2000 | 0x5080 | 0x8000 | 0x80 | 0x400 | 0x800 |
+
+(`x0..x4`, `y0..y3` are 0x1, 0x2, 0x4, 0x10, 0x20 and 0x8, 0x40, 0x100, 0x200
+in every run.)  Reading the bit positions off that, with
+`half = x5 ^ trow` and `tile = (y >> 4) * (pitch >> 5) + (x >> 5)`:
 
 ```
-b0..b2 = x0,x1,x2      b3 = y0      b4,b5 = x3,x4      b6 = y1
-b7     = z0 ^ g0
-b8,b9  = y2,y3
-b10..  = g              where g = t ^ (t >> 1),
-                              t = (y >> 4) * (pitch >> 5) + (x >> 5)
+bits 0..6   x0,x1,x2, y0, x3,x4, y1      -- a 512-byte granule of 32x4 texels
+bit 7       (z & 1) ^ half
+bits 8,9    y2, y3                       -- the granules of a 32x16 sub-tile
+bits 10..   z >> 1                       -- log2(D) - 1 further slice bits
+above that  (tile & ~1) | half
 ```
 
-so a volume is laid out as
-
-* a **512-byte granule of 32x4 texels** — the same seven low bits the 2-D
-  order uses;
-* the slices of one granule consecutively, `z` occupying `log2(D)` bits
-  immediately above it;
-* the four granules of a 32x16 sub-tile above that;
-* the sub-tile index Gray-coded, which is the same `x5 ^ trow` half-swap the
-  plain 64x16 texture tile applies, generalised.
-
-A volume is therefore **not** a stack of whole 2-D images, and it is not the
-vendor's generic `(blockIndex * depth + z) * blockBytes` either (that formula,
-`mtx2146` `.text+0x213df`, interleaves whole 32x16 blocks; the P690 interleaves
-the 512-byte granule inside them).  One slice still costs
+So a volume is laid out as the 32x4 granule, then **the slices of that one
+granule consecutively**, then the granules of the sub-tile, then the sub-tile
+index whose bit 0 carries the same `x5 ^ trow` half swap the plain 64x16
+texture tile applies.  It is **not** a stack of whole 2-D images, and not the
+vendor's generic `(blockIndex * depth + z) * blockBytes` either — that formula
+(`mtx2146` `.text+0x213df`) interleaves whole 32x16 blocks where the P690
+interleaves the 512-byte granule inside them.  One slice still costs
 `pitch * align(height,16) * 4` bytes, so the object is
 `pitch * align(height,16) * 4 * D`.
 
-`ph_volume_texel_offset()` in `parhelia_mipmap.h` implements this; the
-contribution table above is a host selftest (`--selftest`, "measured P690
-volume texel order").
+`ph_volume_texel_offset()` in `parhelia_mipmap.h` implements this, and the
+whole contribution table is a host selftest (`--selftest`, "measured P690
+volume texel order").  It needs a pitch of at least 64; a 32-texel volume
+pitch is not measured, so `ph_resource_create()` refuses a volume narrower
+than 64 texels.
 
 ## 4. Cube maps
 
@@ -194,7 +204,18 @@ Vendor evidence, all **PROVEN**:
 `TextureFilterCaps` (`0x881bd`/`0x881c3`/`0x881c9`), so cube and volume get the
 full point/linear/anisotropic filter set.
 
-Hardware result: see section 7.
+Hardware result: through the GL path a cube map is exact, face by face and
+texel by texel (section 7).  The **direct** probe is not: fed the GL 1.3
+major-axis direction vectors for a face, `--texture-volume-probe PROBE_CUBE=1`
+reports an address that is not an affine function of the quad position
+(16374 of 24576 texels disagree with the XOR-linear form) and only its +X and
+-X faces land one face image apart (`f0 = 0x1000` dwords = 0x4000 bytes = one
+64x64 level, which does confirm the face stride).  Feeding `(u, v, layer)`
+instead (`PROBE_CUBE=2`) is worse: the faces separate by 0x44 dwords.  So the
+coordinate convention the address unit expects for a cube map is still
+unresolved, and the probe's cube mode is diagnostic only — the GL-level test
+is the cube-map evidence.  The next experiments are the TA opcode field
+`0x1200[23:19]` and a four-component coordinate with q.
 
 ## 5. 1-D textures
 
@@ -206,8 +227,23 @@ four converge on the same sampler emit at `0x10f821`, and the 1-D texture-object
 constructors preset height = depth = 1 (`0x1a0370`, `0x1a03d0`).
 
 `GL_TEXTURE_1D` is therefore a height-1 2-D surface.  The driver creates it
-exactly like a 2-D texture and lets the address unit derive the chain, which
-`--mip-address-probe W 1` measures level by level.
+exactly like a 2-D texture and lets the address unit derive the chain, and
+`--mip-address-probe W 1` measures that chain level by level.  On the P690 a
+64x1 base (7 levels) and a 256x1 base (9 levels) both report **0 differing
+texels at every level**, tail included, against the chain geometry
+`ph_mip_layout_init_chip()` already builds for 2-D — the tail block behaves
+exactly as it does for a square base, with the 32x1 level at the tail base and
+the 16x1 and smaller levels at the tail table's positions:
+
+```
+256x1: level 0 at 0, 1 at 0x4000, 2 at 0x6000, 3..8 sharing the tail at 0x7000
+       (hardware (0,0) bytes 0x7000, 0x7200, 0x7280, 0x72c0, 0x7a80, 0x7ac0)
+```
+
+One thing a one-row image does need: the layout quantises the base level to 32
+rows, so the allocation has to ask for those rows rather than for `height0`.
+Without that a 256x1 texture fails to allocate and `glTexImage1D` returns
+`GL_OUT_OF_MEMORY`.
 
 ## 6. Array textures are not supported
 
@@ -228,14 +264,34 @@ blend neighbouring layers — that is not an array texture.  `PIPE_TEXTURE_1D_AR
 
 ## 7. Hardware results
 
-`--texture-volume-probe /dev/dri/renderD128 64 32 2`, P690, module `1e8f7fb`:
+P690, kernel module `1e8f7fb`.
+
+`parhelia-drm-test`:
 
 | run | result |
 |---|---|
-| `PROBE_TYPE=0 PROBE_COORD=4 PROBE_DEPTH_FIELD=1` | 0/2048 texels differ from the plain 2-D order in either slice, and both slices fetch the identical addresses: a two-coordinate descriptor ignores `r`. Also proves the three-component vertex descriptor, since the image samples exactly. |
-| `PROBE_TYPE=2 PROBE_COORD=6` | the slices separate (slice 1's origin is 0x200 bytes above slice 0's) and the thirteen coordinate-bit contributions are those in section 3, which `ph_volume_texel_offset()` reproduces exactly. |
+| `--texture-volume-probe 64 32 2` with `PROBE_TYPE=0 PROBE_COORD=4 PROBE_DEPTH_FIELD=1` | 0/2048 texels differ from the plain 2-D order in either slice and both slices fetch identical addresses: a two-coordinate descriptor ignores `r`. Also proves the three-component vertex descriptor, since the image samples exactly. |
+| `--texture-volume-probe` at 64x16x2, 64x32x2, 64x32x4, 128x32x2 and 128x64x8 with `PROBE_TYPE=2 PROBE_COORD=6` | **0 of 84992 texels** off `ph_volume_texel_offset()`, and 0 off the XOR-linear form. |
+| `--mip-address-probe 64 1` and `256 1` | every level PASS, 0 differing texels, tail included. |
 
-The contribution table is kept as a host selftest so the order cannot drift:
+`tools/parhelia-gl-texture-target-test` on a glamor X server, texels compared
+one by one against their uploaded values: **0 failing checks**.
+
+* 1-D 32, 64 and 256 at level 0, and every level of the 64 (7 levels) and 256
+  (9 levels) chains;
+* 3-D 64x32x2, 64x32x4 and 128x64x8, every slice;
+* cube maps of 32 and 64 texels, all six faces;
+* 2-D array textures reported unsupported, as section 6 requires.
+
+Regressions on the same build: `parhelia-gl-clear-test` and
+`parhelia-gl-prim-test` pass, `parhelia-gl-mipmap-test` has 0 failing checks,
+`parhelia-gl-texture-test` keeps its one pre-existing failure ("rendered FBO
+texture read back"), and Quake 3 at 1280x1024 measures 29.2 fps in a 24-bit
+visual and 48.8 fps at depth 16 (56.1 with `PARHELIA_ZINIT_CLEAR=1`) — the
+same figures with `PARHELIA_NO_VOLUME_TARGETS=1`, so the new targets cost
+nothing.
+
+The contribution tables are kept as a host selftest so the order cannot drift:
 `parhelia-drm-test --selftest`, "measured P690 volume texel order and the
 three-coordinate volume descriptor".
 
@@ -243,18 +299,18 @@ three-coordinate volume descriptor".
 
 | target | state |
 |---|---|
-| `PIPE_TEXTURE_1D` | on; level-0 height-1 2-D storage in the measured order |
+| `PIPE_TEXTURE_1D` | on, with its full mip chain; height-1 2-D storage in the measured order |
 | `PIPE_TEXTURE_2D`, `PIPE_TEXTURE_RECT` | unchanged |
-| `PIPE_TEXTURE_3D` | `PARHELIA_VOLUME_TARGETS=1`; sampler-only, level 0, width at least 64 and a power-of-two depth up to 64 |
-| `PIPE_TEXTURE_CUBE` | `PARHELIA_CUBE_TARGETS=1` as well; sampler-only, level 0, square faces |
+| `PIPE_TEXTURE_3D` | on; sampler-only, level 0, width at least 64 and a power-of-two depth up to 64 |
+| `PIPE_TEXTURE_CUBE` | on; sampler-only, level 0, square faces up to 512 |
 | 1-D/2-D/cube arrays | off; no hardware target (section 6) |
 
-The two opt-ins record exactly how far the hardware evidence reaches.  The
-volume descriptor and texel order are measured, but for one image geometry
-only and never yet end to end through the GL path; the cube-map face stride is
-PROVEN from the vendor HAL and has not been measured on this silicon at all.
-Both gates should fall as soon as `--texture-volume-probe` has run over the
-remaining geometries and `tools/parhelia-gl-texture-target-test` is green.
+`PARHELIA_NO_VOLUME_TARGETS=1` returns the driver to 2-D and 1-D only.
+
+Three restrictions are worth stating plainly, because they are limits of the
+measurement rather than of the silicon: a volume or cube map carries level 0
+only (section 9), a volume must be at least 64 texels wide (section 3), and a
+volume or cube-map draw cannot carry a Gouraud vertex colour (section 2).
 
 ## 9. Open
 
@@ -270,3 +326,7 @@ remaining geometries and `tools/parhelia-gl-texture-target-test` is green.
 * Whether `0x11e0[20:19]` is a 2-bit enum or two independent flags.  Only
   TYPE 3 distinguishes them and nothing emits it.
 * A Gouraud-coloured volume or cube-map primitive; see section 2.
+* The coordinate convention the address unit wants for a cube map, so that
+  `--texture-volume-probe` can characterise cube storage directly instead of
+  relying on the GL-level comparison; see section 4.
+* A volume narrower than 64 texels, whose descriptor pitch is 32.
