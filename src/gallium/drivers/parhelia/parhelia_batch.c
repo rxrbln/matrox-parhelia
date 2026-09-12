@@ -534,21 +534,47 @@ packet_vertex_step(enum p3d_prim prim)
    }
 }
 
-/* Vertices the next packet of a run may consume.  A packet of exactly nine
- * vertices is a P690 trap: --depth-interlock-probe renders a nine-vertex
- * strip with 7186 wrong pixels and the engine then never retires the
- * following draw, while every other count from three to sixty is byte-exact
- * against one packet per primitive.  Such a run is split instead.
- * PARHELIA_NINE_VERTEX_PACKETS=1 restores the unsplit form for probing. */
+/* Vertex counts a single P690 draw packet must not carry.  Nine is a proven
+ * trap: --depth-interlock-probe renders a nine-vertex strip with 7186 wrong
+ * pixels and the engine then never retires the following draw, while every
+ * other count from three to sixty is byte-exact against one packet per
+ * primitive.  PARHELIA_PACKET_TRAPS is a comma-separated override for
+ * bisecting further counts; PARHELIA_NINE_VERTEX_PACKETS=1 clears the set. */
+static bool
+packet_vertex_trap(unsigned run)
+{
+   const char *traps = getenv("PARHELIA_PACKET_TRAPS");
+   const char *allow = getenv("PARHELIA_NINE_VERTEX_PACKETS");
+
+   if (allow && strcmp(allow, "0"))
+      return false;
+   if (!traps)
+      return run == 9;
+   for (const char *p = traps; *p;) {
+      char *end;
+      unsigned long value = strtoul(p, &end, 0);
+
+      if (end == p)
+         break;
+      if (value == run)
+         return true;
+      p = *end ? end + 1 : end;
+   }
+   return false;
+}
+
+/* Vertices the next packet of a run may consume: the largest multiple of the
+ * primitive's vertex step that is neither longer than what is left nor a
+ * trapped count. */
 static unsigned
 packet_run(enum p3d_prim prim, unsigned per_packet, unsigned left)
 {
-   const unsigned run = left < per_packet ? left : per_packet;
-   const char *allow = getenv("PARHELIA_NINE_VERTEX_PACKETS");
+   const unsigned step = packet_vertex_step(prim);
+   unsigned run = left < per_packet ? left : per_packet;
 
-   if (run != 9 || (allow && strcmp(allow, "0")))
-      return run;
-   return run - packet_vertex_step(prim);
+   while (run > step && packet_vertex_trap(run))
+      run -= step;
+   return run;
 }
 
 /* Draw packets a run of @vertices needs, or zero when the run cannot be cut

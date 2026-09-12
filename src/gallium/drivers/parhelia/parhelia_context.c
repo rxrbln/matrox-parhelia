@@ -815,20 +815,24 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
       ret = ph_submit_batch_now_untimed(ctx, batch, vertices, vertex_dwords);
       if (!ret)
          ph_hang_record(batch, vertices, vertex_dwords, ctx->fence);
-      else if (ret == -EIO)
-         ph_hang_write();
-      return ret;
+   } else {
+      start = ph_now_ns();
+      ret = ph_submit_batch_now_untimed(ctx, batch, vertices, vertex_dwords);
+      /* Record before the wait: synchronous mode retires one batch at a time,
+       * so the batch the engine stops on is the last one recorded. */
+      if (!ret)
+         ph_hang_record(batch, vertices, vertex_dwords, ctx->fence);
+      if (!ret && ctx->async_pending) {
+         ret = parhelia_wait_fence(ph_screen(ctx->base.screen)->fd, ctx->fence,
+                                   -1, NULL);
+         ctx->async_pending = ret != 0;
+      }
+      ctx->stat.kind_count[ctx->stat_kind]++;
+      ctx->stat.kind_ns[ctx->stat_kind] += ph_now_ns() - start;
+      ctx->stat.kind_pixels[ctx->stat_kind] += ctx->stat_pixels;
    }
-   start = ph_now_ns();
-   ret = ph_submit_batch_now_untimed(ctx, batch, vertices, vertex_dwords);
-   if (!ret && ctx->async_pending) {
-      ret = parhelia_wait_fence(ph_screen(ctx->base.screen)->fd, ctx->fence,
-                                -1, NULL);
-      ctx->async_pending = ret != 0;
-   }
-   ctx->stat.kind_count[ctx->stat_kind]++;
-   ctx->stat.kind_ns[ctx->stat_kind] += ph_now_ns() - start;
-   ctx->stat.kind_pixels[ctx->stat_kind] += ctx->stat_pixels;
+   if (ret == -EIO)
+      ph_hang_write();
    return ret;
 }
 
