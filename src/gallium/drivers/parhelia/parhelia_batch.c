@@ -264,11 +264,18 @@ parhelia_batch_slice(struct parhelia_batch *dst,
 static bool
 compact_state_packets_enabled(void)
 {
-   const char *value = getenv("PARHELIA_COMPACT_STATE_PACKETS");
-
    /* Hardware validation covers untextured, depth, one/two-texture and
-    * vertex-alpha streams.  Retain an immediate diagnostic escape hatch. */
-   return !value || strcmp(value, "0");
+    * vertex-alpha streams.  Retain an immediate diagnostic escape hatch,
+    * read once rather than per state packet. */
+   static bool enabled, read;
+
+   if (!read) {
+      const char *value = getenv("PARHELIA_COMPACT_STATE_PACKETS");
+
+      enabled = !value || strcmp(value, "0");
+      read = true;
+   }
+   return enabled;
 }
 
 static int batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
@@ -543,9 +550,16 @@ packet_vertex_step(enum p3d_prim prim)
 static bool
 packet_vertex_trap(unsigned run)
 {
-   const char *traps = getenv("PARHELIA_PACKET_TRAPS");
-   const char *allow = getenv("PARHELIA_NINE_VERTEX_PACKETS");
+   /* This is asked for every draw packet - over a thousand per frame in
+    * ioquake3 - so the environment is read once, not per packet. */
+   static const char *traps, *allow;
+   static bool read;
 
+   if (!read) {
+      traps = getenv("PARHELIA_PACKET_TRAPS");
+      allow = getenv("PARHELIA_NINE_VERTEX_PACKETS");
+      read = true;
+   }
    if (allow && strcmp(allow, "0"))
       return false;
    if (!traps)
