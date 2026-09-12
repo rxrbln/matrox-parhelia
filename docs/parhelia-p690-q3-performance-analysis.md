@@ -225,14 +225,40 @@ before that, the same clear ran at first submit.
 
 ## Mip chain geometry (measured with `--mip-address-probe`)
 
-* Levels with a pitch of 64 or more reserve 16-row multiples, pitch-32 levels
-  32-row multiples; every level starts 4 KiB aligned.
+* Every level reserves 16-row multiples, at a 32-texel pitch too, and the
+  pitch is `align(width, 32)` texels rather than the next power of two.
+* Levels are **not** 4 KiB aligned: the chain advances in 32x16-texel half
+  tiles, a level occupying `(align(height,16)/16) * (pitch/32)` of them and
+  the next starting where it ends.  The two halves of a 64x16 tile interleave
+  every 512 bytes, so a level can begin mid-tile (0x4200 for the second level
+  of 96x40).  Full derivation, measured bases and the vendor addresses:
+  `parhelia-p690-mip-chain-half-tiles.md`.
 * The tail starts at the first level with w <= 32 and h <= 16.  A 32-wide
   tail level sits at (0,0) with compact (pitch-32) addressing; the smaller
   levels use the tail table x {0,16,24,16,24}, y {0,0,0,8,8} shifted by
   x+32.
 * Bases up to 32 texels wide use the compact pitch-32 order, wider bases the
   native pitch >= 64 order.
+* The tail slot is a plain count of tail levels, exactly as the vendor chain
+  builder computes it (`mtx325` `.text+0x28a6d`, `level - firstTailLevel`,
+  with the first level of `w <= 16, h <= 16, d <= 31` recorded at
+  `.text+0x28c43` and the three `.rodata` tables `mtx3067`/`mtx516`/`mtx1834`
+  indexed by it).  It is **not** a function of the level's own size.
+* **Three probe levels that looked like tail-placement failures are the
+  probe's own LOD rounding.**  `--mip-address-probe` draws each level over a
+  1:1 quad of that level's size with `MIP_NEAREST`, so the minification ratio
+  is `max(W/lw, H/lh)` and the unit rounds `log2` of it to the nearest level.
+  A level whose ratio is `1.5 * 2^k` therefore samples the *next* level and
+  reports that level's address: 96x48 level 5 (48/1 = 1.5 * 32) fetches level
+  6's `0x7880`, and 192x24 level 4 (24/1 = 1.5 * 16) fetches level 5's
+  `0x9080`, while 96x40 - the same level widths, ratio 1.25 * 32 - is exact at
+  every level.  The probe now expects the sampled level's addresses and prints
+  the substitution; `PROBE_PIN_LEVEL=1` caps the descriptor's maximum level at
+  the level under test so the LOD clamp forces the intended one.  Predicted
+  substitutions, all at the only level with a 1.5x ratio: level 5 of every
+  height-48 chain (64x48, 96x48, 128x48, 160x48, 192x48, 224x48) and level 4
+  of every height-24 chain (96x24, 192x24); 96x44 (ratio 1.375) must show
+  none, which brackets the rounding threshold.
 * LOD bias: 0x11c0[24:16], signed 4.4 with a -4 offset (0x1c0 = bias 0).
 
 `tools/parhelia-gl-mipmap-test.c` checks these against synthetic data
