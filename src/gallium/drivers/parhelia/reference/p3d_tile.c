@@ -195,12 +195,69 @@ p3d_texture_tile_offset_64x16(uint32_t x, uint32_t y, uint32_t pitch)
 	return (trow * tpr + tcol) * 4096 + i * 4;
 }
 
+/* The P690 texture unit reads 8- and 16-bit textures in 64x32-texel tiles,
+ * 2048 bytes at one byte per texel and 4096 at two, with the tile-row parity
+ * on x bit 5 that every other Parhelia surface order also carries.  Measured
+ * exhaustively with parhelia-drm-test --texture-format-probe over two tile
+ * rows and two tile columns; it is neither the vendor's generic 32x16-block
+ * order nor this chip's own 32-bit 64x16 order, and the two texel sizes do
+ * not share one order either. */
+uint32_t
+p3d_texture_tile_offset_p690_narrow(uint32_t x, uint32_t y, uint32_t pitch,
+				    unsigned cpp)
+{
+	/* A tile always spans 64x32 texels of storage, so at a 32-texel pitch
+	 * two consecutive 32-row bands share one tile and are told apart by
+	 * the parity bit alone; multiplying before dividing expresses both. */
+	uint32_t trow = y / 32;
+	uint32_t tile = ((trow * pitch) / P3D_TILE_W) + x / P3D_TILE_W;
+	uint32_t ix = x % P3D_TILE_W, iy = y % 32;
+	uint32_t x5 = ((ix >> 5) & 1) ^ (trow & 1);
+	uint32_t i;
+
+	if (cpp == 2)
+		i =  ((ix       & 1) << 1) |
+		     (((ix >> 1) & 1) << 2) |
+		     (( iy       & 1) << 3) |
+		     (((ix >> 2) & 1) << 4) |
+		     (((iy >> 1) & 1) << 5) |
+		     (((ix >> 3) & 1) << 6) |
+		     (((ix >> 4) & 1) << 7) |
+		     (((iy >> 2) & 1) << 8) |
+		     ( x5             << 9) |
+		     (((iy >> 3) & 1) << 10) |
+		     (((iy >> 4) & 1) << 11);
+	else if (cpp == 1)
+		i =  ( ix       & 1)       |
+		     (((ix >> 1) & 1) << 1) |
+		     (((ix >> 2) & 1) << 2) |
+		     (( iy       & 1) << 3) |
+		     (((ix >> 3) & 1) << 4) |
+		     (((iy >> 1) & 1) << 5) |
+		     (((ix >> 4) & 1) << 6) |
+		     (((iy >> 2) & 1) << 7) |
+		     (((iy >> 3) & 1) << 8) |
+		     ( x5             << 9) |
+		     (((iy >> 4) & 1) << 10);
+	else
+		return UINT32_MAX;
+	return tile * (2048u * cpp) + i;
+}
+
 bool
 p3d_texture_uses_native_64x16(uint32_t chip_id, uint32_t tile_layout,
 			      unsigned cpp)
 {
 	return chip_id == 0x2539 && tile_layout == PARHELIA_TILE_64X16_4K &&
 	       cpp == 4;
+}
+
+bool
+p3d_texture_uses_p690_narrow(uint32_t chip_id, uint32_t tile_layout,
+			     unsigned cpp)
+{
+	return chip_id == 0x2539 && tile_layout == PARHELIA_TILE_64X16_4K &&
+	       (cpp == 1 || cpp == 2);
 }
 
 uint32_t
@@ -210,5 +267,7 @@ p3d_texture_tile_offset_chip(uint32_t x, uint32_t y, uint32_t pitch,
 {
 	if (p3d_texture_uses_native_64x16(chip_id, tile_layout, cpp))
 		return p3d_texture_tile_offset_64x16(x, y, pitch);
+	if (p3d_texture_uses_p690_narrow(chip_id, tile_layout, cpp))
+		return p3d_texture_tile_offset_p690_narrow(x, y, pitch, cpp);
 	return p3d_texture_tile_offset_cpp(x, y, pitch, cpp);
 }

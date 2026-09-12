@@ -56,6 +56,8 @@ struct ph_mip_layout {
    unsigned cpp;
    /* Bytes per 4x4 block when the storage is S3TC; zero otherwise. */
    unsigned block_bytes;
+   /* The measured P690 8/16-bit tile order backs this chain. */
+   bool p690_narrow;
    bool tiled;
    bool native_64x16_32;
 };

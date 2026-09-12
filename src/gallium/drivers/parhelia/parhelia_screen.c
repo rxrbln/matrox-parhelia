@@ -536,6 +536,8 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    const unsigned cpp = native_storage && !block_bytes ? native_format.cpp : 4;
    const bool p690_native_texture32 = sampler_storage && !block_bytes &&
       p3d_texture_uses_native_64x16(screen->chip_id, screen->tile_layout, cpp);
+   const bool p690_narrow = sampler_storage && !block_bytes &&
+      p3d_texture_uses_p690_narrow(screen->chip_id, screen->tile_layout, cpp);
    const bool native_depth = screen->native_rt_classes &&
       (templ->bind & PIPE_BIND_DEPTH_STENCIL);
    const bool native_color = screen->native_rt_classes && !sampler_storage &&
@@ -601,6 +603,15 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
                                                    templ->height0,
                                                    block_bytes),
                                  block_bytes == 8 ? 0x800u : 0x1000u);
+   }
+   /* The 8/16-bit order addresses 64x32-texel tiles but takes its pitch from
+    * the descriptor width, so a 32-texel image keeps a 32-texel pitch and
+    * shares each tile between two row bands. */
+   if (p690_narrow) {
+      r->mip.p690_narrow = true;
+      r->mip.size = ph_mip_align(r->mip.level[0].pitch *
+                                 ph_mip_align(templ->height0, 32) * cpp,
+                                 0x2000);
    }
    if (p690_native_texture32) {
       /* Live spatial sampling proves the hybrid address permutations used
@@ -1203,10 +1214,14 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->render_transfer =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &render_transfer) &&
       render_transfer.value == 1;
-   /* Native narrow-texel and S3TC storage are implemented but have not
-    * retired on this silicon; PARHELIA_NARROW_FORMATS=1 and PARHELIA_S3TC=1
-    * enable them for testing. */
-   s->narrow_formats = s->texture_upload && ph_env("PARHELIA_NARROW_FORMATS");
+   /* Native 8- and 16-bit sampler storage is on where its texel order has
+    * been measured: parhelia-drm-test --texture-format-probe reproduces every
+    * texel of L8, A1R5G5B5, R5G6B5 and A4R4G4B4 over two tile rows and two
+    * tile columns on the P690.  PARHELIA_NO_NARROW_FORMATS=1 opts out.
+    * Native S3TC is implemented but has not retired on hardware. */
+   s->narrow_formats = s->texture_upload &&
+      p3d_texture_uses_p690_narrow(s->chip_id, s->tile_layout, 2) &&
+      !ph_env("PARHELIA_NO_NARROW_FORMATS");
    s->s3tc = s->texture_upload && ph_env("PARHELIA_S3TC");
    if (!ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &max_packets) &&
        max_packets.value && max_packets.value <= PH_BATCH_PACKETS)
