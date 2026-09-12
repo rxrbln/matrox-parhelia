@@ -1096,6 +1096,11 @@ static void
 ph_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *pres)
 {
    struct parhelia_resource *r = ph_resource(pres);
+
+   /* Nothing can consume an outstanding hardware depth clear once the surface
+    * is gone; only the resolve target's reference has to be released. */
+   r->zinit_pending = false;
+   pipe_resource_reference(&r->zinit_colour, NULL);
    if (r->premul_rgb_handle) {
       struct drm_gem_close close = {.handle = r->premul_rgb_handle};
       ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &close);

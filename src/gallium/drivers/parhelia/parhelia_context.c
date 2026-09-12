@@ -258,6 +258,9 @@ struct ph_context {
    uint32_t fence;
    bool async_pending;
    int submit_error;
+   /* The one depth resource whose hardware clear is still outstanding.  The
+    * Z unit tracks a single surface, so arming another resolves this one. */
+   struct parhelia_resource *zinit_res;
    /* Consecutive state batches share one ioctl until an ABI bound or a CPU
     * visibility boundary is reached.  Resource references keep every GEM
     * handle alive until the kernel has copied and pinned the aggregate. */
@@ -5604,6 +5607,9 @@ ph_sampler_view_destroy(struct pipe_context *p, struct pipe_sampler_view *view)
    FREE(v);
 }
 
+static void ph_zinit_resolve(struct ph_context *ctx,
+                             struct parhelia_resource *r);
+
 static void ph_set_sampler_views(struct pipe_context *p, mesa_shader_stage sh,
                                  unsigned start, unsigned count,
                                  unsigned trailing,
@@ -5622,6 +5628,10 @@ static void ph_set_sampler_views(struct pipe_context *p, mesa_shader_stage sh,
    return;
 changed:
    ph_submit_vertices(ctx);
+   /* Sampling reads memory, not the Z unit's tracked tiles. */
+   for (unsigned i = 0; i < count; i++)
+      if (views[i])
+         ph_zinit_resolve(ctx, ph_resource(views[i]->texture));
    for (unsigned i = 0; i < count; i++) {
       pipe_sampler_view_reference(&ctx->bound_views[start + i], views[i]);
       pipe_sampler_view_reference(&ctx->sampler_views[start + i], views[i]);
@@ -6096,6 +6106,12 @@ ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *
     * into tiny submits and forces async retirement pressure. */
    if (util_framebuffer_state_equal(&ctx->fb, fb))
       return;
+   /* Only one depth surface may own the Z unit's tracked state.  A draw that
+    * binds no depth surface at all leaves it alone (measured), so a
+    * framebuffer without one is not a handover. */
+   if (ctx->zinit_res && fb && fb->zsbuf.texture &&
+       ctx->zinit_res != ph_resource(fb->zsbuf.texture))
+      ph_zinit_resolve(ctx, ctx->zinit_res);
    ph_submit_vertices(ctx);
    util_copy_framebuffer_state(&ctx->fb, fb);
    if (fb && fb->zsbuf.texture)
@@ -6126,6 +6142,113 @@ ph_colour_write_mask(enum pipe_format format, unsigned colormask)
    return mask;
 }
 
+/* ------------------------------------------------ hardware depth clear
+ *
+ * Instead of filling the depth buffer, the P690 Z unit can be told that every
+ * tile of the bound depth surface reads as one value: DWGCTL 0x20a arms the
+ * surface and 0x12b4 plus DWGCTL 0x208 loads the value
+ * (docs/parhelia-p690-fast-depth-clear.md).  Memory is not written.  The Z
+ * unit materialises the value the first time it touches a tile, so rendering
+ * is bit-identical to a filled buffer, but a tile no draw reached still holds
+ * its old bytes: every consumer outside the Z unit needs a resolve first.
+ *
+ * The tracked state is one global hardware resource.  A 3-D draw against a
+ * different depth surface destroys it, which is why only one surface is ever
+ * armed and why it is resolved before the framebuffer moves away.  Measured
+ * coverage on this chip is 640 tiles of 4096 bytes from the surface origin;
+ * a larger depth buffer keeps the 2-D fill.
+ */
+#define PH_ZINIT_TILE_BYTES 4096u
+#define PH_ZINIT_TILES 640u
+
+static bool
+ph_zinit_enabled(void)
+{
+   const char *value = getenv("PARHELIA_ZINIT_CLEAR");
+
+   return value && strcmp(value, "0");
+}
+
+static unsigned
+ph_zinit_alloc_height(const struct parhelia_resource *r)
+{
+   return ALIGN_POT(r->base.height0,
+                    r->tile_layout == PARHELIA_TILE_64X16_4K ? 16 : 32);
+}
+
+static bool
+ph_zinit_fits(const struct parhelia_resource *r)
+{
+   const uint64_t bytes = (uint64_t)r->stride * r->cpp *
+                          ph_zinit_alloc_height(r);
+
+   return bytes && bytes <= (uint64_t)PH_ZINIT_TILES * PH_ZINIT_TILE_BYTES;
+}
+
+/* The vertex depth that stores exactly @value.  Both quotients are exact in
+ * binary32 for every representable depth, so the interpolated constant lands
+ * in its own bucket whether the hardware rounds or truncates. */
+static float
+ph_zinit_depth(const struct parhelia_resource *r, uint32_t value)
+{
+   return r->cpp == 2 ? (float)(value & 0xffffu) / 65536.0f :
+                        (float)(value & 0x00ffffffu) / 16777216.0f;
+}
+
+/* Write out every tile the Z unit is still holding: a full-surface rectangle
+ * that passes only where the depth already reads as the clear value, writes
+ * that value back, and touches no colour.  Then drop the tracked state. */
+static void
+ph_zinit_resolve(struct ph_context *ctx, struct parhelia_resource *r)
+{
+   struct parhelia_batch *batch = &ctx->build_batch;
+   struct parhelia_resource *colour;
+   struct p3d_state state;
+   const unsigned height = ph_zinit_alloc_height(r);
+   float quad[6][6];
+   float depth;
+   int ret;
+
+   if (!r || !r->zinit_pending)
+      return;
+   r->zinit_pending = false;
+   if (ctx->zinit_res == r)
+      ctx->zinit_res = NULL;
+   colour = ph_resource(r->zinit_colour);
+   depth = ph_zinit_depth(r, r->zinit_value);
+   state = (struct p3d_state){
+      .colour = {.pitch = colour->stride, .fmt = colour->surf_fmt},
+      .depth = {.pitch = r->stride, .fmt = r->surf_fmt},
+      .screen_w = r->stride, .screen_h = height,
+      .prim = P3D_TRIANGLES, .warp_entry = ctx->warp_passthrough,
+      .dw_per_vertex = 6, .has_depth = 1, .depth_slot = 1, .depth_test = 1,
+      .depth_func = P3D_CMP_EQUAL, .depth_write = 1, .mask_explicit = 1,
+   };
+   for (unsigned v = 0; v < 6; v++) {
+      const bool right = v == 1 || v == 3 || v == 4;
+      const bool bottom = v == 2 || v == 4 || v == 5;
+
+      quad[v][0] = right ? (float)r->stride : 0.0f;
+      quad[v][1] = bottom ? (float)height : 0.0f;
+      quad[v][2] = depth;
+      quad[v][3] = quad[v][4] = quad[v][5] = 0.0f;
+   }
+   ph_submit_vertices(ctx);
+   ret = parhelia_batch_state(batch, colour->handle, r->handle, &state, 2);
+   if (!ret)
+      ret = ph_submit_batch(ctx, batch, quad, 36, r, colour, NULL, NULL);
+   if (!ret)
+      ret = parhelia_batch_zdiscard(batch, r->handle, r->stride, r->surf_fmt);
+   if (!ret)
+      ret = ph_submit_batch(ctx, batch, NULL, 0, r, NULL, NULL, NULL);
+   if (ph_env("PARHELIA_TRACE"))
+      fprintf(stderr, "parhelia: resolved hardware depth clear %#x on "
+              "resource=%u ret=%d\n", r->zinit_value, r->handle, ret);
+   if (ret)
+      ctx->submit_error = ret;
+   pipe_resource_reference(&r->zinit_colour, NULL);
+}
+
 /* Native format 0x36 keeps Z24 in [23:0] and stencil in [31:24]; 0x2a is a
  * bare 16-bit depth with no stencil. */
 static uint32_t
@@ -6136,6 +6259,124 @@ ph_zs_write_mask(enum pipe_format format, unsigned buffers,
       return (buffers & PIPE_CLEAR_DEPTH) ? 0xffffffffu : 0;
    return ((buffers & PIPE_CLEAR_DEPTH) ? 0x00ffffffu : 0) |
           ((buffers & PIPE_CLEAR_STENCIL) ? (uint32_t)stencil_mask << 24 : 0);
+}
+
+/* Arm the hardware clear instead of filling.  It carries neither an extent
+ * nor a write mask, so only a whole-surface clear of every bit qualifies, and
+ * the resolve needs a render target at least as wide as the depth surface. */
+static bool
+ph_zinit_clear(struct ph_context *ctx, struct parhelia_resource *r,
+               uint32_t value, uint32_t write_mask, unsigned x, unsigned y,
+               unsigned width, unsigned height)
+{
+   struct parhelia_batch *batch = &ctx->build_batch;
+   struct parhelia_resource *colour;
+   int ret;
+
+   if (!ph_zinit_enabled() || !r || !r->handle || ctx->submit_error)
+      return false;
+   if (x || y || width != r->base.width0 || height != r->base.height0 ||
+       write_mask != 0xffffffffu || r->upload_texture || !ph_zinit_fits(r))
+      return false;
+   if (!ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture)
+      return false;
+   colour = ph_resource(ctx->fb.cbufs[0].texture);
+   if (!colour->handle || colour->upload_texture ||
+       colour->stride < r->stride ||
+       colour->size < (uint64_t)colour->stride * colour->cpp *
+                      ph_zinit_alloc_height(r))
+      return false;
+   if (ctx->zinit_res && ctx->zinit_res != r)
+      ph_zinit_resolve(ctx, ctx->zinit_res);
+   if (parhelia_batch_zclear(batch, r->handle, r->stride, r->surf_fmt, value))
+      return false;
+   ctx->stat.clears++;
+   ctx->stat_kind = PH_STAT_CLEAR;
+   ret = ph_submit_batch(ctx, batch, NULL, 0, r, NULL, NULL, NULL);
+   ctx->stat_kind = PH_STAT_OTHER;
+   if (ret) {
+      ctx->submit_error = ret;
+      return true;
+   }
+   r->zinit_pending = true;
+   r->zinit_value = value;
+   pipe_resource_reference(&r->zinit_colour, &colour->base);
+   ctx->zinit_res = r;
+   r->tiled_dirty = true;
+   r->linear_dirty = false;
+   r->mip_defined |= BITFIELD_BIT(0);
+   r->content_generation++;
+   if (ph_env("PARHELIA_TRACE"))
+      fprintf(stderr,
+              "parhelia: hardware depth clear resource=%u fmt=%#x value=%#x "
+              "%ux%u\n", r->handle, r->surf_fmt, value, width, height);
+   return true;
+}
+
+/* Clear part of a surface whose tiles the Z unit still owns.  A 2-D fill would
+ * be overwritten when the Z unit later materialises its value into the same
+ * tiles, so the rectangle goes through the depth pipe instead: depth ALWAYS
+ * with depth writes and no colour writes.  This is the vendor's own P690
+ * default (Use3DClearSundog = 1). */
+static bool
+ph_zinit_rect_clear(struct ph_context *ctx, struct parhelia_resource *r,
+                    uint32_t value, uint32_t write_mask, unsigned x,
+                    unsigned y, unsigned width, unsigned height)
+{
+   struct parhelia_batch *batch = &ctx->build_batch;
+   struct parhelia_resource *colour;
+   struct p3d_state state;
+   float quad[6][6];
+   int ret;
+
+   if (!r->zinit_pending || ctx->submit_error || !r->zinit_colour)
+      return false;
+   /* Stencil planes have no depth-pipe equivalent here, and a masked clear
+    * has no equivalent at all. */
+   if (r->surf_fmt != 0x2a || write_mask != 0xffffffffu)
+      return false;
+   colour = ph_resource(r->zinit_colour);
+   state = (struct p3d_state){
+      .colour = {.pitch = colour->stride, .fmt = colour->surf_fmt},
+      .depth = {.pitch = r->stride, .fmt = r->surf_fmt},
+      .screen_w = r->stride, .screen_h = ph_zinit_alloc_height(r),
+      .prim = P3D_TRIANGLES, .warp_entry = ctx->warp_passthrough,
+      .dw_per_vertex = 6, .has_depth = 1, .depth_slot = 1, .depth_test = 1,
+      .depth_func = P3D_CMP_ALWAYS, .depth_write = 1, .mask_explicit = 1,
+      .scissor = 1, .scissor_minx = (uint16_t)x, .scissor_miny = (uint16_t)y,
+      .scissor_maxx = (uint16_t)(x + width),
+      .scissor_maxy = (uint16_t)(y + height),
+   };
+   for (unsigned v = 0; v < 6; v++) {
+      const bool right = v == 1 || v == 3 || v == 4;
+      const bool bottom = v == 2 || v == 4 || v == 5;
+
+      quad[v][0] = right ? (float)(x + width) : (float)x;
+      quad[v][1] = bottom ? (float)(y + height) : (float)y;
+      quad[v][2] = ph_zinit_depth(r, value);
+      quad[v][3] = quad[v][4] = quad[v][5] = 0.0f;
+   }
+   ph_submit_vertices(ctx);
+   ctx->stat.clears++;
+   ctx->stat.clear_pixels += (uint64_t)width * height;
+   ctx->stat_kind = PH_STAT_CLEAR;
+   ctx->stat_pixels = (double)width * height;
+   ret = parhelia_batch_state(batch, colour->handle, r->handle, &state, 2);
+   if (!ret)
+      ret = ph_submit_batch(ctx, batch, quad, 36, r, colour, NULL, NULL);
+   ctx->stat_kind = PH_STAT_OTHER;
+   ctx->stat_pixels = 0;
+   if (ret) {
+      ctx->submit_error = ret;
+      return true;
+   }
+   r->tiled_dirty = true;
+   r->content_generation++;
+   if (ph_env("PARHELIA_TRACE"))
+      fprintf(stderr,
+              "parhelia: depth-pipe clear resource=%u value=%#x %u,%u %ux%u\n",
+              r->handle, value, x, y, width, height);
+   return true;
 }
 
 static void
@@ -6149,6 +6390,9 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
    int ret;
    if (!r || !r->handle || ctx->submit_error || !write_mask)
       return;
+   /* A fill only writes the bits of its mask inside its rectangle, so the
+    * tiles the Z unit still owns have to reach memory first. */
+   ph_zinit_resolve(ctx, r);
    if (r->upload_texture) {
       ctx->submit_error = -EOPNOTSUPP;
       return;
@@ -6277,6 +6521,9 @@ ph_clear_zs(struct ph_context *ctx, const struct pipe_surface *surf,
       value = (uint32_t)MIN2(depth * 65536.0, 65535.0) * 0x10001u;
    else
       value = util_pack_z_stencil(surf->format, depth, stencil);
+   if (ph_zinit_clear(ctx, r, value, mask, x, y, width, height) ||
+       ph_zinit_rect_clear(ctx, r, value, mask, x, y, width, height))
+      return;
    ph_clear_surface(ctx, r, r->surf_fmt, value, mask, x, y, width, height);
 }
 
@@ -6397,6 +6644,7 @@ ph_flush_resource(struct pipe_context *p, struct pipe_resource *resource)
 {
    struct ph_context *ctx = ph_context(p);
 
+   ph_zinit_resolve(ctx, ph_resource(resource));
    ph_submit_vertices(ctx);
    /* Export/present consumers can observe only work already handed to the
     * kernel.  Keep it asynchronous for native resources, then rely on the
@@ -6599,6 +6847,8 @@ ph_resource_copy_region(struct pipe_context *p,
 {
    struct ph_context *ctx = ph_context(p);
 
+   ph_zinit_resolve(ctx, ph_resource(src));
+   ph_zinit_resolve(ctx, ph_resource(dst));
    if (dstz || src_box->z)
       return;
    if (dst->target == PIPE_BUFFER && src->target == PIPE_BUFFER) {
@@ -6780,6 +7030,8 @@ ph_blit(struct pipe_context *p, const struct pipe_blit_info *info)
        info->src.resource->nr_samples > 1 ||
        info->dst.resource->nr_samples > 1)
       return;
+   ph_zinit_resolve(ctx, ph_resource(info->src.resource));
+   ph_zinit_resolve(ctx, ph_resource(info->dst.resource));
    if (info->src.format == info->dst.format &&
        info->src.format == info->src.resource->format &&
        info->dst.format == info->dst.resource->format &&
@@ -6989,6 +7241,8 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
    struct ph_transfer *t = CALLOC_STRUCT(ph_transfer);
    unsigned cpp = util_format_get_blocksize(res->format);
    bool swap_rb = ph_format_needs_rb_swap(res->format);
+
+   ph_zinit_resolve(ctx, r);
    unsigned image_width, image_height;
    if (!t || !box) {
       FREE(t);

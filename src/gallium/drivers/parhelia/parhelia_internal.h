@@ -120,6 +120,14 @@ struct parhelia_resource {
    struct ph_mip_layout linear_mip;
    uint16_t mip_defined;
    bool trace_mips;
+   /* A P690 hardware depth clear is outstanding: the Z unit holds "every tile
+    * reads as @zinit_value" and memory is still stale.  The 3-D pipeline sees
+    * the cleared buffer; every other consumer needs ph_zinit_resolve() first.
+    * @zinit_colour is the render target the resolve rectangle draws into with
+    * its colour writes masked off. */
+   bool zinit_pending;
+   uint32_t zinit_value;
+   struct pipe_resource *zinit_colour;
 };
 
 static inline struct parhelia_screen *
