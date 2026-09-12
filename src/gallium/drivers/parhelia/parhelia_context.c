@@ -41,6 +41,7 @@
 #include "parhelia_batch.h"
 #include "parhelia_internal.h"
 #include "parhelia_sampler.h"
+#include "parhelia_texel.h"
 #include "parhelia_fs_compile.h"
 #include "parhelia_vs_compile.h"
 
@@ -133,45 +134,6 @@ static bool ph_copy_texture_box(struct ph_context *ctx,
                                 struct pipe_resource *src, unsigned src_level,
                                 const struct pipe_box *src_box,
                                 int dst_width, int dst_height);
-
-static size_t
-ph_mip_texel_offset(const struct ph_mip_layout *mip, unsigned level,
-                    unsigned x, unsigned y, bool linear)
-{
-   const struct ph_mip_level *image = &mip->level[level];
-   unsigned physical_pitch;
-   bool native;
-
-   native = ph_mip_physical_coords(mip, level, 4, &x, &y,
-                                   &physical_pitch);
-   if (native)
-      return p3d_texture_tile_offset_64x16_at(image->offset, x, y,
-                                              physical_pitch);
-   return image->offset + (linear ?
-          ((size_t)y * image->pitch + x) * 4 :
-          p3d_texture_tile_offset(x, y, image->pitch));
-}
-
-static size_t
-ph_mip_texel_offset_cpp(const struct ph_mip_layout *mip, unsigned level,
-                        unsigned x, unsigned y, bool linear, unsigned cpp)
-{
-   const struct ph_mip_level *image = &mip->level[level];
-   unsigned physical_pitch;
-   bool native;
-
-   native = ph_mip_physical_coords(mip, level, cpp, &x, &y,
-                                   &physical_pitch);
-   if (linear)
-      return image->offset + ((size_t)y * image->pitch + x) * cpp;
-   if (native)
-      return p3d_texture_tile_offset_64x16_at(image->offset, x, y,
-                                              physical_pitch);
-   if (mip->p690_narrow)
-      return image->offset +
-         p3d_texture_tile_offset_p690_narrow(x, y, image->pitch, cpp);
-   return image->offset + p3d_texture_tile_offset_cpp(x, y, image->pitch, cpp);
-}
 
 /* The same texel in slice or cube face @layer.  A cube map's faces are whole
  * level images side by side, a volume's slices are interleaved tile by tile;

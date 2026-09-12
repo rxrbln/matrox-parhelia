@@ -25,6 +25,7 @@
 #include "parhelia_batch.h"
 #include "parhelia_internal.h"
 #include "parhelia_public.h"
+#include "parhelia_texel.h"
 
 static void ph_resource_destroy(struct pipe_screen *pscreen,
                                 struct pipe_resource *pres);
@@ -514,15 +515,16 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
     * the surface's. */
    const unsigned texel = r->upload_texture ? cpp : r->cpp;
 
+   /* Sampler texels go through the one function that knows which order the
+    * descriptor selects.  Choosing here instead wrote 8- and 16-bit images in
+    * the generic order while 0x11e0 asked for the measured P690 one, and
+    * 32-bit images without the coordinate permutation of a native level. */
    for (unsigned y = 0; y < r->base.height0; y++)
       for (unsigned x = 0; x < r->base.width0; x++)
          memcpy((uint8_t *)r->map +
                    (r->upload_texture ?
-                    (r->mip.native_64x16_32 ?
-                     p3d_texture_tile_offset_64x16(x, y,
-                                                   r->mip.level[0].pitch) :
-                     p3d_texture_tile_offset_cpp(x, y,
-                                                 r->mip.level[0].pitch, cpp)) :
+                    ph_mip_texel_offset_cpp(&r->mip, 0, x, y, !r->mip.tiled,
+                                            cpp) :
                     p3d_tile_offset_layout_cpp(x, y, r->stride,
                                                r->tile_layout, r->cpp)),
                 (uint8_t *)r->linear_map +
