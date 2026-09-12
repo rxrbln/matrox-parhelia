@@ -279,7 +279,8 @@ static int batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
                         uint32_t source_handle,
                         unsigned triangle_count,
                         unsigned vertex_dwords,
-                        unsigned vertices_per_primitive,
+                        unsigned vertices_per_packet,
+                        unsigned total_vertices,
                         bool bound_ranges);
 
 int
@@ -347,7 +348,7 @@ parhelia_batch_clear_rect_surface(struct parhelia_batch *batch,
    p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_clear(&cs, &surface, value, write_mask, x, y, width, height);
-   return batch_finish(batch, &cs, calls, handle, 0, 0, 0, NULL, 0, 0, 0, 0,
+   return batch_finish(batch, &cs, calls, handle, 0, 0, 0, NULL, 0, 0, 0, 0, 0,
                        false);
 }
 
@@ -382,7 +383,7 @@ parhelia_batch_blit(struct parhelia_batch *batch,
    p3d_emit_blit(&cs, &dst, dst_type, dst_x, dst_y,
                  &src, src_type, src_x, src_y, width, height);
    return batch_finish(batch, &cs, calls, dst_handle, 0, 0, 0, NULL,
-                       src_handle, 0, 0, 0, false);
+                       src_handle, 0, 0, 0, 0, false);
 }
 
 int
@@ -410,16 +411,35 @@ parhelia_batch_triangles(struct parhelia_batch *batch,
    return parhelia_batch_state(batch, colour_handle, 0, &state, triangle_count);
 }
 
+/* Vertex granularity of a run: independent primitives consume a fixed number
+ * of vertices each, strips and fans one more per further primitive. */
+static unsigned
+packet_vertex_step(enum p3d_prim prim)
+{
+   switch (prim) {
+   case P3D_LINESTRIP:
+   case P3D_TRISTRIP:
+   case P3D_TRIFAN:
+      return 1;
+   default:
+      return p3d_minimum_vertices(prim);
+   }
+}
+
+/* @vertices is the whole run consumed by the @triangle_count draw packets;
+ * zero means every packet carries a full state.vertices_per_packet. */
 static int
 batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
             uint32_t depth_handle, uint32_t texture0_handle,
             uint32_t texture1_handle,
-            const struct p3d_state *input, unsigned triangle_count)
+            const struct p3d_state *input, unsigned triangle_count,
+            unsigned vertices)
 {
    struct p3d_reloc calls[PH_BATCH_PACKETS];
    uint32_t ring[PH_BATCH_PACKETS * 5];
    struct p3d_cs cs;
    struct p3d_state state;
+   unsigned per_packet, tail;
    int ret;
 
    if (!batch || !input || !colour_handle || !triangle_count ||
@@ -431,9 +451,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
         (input->vertices_per_packet > PH_BATCH_MAX_PACKET_VERTICES ||
          input->vertices_per_packet <
             p3d_minimum_vertices(input->prim) ||
-         (p3d_vertices_per_primitive(input->prim) &&
-          input->vertices_per_packet %
-             p3d_vertices_per_primitive(input->prim)))) ||
+         input->vertices_per_packet %
+            packet_vertex_step(input->prim))) ||
        !input->screen_w || !input->screen_h || input->screen_h > 0xffff ||
        input->screen_w > input->colour.pitch || (input->colour.pitch & 63) ||
        input->colour.pitch > 0x3fff || input->colour.base ||
@@ -509,6 +528,20 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
          input->depth.fmt != 0x36 || input->depth.pitch != input->colour.pitch ||
          input->depth_slot > 1)))
       return -EINVAL;
+   per_packet = input->vertices_per_packet ? input->vertices_per_packet :
+                p3d_vertices_per_primitive(input->prim);
+   if (!per_packet)
+      return -EINVAL;
+   if (!vertices)
+      vertices = triangle_count * per_packet;
+   /* Only the last packet of a run may be short, and it still has to carry
+    * whole primitives. */
+   if (vertices <= (triangle_count - 1) * per_packet)
+      return -EINVAL;
+   tail = vertices - (triangle_count - 1) * per_packet;
+   if (tail > per_packet || tail < p3d_minimum_vertices(input->prim) ||
+       tail % packet_vertex_step(input->prim))
+      return -EINVAL;
    state = *input;
    state.fence = 0; /* global counter and final drain remain kernel-owned */
    batch->command_count = 0;
@@ -529,10 +562,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
    ret = batch_finish(batch, &cs, calls, colour_handle,
                       state.has_depth ? depth_handle : 0,
                       texture0_handle, texture1_handle, texture_offsets, 0,
-                      triangle_count, state.dw_per_vertex,
-                      state.vertices_per_packet ? state.vertices_per_packet :
-                      p3d_vertices_per_primitive(state.prim),
-                      !!state.bound_ranges);
+                      triangle_count, state.dw_per_vertex, per_packet,
+                      vertices, !!state.bound_ranges);
    /* Q3 reaches this builder with already transformed window-space vertices.
     * Keep the constant-loader/WARP-transform packet cadence outside the first
     * hardware experiment; its exact CALL grouping has separate selftests. */
@@ -547,7 +578,26 @@ parhelia_batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
                      unsigned triangle_count)
 {
    return batch_state(batch, colour_handle, depth_handle, 0, 0, state,
-                      triangle_count);
+                      triangle_count, 0);
+}
+
+int
+parhelia_batch_state_run(struct parhelia_batch *batch, uint32_t colour_handle,
+                         uint32_t depth_handle, uint32_t texture0_handle,
+                         uint32_t texture1_handle,
+                         const struct p3d_state *state, unsigned vertices)
+{
+   unsigned per_packet;
+
+   if (!state)
+      return -EINVAL;
+   per_packet = state->vertices_per_packet ? state->vertices_per_packet :
+                p3d_vertices_per_primitive(state->prim);
+   if (!per_packet || !vertices)
+      return -EINVAL;
+   return batch_state(batch, colour_handle, depth_handle, texture0_handle,
+                      texture1_handle, state,
+                      (vertices + per_packet - 1) / per_packet, vertices);
 }
 
 int
@@ -558,7 +608,7 @@ parhelia_batch_state_textured(struct parhelia_batch *batch,
                               unsigned triangle_count)
 {
    return batch_state(batch, colour_handle, depth_handle, texture_handle, 0,
-                      state, triangle_count);
+                      state, triangle_count, 0);
 }
 
 int
@@ -571,7 +621,7 @@ parhelia_batch_state_multitextured(struct parhelia_batch *batch,
                                    unsigned triangle_count)
 {
    return batch_state(batch, colour_handle, depth_handle, texture0_handle,
-                      texture1_handle, state, triangle_count);
+                      texture1_handle, state, triangle_count, 0);
 }
 
 static int
@@ -583,10 +633,11 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
              uint32_t source_handle,
              unsigned triangle_count,
              unsigned vertex_dwords,
-             unsigned vertices_per_primitive,
+             unsigned vertices_per_packet,
+             unsigned total_vertices,
              bool bound_ranges)
 {
-   unsigned draws = 0, texture_units = 0, selected_unit = 0;
+   unsigned draws = 0, consumed = 0, texture_units = 0, selected_unit = 0;
    unsigned stream_packet = UINT32_MAX;
    if (cs->error)
       return -E2BIG;
@@ -605,14 +656,22 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
             draws++;
             continue;
          }
-         if (call->sec_len != 3 || (cmd[0] >> 24) != 0x97)
+         if (call->sec_len != 3 || (cmd[0] >> 24) != 0x97 ||
+             consumed >= total_vertices)
             return -EINVAL;
+         /* The last packet of a run may be shorter than the rest. */
+         const unsigned left = total_vertices - consumed;
+         const unsigned run = left < vertices_per_packet ? left :
+                              vertices_per_packet;
+
          batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
             .packet = i,
-            .dword = draws++ * vertices_per_primitive * vertex_dwords * 4,
-            .delta = vertices_per_primitive * vertex_dwords * 4,
+            .dword = consumed * vertex_dwords * 4,
+            .delta = run * vertex_dwords * 4,
             .type = PARHELIA_RELOC_DRAW,
          };
+         consumed += run;
+         draws++;
          continue;
       }
       if ((cmd[0] >> 24) == 0x41) {
@@ -699,6 +758,8 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
    }
    batch->command_count = cs->sec_len;
    batch->packet_count = cs->rel_len;
+   if (!bound_ranges && consumed != total_vertices)
+      return -EINVAL;
    return draws == triangle_count ? 0 : -EINVAL;
 }
 

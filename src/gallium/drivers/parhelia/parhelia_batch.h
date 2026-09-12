@@ -124,6 +124,14 @@ int parhelia_batch_state_multitextured(struct parhelia_batch *batch,
                                       uint32_t texture1_handle,
                                       const struct p3d_state *state,
                                       unsigned triangle_count);
+/* Draw a run of @vertices vertices of state->prim, at most
+ * state->vertices_per_packet of them per draw packet, with either texture
+ * handle zero when that unit is unused.  Only the last packet may be short. */
+int parhelia_batch_state_run(struct parhelia_batch *batch,
+                             uint32_t colour_handle, uint32_t depth_handle,
+                             uint32_t texture0_handle,
+                             uint32_t texture1_handle,
+                             const struct p3d_state *state, unsigned vertices);
 int parhelia_batch_submit(int fd, const struct parhelia_batch *batch,
                          const void *vertices, unsigned vertex_dwords,
                          uint32_t *fence);
