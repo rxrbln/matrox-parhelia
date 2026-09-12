@@ -1412,6 +1412,13 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
       ph_env("PARHELIA_FS_COMPILER") ? 120 : 110;
    caps->essl_feature_level = 100;
    caps->npot_textures = true;
+   /* The address unit's 3-bit mode per axis covers repeat, clamp-to-edge,
+    * mirrored repeat, mirror-once (clamp-to-edge) and the two border clamps,
+    * each measured by parhelia-drm-test --wrap-probe.  It mirrors once into
+    * the edge only, so GL_EXT_texture_mirror_clamp's mirror-into-border forms
+    * stay off; ARB_texture_mirror_clamp_to_edge is exact. */
+   caps->texture_mirror_clamp_to_edge = true;
+   caps->texture_mirror_clamp = false;
    caps->anisotropic_filter = true;
    caps->max_texture_anisotropy = 2.0f;
    /* Match the vendor OpenGL driver's advertised limit; the register field

@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1856,6 +1857,94 @@ ph_use_mips(const struct parhelia_resource *texture,
                           ph_view_first_level(texture, view), levels) == levels;
 }
 
+/* Report an unsupportable state once per process, never per draw. */
+static void PRINTFLIKE(1, 2)
+ph_warn_once(const char *fmt, ...)
+{
+   static bool said;
+   va_list ap;
+
+   if (said)
+      return;
+   said = true;
+   va_start(ap, fmt);
+   fprintf(stderr, "parhelia: ");
+   vfprintf(stderr, fmt, ap);
+   va_end(ap);
+}
+
+/* One Gallium wrap mode onto the address unit's 3-bit code.  False means the
+ * unit has no such mode: the caller must refuse the draw, because substituting
+ * a different one silently renders the wrong image. */
+static bool
+ph_sampler_wrap(unsigned wrap, enum p3d_wrap *code)
+{
+   switch (wrap) {
+   case PIPE_TEX_WRAP_REPEAT:
+      *code = P3D_WRAP_REPEAT;
+      return true;
+   case PIPE_TEX_WRAP_CLAMP_TO_EDGE:
+      *code = P3D_WRAP_CLAMP_EDGE;
+      return true;
+   case PIPE_TEX_WRAP_CLAMP:
+      *code = P3D_WRAP_CLAMP;
+      return true;
+   case PIPE_TEX_WRAP_CLAMP_TO_BORDER:
+      *code = P3D_WRAP_BORDER;
+      return true;
+   case PIPE_TEX_WRAP_MIRROR_REPEAT:
+      *code = P3D_WRAP_MIRROR;
+      return true;
+   case PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE:
+      *code = P3D_WRAP_MIRROR_ONCE;
+      return true;
+   default:
+      /* PIPE_TEX_WRAP_MIRROR_CLAMP and MIRROR_CLAMP_TO_BORDER: the unit
+       * mirrors once only into the edge, never into the border. */
+      return false;
+   }
+}
+
+/* GL_TEXTURE_BORDER_COLOR as an A8R8G8B8 value; p3d_border_colour() then
+ * packs it for the sampled format's class.  GL clamps to [0,1] here, which
+ * the vendor's own stack does not. */
+static uint32_t
+ph_sampler_border_colour(const struct pipe_sampler_state *sampler)
+{
+   static const unsigned shift[4] = {16, 8, 0, 24};
+   uint32_t colour = 0;
+
+   if (!sampler)
+      return 0;
+   for (unsigned i = 0; i < 4; i++) {
+      float v = CLAMP(sampler->border_color.f[i], 0.0f, 1.0f);
+
+      colour |= (uint32_t)(v * 255.0f + 0.5f) << shift[i];
+   }
+   return colour;
+}
+
+/* Fill a descriptor's per-axis address modes and its border colour.  The R
+ * axis is only programmed where the sampler runs three coordinates, so a
+ * GL_TEXTURE_WRAP_R the unit cannot express never refuses a 2-D draw. */
+static bool
+ph_sampler_wrap_axes(const struct pipe_sampler_state *sampler,
+                     enum pipe_texture_target target, struct p3d_texture *tex)
+{
+   const bool three = target == PIPE_TEXTURE_3D ||
+                      target == PIPE_TEXTURE_CUBE ||
+                      target == PIPE_TEXTURE_CUBE_ARRAY;
+
+   if (!sampler) {
+      tex->wrap_s = tex->wrap_t = tex->wrap_r = P3D_WRAP_REPEAT;
+      return true;
+   }
+   tex->border_colour = ph_sampler_border_colour(sampler);
+   return ph_sampler_wrap(sampler->wrap_s, &tex->wrap_s) &&
+          ph_sampler_wrap(sampler->wrap_t, &tex->wrap_t) &&
+          (!three || ph_sampler_wrap(sampler->wrap_r, &tex->wrap_r));
+}
+
 static uint32_t
 ph_sampler_filter_word(const struct p3d_texture *texture,
                        const struct pipe_sampler_state *sampler)
@@ -1888,6 +1977,7 @@ ph_sampler_wrap_word(const struct p3d_texture *texture,
 
    return ((uint32_t)texture->wrap_s & 7u) |
       (((uint32_t)texture->wrap_t & 7u) << 3) |
+      (((uint32_t)texture->wrap_r & 7u) << 6) |
       (fixed_min << 16) | (fixed_max << 24);
 }
 
@@ -3565,10 +3655,14 @@ ph_submit_vertices(struct ph_context *ctx)
          sampler ? sampler->max_anisotropy : 0);
       tex.mip_filter = texture_mipped ? ph_sampler_mip_filter(sampler) :
                                        P3D_MIP_NONE;
-      tex.wrap_s = sampler && sampler->wrap_s != PIPE_TEX_WRAP_REPEAT ?
-                      P3D_WRAP_CLAMP : P3D_WRAP_REPEAT;
-      tex.wrap_t = sampler && sampler->wrap_t != PIPE_TEX_WRAP_REPEAT ?
-                      P3D_WRAP_CLAMP : P3D_WRAP_REPEAT;
+      if (!ph_sampler_wrap_axes(sampler, texture->base.target, &tex)) {
+         ph_warn_once("texture wrap mode %u/%u/%u has no hardware address "
+                      "code; the draw is dropped rather than rendered with a "
+                      "different one\n", sampler->wrap_s, sampler->wrap_t,
+                      sampler->wrap_r);
+         ctx->submit_error = -EOPNOTSUPP;
+         goto out;
+      }
       tex.max_level = texture_mipped ?
          ph_view_mip_levels(texture, ctx->sampler_views[0]) - 1 : 0;
       ph_apply_view_base(texture, ctx->sampler_views[0], texture_tiled, &tex);
@@ -3608,10 +3702,13 @@ ph_submit_vertices(struct ph_context *ctx)
             sampler1 ? sampler1->max_anisotropy : 0);
          tex1.mip_filter = texture1_mipped ? ph_sampler_mip_filter(sampler1) :
                                             P3D_MIP_NONE;
-         tex1.wrap_s = sampler1 && sampler1->wrap_s != PIPE_TEX_WRAP_REPEAT ?
-                         P3D_WRAP_CLAMP : P3D_WRAP_REPEAT;
-         tex1.wrap_t = sampler1 && sampler1->wrap_t != PIPE_TEX_WRAP_REPEAT ?
-                         P3D_WRAP_CLAMP : P3D_WRAP_REPEAT;
+         if (!ph_sampler_wrap_axes(sampler1, texture1->base.target, &tex1)) {
+            ph_warn_once("texture wrap mode %u/%u/%u has no hardware address "
+                         "code on the second unit; the draw is dropped\n",
+                         sampler1->wrap_s, sampler1->wrap_t, sampler1->wrap_r);
+            ctx->submit_error = -EOPNOTSUPP;
+            goto out;
+         }
          tex1.max_level = texture1_mipped ?
             ph_view_mip_levels(texture1, ctx->sampler_views[1]) - 1 : 0;
          ph_apply_view_base(texture1, ctx->sampler_views[1], texture1_tiled,

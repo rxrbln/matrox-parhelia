@@ -217,7 +217,16 @@ static inline uint32_t p3d_depth_stencil_bits(uint32_t fmt)
 enum p3d_filter { P3D_FILTER_NEAREST = 0, P3D_FILTER_LINEAR = 2,
 		  P3D_FILTER_ANISO = 3 };
 enum p3d_mip	{ P3D_MIP_NONE = 0, P3D_MIP_NEAREST = 1, P3D_MIP_LINEAR = 2 };
-enum p3d_wrap	{ P3D_WRAP_REPEAT = 0, P3D_WRAP_CLAMP = 6 };
+/* 0x11c4 address modes, a 3-bit enum per axis, not a bit field.  Both vendor
+ * stacks share one table ({0,0,4,1,7,5,6}, MTXPARD .data 0x1d45d0 and kernel
+ * mtx3018 .data 0x19330); codes 2 and 3 are emitted by no path.  Codes from 6
+ * up sample the 0x11c8 border colour outside [0,1], 6 mirroring nothing and 7
+ * being the same clamp with the vendor's own border semantics.  Every code
+ * here is re-measured on the P690 by parhelia-drm-test --wrap-probe; see
+ * docs/parhelia-p690-texture-wrap-border.md. */
+enum p3d_wrap	{ P3D_WRAP_REPEAT = 0, P3D_WRAP_CLAMP_EDGE = 1,
+		  P3D_WRAP_MIRROR = 4, P3D_WRAP_MIRROR_ONCE = 5,
+		  P3D_WRAP_CLAMP = 6, P3D_WRAP_BORDER = 7 };
 
 /* GL_TEXTURE_ENV_MODE.  MODULATE is MUL(TEX, PREV); REPLACE is MOV(TEX), which
  * on this hardware means the alpha combiner slot 0x1260 goes to zero, 0x1268
@@ -431,12 +440,16 @@ struct p3d_texture {
 	uint32_t filter, wrap;		/* raw override; 0 = build from below */
 	enum p3d_filter min_filter, mag_filter;
 	enum p3d_mip	mip_filter;
-	enum p3d_wrap	wrap_s, wrap_t;
+	enum p3d_wrap	wrap_s, wrap_t, wrap_r;
 	unsigned	max_level;	/* 0x11e4[31:28] */
 	enum p3d_texenv	env;
 	/* GL_TEXTURE_ENV_COLOR for P3D_TEXENV_BLEND, in the hardware's own
 	 * component pairing: (red, alpha) and (blue, green). */
 	uint32_t	env_colour_ra, env_colour_bg;	/* P3D_COMBINER_CONST pairs */
+	/* GL_TEXTURE_BORDER_COLOR in 0x11c8, the colour the address modes from
+	 * code 6 up return outside [0,1].  GL's default is transparent black,
+	 * which is this field's zero. */
+	uint32_t	border_colour;
 	uint32_t	reloc_offset;	/* base level byte offset, relocated */
 	/* Diagnostic override of the per-unit auxiliary window
 	 * 0x11cc, 0x11d0, 0x11c8, 0x11d4, 0x11d8; NULL keeps the defaults. */
@@ -445,6 +458,15 @@ struct p3d_texture {
 
 uint32_t p3d_tex_filter(const struct p3d_texture *t);
 uint32_t p3d_tex_wrap(const struct p3d_texture *t);
+uint32_t p3d_border_colour(uint32_t fmt, uint32_t argb);
+
+/* The address unit reads 0x11c8 only for codes 6 and 7, and the vendor gates
+ * the register write on exactly that, on all three axes. */
+static inline int p3d_tex_border_used(const struct p3d_texture *t)
+{
+	return t->wrap_s >= P3D_WRAP_CLAMP || t->wrap_t >= P3D_WRAP_CLAMP ||
+	       t->wrap_r >= P3D_WRAP_CLAMP;
+}
 
 /* Compare functions are a three-bit MASK, shared by the depth test (0x12c8)
  * and the alpha test (0x12e4): bit 0 = EQUAL, bit 1 = LESS, bit 2 = GREATER,

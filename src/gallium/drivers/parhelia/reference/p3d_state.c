@@ -199,6 +199,22 @@ p3d_tex_filter(const struct p3d_texture *t)
 	       (((uint32_t)t->mip_filter & 3u) << 6);
 }
 
+/* 0x11c8 is packed for the sampled format's class, not for its exact layout:
+ * the vendor converter (MTXPARD 0x84560 jump table, kernel mtx678
+ * .text+0x7bc50) passes A8R8G8B8 through for the 8888, 4444, 8-bit and
+ * compressed classes and expands the 5-bit-channel 16 bpp classes to
+ * A2R10G10B10.  Scaling is the vendor's truncating v*1023/255 and a*3/255. */
+uint32_t
+p3d_border_colour(uint32_t fmt, uint32_t argb)
+{
+	if (fmt != 0x26 && fmt != 0x27 && fmt != 0x28)
+		return argb;
+	return ((((argb >> 24) & 0xffu) * 3u / 255u) << 30) |
+	       ((((argb >> 16) & 0xffu) * 1023u / 255u) << 20) |
+	       ((((argb >> 8) & 0xffu) * 1023u / 255u) << 10) |
+	       ((argb & 0xffu) * 1023u / 255u);
+}
+
 uint32_t
 p3d_tex_wrap(const struct p3d_texture *t)
 {
@@ -206,7 +222,8 @@ p3d_tex_wrap(const struct p3d_texture *t)
 		return t->wrap;
 	/* LOD max 15 in [31:24] is the capture's resting value */
 	return 0xf0000000u | ((uint32_t)t->wrap_s & 7u) |
-	       (((uint32_t)t->wrap_t & 7u) << 3);
+	       (((uint32_t)t->wrap_t & 7u) << 3) |
+	       (((uint32_t)t->wrap_r & 7u) << 6);
 }
 
 /* One byte per channel, or the 5:6:5 fields of a 16 bpp target replicated
@@ -809,7 +826,14 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			rw[0].reg = 0x11cc;
 			rw[0].val = tu->aux ? tu->aux[0] : 0xffffffffu;
 			rw[1].reg = 0x11d0; rw[1].val = tu->aux ? tu->aux[1] : 0;
-			rw[2].reg = 0x11c8; rw[2].val = tu->aux ? tu->aux[2] : 0;
+			/* 0x11c8 is the border colour the modes from code 6 up
+			 * sample outside [0,1]; the vendor loads it only when
+			 * an axis asks for one and writes zero otherwise. */
+			rw[2].reg = 0x11c8;
+			rw[2].val = tu->aux ? tu->aux[2] :
+				    p3d_tex_border_used(tu) ?
+				    p3d_border_colour(tu->fmt,
+						      tu->border_colour) : 0;
 			/* the vendor LX table value for one or two stages */
 			rw[3].reg = P3D_R_TEX_CACHE; rw[3].val = 0x00500000u;
 			p3d_reglist(cs, rw, lx ? 4 : 3);
