@@ -3,6 +3,7 @@
 #include <linux/io.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/device.h>
 #include <linux/unaligned.h>
 
 #include "parhelia_drv.h"
@@ -179,11 +180,24 @@ void parhelia_bios_init(struct parhelia_device *pdev)
 	}
 
 	if (parhelia_bios_parse(copy, size, &parsed)) {
+		size_t pins_len;
+
 		pdev->bios = parsed;
+		/* Cold bring-up needs the PInS clock and memory records long
+		 * after the option ROM is unmapped, so keep the structure
+		 * itself - sized by its own length word - and not the ROM. */
+		pins_len = get_unaligned_le16(copy + parsed.pins_offset +
+					      PARHELIA_PINS_LENGTH);
+		if (pins_len > size - parsed.pins_offset)
+			pins_len = size - parsed.pins_offset;
+		pdev->bios.pins = devm_kmemdup(&pdev->pdev->dev,
+					       copy + parsed.pins_offset,
+					       pins_len, GFP_KERNEL);
+		pdev->bios.pins_len = pdev->bios.pins ? pins_len : 0;
 		dev_info(&pdev->pdev->dev,
-			 "PInS %#x at %#x: DDC pin table %#010x (%s)\n",
+			 "PInS %#x at %#x: %zu bytes retained, DDC pin table %#010x (%s)\n",
 			 pdev->bios.pins_version, pdev->bios.pins_offset,
-			 pdev->bios.ddc_pin_ids,
+			 pdev->bios.pins_len, pdev->bios.ddc_pin_ids,
 			 pdev->bios.ddc_pin_ids_from_rom ? "VBIOS" : "default");
 	} else {
 		dev_info(&pdev->pdev->dev,

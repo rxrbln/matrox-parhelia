@@ -3,6 +3,7 @@
 #ifndef __PARHELIA_DRV_H__
 #define __PARHELIA_DRV_H__
 
+#include <linux/unaligned.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/sizes.h>
@@ -115,7 +116,34 @@ struct parhelia_bios {
 	u16 pins_offset;
 	bool pins_valid;
 	bool ddc_pin_ids_from_rom;
+	/* The PInS block itself, kept because cold bring-up reads its clock
+	 * and memory records; sized by the structure's own length word. */
+	const u8 *pins;
+	size_t pins_len;
 };
+
+/* A PInS dword, or 0 when the board's structure is shorter than @offset. */
+static inline u32 parhelia_pins_u32(const struct parhelia_bios *bios,
+				    unsigned int offset)
+{
+	if (!bios->pins || offset + sizeof(u32) > bios->pins_len)
+		return 0;
+	return get_unaligned_le32(bios->pins + offset);
+}
+
+static inline u16 parhelia_pins_u16(const struct parhelia_bios *bios,
+				    unsigned int offset)
+{
+	if (!bios->pins || offset + sizeof(u16) > bios->pins_len)
+		return 0;
+	return get_unaligned_le16(bios->pins + offset);
+}
+
+static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
+				     unsigned int offset, size_t len)
+{
+	return bios->pins && offset + len <= bios->pins_len;
+}
 
 #define PARHELIA_MMIO_RING_START	0x0404
 #define PARHELIA_MMIO_RING_END		0x0408
@@ -195,6 +223,16 @@ struct parhelia_bios {
 #define PARHELIA_DCM_PRIORITY_A		0x1c0c
 #define PARHELIA_DCM_PRIORITY_B		0x1c10
 #define PARHELIA_DCM_PRIORITY_ON	0x0b0b
+/* The VGA register window lives at MMIO 0x1c00 + port. */
+#define PARHELIA_VGA_SEQ_INDEX		0x1fc4
+#define PARHELIA_VGA_SEQ_DATA		0x1fc5
+#define PARHELIA_VGA_SEQ_RESET		0x00
+#define PARHELIA_VGA_SEQ_RESET_NORMAL	0x03
+#define PARHELIA_VGA_SEQ_CLKMODE	0x01
+#define PARHELIA_VGA_SEQ_SCREEN_OFF	0x20
+#define PARHELIA_VGA_ATTR_INDEX		0x1fc0
+#define PARHELIA_VGA_ATTR_PAS		0x20
+#define PARHELIA_VGA_INSTAT1		0x1fda
 #define PARHELIA_VGA_MISC_W		0x1fc2
 #define PARHELIA_VGA_MISC_R		0x1fcc
 #define PARHELIA_VGA_MISC_CLKSEL_MASK	0x0c
@@ -452,6 +490,10 @@ struct parhelia_device {
 	struct drm_plane_helper_funcs plane_helper_funcs;
 	struct parhelia_output outputs[PARHELIA_MAX_OUTPUTS];
 	u8 num_outputs;
+	/* The output the single display pipe is currently driving.  The pipe
+	 * used to program outputs[0] unconditionally, so only the first
+	 * connector in the table could ever light up. */
+	struct parhelia_output *active_output;
 	struct mutex ddc_lock;
 	/* Slots 1..19 and their BAR0 ranges are global hardware state. */
 	struct mutex aperture_lock;
@@ -571,6 +613,26 @@ static inline u8 parhelia_read8(struct parhelia_device *pdev, u32 reg)
 }
 
 int parhelia_modeset_init(struct parhelia_device *pdev);
+/* Whether the firmware ever ran this chip's VBIOS initialisation. */
+enum parhelia_post_state {
+	PARHELIA_POST_COLD,
+	PARHELIA_POST_DONE,
+	PARHELIA_POST_UNKNOWN,
+};
+
+/* The frequency limits a synthesiser must stay inside, from its PInS record
+ * (megahertz there, kilohertz here). */
+struct parhelia_fs_limits {
+	u32 vco_min, vco_max;
+	u32 out_min, out_max;
+};
+
+enum parhelia_post_state parhelia_post_state(struct parhelia_device *pdev);
+int parhelia_post_cold_bringup(struct parhelia_device *pdev);
+bool parhelia_fs_solve(u32 target_khz, const struct parhelia_fs_limits *lim,
+		       u32 *word, u32 *achieved_khz);
+bool parhelia_fs_locked(struct parhelia_device *pdev, u32 reg,
+			unsigned int required);
 void parhelia_bios_init(struct parhelia_device *pdev);
 bool parhelia_bios_parse(const u8 *rom, size_t size,
 			 struct parhelia_bios *bios);
