@@ -145,13 +145,42 @@ static const u32 warp_transform_textured[] = {
 	0x00080200, 0x00440000, 0x301a21a2,
 };
 
-/* Unlike the single-texture variant this one initializes temporary T2, as
- * warp_textured_multitex does: a fresh engine rejects or locks up on a draw
- * that depends on an unwritten T2, and this is the program a two-set
- * transformed draw binds first. */
-static const u32 warp_transform_multitex[] = {
+/* The two-set transform program differs from its single-set sibling in
+ * exactly two instructions, and a two-set transformed draw wedged the engine
+ * with both of them present.  Build the program from those two optional
+ * pieces so each combination costs a module reload rather than a rebuild:
+ * bit 0 writes temporary T2 as warp_textured_multitex does, bit 1 writes o4,
+ * which the hardware needs whenever texture-coordinate set 1 is advertised.
+ */
+static int transform_multitex_ops = 2;
+module_param(transform_multitex_ops, int, 0400);
+MODULE_PARM_DESC(transform_multitex_ops,
+	"Two-set WARP transform program: bit0 write T2, bit1 write o4");
+
+#define WARP_T2_WRITE		0x0800be00, 0x00440015, 0xba9a2249
+#define WARP_O4_WRITE		0x0088024f, 0x00440200, 0xb01a21a2
+#define WARP_TRANSFORM_BODY \
+	0x00003e00, 0x00440000, 0xb89a2249, \
+	0x1804a200, 0x00440103, 0xbb9a21a2, \
+	0x10049200, 0x00440103, 0xbb9a21a2, \
+	0x08048a00, 0x00440103, 0xbb9a21a2, \
+	0x00048600, 0x00440103, 0xbb9a21a2, \
+	0x0e987c1f, 0x00440215, 0xb89a2249, \
+	0x12257ebf, 0x00440289, 0xc49a22a2, \
+	0x2c105e00, 0x004401a1, 0xbb6a2222, \
+	0x08083e00, 0x00440105, 0xb89a2249, \
+	0x0078023f, 0x00440200, 0xb01a21a2
+#define WARP_END \
+	0x00000200, 0x00040000, 0x14c00000, \
+	0x00080200, 0x00440000, 0x301a21a2
+
+static const u32 warp_transform_multitex_none[] = {
+	WARP_TRANSFORM_BODY, WARP_END,
+};
+
+static const u32 warp_transform_multitex_t2[] = {
 	0x00003e00, 0x00440000, 0xb89a2249,
-	0x0800be00, 0x00440015, 0xba9a2249,
+	WARP_T2_WRITE,
 	0x1804a200, 0x00440103, 0xbb9a21a2,
 	0x10049200, 0x00440103, 0xbb9a21a2,
 	0x08048a00, 0x00440103, 0xbb9a21a2,
@@ -161,9 +190,39 @@ static const u32 warp_transform_multitex[] = {
 	0x2c105e00, 0x004401a1, 0xbb6a2222,
 	0x08083e00, 0x00440105, 0xb89a2249,
 	0x0078023f, 0x00440200, 0xb01a21a2,
-	0x0088024f, 0x00440200, 0xb01a21a2,
-	0x00000200, 0x00040000, 0x14c00000,
-	0x00080200, 0x00440000, 0x301a21a2,
+	WARP_END,
+};
+
+static const u32 warp_transform_multitex_o4[] = {
+	WARP_TRANSFORM_BODY,
+	WARP_O4_WRITE,
+	WARP_END,
+};
+
+static const u32 warp_transform_multitex_t2_o4[] = {
+	0x00003e00, 0x00440000, 0xb89a2249,
+	WARP_T2_WRITE,
+	0x1804a200, 0x00440103, 0xbb9a21a2,
+	0x10049200, 0x00440103, 0xbb9a21a2,
+	0x08048a00, 0x00440103, 0xbb9a21a2,
+	0x00048600, 0x00440103, 0xbb9a21a2,
+	0x0e987c1f, 0x00440215, 0xb89a2249,
+	0x12257ebf, 0x00440289, 0xc49a22a2,
+	0x2c105e00, 0x004401a1, 0xbb6a2222,
+	0x08083e00, 0x00440105, 0xb89a2249,
+	0x0078023f, 0x00440200, 0xb01a21a2,
+	WARP_O4_WRITE,
+	WARP_END,
+};
+
+static const struct {
+	const u32 *code;
+	u32 dwords;
+} warp_transform_multitex_variants[4] = {
+	{ warp_transform_multitex_none, ARRAY_SIZE(warp_transform_multitex_none) },
+	{ warp_transform_multitex_t2, ARRAY_SIZE(warp_transform_multitex_t2) },
+	{ warp_transform_multitex_o4, ARRAY_SIZE(warp_transform_multitex_o4) },
+	{ warp_transform_multitex_t2_o4, ARRAY_SIZE(warp_transform_multitex_t2_o4) },
 };
 
 /* Assembled from warp/lighting.wasm: reference lighting plus c6 ambient. */
@@ -864,7 +923,7 @@ int parhelia_warp_init(struct parhelia_device *pdev)
 		  PARHELIA_WARP_TRANSFORM_TEXTURED_ENTRY);
 	WARP_FITS(PARHELIA_WARP_TRANSFORM_TEXTURED_ENTRY, warp_transform_textured,
 		  PARHELIA_WARP_TRANSFORM_MULTITEX_ENTRY);
-	WARP_FITS(PARHELIA_WARP_TRANSFORM_MULTITEX_ENTRY, warp_transform_multitex,
+	WARP_FITS(PARHELIA_WARP_TRANSFORM_MULTITEX_ENTRY, warp_transform_multitex_t2_o4,
 		  PARHELIA_WARP_STORE_INSTRUCTIONS * 4);
 #undef WARP_FITS
 
@@ -909,7 +968,8 @@ int parhelia_warp_init(struct parhelia_device *pdev)
 	warp_upload(pdev, PARHELIA_WARP_TRANSFORM_TEXTURED_ENTRY / 4,
 		    warp_transform_textured, ARRAY_SIZE(warp_transform_textured));
 	warp_upload(pdev, PARHELIA_WARP_TRANSFORM_MULTITEX_ENTRY / 4,
-		    warp_transform_multitex, ARRAY_SIZE(warp_transform_multitex));
+		    warp_transform_multitex_variants[transform_multitex_ops & 3].code,
+		    warp_transform_multitex_variants[transform_multitex_ops & 3].dwords);
 	warp_upload(pdev, PARHELIA_WARP_LIGHTING_ENTRY / 4, warp_lighting, ARRAY_SIZE(warp_lighting));
 	warp_upload(pdev, PARHELIA_WARP_REPLACE_ENTRY / 4, warp_replace, ARRAY_SIZE(warp_replace));
 	warp_upload(pdev, PARHELIA_WARP_CONSTANT_LOADER_ENTRY / 4,
