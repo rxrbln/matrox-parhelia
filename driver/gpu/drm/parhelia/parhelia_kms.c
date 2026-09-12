@@ -546,6 +546,22 @@ static int parhelia_scanout_address(struct parhelia_device *pdev,
 	return ret;
 }
 
+/* DC_FORMAT's surface code, the same field the 3-D engine's surface
+ * configuration carries: 0x32 for A8R8G8B8, 0x28 for R5G6B5 and 0x34 for the
+ * 30-bit GigaColor word (docs/parhelia-p690-gigacolor-10bit.md).
+ */
+static u32 parhelia_dc_surface_code(u32 drm_format)
+{
+	switch (drm_format) {
+	case DRM_FORMAT_RGB565:
+		return 0x28000000u;
+	case DRM_FORMAT_XRGB2101010:
+		return 0x34000000u;
+	default:
+		return 0x32000000u;
+	}
+}
+
 static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 				 struct drm_crtc_state *crtc_state,
 				 struct drm_plane_state *plane_state)
@@ -578,7 +594,7 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 		return;
 	pitch = bo->gpu_pitch / fb->format->cpp[0];
 
-	format = fb->format->format == DRM_FORMAT_RGB565 ? 0x28000000 : 0x32000000;
+	format = parhelia_dc_surface_code(fb->format->format);
 	/* Type 3 is the native display/render-target layout. */
 	format |= 0x00030000 | pitch;
 	/* CPU stores through the host aperture must reach VRAM before scanout is
@@ -664,10 +680,9 @@ static void parhelia_pipe_update(struct drm_simple_display_pipe *pipe,
 			if (gem && !parhelia_scanout_address(pdev, gem, &address)) {
 				u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
 				u32 cpp = state->fb->format->cpp[0];
-				u32 format = (state->fb->format->format ==
-					      DRM_FORMAT_RGB565 ? 0x28030000u :
-					      0x32030000u) |
-					     (bo->gpu_pitch / cpp);
+				u32 format =
+					parhelia_dc_surface_code(state->fb->format->format) |
+					0x00030000u | (bo->gpu_pitch / cpp);
 
 				parhelia_write(pdev, dc + PARHELIA_DC_START,
 					       address & 0x0ffffc00);
@@ -901,6 +916,7 @@ static const struct drm_simple_display_pipe_funcs parhelia_pipe_funcs = {
 static const uint32_t parhelia_formats[] = {
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_RGB565,
+	DRM_FORMAT_XRGB2101010,
 };
 
 static int parhelia_fb_dirty(struct drm_framebuffer *fb,
@@ -932,7 +948,8 @@ parhelia_fb_create(struct drm_device *drm, struct drm_file *file,
 
 	if ((info->format != DRM_FORMAT_XRGB8888 &&
 	     info->format != DRM_FORMAT_ARGB8888 &&
-	     info->format != DRM_FORMAT_RGB565) || mode_cmd->offsets[0])
+	     info->format != DRM_FORMAT_RGB565 &&
+	     info->format != DRM_FORMAT_XRGB2101010) || mode_cmd->offsets[0])
 		return ERR_PTR(-EINVAL);
 	gem = drm_gem_object_lookup(file, mode_cmd->handles[0]);
 	if (!gem)
