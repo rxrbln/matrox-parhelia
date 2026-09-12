@@ -354,6 +354,92 @@ parhelia_batch_clear_rect_surface(struct parhelia_batch *batch,
 }
 
 int
+parhelia_batch_depth_control(struct parhelia_batch *batch,
+                             uint32_t depth_handle, unsigned pitch,
+                             unsigned format, unsigned slot, uint32_t control,
+                             bool load, uint32_t value, uint32_t resume)
+{
+   struct p3d_reloc calls[PH_BATCH_PACKETS];
+   uint32_t ring[PH_BATCH_PACKETS * 5];
+   struct p3d_cs cs;
+   struct p3d_surface surface = {.pitch = pitch, .fmt = format};
+
+   /* Only slot 1 carries a relocatable depth base in batch_finish. */
+   if (!batch || !depth_handle || slot != 1 || !pitch || (pitch & 63) ||
+       pitch > 0x3fff || !p3d_surface_format_bytes(format))
+      return -EINVAL;
+   if (control != P3D_ZTRACK_OFF && control != P3D_ZTRACK_ON &&
+       control != P3D_ZINIT_LOAD && control != P3D_ZINIT_RESET)
+      return -EINVAL;
+   /* The kernel's drain replays the last DWGCTL of a batch, so the word the
+    * command returns to must not be a Z command itself. */
+   if ((resume & 0xfu) == 0x8u || (resume & 0xfu) == 0xau)
+      return -EINVAL;
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
+               PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
+   p3d_emit_depth_control(&cs, &surface, slot, control, load, value, resume);
+   return batch_finish(batch, &cs, calls, 0, depth_handle, 0, 0, NULL, 0, 0, 0,
+                       P3D_TRIANGLES, 0, 0, false);
+}
+
+/* The complete hardware clear: arm the surface, then load the value.  Both
+ * commands travel in one batch so nothing can bind another depth surface in
+ * between. */
+int
+parhelia_batch_zclear(struct parhelia_batch *batch, uint32_t depth_handle,
+                      unsigned pitch, unsigned format, uint32_t value)
+{
+   struct p3d_reloc calls[PH_BATCH_PACKETS];
+   uint32_t ring[PH_BATCH_PACKETS * 5];
+   struct p3d_cs cs;
+   struct p3d_surface surface = {.pitch = pitch, .fmt = format};
+
+   if (!batch || !depth_handle || !pitch || (pitch & 63) || pitch > 0x3fff ||
+       !p3d_surface_format_bytes(format))
+      return -EINVAL;
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
+               PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
+   p3d_emit_depth_control(&cs, &surface, 1, P3D_ZTRACK_ON, false, 0,
+                          P3D_DWGCTL_SOLID);
+   p3d_emit_depth_control(&cs, &surface, 1, P3D_ZINIT_LOAD, true, value,
+                          P3D_DWGCTL_SOLID);
+   return batch_finish(batch, &cs, calls, 0, depth_handle, 0, 0, NULL, 0, 0, 0,
+                       P3D_TRIANGLES, 0, 0, false);
+}
+
+/* Drop the tracked tile state after it has been written out. */
+int
+parhelia_batch_zdiscard(struct parhelia_batch *batch, uint32_t depth_handle,
+                        unsigned pitch, unsigned format)
+{
+   struct p3d_reloc calls[PH_BATCH_PACKETS];
+   uint32_t ring[PH_BATCH_PACKETS * 5];
+   struct p3d_cs cs;
+   struct p3d_surface surface = {.pitch = pitch, .fmt = format};
+
+   if (!batch || !depth_handle || !pitch || (pitch & 63) || pitch > 0x3fff ||
+       !p3d_surface_format_bytes(format))
+      return -EINVAL;
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
+               PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
+   p3d_emit_depth_control(&cs, &surface, 1, P3D_ZINIT_RESET, false, 0,
+                          P3D_DWGCTL_SOLID);
+   p3d_emit_depth_control(&cs, &surface, 1, P3D_ZTRACK_OFF, false, 0,
+                          P3D_DWGCTL_SOLID);
+   return batch_finish(batch, &cs, calls, 0, depth_handle, 0, 0, NULL, 0, 0, 0,
+                       P3D_TRIANGLES, 0, 0, false);
+}
+
+int
 parhelia_batch_blit(struct parhelia_batch *batch,
                     uint32_t dst_handle, unsigned dst_pitch,
                     unsigned dst_type, unsigned dst_x, unsigned dst_y,

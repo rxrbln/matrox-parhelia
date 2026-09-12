@@ -86,6 +86,22 @@ int parhelia_batch_clear_rect_surface(struct parhelia_batch *batch,
                                       uint32_t write_mask, unsigned x,
                                       unsigned y, unsigned width,
                                       unsigned height);
+/* One vendor Z control command (a P3D_ZTRACK_ or P3D_ZINIT_ word) against the
+ * depth surface bound in slot @slot.  @load writes the Z-init value first;
+ * @resume is the draw word DWGCTL is left holding. */
+int parhelia_batch_depth_control(struct parhelia_batch *batch,
+                                 uint32_t depth_handle, unsigned pitch,
+                                 unsigned format, unsigned slot,
+                                 uint32_t control, bool load, uint32_t value,
+                                 uint32_t resume);
+/* The P690 hardware depth clear: mark every tile of @depth_handle as holding
+ * @value without writing memory.  The value is materialised by the Z unit on
+ * first access; parhelia_batch_zdiscard() drops what is left. */
+int parhelia_batch_zclear(struct parhelia_batch *batch, uint32_t depth_handle,
+                          unsigned pitch, unsigned format, uint32_t value);
+int parhelia_batch_zdiscard(struct parhelia_batch *batch,
+                            uint32_t depth_handle, unsigned pitch,
+                            unsigned format);
 int parhelia_batch_blit(struct parhelia_batch *batch,
                         uint32_t dst_handle, unsigned dst_pitch,
                         unsigned dst_type, unsigned dst_x, unsigned dst_y,

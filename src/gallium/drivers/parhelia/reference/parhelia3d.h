@@ -86,6 +86,7 @@
 #define P3D_R_COMB_ALPHA	0x1260	/* combiner: RGB 0x1264/0x126c, A 0x1260/0x1268 */
 #define P3D_R_COMB_RGB		0x1264
 #define P3D_R_WATERMARK		0x12b0
+#define P3D_R_ZINIT		0x12b4	/* Z-init clear value, packed like FCOL */
 #define P3D_R_EOBTAG		0x12b8	/* end-of-batch, constant 0x00070601 */
 #define P3D_R_FENCE		0x12bc	/* batch fence COUNTER, steps by 8 */
 #define P3D_R_GUARDBAND		0x12f4
@@ -648,6 +649,7 @@ struct p3d_state {
  * write_mask is PLNWT: destination bits outside it keep their old value. */
 #define P3D_ZCLEAR_FAR	0x00ffffffu
 #define P3D_ZCLEAR_NEAR	0x00000000u
+#define P3D_DWGCTL_SOLID	0xc0u	/* opaque 2-D solid fill; LEN fires it */
 void	 p3d_emit_clear(struct p3d_cs *cs, const struct p3d_surface *s,
 			uint32_t value, uint32_t write_mask, uint32_t x,
 			uint32_t y, uint32_t w, uint32_t h);
@@ -657,6 +659,21 @@ void	 p3d_emit_blit(struct p3d_cs *cs, const struct p3d_surface *dst,
 		       uint32_t src_x, uint32_t src_y, uint32_t w, uint32_t h);
 void	 p3d_emit_clear_frame(struct p3d_cs *cs, const struct p3d_state *st,
 			      uint32_t colour, uint32_t depth);
+
+/* Vendor Z-tracking / Z-init one-shot DWGCTL words, recovered in
+ * docs/parhelia-p690-zcompression-clear-banks-re.md section 2.4.  Each is
+ * written to DWGCTL and immediately followed by the running draw word, so the
+ * command acts once. */
+#define P3D_ZTRACK_OFF	0x0000000au
+#define P3D_ZTRACK_ON	0x0000020au
+#define P3D_ZINIT_LOAD	0x00000208u	/* set every tracked tile to 0x12b4 */
+#define P3D_ZINIT_RESET	0x00000308u	/* discard the tracked tile state */
+/* Bind @s as the depth surface in slot @slot and issue one Z control word,
+ * optionally preceded by the Z-init value.  @resume is the draw word the
+ * hardware returns to. */
+void	 p3d_emit_depth_control(struct p3d_cs *cs, const struct p3d_surface *s,
+				unsigned slot, uint32_t control, int load,
+				uint32_t value, uint32_t resume);
 void	 p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st);
 
 /* Emit one draw.  index is the draw's ordinal in this batch and selects its

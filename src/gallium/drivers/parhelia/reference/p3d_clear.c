@@ -19,7 +19,6 @@
  */
 #include "parhelia3d.h"
 
-#define P3D_DWGCTL_SOLID	0xc0u
 #define P3D_DWGCTL_BITBLT_2_TO_0 0x2c2u
 
 static uint32_t
@@ -76,6 +75,29 @@ p3d_emit_blit(struct p3d_cs *cs, const struct p3d_surface *dst,
 	rw[n].reg = 0x1304; rw[n].val = (src_y << 16) | (src_x & 0xffffu); n++;
 	rw[n].reg = 0x1308; rw[n].val = (dst_y << 16) | (dst_x & 0xffffu); n++;
 	rw[n].reg = 0x138c; rw[n].val = (h << 16) | (w & 0xffffu); n++;
+	p3d_reglist(cs, rw, n);
+}
+
+/* The vendor's Z-init sequence (mtxpserd.dll 0x9eff0/0x9f270): the value
+ * register and both DWGCTL writes travel in ONE register list, so the control
+ * word is consumed before anything else can run. */
+void
+p3d_emit_depth_control(struct p3d_cs *cs, const struct p3d_surface *s,
+		       unsigned slot, uint32_t control, int load,
+		       uint32_t value, uint32_t resume)
+{
+	struct p3d_rw rw[6];
+	size_t n = 0;
+
+	rw[n].reg = P3D_R_SURF0_BASE + 8 * slot;     rw[n].val = s->base; n++;
+	rw[n].reg = P3D_R_SURF0_BASE + 8 * slot + 4;
+	rw[n].val = p3d_surface_cfg(s); n++;
+	rw[n].reg = P3D_BREAK; rw[n].val = 0; n++;
+	if (load) {
+		rw[n].reg = P3D_R_ZINIT; rw[n].val = value; n++;
+	}
+	rw[n].reg = P3D_R_DWGCTL; rw[n].val = control; n++;
+	rw[n].reg = P3D_R_DWGCTL; rw[n].val = resume;  n++;
 	p3d_reglist(cs, rw, n);
 }
 
