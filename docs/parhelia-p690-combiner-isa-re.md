@@ -304,9 +304,36 @@ times texture" and "glsl mad: texture * colour + constant".
 ## 9. What the driver implements
 
 `reference/parhelia3d.h` carries this as `struct p3d_comb_program` and
-`reference/p3d_state.c` encodes it.  `parhelia_fs_compile.c` is the NIR front
-end.  Current capability, with the five-instruction quantum and the pipe
-merges taken off the top:
+`reference/p3d_state.c` encodes it.  `parhelia_fs_compile.c` compiles every
+fragment shader into it on both families; the instruction-count matcher is
+gone.  `PARHELIA_FS_TEXENV=1` returns to the fixed-function texenv words and
+GLSL 1.10, for A/B runs.
+
+* **Two lanes.**  A register's RGB and alpha halves are separate storage, so
+  the output's RGB and alpha are compiled as separate lanes whose nodes are
+  zipped into slots.  A DP3 writes both halves and takes both.
+* **Polynomials.**  Each lane is expanded into a sum of products over the
+  values that are no sums or products: samples, colours, constants and other
+  operations.  Expansion stops at a value with more than one use, so it is
+  computed once.  Mesa's flrp lowerings, `ffma`, `fsub` and `mix()` all reduce
+  to the same polynomial.
+* **Selection.**  `a*t + b*(1-t)` becomes LRP, a product plus a rest becomes
+  MAD, `-x` and `1-x` become NEG and INVERT, `x-0.5` and `2x-1` become BIAS
+  and SIGNED on non-texture operands (section 3 leaves them OPEN on a texture),
+  a shared power-of-two weight becomes the result scale and any other weight
+  a MAD by a literal.  `fsat` sets saturate, `fcsel_ge`, `fcsel_gt`, `fmax`,
+  `fmin` and `fabs` become CMP, `fdot3` becomes DP3.
+* **Constants.**  A literal is stored with the modifier that makes it exact
+  in Q1.10, so 1.0 is INVERT of 0.  Runtime constants are copied per channel
+  from the constant buffer before each draw, so a vec3 starting at component 1
+  works and one register can carry an RGB uniform and a different alpha.
+* **Registers.**  r1, r0, then a texture pipe whose sample is no longer read.
+  The result is pinned to r0 and only it saturates.
+* **Routes.**  The draw routes that still emit fixed-function words - the
+  alpha routes and the P690's serial multitexture passes - take their
+  environment from a class found by *evaluating* the compiled program against
+  MODULATE, REPLACE, DECAL, ADD and the two-unit forms, not from instruction
+  shapes.
 
 | draw | merge slots | ALU instructions available |
 |---|---|---|
@@ -317,7 +344,32 @@ merges taken off the top:
 Going to ten needs `0x1300` bit 19 and costs half the fill rate; it is the
 obvious next extension and is untested.
 
+**Host verification.**  `parhelia-drm-test --selftest` builds 29 shapes with
+nir_builder, compiles them and runs each program through the combiner model
+(`ph_fs_eval`) on 256 random fragments against NIR's own constant evaluation
+of the shader.  All five texenv modes compile to one instruction as the vendor
+emits them, two-unit MODULATE and MODULATE-then-ADD to two, fogged MODULATE
+to two, GL_DOT3_RGB to three (its DP3 must fill both halves, so the alpha
+result follows it).  Control flow, explicit-level lookups and programs past
+the quantum are refused.
+
+**Not measured on hardware yet** - both targets were unreachable when this
+landed; `tools/parhelia-gl-combiner-test` group 4 measures each:
+
+* CMP (`0x3e`) and the BIAS and SIGNED modifiers, BIN only;
+* the result scale on an intermediate;
+* whether an intermediate holds values outside [-1, 1] (D3D reports
+  `MaxPixelShaderValue = 1.0`).  The selftest marks the shapes whose result
+  depends on it, such as `(texture + colour) / 2`;
+* a texture-pipe register used as a temporary (the merge stages write those
+  registers, so the write itself is proven).
+
 ## 10. Measured coverage
+
+The figures below are from the previous compiler and the old solid-colour
+test.  `tools/parhelia-gl-combiner-test` now samples two patterned textures
+whose texels carry their coordinates under a vertex-colour gradient and checks
+every pixel; it has not been re-run on hardware with the new compiler.
 
 `tools/parhelia-gl-combiner-test` compares the rendered result of 27 shapes
 with the value the GL specification requires.  On the P690, with the driver's
