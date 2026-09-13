@@ -22,16 +22,88 @@
  * translates and zeroed other objects (a new 512x512 target wiped 77% of a
  * resident texture).  Place new objects without CPU access; the driver
  * clears them through its own aperture window. */
+/* TTM's own move is a CPU copy over BAR0, which on this chip is a translated
+ * window rather than a linear view of VRAM, so a moved object kept only the
+ * bytes its first window covered.  Copy through the aperture instead, which
+ * makes eviction work: VRAM objects no longer have to stay resident for their
+ * whole lifetime, and exhausting VRAM stops being fatal. */
 static int parhelia_ttm_move(struct ttm_buffer_object *bo, bool evict,
 			     struct ttm_operation_ctx *ctx,
 			     struct ttm_resource *new_mem,
 			     struct ttm_place *hop)
 {
 	struct parhelia_device *pdev = to_parhelia(bo->base.dev);
+	struct ttm_resource *old_mem = bo->resource;
+	bool old_vram = old_mem && old_mem->mem_type == TTM_PL_VRAM;
+	bool new_vram = new_mem->mem_type == TTM_PL_VRAM;
+	int ret;
 
-	if (bo->resource && bo->resource->mem_type == TTM_PL_SYSTEM &&
-	    new_mem->mem_type == TTM_PL_VRAM &&
+	/* A newly created object has nothing to preserve. */
+	if (old_mem && old_mem->mem_type == TTM_PL_SYSTEM && new_vram &&
 	    (!bo->ttm || !ttm_tt_is_populated(bo->ttm))) {
+		ttm_bo_move_null(bo, new_mem);
+		return 0;
+	}
+	/* A placement change inside VRAM - between the colour, scanout and
+	 * depth bands - goes window by window through a bounce buffer, since
+	 * the aperture shows one translated range at a time.  Asking TTM for a
+	 * system hop instead needed pages this object may not have, and the
+	 * failed move left the engine reading a stale address. */
+	if (old_vram && new_vram) {
+		if (pdev->submit_owner == current)
+			return -EBUSY;
+		ret = parhelia_submit_idle_lock(pdev);
+		if (ret)
+			return ret;
+		ret = parhelia_vram_copy_resources(pdev, bo, old_mem, new_mem);
+		parhelia_submit_unlock(pdev);
+		if (ret) {
+			dev_err_ratelimited(&pdev->pdev->dev,
+				"cannot move %zu bytes inside VRAM: %d\n",
+				bo->base.size, ret);
+			return ret;
+		}
+		ttm_bo_move_null(bo, new_mem);
+		return 0;
+	}
+	/* Never hand a move that touches VRAM to the helper: its CPU copy goes
+	 * through BAR0, the translated window, and scribbles wherever that
+	 * currently points - which locked the engine up as soon as objects
+	 * became evictable.  Without pages to copy into, keep the object. */
+	if ((old_vram || new_vram) && !bo->ttm) {
+		dev_info_ratelimited(&pdev->pdev->dev,
+			"move declined: %zu bytes without pages\n",
+			bo->base.size);
+		return -EBUSY;
+	}
+	if (old_vram != new_vram) {
+		ret = ttm_bo_populate(bo, ctx);
+		if (ret)
+			return ret;
+		/* Retargeting the shared host aperture while the engine runs
+		 * stops the command fetcher: a concurrent submit locked up
+		 * once per run before this park was added.  A move called from
+		 * inside a submit cannot park anything - it would wait for the
+		 * lock that path already holds - so it declines; the submit
+		 * path pins everything it needs before taking that lock. */
+		if (pdev->submit_owner == current)
+			return -EBUSY;
+		ret = parhelia_submit_idle_lock(pdev);
+		if (ret)
+			return ret;
+		ret = parhelia_vram_move_pages(pdev, bo,
+					       new_vram ? new_mem : old_mem,
+					       new_vram);
+		parhelia_submit_unlock(pdev);
+		if (ret) {
+			dev_err_ratelimited(&pdev->pdev->dev,
+				"cannot %s %zu bytes through the aperture: %d\n",
+				new_vram ? "restore" : "evict",
+				bo->base.size, ret);
+			return ret;
+		}
+		atomic_inc(new_vram ? &pdev->vram_restores :
+				      &pdev->vram_evictions);
 		ttm_bo_move_null(bo, new_mem);
 		return 0;
 	}

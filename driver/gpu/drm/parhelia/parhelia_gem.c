@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2026 René Rebe <rene@exactco.de> */
+#include <linux/highmem.h>
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -14,6 +15,7 @@
 #include <drm/drm_gem_ttm_helper.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_managed.h>
+#include <drm/ttm/ttm_tt.h>
 
 #include "parhelia_drv.h"
 
@@ -496,6 +498,165 @@ int parhelia_vram_gpu_addr(struct parhelia_device *pdev,
 	return 0;
 }
 
+/* Engine address of @offset inside an explicit VRAM resource.  A TTM move
+ * cannot use parhelia_vram_gpu_addr(): the destination resource is not
+ * assigned to the object yet, and the source one is about to be replaced.
+ * The bank encoding is the same as there. */
+static int parhelia_resource_gpu_addr(struct parhelia_device *pdev,
+				      struct ttm_resource *res, u64 offset,
+				      u64 length, u32 *gpu_addr)
+{
+	u64 bank_size = pdev->vram_size >> 1;
+	u64 physical, gpu;
+
+	if (!bank_size || !res || res->mem_type != TTM_PL_VRAM || !length)
+		return -EINVAL;
+	physical = ((u64)res->start << PAGE_SHIFT) + offset;
+	if (physical > U32_MAX || physical >= pdev->vram_size ||
+	    length > pdev->vram_size - physical)
+		return -ERANGE;
+	/* One linear engine range cannot cross the gap between the banks. */
+	if (physical < bank_size && physical + length > bank_size)
+		return -ERANGE;
+	gpu = physical >= bank_size ?
+		PARHELIA_LOCAL_BANK_B_BASE + physical - bank_size : physical;
+	if (gpu >= PARHELIA_HOST_APERTURE_BASE ||
+	    length > PARHELIA_HOST_APERTURE_BASE - gpu)
+		return -ERANGE;
+	*gpu_addr = gpu;
+	return 0;
+}
+
+/* Move an object from one VRAM resource to another through the aperture, one
+ * window at a time via a bounce buffer: the window shows a single translated
+ * range, so source and destination cannot be mapped at once.  This is what a
+ * placement change between the colour, scanout and depth bands needs. */
+int parhelia_vram_copy_resources(struct parhelia_device *pdev,
+				 struct ttm_buffer_object *bo,
+				 struct ttm_resource *from,
+				 struct ttm_resource *to)
+{
+	struct parhelia_aperture_mapping mapping = { };
+	u64 size = bo->base.size, done;
+	void *bounce;
+	int ret;
+
+	bounce = kmalloc(SZ_8K, GFP_KERNEL);
+	if (!bounce)
+		return -ENOMEM;
+	mutex_lock(&pdev->aperture_lock);
+	ret = parhelia_aperture_alloc_locked(pdev, &mapping, SZ_8K);
+	for (done = 0; !ret && done < size; done += SZ_8K) {
+		u32 bytes = min_t(u64, size - done, SZ_8K);
+		u32 src, dst;
+
+		ret = parhelia_resource_gpu_addr(pdev, from, done, bytes, &src);
+		if (!ret)
+			ret = parhelia_resource_gpu_addr(pdev, to, done, bytes,
+							 &dst);
+		if (ret)
+			break;
+		if (!mapping.active)
+			parhelia_aperture_publish_locked(pdev, &mapping, src,
+				0x10000020, 0x00010001, NULL);
+		else
+			parhelia_aperture_retarget_locked(pdev, &mapping, src,
+				0x10000020, 0x00010001);
+		memcpy_fromio(bounce,
+			      (u8 __iomem *)pdev->vram + mapping.node.start,
+			      bytes);
+		parhelia_aperture_retarget_locked(pdev, &mapping, dst,
+			0x10000020, 0x00010001);
+		memcpy_toio((u8 __iomem *)pdev->vram + mapping.node.start,
+			    bounce, bytes);
+		wmb();
+		parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(mapping.slot));
+	}
+	if (mapping.active)
+		parhelia_aperture_release_locked(pdev, &mapping);
+	else
+		parhelia_aperture_free_unpublished_locked(&mapping);
+	mutex_unlock(&pdev->aperture_lock);
+	kfree(bounce);
+	return ret;
+}
+
+/* Copy a whole object between a VRAM resource and its system pages through
+ * the translated host aperture, so TTM can evict and restore it.
+ *
+ * TTM's own move is a CPU copy over BAR0, which on this chip is a translated
+ * window rather than a linear view of VRAM: a moved object kept only the
+ * bytes its first window happened to cover.  This takes aperture_lock alone,
+ * never submit_lock: a move runs inside a validate that may already hold it,
+ * and an object TTM is moving is by definition unpinned, so no queued submit
+ * can have it bound.
+ */
+int parhelia_vram_move_pages(struct parhelia_device *pdev,
+			     struct ttm_buffer_object *bo,
+			     struct ttm_resource *vram, bool to_vram)
+{
+	struct parhelia_aperture_mapping mapping = { };
+	struct ttm_tt *tt = bo->ttm;
+	u64 size = bo->base.size, done;
+	int ret;
+
+	if (!tt || !ttm_tt_is_populated(tt) || !tt->pages)
+		return -EINVAL;
+
+	mutex_lock(&pdev->aperture_lock);
+	ret = parhelia_aperture_alloc_locked(pdev, &mapping, SZ_8K);
+	for (done = 0; !ret && done < size; ) {
+		u32 bytes = min_t(u64, size - done, SZ_8K);
+		u32 surface_address, in_window = 0;
+
+		ret = parhelia_resource_gpu_addr(pdev, vram, done, bytes,
+						 &surface_address);
+		if (ret)
+			break;
+		if (!mapping.active)
+			parhelia_aperture_publish_locked(pdev, &mapping,
+				surface_address, 0x10000020, 0x00010001, NULL);
+		else
+			parhelia_aperture_retarget_locked(pdev, &mapping,
+				surface_address, 0x10000020, 0x00010001);
+
+		/* The window spans two pages at most, but say it in general. */
+		while (in_window < bytes) {
+			u64 at = done + in_window;
+			u32 page_offset = offset_in_page(at);
+			u32 chunk = min_t(u32, bytes - in_window,
+					  PAGE_SIZE - page_offset);
+			void __iomem *window = (u8 __iomem *)pdev->vram +
+					       mapping.node.start + in_window;
+			void *page;
+
+			if (!tt->pages[at >> PAGE_SHIFT]) {
+				ret = -EFAULT;
+				break;
+			}
+			page = kmap_local_page(tt->pages[at >> PAGE_SHIFT]);
+			if (to_vram)
+				memcpy_toio(window, page + page_offset, chunk);
+			else
+				memcpy_fromio(page + page_offset, window, chunk);
+			kunmap_local(page);
+			in_window += chunk;
+		}
+		if (!ret && to_vram) {
+			wmb();
+			parhelia_read(pdev,
+				      PARHELIA_HOST_APERTURE_SLOT(mapping.slot));
+		}
+		done += bytes;
+	}
+	if (mapping.active)
+		parhelia_aperture_release_locked(pdev, &mapping);
+	else
+		parhelia_aperture_free_unpublished_locked(&mapping);
+	mutex_unlock(&pdev->aperture_lock);
+	return ret;
+}
+
 static void parhelia_host_descriptor_disable(struct parhelia_bo *bo)
 {
 	struct parhelia_device *pdev = to_parhelia(bo->gbo.bo.base.dev);
@@ -545,7 +706,7 @@ static void parhelia_raw_object_free(struct drm_gem_object *gem)
 
 	parhelia_root_trace_check(pdev, "raw_free:enter",
 				  to_parhelia_bo(gem)->layout, gem->size, 0);
-	if (to_parhelia_bo(gem)->resident)
+	if (drm_gem_vram_of_gem(gem)->bo.pin_count)
 		parhelia_vram_unpin(drm_gem_vram_of_gem(gem));
 	drm_gem_vram_put(drm_gem_vram_of_gem(gem));
 }
@@ -749,6 +910,49 @@ int parhelia_vram_clear(struct parhelia_device *pdev,
 	return ret;
 }
 
+/* Copy @len bytes into a VRAM object through the driver's own aperture window.
+ * BAR0 is translated by the host-aperture descriptors, so a plain vmap of the
+ * object does not reliably reach its storage: on the original family a cursor
+ * image written that way never arrived in VRAM. */
+int parhelia_vram_write(struct parhelia_device *pdev,
+			struct drm_gem_vram_object *gbo, u64 offset,
+			const void *src, size_t len)
+{
+	struct parhelia_aperture_mapping mapping = { };
+	u64 done;
+	int ret;
+
+	if (offset > gbo->bo.base.size || len > gbo->bo.base.size - offset)
+		return -EINVAL;
+	mutex_lock(&pdev->aperture_lock);
+	ret = parhelia_aperture_alloc_locked(pdev, &mapping, SZ_8K);
+	for (done = 0; !ret && done < len; done += SZ_8K) {
+		u32 bytes = min_t(u64, len - done, SZ_8K);
+		u32 surface_address;
+
+		ret = parhelia_vram_gpu_addr(pdev, gbo, offset + done, bytes,
+					     &surface_address);
+		if (ret)
+			break;
+		if (!mapping.active)
+			parhelia_aperture_publish_locked(pdev, &mapping,
+				surface_address, 0x10000020, 0x00010001, NULL);
+		else
+			parhelia_aperture_retarget_locked(pdev, &mapping,
+				surface_address, 0x10000020, 0x00010001);
+		memcpy_toio((u8 __iomem *)pdev->vram + mapping.node.start,
+			    (const u8 *)src + done, bytes);
+		wmb();
+		parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(mapping.slot));
+	}
+	if (mapping.active)
+		parhelia_aperture_release_locked(pdev, &mapping);
+	else
+		parhelia_aperture_free_unpublished_locked(&mapping);
+	mutex_unlock(&pdev->aperture_lock);
+	return ret;
+}
+
 int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 			 struct drm_mode_create_dumb *args)
 {
@@ -894,7 +1098,7 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 	void *buffer;
 	int ret;
 
-	if (pdev->pdev->device != 0x2539 || !pdev->raw_aperture_owned)
+	if (!pdev->raw_aperture_owned)
 		return -EOPNOTSUPP;
 	if (!args->data || !args->handle || !args->size || args->flags ||
 	    args->pad || !IS_ALIGNED(args->offset, 4) ||
@@ -1012,7 +1216,7 @@ out_aperture_unlock:
 	mutex_unlock(&pdev->aperture_lock);
 	parhelia_vram_unpin(&bo->gbo);
 out_submit_unlock:
-	mutex_unlock(&pdev->submit_lock);
+	parhelia_submit_unlock(pdev);
 out_gem:
 	drm_gem_object_put(gem);
 out_buffer:

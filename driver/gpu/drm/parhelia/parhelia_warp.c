@@ -121,7 +121,8 @@ static const u32 warp_transform[] = {
 	0x0e987c1f, 0x00440215, 0xb89a2249,
 	0x12257ebf, 0x00440289, 0xc49a22a2,
 	0x2c105e00, 0x004401a1, 0xbb6a2222,
-	0x08083e00, 0x00440105, 0xb89a2249,
+	0x08081e00, 0x00440105, 0xb89a2249,
+	0x08082200, 0x00440095, 0xb89a2249,
 	0x00000200, 0x00040000, 0x14c00000,
 	0x00080200, 0x00440000, 0x301a21a2,
 };
@@ -139,7 +140,8 @@ static const u32 warp_transform_textured[] = {
 	0x0e987c1f, 0x00440215, 0xb89a2249,
 	0x12257ebf, 0x00440289, 0xc49a22a2,
 	0x2c105e00, 0x004401a1, 0xbb6a2222,
-	0x08083e00, 0x00440105, 0xb89a2249,
+	0x08081e00, 0x00440105, 0xb89a2249,
+	0x08082200, 0x00440095, 0xb89a2249,
 	0x0078023f, 0x00440200, 0xb01a21a2,
 	0x00000200, 0x00040000, 0x14c00000,
 	0x00080200, 0x00440000, 0x301a21a2,
@@ -168,7 +170,8 @@ MODULE_PARM_DESC(transform_multitex_ops,
 	0x0e987c1f, 0x00440215, 0xb89a2249, \
 	0x12257ebf, 0x00440289, 0xc49a22a2, \
 	0x2c105e00, 0x004401a1, 0xbb6a2222, \
-	0x08083e00, 0x00440105, 0xb89a2249, \
+	0x08081e00, 0x00440105, 0xb89a2249, \
+	0x08082200, 0x00440095, 0xb89a2249, \
 	0x0078023f, 0x00440200, 0xb01a21a2
 #define WARP_END \
 	0x00000200, 0x00040000, 0x14c00000, \
@@ -188,7 +191,8 @@ static const u32 warp_transform_multitex_t2[] = {
 	0x0e987c1f, 0x00440215, 0xb89a2249,
 	0x12257ebf, 0x00440289, 0xc49a22a2,
 	0x2c105e00, 0x004401a1, 0xbb6a2222,
-	0x08083e00, 0x00440105, 0xb89a2249,
+	0x08081e00, 0x00440105, 0xb89a2249,
+	0x08082200, 0x00440095, 0xb89a2249,
 	0x0078023f, 0x00440200, 0xb01a21a2,
 	WARP_END,
 };
@@ -209,7 +213,8 @@ static const u32 warp_transform_multitex_t2_o4[] = {
 	0x0e987c1f, 0x00440215, 0xb89a2249,
 	0x12257ebf, 0x00440289, 0xc49a22a2,
 	0x2c105e00, 0x004401a1, 0xbb6a2222,
-	0x08083e00, 0x00440105, 0xb89a2249,
+	0x08081e00, 0x00440105, 0xb89a2249,
+	0x08082200, 0x00440095, 0xb89a2249,
 	0x0078023f, 0x00440200, 0xb01a21a2,
 	WARP_O4_WRITE,
 	WARP_END,
@@ -240,7 +245,8 @@ static const u32 warp_lighting[] = {
 	0x08087e00, 0x00440109, 0xb89a2249,
 	0x12257ebf, 0x00440289, 0xc49a22a2,
 	0x2c105e00, 0x004401a1, 0xbb6a2222,
-	0x08083e00, 0x00440105, 0xb89a2249,
+	0x08081e00, 0x00440105, 0xb89a2249,
+	0x08082200, 0x00440095, 0xb89a2249,
 	0x00000200, 0x00040000, 0x14c00000,
 	0x00080200, 0x00440000, 0x301a21a2,
 };
@@ -305,6 +311,10 @@ static const u32 warp_wra_tail[3] = { 0x00080200, 0x00440000, 0x301a21a2 };
 /* Primary opcodes with an established meaning.  Anything else, and the whole
  * control class below 0x60, is rejected: without branches a program cannot
  * loop, so it cannot stall the engine. */
+/* 0x10f0 is the WARP mode latch; bit 31 invalidates the instruction cache. */
+#define PARHELIA_WARP_MODE_INVALIDATE_REG	0x10f0
+#define PARHELIA_WARP_MODE_INVALIDATE		0x80000000u
+
 static bool warp_primary_allowed(u32 op)
 {
 	switch (op) {
@@ -313,6 +323,17 @@ static bool warp_primary_allowed(u32 op)
 	case 0x77: case 0x78: case 0x89: case 0x8a:
 	case 0x8b: case 0x8c: case 0x8d:
 	case 0x91: case 0x92: case 0x93: case 0x94:
+	/* The fixed-function light accumulator: 0x82 starts a light walk and
+	 * 0x81 adds a light to it, neither encoding a destination, and
+	 * 0x84/0x86 read the diffuse and specular accumulators out through the
+	 * ordinary write ports.  They cannot branch, so they cannot stall the
+	 * engine, and writing no destination leaves the file-3 check below
+	 * exactly as strict (parhelia-fog-points-implementation-leads.md). */
+	case 0x81: case 0x82: case 0x84: case 0x86:
+	/* User clip planes: 0x7a starts the dp4 chain against the plane
+	 * equations and 0x79 accumulates each further plane, with 0x6d (already
+	 * allowed) publishing the clip code to o10.x.  Neither branches. */
+	case 0x79: case 0x7a:
 		return true;
 	default:
 		return false;
@@ -568,7 +589,7 @@ int parhelia_warp_program_ioctl(struct drm_device *drm, void *data,
 		goto out;
 	ret = warp_gate_ready(pdev);
 	if (ret) {
-		mutex_unlock(&pdev->submit_lock);
+		parhelia_submit_unlock(pdev);
 		goto out;
 	}
 	mutex_lock(&pdev->warp_user_lock);
@@ -585,12 +606,25 @@ int parhelia_warp_program_ioctl(struct drm_device *drm, void *data,
 		       PARHELIA_WARP_USER_IMAGE_INSTRUCTIONS * 12);
 		memcpy(pdev->warp_user_cpu + offset, code, args->count * 12);
 		dma_wmb();
+		/* The engine serves an entry that has already run from an
+		 * instruction cache, so fresh code at a reused address executes
+		 * the old program: measured as a byte-identical copy of the
+		 * kernel's own program sampling a different colour, and as
+		 * hardware wide points landing in a corner once a second
+		 * program had been uploaded.  0x10f0 bit 31 is the software
+		 * cache invalidate (parhelia-3d-submission-audit.md line 102);
+		 * the engine is drained and gated here, and the vendor's own
+		 * bind path issues it only when its invalidate flag is set, so
+		 * it belongs at the upload rather than on every bind - doing it
+		 * per bind was measured to draw nothing at all. */
+		parhelia_write(pdev, PARHELIA_WARP_MODE_INVALIDATE_REG,
+			       PARHELIA_WARP_MODE_INVALIDATE);
 		pdev->warp_user_image[slot - 1] = image;
 		args->slot = slot;
 		args->entry = warp_user_entry(pdev, slot, image);
 	}
 	mutex_unlock(&pdev->warp_user_lock);
-	mutex_unlock(&pdev->submit_lock);
+	parhelia_submit_unlock(pdev);
 out:
 	kfree(code);
 	return ret;

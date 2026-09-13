@@ -107,13 +107,15 @@ static void parhelia_cursor_upload(struct parhelia_cursor *cursor,
 	unsigned int palette_count = 0;
 	u32 row[PARHELIA_CURSOR_STRIDE / sizeof(u32)];
 	u32 *pixels;
+	u8 *image;
 	unsigned int x, y, bitplane, i;
 	int ret;
 
 	pixels = kcalloc(PARHELIA_CURSOR_WIDTH * PARHELIA_CURSOR_HEIGHT,
 			 sizeof(*pixels), GFP_KERNEL);
-	if (!pixels)
-		return;
+	image = kzalloc(PARHELIA_CURSOR_SIZE, GFP_KERNEL);
+	if (!pixels || !image)
+		goto out_free;
 
 	gem = drm_gem_fb_get_obj(fb, 0);
 	if (!gem)
@@ -155,10 +157,16 @@ static void parhelia_cursor_upload(struct parhelia_cursor *cursor,
 				if (alpha & BIT(bitplane + 3))
 					row[8 + bitplane * 2 + word] |= bit;
 		}
-		iosys_map_memcpy_to(&cursor->image_map,
-				    y * PARHELIA_CURSOR_STRIDE, row,
-				    sizeof(row));
+		memcpy(image + y * PARHELIA_CURSOR_STRIDE, row, sizeof(row));
 	}
+	/* The original family's cursor storage is only reachable through an
+	 * aperture window; a vmap write there never arrived in VRAM. */
+	if (cursor->pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL)
+		parhelia_vram_write(cursor->pdev, cursor->image, 0, image,
+				    PARHELIA_CURSOR_SIZE);
+	else
+		iosys_map_memcpy_to(&cursor->image_map, 0, image,
+				    PARHELIA_CURSOR_SIZE);
 	wmb(); /* Make the complete planar image visible before changing its base. */
 
 	parhelia_write(cursor->pdev,
@@ -177,6 +185,7 @@ static void parhelia_cursor_upload(struct parhelia_cursor *cursor,
 			       palette[i]);
 	}
 out_free:
+	kfree(image);
 	kfree(pixels);
 }
 
@@ -204,6 +213,17 @@ static int parhelia_cursor_atomic_check(struct drm_plane *plane,
 	return 0;
 }
 
+/* The vendor's single-screen cursor (mtx68/mtx69) never writes DC+0x88; 0x16
+ * belongs to its TripleHead/QuadHead paths, and a vendor capture on a 0528 reads
+ * 0x1a88 = 0 with the hardware cursor visible.  On the original family bit 4
+ * delays the whole scanout by 8 pixels, so nothing is written there.  The P690
+ * keeps the value it was tested with. */
+static u32 parhelia_cursor_dc_enable(struct parhelia_device *pdev)
+{
+	return pdev->chip->output_family == PARHELIA_OUTPUT_P690 ?
+		PARHELIA_CURSOR_DC_ENABLE : 0;
+}
+
 static void parhelia_cursor_atomic_update(struct drm_plane *plane,
 					  struct drm_atomic_commit *commit)
 {
@@ -214,7 +234,7 @@ static void parhelia_cursor_atomic_update(struct drm_plane *plane,
 	unsigned int head = parhelia_cursor_head(pdev);
 	int x = max_t(int, state->crtc_x, -PARHELIA_CURSOR_WIDTH) + 64;
 	int y = max_t(int, state->crtc_y, -PARHELIA_CURSOR_HEIGHT) + 64;
-	u32 dc;
+	u32 dc, enable;
 
 	/* The legacy cursor ioctl reuses one framebuffer and changes its pixels
 	 * in place, so a framebuffer pointer comparison cannot detect updates.
@@ -224,9 +244,12 @@ static void parhelia_cursor_atomic_update(struct drm_plane *plane,
 	parhelia_cursor_wait_ready(cursor);
 	parhelia_write(pdev, parhelia_cursor_reg(cursor, PARHELIA_CURSOR_POS),
 		       ((x & 0x7fff) << 14) | (y & 0x7fff));
-	dc = parhelia_read(pdev, PARHELIA_DC(head) + PARHELIA_DC_PARAMS);
-	parhelia_write(pdev, PARHELIA_DC(head) + PARHELIA_DC_PARAMS,
-		       dc | PARHELIA_CURSOR_DC_ENABLE);
+	enable = parhelia_cursor_dc_enable(pdev);
+	if (enable) {
+		dc = parhelia_read(pdev, PARHELIA_DC(head) + PARHELIA_DC_PARAMS);
+		parhelia_write(pdev, PARHELIA_DC(head) + PARHELIA_DC_PARAMS,
+			       dc | enable);
+	}
 	parhelia_write(pdev,
 		       PARHELIA_CURSOR_BASE(head ^ 1) + PARHELIA_CURSOR_CTL, 0);
 	parhelia_write(pdev, parhelia_cursor_reg(cursor, PARHELIA_CURSOR_CTL),
@@ -239,13 +262,16 @@ static void parhelia_cursor_atomic_disable(struct drm_plane *plane,
 	struct parhelia_cursor *cursor = to_parhelia_cursor(plane);
 	struct parhelia_device *pdev = cursor->pdev;
 	unsigned int head = parhelia_cursor_head(pdev);
-	u32 dc;
+	u32 dc, enable;
 
 	parhelia_write(pdev, parhelia_cursor_reg(cursor, PARHELIA_CURSOR_CTL),
 		       0);
-	dc = parhelia_read(pdev, PARHELIA_DC(head) + PARHELIA_DC_PARAMS);
-	parhelia_write(pdev, PARHELIA_DC(head) + PARHELIA_DC_PARAMS,
-		       dc & ~PARHELIA_CURSOR_DC_ENABLE);
+	enable = parhelia_cursor_dc_enable(pdev);
+	if (enable) {
+		dc = parhelia_read(pdev, PARHELIA_DC(head) + PARHELIA_DC_PARAMS);
+		parhelia_write(pdev, PARHELIA_DC(head) + PARHELIA_DC_PARAMS,
+			       dc & ~enable);
+	}
 }
 
 static const struct drm_plane_helper_funcs parhelia_cursor_helper_funcs = {
@@ -317,7 +343,10 @@ int parhelia_cursor_init(struct parhelia_device *pdev)
 	cursor->image = image;
 	cursor->image_map = image_map;
 	cursor->image_offset = address;
-	iosys_map_memset(&cursor->image_map, 0, 0, PARHELIA_CURSOR_SIZE);
+	if (pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL)
+		parhelia_vram_clear(pdev, image);
+	else
+		iosys_map_memset(&cursor->image_map, 0, 0, PARHELIA_CURSOR_SIZE);
 
 	ret = drmm_add_action_or_reset(&pdev->drm, parhelia_cursor_release,
 				       cursor);

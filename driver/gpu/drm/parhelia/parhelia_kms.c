@@ -84,10 +84,28 @@ parhelia_commit_output(struct parhelia_device *pdev,
 		       struct drm_crtc_state *crtc_state)
 {
 	struct drm_connector *connector = NULL;
+	struct drm_connector_list_iter iter;
+	struct drm_connector *c;
 
 	if (crtc_state->state)
 		connector = drm_atomic_get_new_connector_for_encoder(
 			crtc_state->state, &pdev->pipe.encoder);
+	/* drm_atomic_helper_swap_state() clears each new object state's back
+	 * pointer to the atomic state, so by the time the commit tail runs
+	 * crtc_state->state is NULL and the lookup above finds nothing.  Read
+	 * the connectors' own committed state instead: without this every
+	 * commit fell back to outputs[0] and the second connector could never
+	 * be driven, whatever the commit had actually enabled. */
+	if (!connector) {
+		drm_connector_list_iter_begin(&pdev->drm, &iter);
+		drm_for_each_connector_iter(c, &iter) {
+			if (c->state && c->state->crtc == &pdev->pipe.crtc) {
+				connector = c;
+				break;
+			}
+		}
+		drm_connector_list_iter_end(&iter);
+	}
 	if (connector)
 		return to_parhelia_output(connector);
 	return pdev->num_outputs ? &pdev->outputs[0] : NULL;
@@ -107,14 +125,10 @@ static unsigned int parhelia_kms_head(struct parhelia_device *pdev)
 
 static u32 parhelia_vblank_mask(struct parhelia_device *pdev)
 {
-	/* P690's routed single display pipe reports retrace on the legacy display
-	 * source even when DVI-1 is fed by controller B.  Bit 28 is the vendor
-	 * multi-head object's second independent CRTC source; it produces no IRQ
-	 * for this routing and makes atomic commits time out. */
-	if (pdev->chip->output_family == PARHELIA_OUTPUT_P690)
-		return PARHELIA_IRQ_VBLANK_HEAD0;
-	/* OsSetVSyncInterruptState: bit 1=head 0, bit 28=head 1. */
-	return parhelia_kms_head(pdev) ? BIT(28) : PARHELIA_IRQ_VBLANK_HEAD0;
+	/* Both families report the single pipe's retrace on bit 1 even when it
+	 * scans out of controller B: on the 0528 with DC 0 off, bit 1 latches at
+	 * DC 1 line VDISP.  Bit 28 (the vendor's second CRTC object) never does. */
+	return PARHELIA_IRQ_VBLANK_HEAD0;
 }
 
 /* The display controller owns a 256-entry RGB LUT, physically ten bits wide.
@@ -447,7 +461,7 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 		/* Route this head's own controller, then select the DC head's
 		 * clock source: without this write head 1's clock never
 		 * engaged on hardware. */
-		parhelia_route_dcm(pdev, head, 3);
+		parhelia_route_dcm(pdev, head, PARHELIA_HSLPAR_PIXEL_CLKSEL);
 		/* Controller A, and only controller A, additionally takes the
 		 * VGA MISC clock-select byte: HSLPARSelectDisplayControllerClock
 		 * writes 0x68 there on that branch, and a head left on the
@@ -489,7 +503,7 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 			parhelia_write(pdev, PARHELIA_DCM_CLKCTL_B,
 				       ctl & ~PARHELIA_DCM_CLKCTL_HOLD);
 		} else {
-			parhelia_route_dcm(pdev, head, 3);
+			parhelia_route_dcm(pdev, head, PARHELIA_HSLPAR_PIXEL_CLKSEL);
 		}
 		parhelia_write(pdev, PARHELIA_DCM_PRIORITY_A,
 			       PARHELIA_DCM_PRIORITY_ON);
@@ -524,12 +538,119 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 	return 0;
 }
 
+/* Each original-family serializer has its own clock select and gate: DVO1 in
+ * 0x1c00 bits [14:13] plus bit 27 with the gate at bit 12, DVO2 in 0x1c04
+ * bits [17:15] with the gate at bit 14.  A gate bit set parks the clock, so
+ * enabling clears it (docs/parhelia-hslpar-output-path-re.md section 9). */
+static void parhelia_hslpar_dvo_clock(struct parhelia_device *pdev, u32 clksel)
+{
+	u32 v = parhelia_read(pdev, PARHELIA_DCM_CLKCTL_A);
+
+	/* Both serializers clock off controller A's register on this family:
+	 * the board's VBIOS reaches one routine for DVO1 and DVO2 alike, and it
+	 * writes only 0x1c00 - select in [14:13] with the high bit at 27, gate
+	 * at bit 12.  The 0x1c04 [17:15] field the LX/P690 uses does not exist
+	 * here; writes to it are dropped by the hardware, which left DVO2
+	 * without a pixel clock and its monitor dark. */
+	v = (v & 0xf7ff9fffu) | ((clksel & 3u) << 13) |
+	    (((clksel >> 2) & 1u) << 27) | PARHELIA_DVO_CLK_GATE;
+	parhelia_write(pdev, PARHELIA_DCM_CLKCTL_A, v);
+}
+
+/* Bring one integrated TMDS serializer up for a digital monitor, in the order
+ * the vendor's HSLPAREnableDVO uses: clock first, then release power, then
+ * install the control byte.  Byte bit 0 and the second 0x1c20 pass are gated
+ * on 0x2537..0x2539 in the vendor binary, so neither belongs on this family. */
+/* Bring one integrated serializer up in the order both the vendor HAL and this
+ * board's own VBIOS use: gate its clock and power it down, install the board
+ * configuration and the crossbar byte while it is quiet, and only then ungate
+ * and power up.  Doing it the other way round changes the source select of a
+ * running TMDS encoder, which leaves the link up carrying a stale frame.
+ * Byte bit 0 and the vendor's second 0x1c20 pass are gated on 0x2537..0x2539
+ * in the binary, so neither belongs on this family. */
+static void parhelia_hslpar_enable_dvo(struct parhelia_device *pdev,
+				       struct parhelia_output *output,
+				       const struct drm_display_mode *mode,
+				       unsigned int head)
+{
+	bool dvo2 = output->desc->digital_route == PARHELIA_ROUTE_DVO2;
+	unsigned int shift = dvo2 ? PARHELIA_DVO2_BYTE_SHIFT :
+				    PARHELIA_DVO1_BYTE_SHIFT;
+	unsigned int idle = dvo2 ? PARHELIA_DVO1_BYTE_SHIFT :
+				   PARHELIA_DVO2_BYTE_SHIFT;
+	u32 byte = PARHELIA_DVO_BYTE_ENABLE;
+	u32 v;
+
+	/* 1. Park the clock and power the serializer down before touching it. */
+	v = parhelia_read(pdev, PARHELIA_DCM_CLKCTL_A);
+	parhelia_write(pdev, PARHELIA_DCM_CLKCTL_A, v | PARHELIA_DVO_CLK_GATE);
+	v = parhelia_read(pdev, PARHELIA_REG_DVO_PWR);
+	parhelia_write(pdev, PARHELIA_REG_DVO_PWR,
+		       v | PARHELIA_DVO_PWR_DVO1 | PARHELIA_DVO_PWR_DVO2);
+
+	/* 2. Select the clock while it stays gated. */
+	parhelia_hslpar_dvo_clock(pdev, PARHELIA_HSLPAR_PIXEL_CLKSEL);
+
+	/* 3. Board configuration, which the VBIOS installs before the crossbar:
+	 * a structure older than 6 takes the fixed 0x1f, newer takes the
+	 * board's own pair.  Neither register was written on this family. */
+	if ((parhelia_pins_u32(&pdev->bios, 0x04) & 0xffu) < 6) {
+		parhelia_write(pdev, PARHELIA_REG_DVO_FORMAT2, 0x1f);
+	} else {
+		parhelia_write(pdev, PARHELIA_REG_DVO_FORMAT2,
+			       parhelia_pins_u32(&pdev->bios, 0x190));
+		parhelia_write(pdev, PARHELIA_REG_DVO_DATA,
+			       parhelia_pins_u32(&pdev->bios, 0x194));
+	}
+
+	/* 4. The crossbar byte, and clear the serializer we are not using so a
+	 * previous selection cannot keep claiming pipes. */
+	/* The sync-polarity bits stay clear here: this family's enable path
+	 * sets the data/format pair and explicitly masks bits 3 and 5 off
+	 * ("or 0x14; and ~0x28"), and the VBIOS only ever touches them from a
+	 * separate polarity routine.  Driving them from the mode flags put
+	 * 0x7c in the byte on a -hsync -vsync mode where the board expects
+	 * 0x54. */
+	byte |= (head << PARHELIA_DVO_BYTE_MODULE_SHIFT) &
+		PARHELIA_DVO_BYTE_MODULE_MASK;
+	v = parhelia_read(pdev, PARHELIA_REG_DVO_XBAR);
+	v &= ~((0xffu << shift) | (0xffu << idle) | PARHELIA_DVO_XBAR_CLEARED);
+	v |= byte << shift;
+	parhelia_write(pdev, PARHELIA_REG_DVO_XBAR, v);
+
+	/* 5. Ungate the clock, then power up: active low, so the serializer in
+	 * use and the shared block clear and the other one stays parked. */
+	v = parhelia_read(pdev, PARHELIA_DCM_CLKCTL_A);
+	parhelia_write(pdev, PARHELIA_DCM_CLKCTL_A, v & ~PARHELIA_DVO_CLK_GATE);
+	v = parhelia_read(pdev, PARHELIA_REG_DVO_PWR);
+	v &= ~((dvo2 ? PARHELIA_DVO_PWR_DVO2 : PARHELIA_DVO_PWR_DVO1) |
+	       PARHELIA_DVO_PWR_COMMON);
+	v |= dvo2 ? PARHELIA_DVO_PWR_DVO1 : PARHELIA_DVO_PWR_DVO2;
+	parhelia_write(pdev, PARHELIA_REG_DVO_PWR, v);
+	udelay(200);
+	dev_dbg(&pdev->pdev->dev,
+		"%s: DVO%u from head %u, 0x1c20=%#010x 0x1c24=%#010x 0x1c00=%#010x\n",
+		output->connector.name, dvo2 ? 2 : 1, head,
+		parhelia_read(pdev, PARHELIA_REG_DVO_XBAR),
+		parhelia_read(pdev, PARHELIA_REG_DVO_PWR),
+		parhelia_read(pdev, PARHELIA_DCM_CLKCTL_A));
+}
+
 static void parhelia_program_output(struct parhelia_device *pdev,
 				    struct parhelia_output *output,
 				    const struct drm_display_mode *mode,
 				    unsigned int head)
 {
 	u32 dac_reg, power_mask, v, fmt;
+
+	/* A digital monitor on the original family takes the integrated
+	 * serializer; its analog pins stay unpowered and the DAC block below
+	 * is not involved. */
+	if (pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL &&
+	    output->edid_digital) {
+		parhelia_hslpar_enable_dvo(pdev, output, mode, head);
+		return;
+	}
 
 	if (pdev->chip->output_family == PARHELIA_OUTPUT_P690 &&
 	    output->edid_digital &&
@@ -723,6 +844,19 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	/* Stop fetch before selecting the new native surface. */
 	parhelia_write(pdev, dc + PARHELIA_DC_CTRL,
 		       parhelia_read(pdev, dc + PARHELIA_DC_CTRL) & ~1);
+	/* One pipe scans out one head.  The other controller must not keep
+	 * fetching: firmware leaves its own head enabled on this family, and it
+	 * then scans whatever base it was left with - a second monitor showing
+	 * a stale framebuffer - while both heads compete for memory bandwidth.
+	 * Only the original family is tested here; the P690 keeps its existing
+	 * behaviour until the same thing can be measured on one. */
+	if (pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL) {
+		u32 idle = PARHELIA_DC(head ? PARHELIA_DC_HEAD0 :
+					      PARHELIA_DC_HEAD1);
+
+		parhelia_write(pdev, idle + PARHELIA_DC_CTRL,
+			       parhelia_read(pdev, idle + PARHELIA_DC_CTRL) & ~1);
+	}
 	gem = drm_gem_fb_get_obj(fb, 0);
 	if (!gem)
 		return;
@@ -773,7 +907,6 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	 * initializer proves those words are host-aperture descriptors; changing
 	 * them after engine ownership redirects 3D writes outside the surface. */
 	parhelia_update_priority_levels(pdev, head);
-	parhelia_program_output(pdev, pdev->active_output, m, head);
 	/* Release the dim/fade blank this family asserts around the timing
 	 * writes; POST can leave it asserted, which is a black picture with a
 	 * running raster. */
@@ -791,6 +924,11 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 		parhelia_write(pdev, dc + PARHELIA_DC_PARAMS, params);
 	}
 	parhelia_write(pdev, dc + PARHELIA_DC_CTRL, parhelia_dc_ctrl_on(pdev));
+	/* The output comes up against a controller that is already running:
+	 * the vendor enables the display controller in SetDCParameters and only
+	 * then reaches EnableDVO, and this board's VBIOS does the same in its
+	 * VGA-to-hires path. */
+	parhelia_program_output(pdev, pdev->active_output, m, head);
 	parhelia_apply_vid_reset(pdev, head);
 	/* The P690 reset transient can clear DC_CTRL's enable bit. */
 	parhelia_write(pdev, dc + PARHELIA_DC_CTRL, parhelia_dc_ctrl_on(pdev));
@@ -1014,7 +1152,7 @@ static void parhelia_plane_async_update(struct drm_plane *plane,
 	if (gem && !parhelia_scanout_address(pdev, gem, &address)) {
 		wmb();
 		parhelia_write(pdev, dc + PARHELIA_DC_START,
-			       address & 0x0ffffc00);
+			       address & parhelia_dc_start_mask(pdev));
 		atomic64_inc(&pdev->submit_stats.async_flips);
 	}
 	/* The asynchronous helper does not process events.  Report completion as
@@ -1184,14 +1322,25 @@ static const struct parhelia_output_desc parhelia_lx_outputs[] = {
  * both connectors are DVI-I and each keeps its own DAC route.  Declaring the
  * first one VGA also suppressed its DVI-I subconnector property and forced
  * output->edid_digital false before any EDID was read. */
+/* DDC pins 3/1 carry DVO1 and DAC1, pins 2/0 carry DVO2 and DAC2: a digital
+ * panel on the 3/1 connector is lit through DVO1 on this hardware, measured.
+ * DVO2 produces no signal even with a correct crossbar byte, power and clock,
+ * so the serializer behind it needs something this driver does not yet do.
+ *
+ * The controller that feeds an output is selectable rather than wired (same
+ * section: it is the module index written into the DAC/DVO route field), and
+ * controller B is the one this board's firmware configures and the only one
+ * measured to produce a signal here.  The single display pipe therefore drives
+ * either connector from head 1; head 0 needs its own bring-up before it can
+ * carry a second, independent head. */
 static const struct parhelia_output_desc parhelia_original_outputs[] = {
 	{
 		.connector_type = DRM_MODE_CONNECTOR_DVII,
 		.ddc_line = 0,
 		.ddc_scl = 3, .ddc_sda = 1,
-		.preferred_head = 0,
-		.digital_route = PARHELIA_ROUTE_DVO2,
-		.analog_route = PARHELIA_ROUTE_DAC2,
+		.preferred_head = 1,
+		.digital_route = PARHELIA_ROUTE_DVO1,
+		.analog_route = PARHELIA_ROUTE_DAC1,
 		.expose = true,
 		.ready = true,
 	}, {
@@ -1199,8 +1348,8 @@ static const struct parhelia_output_desc parhelia_original_outputs[] = {
 		.ddc_line = 1,
 		.ddc_scl = 2, .ddc_sda = 0,
 		.preferred_head = 1,
-		.digital_route = PARHELIA_ROUTE_DVO1,
-		.analog_route = PARHELIA_ROUTE_DAC1,
+		.digital_route = PARHELIA_ROUTE_DVO2,
+		.analog_route = PARHELIA_ROUTE_DAC2,
 		.expose = true,
 		.ready = true,
 	},

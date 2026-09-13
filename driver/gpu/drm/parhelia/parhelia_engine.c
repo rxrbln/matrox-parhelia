@@ -78,8 +78,14 @@ int parhelia_engine_init(struct parhelia_device *pdev)
 	parhelia_root_trace_check(pdev, "engine_init:video_reset", 0, 0, 0);
 	/* Both vendor initializers OR 0x00809020 here, ours dropped bit 12 -
 	 * DVO1's clock gate - leaving that serializer's clock running on a board
-	 * whose picture leaves through the other one. */
-	parhelia_rmw(pdev, 0x1c00, ~0u, 0x00809020u);
+	 * whose picture leaves through the other one.  Bit 15 is left out on the
+	 * original family: this board's VBIOS never sets it (POST leaves 0x1c00
+	 * at 0x...60c2 with a working digital output), and the one HAL writer
+	 * sets it only for a Chrontel/TV clock source.  The doc line that put it
+	 * here read 0x1c19, which is DAC1's byte 1, as 0x1c00's high byte. */
+	parhelia_rmw(pdev, 0x1c00, ~0u,
+		     pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL ?
+		     0x00001020u : 0x00809020u);
 	parhelia_rmw(pdev, 0x1c04, ~0u, 0x00000020u);
 	udelay(10);
 	parhelia_write(pdev, 0x1c08, 2);

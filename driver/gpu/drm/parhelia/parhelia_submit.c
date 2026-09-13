@@ -92,6 +92,10 @@ static int parhelia_submit_stats_show(struct seq_file *m, void *data)
 	seq_printf(m, "async_slots %u\n", PARHELIA_ASYNC_SLOTS);
 	seq_printf(m, "async_primary_dwords %u\n",
 		   PARHELIA_ASYNC_PRIMARY_DWORDS);
+	seq_printf(m, "vram_evictions %u\n",
+		   atomic_read(&pdev->vram_evictions));
+	seq_printf(m, "vram_restores %u\n",
+		   atomic_read(&pdev->vram_restores));
 	seq_printf(m, "queued_slots %u\n", READ_ONCE(pdev->queued_slots));
 	seq_printf(m, "primary_put_dwords %u\n", READ_ONCE(pdev->primary_put));
 	seq_printf(m, "primary_get_dwords %u\n", READ_ONCE(pdev->primary_get));
@@ -1599,6 +1603,34 @@ void parhelia_vram_unpin(struct drm_gem_vram_object *bo)
 	}
 }
 
+/* Pin @bo inside VRAM pages [fpfn, lpfn), moving it there if needed.  An
+ * object already pinned elsewhere cannot move and returns -EBUSY. */
+static int parhelia_vram_pin_range(struct drm_gem_vram_object *bo,
+				   unsigned long fpfn, unsigned long lpfn)
+{
+	struct parhelia_device *pdev = to_parhelia(bo->bo.base.dev);
+	struct ttm_operation_ctx ctx = { false, false };
+	int ret;
+
+	ret = ttm_bo_reserve(&bo->bo, true, false, NULL);
+	if (ret)
+		return ret;
+	if (bo->bo.pin_count) {
+		if (!bo->bo.resource || bo->bo.resource->start < fpfn ||
+		    bo->bo.resource->start + PFN_UP(bo->bo.base.size) > lpfn)
+			ret = -EBUSY;
+	} else {
+		ret = parhelia_vram_placement_range(bo, pdev->vram_size, false,
+						    fpfn, lpfn);
+		if (!ret)
+			ret = ttm_bo_validate(&bo->bo, &bo->placement, &ctx);
+	}
+	if (!ret)
+		ttm_bo_pin(&bo->bo);
+	ttm_bo_unreserve(&bo->bo);
+	return ret;
+}
+
 static const char *parhelia_fence_get_driver_name(struct dma_fence *fence)
 {
 	return "parhelia";
@@ -1877,7 +1909,7 @@ static void parhelia_async_file_turn_cancel(struct parhelia_device *pdev,
 {
 	bool was_first;
 
-	mutex_lock(&pdev->submit_lock);
+	parhelia_submit_lock(pdev);
 	was_first = parhelia_async_first_waiter(pdev) == waiter;
 	parhelia_async_waiter_del(pdev, waiter);
 	if (was_first && pdev->queue_handoff) {
@@ -1885,7 +1917,7 @@ static void parhelia_async_file_turn_cancel(struct parhelia_device *pdev,
 			time_after_eq(jiffies, pdev->queue_owner_deadline);
 	}
 	wake_up_all(&pdev->submit_waitq);
-	mutex_unlock(&pdev->submit_lock);
+	parhelia_submit_unlock(pdev);
 }
 
 static int parhelia_async_file_turn_static_selftest(void)
@@ -2033,11 +2065,11 @@ static void parhelia_retire_work(struct work_struct *work)
 	struct parhelia_device *pdev = container_of(to_delayed_work(work),
 						     struct parhelia_device, retire_work);
 
-	mutex_lock(&pdev->submit_lock);
+	parhelia_submit_lock(pdev);
 	parhelia_retire_locked(pdev);
 	if (pdev->queued_slots && !pdev->wedged)
 		mod_delayed_work(system_wq, &pdev->retire_work, msecs_to_jiffies(1));
-	mutex_unlock(&pdev->submit_lock);
+	parhelia_submit_unlock(pdev);
 }
 
 /* Drain every queued hardware user, then return with submit_lock held.  A
@@ -2049,15 +2081,15 @@ int parhelia_submit_idle_lock(struct parhelia_device *pdev)
 	int ret;
 
 	for (;;) {
-		mutex_lock(&pdev->submit_lock);
+		parhelia_submit_lock(pdev);
 		parhelia_retire_locked(pdev);
 		if (pdev->wedged) {
-			mutex_unlock(&pdev->submit_lock);
+			parhelia_submit_unlock(pdev);
 			return -EIO;
 		}
 		if (!pdev->queued_slots)
 			return 0;
-		mutex_unlock(&pdev->submit_lock);
+		parhelia_submit_unlock(pdev);
 		ret = wait_event_interruptible_timeout(pdev->submit_waitq,
 			READ_ONCE(pdev->wedged) || !READ_ONCE(pdev->queued_slots),
 			msecs_to_jiffies(10));
@@ -3107,6 +3139,16 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 
 		bo_size = max(bo_size, tiled);
 	}
+	/* The original's sampler reads 32-bit textures from 64x32-texel 8 KiB
+	 * tiles at (row * pitch + x) >> 6, so cover every tile a row band
+	 * reaches (glprobe, 16x16 to 200x72 exact). */
+	if (args->flags & PARHELIA_CREATE_RENDER_TEXTURE && cpp == 4 &&
+	    pdev->chip->tile_layout == PARHELIA_TILE_64X32_8K) {
+		u32 rows = max_t(u32, 1, ALIGN(args->height, 32) / 32);
+
+		bo_size = max(bo_size, DIV_ROUND_UP((size_t)rows * pitch_pixels,
+						    64) * SZ_8K);
+	}
 	bo_size = ALIGN(bo_size, 8192);
 	bo = drm_gem_vram_create(drm, bo_size, align_pages);
 	if (IS_ERR(bo))
@@ -3135,18 +3177,19 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 				PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
 				PARHELIA_CREATE_RENDER_NATIVE_SCANOUT))
 		parhelia_bo_force_unmappable(bo);
-	/* TTM moves VRAM objects with a CPU copy through BAR0, which on P690 is
-	 * a translated aperture rather than a linear view of VRAM: a moved
-	 * texture lost everything past its first 16 KiB.  Keep render and
-	 * texture storage resident for its whole lifetime instead. */
+	/* A new object is zeroed through the driver's own aperture window,
+	 * because TTM's CPU clear over BAR0 lands wherever that translated
+	 * window currently points.  The pin is held for the clear only:
+	 * parhelia_ttm_move() copies through the aperture too, so TTM may
+	 * evict these objects afterwards instead of failing an allocation. */
 	if (pdev->pdev->device == PARHELIA_P690) {
 		ret = parhelia_vram_pin(bo);
 		if (ret) {
 			drm_gem_object_put(&bo->bo.base);
 			return ret;
 		}
-		to_parhelia_bo(&bo->bo.base)->resident = true;
 		ret = parhelia_vram_clear(pdev, bo);
+		parhelia_vram_unpin(bo);
 		if (ret) {
 			drm_gem_object_put(&bo->bo.base);
 			return ret;
@@ -3194,7 +3237,7 @@ int parhelia_create_vertex_ioctl(struct drm_device *drm, void *data,
 	if (ret)
 		goto out_put;
 
-	mutex_lock(&pdev->submit_lock);
+	parhelia_submit_lock(pdev);
 	if (pdev->wedged) {
 		ret = -EIO;
 	} else {
@@ -3204,7 +3247,7 @@ int parhelia_create_vertex_ioctl(struct drm_device *drm, void *data,
 		entry->file = file;
 		list_add_tail(&entry->link, &pdev->vertex_bos);
 	}
-	mutex_unlock(&pdev->submit_lock);
+	parhelia_submit_unlock(pdev);
 	if (ret)
 		goto out_handle;
 
@@ -3338,8 +3381,10 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		args->value = pdev->raw_aperture_owned;
 		break;
 	case PARHELIA_PARAM_TEXTURE_UPLOAD:
-		args->value = pdev->pdev->device == PARHELIA_P690 &&
-			pdev->raw_aperture_owned && parhelia_texture_upload_enabled();
+		/* Both families: a texture object carries no mmap offset while the
+		 * upload path is on, and the original's raw BAR0 view aliases. */
+		args->value = pdev->raw_aperture_owned &&
+			parhelia_texture_upload_enabled();
 		break;
 	case PARHELIA_PARAM_NATIVE_RT_CLASSES:
 		args->value = pdev->pdev->device == PARHELIA_P690 &&
@@ -3353,6 +3398,158 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		return -EINVAL;
 	}
 	return 0;
+}
+
+/* Look up and pin every VRAM relocation target, one pin per unique object.
+ * This runs before submit_lock is taken because a pin that has to evict
+ * another object calls parhelia_ttm_move(), which drains the engine and
+ * retargets the shared aperture: neither is possible once this path owns the
+ * lock and has an engine batch half built.  Unwinds itself on failure. */
+/* The register a VRAM relocation's operand writes.  Packets are validated
+ * only after pinning, so bound everything here. */
+static bool parhelia_reloc_target_reg(const u32 *commands, u32 command_dwords,
+				      const struct drm_parhelia_packet *packets,
+				      u32 packet_count,
+				      const struct drm_parhelia_reloc *reloc,
+				      u32 *reg)
+{
+	const struct drm_parhelia_packet *packet;
+
+	if (reloc->type != PARHELIA_RELOC_VRAM || reloc->packet >= packet_count)
+		return false;
+	packet = &packets[reloc->packet];
+	if (packet->offset >= command_dwords ||
+	    packet->length > command_dwords - packet->offset ||
+	    reloc->dword >= packet->length ||
+	    commands[packet->offset] >> 24)
+		return false;
+	return parhelia_vram_operand_reg(&commands[packet->offset],
+					 packet->length, reloc->dword, reg);
+}
+
+/* The original Parhelia's depth unit takes the upper bits of the Z surface
+ * address from the colour target: Z only lands in the 16 MiB engine window
+ * directly above the colour target's (glprobe, every other window mixes both
+ * buffers).  Pin @depth there, draining queued work that still holds it. */
+static int parhelia_pin_depth_window(struct parhelia_device *pdev,
+				     struct drm_gem_vram_object *colour,
+				     struct drm_gem_vram_object *depth)
+{
+	u64 bank_size = pdev->vram_size >> 1;
+	u64 lo, hi;
+	u32 gpu;
+	int ret, tries;
+
+	ret = parhelia_vram_gpu_addr(pdev, colour, 0, colour->bo.base.size, &gpu);
+	if (ret)
+		return ret;
+	lo = ALIGN_DOWN((u64)gpu, SZ_16M) + SZ_16M;
+	hi = lo + SZ_16M;
+	if (lo >= PARHELIA_LOCAL_BANK_B_BASE) {
+		lo = lo - PARHELIA_LOCAL_BANK_B_BASE + bank_size;
+		hi = hi - PARHELIA_LOCAL_BANK_B_BASE + bank_size;
+	} else if (hi > bank_size) {
+		hi = 0;
+	}
+	if (!hi || hi > pdev->vram_size) {
+		dev_warn_ratelimited(&pdev->pdev->dev,
+			"no depth window above colour target %#x\n", gpu);
+		return parhelia_vram_pin(depth);
+	}
+	for (tries = 0; tries < 4; tries++) {
+		ret = parhelia_vram_pin_range(depth, lo >> PAGE_SHIFT,
+					      hi >> PAGE_SHIFT);
+		if (ret != -EBUSY)
+			break;
+		ret = parhelia_submit_idle_lock(pdev);
+		if (ret)
+			return ret;
+		parhelia_submit_unlock(pdev);
+	}
+	if (ret == -EBUSY || ret == -ENOMEM || ret == -ENOSPC) {
+		dev_warn_ratelimited(&pdev->pdev->dev,
+			"depth surface kept outside window %#llx: %d\n",
+			(unsigned long long)lo, ret);
+		return parhelia_vram_pin(depth);
+	}
+	return ret;
+}
+
+static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
+				      struct drm_file *file,
+				      const u32 *commands, u32 command_dwords,
+				      const struct drm_parhelia_packet *packets,
+				      u32 packet_count,
+				      const struct drm_parhelia_reloc *relocs,
+				      u32 count,
+				      struct drm_gem_object **objects,
+				      struct drm_gem_vram_object **pinned)
+{
+	struct drm_gem_object *colour = NULL, *depth = NULL, *last_colour = NULL;
+	u32 i, j, reg;
+	int ret;
+
+	for (i = 0; i < count; i++) {
+		if (relocs[i].type != PARHELIA_RELOC_VRAM)
+			continue;
+		objects[i] = drm_gem_object_lookup(file, relocs[i].handle);
+		if (!objects[i]) {
+			ret = -ENOENT;
+			goto unwind;
+		}
+		/* Pair a draw's depth with the colour bound before it.  A clear
+		 * binds one surface into both slots, so its 0x1228 names the
+		 * 0x1220 object and is not a pair. */
+		if (pdev->pdev->device != PARHELIA_P690 && !depth &&
+		    parhelia_reloc_target_reg(commands, command_dwords, packets,
+					      packet_count, &relocs[i], &reg)) {
+			if (reg == 0x1220) {
+				last_colour = objects[i];
+			} else if (reg == 0x1228 && last_colour &&
+				   last_colour != objects[i]) {
+				colour = last_colour;
+				depth = objects[i];
+			}
+		}
+	}
+	for (i = 0; i < count; i++) {
+		if (!objects[i] || (depth && objects[i] == depth))
+			continue;
+		for (j = 0; j < i; j++)
+			if (objects[j] == objects[i] && pinned[j])
+				break;
+		if (j < i)
+			continue;
+		ret = parhelia_vram_pin(drm_gem_vram_of_gem(objects[i]));
+		if (ret)
+			goto unwind;
+		pinned[i] = drm_gem_vram_of_gem(objects[i]);
+	}
+	if (depth) {
+		for (i = 0; objects[i] != depth; i++)
+			;
+		ret = colour ?
+			parhelia_pin_depth_window(pdev, drm_gem_vram_of_gem(colour),
+						  drm_gem_vram_of_gem(depth)) :
+			parhelia_vram_pin(drm_gem_vram_of_gem(depth));
+		if (ret)
+			goto unwind;
+		pinned[i] = drm_gem_vram_of_gem(depth);
+	}
+	return 0;
+
+unwind:
+	for (i = 0; i < count; i++) {
+		if (pinned[i]) {
+			parhelia_vram_unpin(pinned[i]);
+			pinned[i] = NULL;
+		}
+		if (objects[i]) {
+			drm_gem_object_put(objects[i]);
+			objects[i] = NULL;
+		}
+	}
+	return ret;
 }
 
 int parhelia_submit_ioctl(struct drm_device *drm, void *data,
@@ -3472,6 +3669,12 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 		ret = -ENOMEM;
 		goto out_relocs;
 	}
+	ret = parhelia_pin_reloc_targets(pdev, file, commands,
+					 args->command_dwords, packets,
+					 args->packet_count, relocs,
+					 args->reloc_count, objects, pinned);
+	if (ret)
+		goto out_relocs;
 
 	for (i = 0; i < args->packet_count; i++) {
 		if (packets[i].offset != end ||
@@ -3542,14 +3745,14 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 
 
 retry_slot:
-	mutex_lock(&pdev->submit_lock);
+	parhelia_submit_lock(pdev);
 	parhelia_retire_locked(pdev);
 	if (pdev->wedged) {
 		ret = -EIO;
 		goto out_unlock;
 	}
 	if (async && !parhelia_async_file_turn(pdev, file, &file_waiter)) {
-		mutex_unlock(&pdev->submit_lock);
+		parhelia_submit_unlock(pdev);
 		ret = wait_event_interruptible_timeout(pdev->submit_waitq,
 			pdev->wedged || parhelia_async_file_turn_ready(pdev, file),
 			msecs_to_jiffies(10));
@@ -3559,7 +3762,7 @@ retry_slot:
 		goto retry_slot;
 	}
 	if (async && submit_root_probe && pdev->queued_slots) {
-		mutex_unlock(&pdev->submit_lock);
+		parhelia_submit_unlock(pdev);
 		ret = wait_event_interruptible_timeout(pdev->submit_waitq,
 			pdev->wedged || !pdev->queued_slots, msecs_to_jiffies(10));
 		if (ret < 0)
@@ -3594,7 +3797,7 @@ retry_slot:
 			ret = pdev->wedged ? -EIO : 0;
 			wait_begin = ret ? 0 :
 				parhelia_submit_wait_begin(&stats->slot_waits);
-			mutex_unlock(&pdev->submit_lock);
+			parhelia_submit_unlock(pdev);
 			if (ret)
 				goto out_relocs;
 			ret = wait_event_interruptible_timeout(pdev->submit_waitq,
@@ -3610,7 +3813,7 @@ retry_slot:
 		 * restarting at its base. */
 		if (!pdev->queued_slots && pdev->primary_armed) {
 			if (!(parhelia_read(pdev, 0x08f0) & BIT(17))) {
-				mutex_unlock(&pdev->submit_lock);
+				parhelia_submit_unlock(pdev);
 				ret = wait_event_interruptible_timeout(pdev->submit_waitq,
 					pdev->wedged || (parhelia_read(pdev, 0x08f0) & BIT(17)),
 					msecs_to_jiffies(1));
@@ -3631,7 +3834,7 @@ retry_slot:
 				u64 wait_begin =
 					parhelia_submit_wait_begin(&stats->tail_waits);
 
-				mutex_unlock(&pdev->submit_lock);
+				parhelia_submit_unlock(pdev);
 				ret = wait_event_interruptible_timeout(pdev->submit_waitq,
 					pdev->wedged || !pdev->queued_slots,
 					msecs_to_jiffies(10));
@@ -3655,7 +3858,7 @@ retry_slot:
 		primary_bus = pdev->async_primary_bus + pdev->primary_put * sizeof(u32);
 	}
 	if (!async && pdev->queued_slots) {
-		mutex_unlock(&pdev->submit_lock);
+		parhelia_submit_unlock(pdev);
 		ret = wait_event_interruptible_timeout(pdev->submit_waitq,
 			pdev->wedged || !pdev->queued_slots, msecs_to_jiffies(10));
 		if (ret < 0)
@@ -3925,7 +4128,6 @@ retry_slot:
 			ret = -EINVAL;
 			goto out_unpin;
 		}
-		objects[i] = drm_gem_object_lookup(file, reloc->handle);
 		if (!objects[i]) {
 			ret = -ENOENT;
 			goto out_unpin;
@@ -3935,27 +4137,13 @@ retry_slot:
 			goto out_unpin;
 		}
 		/* A Q3 state batch names a colour target and texture repeatedly.
-		 * Keep one GEM reference for every relocation so the existing cleanup
-		 * remains simple, but take only one transient TTM pin per unique BO.
-		 * Re-pinning a duplicate holds the same placement count dozens of
-		 * times until the async fence retires and exhausts the P690's small
-		 * VRAM placement budget. */
+		 * parhelia_pin_reloc_targets() kept one GEM reference for every
+		 * relocation so the existing cleanup stays simple, but only one
+		 * TTM pin per unique object; j == i still marks that first
+		 * occurrence for the trace below. */
 		for (j = 0; j < i; j++)
 			if (objects[j] == objects[i] && pinned[j])
 				break;
-		if (j == i) {
-			async_failure_stage = "VRAM relocation pin";
-			ret = parhelia_vram_pin(drm_gem_vram_of_gem(objects[i]));
-			if (ret) {
-				if (async)
-					dev_warn_ratelimited(&pdev->pdev->dev,
-						"async VRAM pin failed: relocation=%u handle=%u size=%zu pin_count=%u ret=%d\n",
-						i, reloc->handle, objects[i]->size,
-						drm_gem_vram_of_gem(objects[i])->bo.pin_count, ret);
-				goto out_unpin;
-			}
-			pinned[i] = drm_gem_vram_of_gem(objects[i]);
-		}
 		ret = parhelia_vram_gpu_addr(pdev,
 				drm_gem_vram_of_gem(objects[i]), reloc->delta,
 				objects[i]->size - reloc->delta,
@@ -4518,7 +4706,7 @@ out_unpin:
 			drm_gem_object_put(objects[i]);
 	}
 out_unlock:
-	mutex_unlock(&pdev->submit_lock);
+	parhelia_submit_unlock(pdev);
 out_relocs:
 	parhelia_async_file_turn_cancel(pdev, &file_waiter);
 	kfree(objects);
@@ -4569,10 +4757,10 @@ int parhelia_wait_fence_ioctl(struct drm_device *drm, void *data,
 	if (args->flags || args->pad || args->timeout_ns < -1)
 		return -EINVAL;
 	args->completed = parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE) & ~7u;
-	mutex_lock(&pdev->submit_lock);
+	parhelia_submit_lock(pdev);
 	parhelia_retire_locked(pdev);
 	issued = parhelia_fence_is_issued_locked(pdev, args->fence);
-	mutex_unlock(&pdev->submit_lock);
+	parhelia_submit_unlock(pdev);
 	if (!issued)
 		return -EINVAL;
 
@@ -4623,7 +4811,7 @@ void parhelia_submit_fini(struct parhelia_device *pdev)
 	u32 i;
 
 	cancel_delayed_work_sync(&pdev->retire_work);
-	mutex_lock(&pdev->submit_lock);
+	parhelia_submit_lock(pdev);
 	pdev->wedged = true;
 	parhelia_state_shadow_invalidate(pdev, "submit teardown");
 	/* Teardown only: block external DMA before devres frees coherent memory. */
@@ -4659,7 +4847,7 @@ void parhelia_submit_fini(struct parhelia_device *pdev)
 		list_del(&entry->link);
 		drm_gem_object_put(&entry->dma.base);
 	}
-	mutex_unlock(&pdev->submit_lock);
+	parhelia_submit_unlock(pdev);
 }
 
 void parhelia_submit_postclose(struct parhelia_device *pdev,
@@ -4669,7 +4857,7 @@ void parhelia_submit_postclose(struct parhelia_device *pdev,
 	u32 i;
 
 retry:
-	mutex_lock(&pdev->submit_lock);
+	parhelia_submit_lock(pdev);
 	parhelia_retire_locked(pdev);
 	if (!pdev->queued_slots && pdev->queue_owner == file)
 		pdev->queue_owner = NULL;
@@ -4680,7 +4868,7 @@ retry:
 			struct parhelia_submit_slot *slot = &pdev->slots[i];
 
 			if (slot->state == PARHELIA_SLOT_QUEUED && slot->file == file) {
-				mutex_unlock(&pdev->submit_lock);
+				parhelia_submit_unlock(pdev);
 				/* postclose must not release a CREATE_VERTEX allocation while an
 				 * in-flight class-3 batch still owns its GEM lookup.  A retired
 				 * slot can be reused by another DRM client before this waiter runs;
@@ -4708,5 +4896,5 @@ retry:
 		list_del(&entry->link);
 		drm_gem_object_put(&entry->dma.base);
 	}
-	mutex_unlock(&pdev->submit_lock);
+	parhelia_submit_unlock(pdev);
 }

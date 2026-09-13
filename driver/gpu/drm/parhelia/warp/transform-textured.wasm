@@ -12,7 +12,10 @@ dp4 r2.x, T0, c0
 add o1, v5, r1.0000 | mov T1, c9
 smul r5, r2, r2.xyz1 | mov o11, r2
 mad T1.xyz, c8.xyz1, r5, T1.xyz0
-add o0, T1, r1.0000
+; o0.w carries 1/w for perspective-correct interpolation in the setup unit;
+; T1.w is still the viewport height from c9.
+add o0.xyz, T1, r1.0000
+add o0.w, r5, r1.0000
 wra | mov o3, v7
 end
 wra

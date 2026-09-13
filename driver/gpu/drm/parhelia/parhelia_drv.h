@@ -267,6 +267,31 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 #define PARHELIA_VGA_MISC_CLKSEL_FS	0x08
 #define PARHELIA_REG_DVO_XBAR		0x1c20
 #define PARHELIA_REG_DVO_PWR		0x1c24
+/* 0x1c20 carries one control byte per integrated serializer, DVO1 in [15:8]
+ * and DVO2 in [31:24].  Inside a byte, bits 2 and 4 are the data/format
+ * enable pair, bit 3 is HSYNC-negative, bit 5 VSYNC-negative and bits [7:6] a
+ * two-bit select naming the display controller that feeds the serializer -
+ * the same encoding DAC2 uses in its own [15:14]
+ * (docs/parhelia-hslpar-output-path-re.md section 6). */
+#define PARHELIA_DVO1_BYTE_SHIFT	8
+#define PARHELIA_DVO2_BYTE_SHIFT	24
+#define PARHELIA_DVO_BYTE_ENABLE	0x14
+#define PARHELIA_DVO_BYTE_HSYNC_NEG	BIT(3)
+#define PARHELIA_DVO_BYTE_VSYNC_NEG	BIT(5)
+#define PARHELIA_DVO_BYTE_MODULE_SHIFT	6
+#define PARHELIA_DVO_BYTE_MODULE_MASK	(3u << 6)
+/* The vendor clears these two alongside whichever byte it installs. */
+#define PARHELIA_DVO_XBAR_CLEARED	(BIT(6) | BIT(25))
+/* 0x1c24 is active low: bit 0 powers DVO1, bit 1 DVO2, bit 2 the block both
+ * serializers share (section 6, HSLPARDisableDVO1/2 and HSLPAREnableDVO1). */
+/* Both serializers share one clock gate on this family: 0x1c00 bit 12. */
+#define PARHELIA_DVO_CLK_GATE		BIT(12)
+#define PARHELIA_DVO_PWR_DVO1		BIT(0)
+#define PARHELIA_DVO_PWR_DVO2		BIT(1)
+#define PARHELIA_DVO_PWR_COMMON		BIT(2)
+/* The HSLPAR pixel path drives synthesiser index 2 (0x0e18) and a display
+ * controller names it as clksel = index + 1 (section 10.1). */
+#define PARHELIA_HSLPAR_PIXEL_CLKSEL	3
 #define PARHELIA_REG_DVO_FORMAT2	0x1c54
 #define PARHELIA_REG_DVO_SYNC2		0x1c58
 #define PARHELIA_REG_DVO_DATA		0x1c70
@@ -490,8 +515,6 @@ struct parhelia_bo {
 	u8 aperture_slot;
 	u8 placement_class;
 	bool host_aperture;
-	/* Pinned from creation until free. */
-	bool resident;
 };
 
 static inline struct parhelia_bo *to_parhelia_bo(struct drm_gem_object *gem)
@@ -555,6 +578,15 @@ struct parhelia_device {
 	struct parhelia_submit_slot slots[PARHELIA_ASYNC_SLOTS];
 	wait_queue_head_t submit_waitq;
 	struct delayed_work retire_work;
+	/* The task holding submit_lock, so a TTM move called from inside a
+	 * submit can tell that it must not wait for the lock it already
+	 * holds.  Written only by its owner, under the lock. */
+	struct task_struct *submit_owner;
+	/* Objects TTM has moved out of and back into VRAM through the
+	 * aperture, so a test can tell a working eviction from a working
+	 * fit. */
+	atomic_t vram_evictions;
+	atomic_t vram_restores;
 	u32 primary_put;
 	u32 primary_get;
 	u32 queued_slots;
@@ -641,6 +673,25 @@ static inline u8 parhelia_read8(struct parhelia_device *pdev, u32 reg)
 }
 
 int parhelia_modeset_init(struct parhelia_device *pdev);
+static inline void parhelia_submit_lock(struct parhelia_device *pdev)
+{
+	mutex_lock(&pdev->submit_lock);
+	pdev->submit_owner = current;
+}
+
+static inline void parhelia_submit_unlock(struct parhelia_device *pdev)
+{
+	pdev->submit_owner = NULL;
+	mutex_unlock(&pdev->submit_lock);
+}
+
+int parhelia_vram_copy_resources(struct parhelia_device *pdev,
+				 struct ttm_buffer_object *bo,
+				 struct ttm_resource *from,
+				 struct ttm_resource *to);
+int parhelia_vram_move_pages(struct parhelia_device *pdev,
+			     struct ttm_buffer_object *bo,
+			     struct ttm_resource *vram, bool to_vram);
 /* Whether the firmware ever ran this chip's VBIOS initialisation. */
 enum parhelia_post_state {
 	PARHELIA_POST_COLD,
@@ -729,6 +780,9 @@ int parhelia_vram_bar_addr(struct parhelia_device *pdev,
 			   u64 length, u32 *bar_addr);
 int parhelia_vram_clear(struct parhelia_device *pdev,
 			struct drm_gem_vram_object *gbo);
+int parhelia_vram_write(struct parhelia_device *pdev,
+			struct drm_gem_vram_object *gbo, u64 offset,
+			const void *src, size_t len);
 int parhelia_vram_gpu_addr(struct parhelia_device *pdev,
 			   struct drm_gem_vram_object *bo, u64 offset,
 			   u64 length, u32 *gpu_addr);
