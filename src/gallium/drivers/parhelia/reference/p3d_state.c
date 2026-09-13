@@ -649,6 +649,32 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	rw[3].reg = 0x12f8;            rw[3].val = 0x007fe000u;	/* AA threshold */
 	p3d_reglist(cs, rw, 4);
 
+	/* Line stipple.  Every state image states it, because a register this
+	 * driver never wrote could be left holding another client's pattern and
+	 * silently dash our lines.  GL's own stipple stays with the draw module
+	 * for now: it applies to every line, including the wide and smooth ones
+	 * this driver expands into triangles, which the hardware line unit would
+	 * not stipple.  Enabling the hardware here therefore means disabling
+	 * that stage at the same time, and only for lines that stay native. */
+	{
+		const unsigned repeat = st->line_stipple_enable &&
+					st->line_stipple_repeat ?
+					st->line_stipple_repeat : 1u;
+		const unsigned pattern = st->line_stipple_enable ?
+					 st->line_stipple_pattern & 0xffffu :
+					 0xffffu;
+
+		rw[0].reg = P3D_R_LINE_STIPPLE;
+		rw[0].val = ((repeat & 0xffffu) << 16) | pattern;
+		p3d_reglist(cs, rw, 1);
+	}
+
+	if (st->probe_reg) {
+		rw[0].reg = st->probe_reg;
+		rw[0].val = st->probe_val;
+		p3d_reglist(cs, rw, 1);
+	}
+
 	rw[0].reg = P3D_R_BLEND; rw[0].val = p3d_blendctl(st);
 	/* the alpha test shares the depth test's compare encoding; a disabled
 	 * test carries ALWAYS, which is what the vendor's baseline holds */

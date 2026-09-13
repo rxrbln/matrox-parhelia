@@ -48,6 +48,7 @@
 #define P3D_R_TEX_UNK10FC	0x10fc	/* textured draws only (section 19) */
 #define P3D_R_WARP_ENTRY	0x1100
 #define P3D_R_WARP_ENTRY2	0x1104
+#define P3D_R_LINE_STIPPLE	0x1028	/* (repeat << 16) | pattern */
 #define P3D_R_ATTR_PRESENT	0x1110	/* bitmask over declared attribute kinds */
 #define P3D_R_ATTR_MAP0		0x1114
 #define P3D_R_ATTR_MAP1		0x1118
@@ -586,6 +587,17 @@ struct p3d_state {
 	 * parhelia-blend-alpha-encoding.md section 198). */
 	int		   logicop_enable;
 	unsigned	   logicop;
+	/* GL_LINE_STIPPLE.  0x1028 carries (repeat << 16) | pattern, where the
+	 * repeat is GL's factor and the pattern its sixteen bits, bit 0 first
+	 * (parhelia-fragment-ops.md section 2, CONFIRMED).  A disabled stipple
+	 * is the solid pattern at repeat one, which is the reset state. */
+	int		   line_stipple_enable;
+	unsigned	   line_stipple_pattern;	/* 16 bits */
+	unsigned	   line_stipple_repeat;		/* GL factor, 1..256 */
+	/* Diagnostic: one extra register write emitted with the raster state,
+	 * so a candidate register can be measured on hardware without a new
+	 * builder.  Zero emits nothing.  Never set by Gallium. */
+	uint32_t	   probe_reg, probe_val;
 	/* 0x1324 colour write mask, one byte per channel in the render
 	 * target's own order: B [7:0], G [15:8], R [23:16], A [31:24].
 	 * glColorMask(1,0,1,1) was captured as 0xffff00ff.  All four clear

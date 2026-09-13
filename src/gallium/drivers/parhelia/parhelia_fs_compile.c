@@ -283,10 +283,14 @@ ph_fs_emit(struct ph_fs_ctx *ctx, uint8_t op, struct ph_fs_value *src,
    uint8_t dst = 0xff;
 
    if (index >= ctx->max_instructions) {
+      if (getenv("PARHELIA_TRACE_FS"))
+         fprintf(stderr, "  fs: out of combiner slots at %u\n", index);
       ph_fs_fail(ctx);
       return false;
    }
    if (!ph_fs_place_constants(ctx, index, src, count)) {
+      if (getenv("PARHELIA_TRACE_FS"))
+         fprintf(stderr, "  fs: constants do not fit instruction %u\n", index);
       ph_fs_fail(ctx);
       return false;
    }
@@ -513,6 +517,9 @@ ph_fs_alu(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, bool alpha,
       return ph_fs_emit(ctx, P3D_COMB_MAD, ordered, 3, out);
    }
    default:
+      if (getenv("PARHELIA_TRACE_FS"))
+         fprintf(stderr, "  fs: no combiner form for %s\n",
+                 nir_op_infos[alu->op].name);
       return false;
    }
 }
@@ -525,8 +532,11 @@ ph_fs_value(struct ph_fs_ctx *ctx, nir_def *def, bool alpha,
       return false;
    if (ph_fs_leaf(ctx, def, out))
       return true;
-   if (nir_def_instr(def)->type != nir_instr_type_alu)
+   if (nir_def_instr(def)->type != nir_instr_type_alu) {
+      if (getenv("PARHELIA_TRACE_FS"))
+         fprintf(stderr, "  fs: value is not an alu result\n");
       return false;
+   }
    return ph_fs_alu(ctx, nir_instr_as_alu(nir_def_instr(def)), alpha, out);
 }
 
