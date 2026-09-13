@@ -8,16 +8,34 @@
 #define PARHELIA_FS_COMPILE_H
 
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
 #include "compiler/nir/nir.h"
 #include "reference/parhelia3d.h"
 
-/* A constant the program reads out of the fragment constant buffer.  The
- * compiler cannot know its value, so it records where to copy it from and the
- * driver fills it in before each draw. */
+/* A constant register filled from the fragment constant buffer before each
+ * draw: component c of constant @slot of @instruction is scalar @offset[c] of
+ * the buffer, for every c in @mask. */
 struct ph_fs_const_ref {
    uint8_t instruction;
-   uint8_t slot;        /* 0 = c0, 1 = c1 */
-   uint16_t vec4_index; /* offset in the fragment constant buffer, in vec4s */
+   uint8_t slot;
+   uint8_t mask;
+   uint16_t offset[4];
+};
+
+/* The fixed-function algebra a program computes, decided by evaluating it,
+ * for the draw routes that emit their own combiner words.  Units are logical:
+ * t1 is the second bound texture. */
+enum ph_fs_class {
+   PH_FS_CLASS_OTHER = 0,
+   PH_FS_CLASS_COLOUR,     /* v0 */
+   PH_FS_CLASS_REPLACE,    /* t0 */
+   PH_FS_CLASS_MODULATE,   /* t0 * v0 */
+   PH_FS_CLASS_DECAL,      /* rgb mix(v0, t0, t0.a), alpha v0 */
+   PH_FS_CLASS_ADD,        /* rgb t0 + v0, alpha t0 * v0 */
+   PH_FS_CLASS_MODULATE2,  /* t0 * v0 * t1 */
+   PH_FS_CLASS_ADD2,       /* rgb t0 * v0 + t1, alpha t0 * v0 * t1 */
+   PH_FS_CLASS_REPLACE1,   /* t1 */
 };
 
 struct ph_fs_program {
@@ -25,25 +43,27 @@ struct ph_fs_program {
    unsigned sampler_mask;
    unsigned const_ref_count;
    struct ph_fs_const_ref const_ref[2 * P3D_COMB_MAX_INSTRUCTIONS];
-   /* Set when the shader reads an interpolated colour, so the draw path knows
-    * it must fetch and pass the vertex colour attribute. */
    bool uses_color;
-   /* Set when it reads the second colour (v1), which carries the fog
-    * coordinate: the draw then needs the kind-6 attribute and the program
-    * that forwards it to output 2. */
-   bool uses_color1;
+   bool uses_color1;       /* v1 carries the fog coordinate */
    bool valid;
+   enum ph_fs_class cls;
+   const char *reject;     /* why it did not compile */
 };
 
-/* Compile @nir into @out using at most @max_instructions combiner slots.
- * Returns false and leaves out->valid clear when the shader is outside the
- * combiner's expression set; the caller then falls back to the draw module. */
+/* Compile @nir into at most @max_instructions combiner slots. */
 bool ph_fs_compile(nir_shader *nir, unsigned max_instructions,
                    struct ph_fs_program *out);
 
-/* Copy the runtime constants the program refers to into its instructions.
+/* Copy the runtime constants into the program's constant registers.
  * @constants is the mapped fragment constant buffer, @size its bytes. */
 void ph_fs_update_constants(struct ph_fs_program *program,
                             const void *constants, unsigned size);
+
+/* Run @prog on one fragment: logical texture values @tex, colours @colour.
+ * Every intermediate is clamped to [-@range, @range]. */
+void ph_fs_eval(const struct p3d_comb_program *prog, const float tex[4][4],
+                const float colour[2][4], float range, float out[4]);
+
+void ph_fs_dump(const struct ph_fs_program *program, FILE *f);
 
 #endif

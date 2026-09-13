@@ -4744,7 +4744,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	 * useful when the compiled combiner is the thing that reads v1; with
 	 * the fixed-function combiner it would widen the stream for nothing.
 	 * PARHELIA_NO_FOG_COLOUR1 turns it off on its own. */
-	colour1 = ph_env("PARHELIA_FS_COMPILER") &&
+	colour1 = !ph_env("PARHELIA_FS_TEXENV") &&
 	          !ph_env("PARHELIA_NO_FOG_COLOUR1") &&
 	          !textured && !vertex_alpha && ctx->fs &&
 	          ctx->fs->program.valid && ctx->fs->program.uses_color1 &&
@@ -5956,29 +5956,29 @@ ph_tcl_matrix(struct ph_context *ctx, float mvp[16])
  * colour, and a draw that stages white into the colour slot renders white
  * instead of the colour the application asked for.  The fragment compiler
  * already resolves such a shader to one instruction moving a constant-buffer
- * vec4, so read that vec4 and stage it. */
+ * vec4, so evaluate the program and stage its result. */
 static bool
 ph_fs_constant_colour(struct ph_context *ctx, float out[4])
 {
-   const struct ph_fs *fs = ctx->fs;
+   static const float zero[4][4];
+   struct ph_fs *fs = ctx->fs;
    const uint8_t *base = NULL;
-   unsigned offset;
 
    if (!fs || !fs->program.valid || fs->program.sampler_mask ||
-       fs->program.comb.count != 1 || fs->program.const_ref_count != 1)
+       fs->program.uses_color)
       return false;
-   if (ctx->user_constants[MESA_SHADER_FRAGMENT])
-      base = ctx->user_constants[MESA_SHADER_FRAGMENT];
-   else if (ctx->constants[MESA_SHADER_FRAGMENT])
-      base = ph_resource(ctx->constants[MESA_SHADER_FRAGMENT])->malloc_data;
-   if (!base)
-      return false;
-   base += ctx->constant_offset[MESA_SHADER_FRAGMENT];
-   offset = fs->program.const_ref[0].vec4_index * 4u * sizeof(float);
-   if (offset + 4u * sizeof(float) >
-       ctx->constant_size[MESA_SHADER_FRAGMENT])
-      return false;
-   memcpy(out, base + offset, 4 * sizeof(float));
+   if (fs->program.const_ref_count) {
+      if (ctx->user_constants[MESA_SHADER_FRAGMENT])
+         base = ctx->user_constants[MESA_SHADER_FRAGMENT];
+      else if (ctx->constants[MESA_SHADER_FRAGMENT])
+         base = ph_resource(ctx->constants[MESA_SHADER_FRAGMENT])->malloc_data;
+      if (!base)
+         return false;
+      ph_fs_update_constants(&fs->program,
+                             base + ctx->constant_offset[MESA_SHADER_FRAGMENT],
+                             ctx->constant_size[MESA_SHADER_FRAGMENT]);
+   }
+   ph_fs_eval(&fs->program.comb, zero, (const float (*)[4])zero, 1.0f, out);
    return true;
 }
 
@@ -6799,121 +6799,35 @@ ph_nir_sampler_mask(nir_shader *nir)
    return mask;
 }
 
-static enum ph_serial_op
-ph_nir_serial_op(nir_shader *nir)
+/* The fixed-function words the special draw routes emit, from the algebra
+ * the compiled program computes. */
+static void
+ph_fs_route_class(struct ph_fs *fs)
 {
-   unsigned tex0 = 0, tex1 = 0, other_tex = 0;
-   unsigned fmul = 0, fadd = 0;
-
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_tex) {
-               const nir_tex_instr *tex = nir_instr_as_tex(instr);
-
-               if (tex->sampler_index == 0)
-                  tex0++;
-               else if (tex->sampler_index == 1)
-                  tex1++;
-               else
-                  other_tex++;
-            } else if (instr->type == nir_instr_type_alu) {
-               const nir_alu_instr *alu = nir_instr_as_alu(instr);
-
-               if (alu->op == nir_op_fmul)
-                  fmul++;
-               else if (alu->op == nir_op_fadd)
-                  fadd++;
-            }
-         }
-      }
+   switch (fs->program.cls) {
+   case PH_FS_CLASS_REPLACE:   fs->texenv = P3D_TEXENV_REPLACE; break;
+   case PH_FS_CLASS_MODULATE:  fs->texenv = P3D_TEXENV_MODULATE; break;
+   case PH_FS_CLASS_DECAL:     fs->texenv = P3D_TEXENV_DECAL; break;
+   case PH_FS_CLASS_ADD:       fs->texenv = P3D_TEXENV_ADD; break;
+   case PH_FS_CLASS_MODULATE2: fs->serial_op = PH_SERIAL_MODULATE; break;
+   case PH_FS_CLASS_ADD2:      fs->serial_op = PH_SERIAL_ADD; break;
+   case PH_FS_CLASS_REPLACE1:  fs->serial_op = PH_SERIAL_REPLACE1; break;
+   default: break;
    }
-
-   /* Mesa's fixed-function GL1 REPLACE shader declares both sampler slots,
-    * but samples only slot 1. */
-   if (!other_tex && !tex0 && tex1 == 1 && !fmul && !fadd)
-      return PH_SERIAL_REPLACE1;
-
-   /* These are the exact GL1 fixed-function forms captured in
-    * t2r4-gl1-shaders.log: two samples, then texture0*colour and either a
-    * second multiply or an add.  Keep the match deliberately narrow. */
-   if (!other_tex && tex0 == 1 && tex1 == 1) {
-      if (fmul == 2 && !fadd)
-         return PH_SERIAL_MODULATE;
-      if (fmul == 1 && fadd == 1)
-         return PH_SERIAL_ADD;
-   }
-   return PH_SERIAL_UNSUPPORTED;
-}
-
-/* The fixed-function GL1 DECAL program survives as one texture instruction
- * followed by FLRP(previous, texture, texture.a).  Do not attempt to infer
- * arbitrary shader algebra here: a wrong texenv corrupts alpha-tested UI.
- * The caller supplies the historical colour/replacement fallback for every
- * shape other than the exact single-texture forms below. */
-static enum p3d_texenv
-ph_nir_texenv(nir_shader *nir, enum p3d_texenv fallback)
-{
-   unsigned tex0 = 0, other_tex = 0;
-   unsigned fmul = 0, fadd = 0, flrp = 0, decal_flrp = 0;
-
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_tex) {
-               const nir_tex_instr *tex = nir_instr_as_tex(instr);
-
-               if (tex->sampler_index == 0)
-                  tex0++;
-               else
-                  other_tex++;
-            } else if (instr->type == nir_instr_type_alu) {
-               const nir_alu_instr *alu = nir_instr_as_alu(instr);
-
-               if (alu->op == nir_op_flrp) {
-                  const nir_tex_instr *colour_tex = NULL;
-                  const nir_tex_instr *alpha_tex = NULL;
-
-                  flrp++;
-                  if (alu->src[1].src.ssa && alu->src[2].src.ssa &&
-                      nir_def_instr(alu->src[1].src.ssa)->type == nir_instr_type_tex &&
-                      nir_def_instr(alu->src[2].src.ssa)->type == nir_instr_type_tex) {
-                     colour_tex = nir_instr_as_tex(nir_def_instr(alu->src[1].src.ssa));
-                     alpha_tex = nir_instr_as_tex(nir_def_instr(alu->src[2].src.ssa));
-                     if (colour_tex == alpha_tex && colour_tex->sampler_index == 0)
-                        decal_flrp++;
-                  }
-               } else if (alu->op == nir_op_fmul)
-                  fmul++;
-               else if (alu->op == nir_op_fadd)
-                  fadd++;
-            }
-         }
-      }
-   }
-
-   if (tex0 != 1 || other_tex)
-      return fallback;
-   if (flrp == 1 && decal_flrp == 1 && !fmul && !fadd)
-      return P3D_TEXENV_DECAL;
-   if (fmul == 1 && !flrp && !fadd)
-      return P3D_TEXENV_MODULATE;
-   if (!flrp && !fmul && !fadd)
-      return P3D_TEXENV_REPLACE;
-   return fallback;
 }
 
 /* Use the compiled combiner program when it matches this draw.  The special
  * alpha routes own their own combiner words, and the serial multitexture
  * passes rewrite the environment per pass, so they keep the fixed-function
- * emission.  Opt-in until the compiler has been through the GL tests. */
+ * emission.  PARHELIA_FS_TEXENV=1 forces that emission everywhere, for A/B
+ * runs. */
 static const struct p3d_comb_program *
 ph_compiled_combiner(struct ph_context *ctx, bool two_units)
 {
    struct ph_fs *fs = ctx->fs;
    const uint8_t *base = NULL;
 
-   if (!fs || !fs->program.valid || !ph_env("PARHELIA_FS_COMPILER"))
+   if (!fs || !fs->program.valid || ph_env("PARHELIA_FS_TEXENV"))
       return NULL;
    /* The draw binds a second texture unit only for the shapes the
     * instruction-shape matcher recognises.  A program that samples unit 1
@@ -6957,7 +6871,6 @@ static void *ph_create_fs(struct pipe_context *p,
          if (s->type == PIPE_SHADER_IR_NIR) {
             fs->sampler_mask |= s->ir.nir->info.textures_used[0];
             fs->sampler_mask |= ph_nir_sampler_mask(s->ir.nir);
-            fs->serial_op = ph_nir_serial_op(s->ir.nir);
          }
          fs->uses_texture = fs->sampler_mask != 0 ||
             (s->type == PIPE_SHADER_IR_NIR && ph_nir_uses_texture(s->ir.nir));
@@ -6981,24 +6894,31 @@ static void *ph_create_fs(struct pipe_context *p,
          }
          fs->texenv = fs->uses_color ? P3D_TEXENV_MODULATE :
                                       P3D_TEXENV_REPLACE;
-         if (s->type == PIPE_SHADER_IR_NIR)
-            fs->texenv = ph_nir_texenv(s->ir.nir, fs->texenv);
+         fs->serial_op = PH_SERIAL_UNSUPPORTED;
          if (s->type == PIPE_SHADER_IR_NIR) {
             /* Slot 0 merges the ganged texture pipes and, with two units,
              * slot 1 merges the second; the rest of the five-instruction
-             * quantum is the program's. */
+             * quantum is the program's.  A program may sample fewer units
+             * than the shader declares, never more. */
             unsigned units = util_bitcount(fs->sampler_mask);
             unsigned budget = P3D_COMB_QUANTUM - (units > 0) - (units > 1);
 
             if (ph_fs_compile(s->ir.nir, budget, &fs->program) &&
-                fs->program.sampler_mask != fs->sampler_mask)
+                (fs->program.sampler_mask & ~fs->sampler_mask))
                fs->program.valid = false;
+            if (fs->program.valid)
+               ph_fs_route_class(fs);
+            else if (ph_env("PARHELIA_TRACE"))
+               fprintf(stderr, "parhelia: fs=%p has no combiner program: %s\n",
+                       (void *)fs, fs->program.reject ? fs->program.reject :
+                                                        "declared samplers");
          }
          if (ph_env("PARHELIA_TRACE")) {
             fprintf(stderr,
-                    "parhelia: fs=%p combiner %s (%u instructions, %u runtime constants)\n",
+                    "parhelia: fs=%p combiner %s (%u instructions, %u runtime constants, class %u)\n",
                     (void *)fs, fs->program.valid ? "compiled" : "not compiled",
-                    fs->program.comb.count, fs->program.const_ref_count);
+                    fs->program.comb.count, fs->program.const_ref_count,
+                    fs->program.cls);
          }
          if (ph_env("PARHELIA_TRACE")) {
             fprintf(stderr,

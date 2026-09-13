@@ -1643,14 +1643,12 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * fence solely to throttle every swap in the client. */
    caps->throttle = false;
    /* The fragment pipeline evaluates only what the combiner can express, and
-    * there is no software fragment fallback: a shader the driver cannot lower
-    * is still rendered by the hardware, with the wrong algebra.  Advertising
-    * GLSL 1.20 is therefore only defensible once the data-flow compiler is
-    * on; with the instruction-shape matcher alone, 24 of the 27 checks in
-    * tools/parhelia-gl-combiner-test render the wrong colour.  Report 1.10
-    * by default so applications that can choose a fixed-function path do. */
+    * there is no software fragment fallback.  The data-flow compiler covers
+    * the fixed-function environments and the GLSL 1.20 shapes of
+    * tools/parhelia-gl-combiner-test; PARHELIA_FS_TEXENV=1 returns to the
+    * fixed-function words and reports 1.10. */
    caps->glsl_feature_level = caps->glsl_feature_level_compatibility =
-      ph_env("PARHELIA_FS_COMPILER") ? 120 : 110;
+      ph_env("PARHELIA_FS_TEXENV") ? 110 : 120;
    caps->essl_feature_level = 100;
    caps->npot_textures = true;
    /* The address unit's 3-bit mode per axis covers repeat, clamp-to-edge,
