@@ -351,6 +351,40 @@ p3d_texture_tile_offset_p690_narrow(uint32_t x, uint32_t y, uint32_t pitch,
 	return tile * (2048u * cpp) + i;
 }
 
+/* The original Parhelia's sampler reads 32-bit textures from the 64x32-texel
+ * 8 KiB render tiles, row bands advancing by the 32-aligned width: the tile is
+ * (row * pitch + x) >> 6 and bit 7 selects the half by x bit 5 and the row
+ * parity, as the P690 half-tile order does.  Every texel of 16x16 to 200x72,
+ * power-of-two and not, was read back exactly with ph-glprobe. */
+uint32_t
+p3d_texture_tile_offset_64x32(uint32_t x, uint32_t y, uint32_t pitch)
+{
+	uint32_t trow = y / P3D_TILE_H, iy = y % P3D_TILE_H;
+	uint32_t tile = (trow * pitch + x) / P3D_TILE_W;
+	uint32_t i;
+
+	i =  ( x         & 1)       |
+	     ((x >> 1)   & 1) << 1  |
+	     ((x >> 2)   & 1) << 2  |
+	     ((iy >> 1)  & 1) << 3  |
+	     ((x >> 3)   & 1) << 4  |
+	     ((x >> 4)   & 1) << 5  |
+	     ( iy        & 1) << 6  |
+	     (((x >> 5) ^ trow) & 1) << 7 |
+	     ((iy >> 2)  & 1) << 8  |
+	     ((iy >> 3)  & 1) << 9  |
+	     ((iy >> 4)  & 1) << 10;
+	return tile * P3D_TILE_BYTES + i * 4;
+}
+
+bool
+p3d_texture_uses_native_64x32(uint32_t chip_id, uint32_t tile_layout,
+			      unsigned cpp)
+{
+	return (chip_id == 0x0527 || chip_id == 0x0528) &&
+	       tile_layout == PARHELIA_TILE_64X32_8K && cpp == 4;
+}
+
 bool
 p3d_texture_uses_native_64x16(uint32_t chip_id, uint32_t tile_layout,
 			      unsigned cpp)
@@ -367,14 +401,28 @@ p3d_texture_uses_p690_narrow(uint32_t chip_id, uint32_t tile_layout,
 	       (cpp == 1 || cpp == 2);
 }
 
+/* The P690's 32-bit sampler order is the render-target order, and
+ * p3d_texture_tile_offset_64x16() reaches it from a y whose bits 0 and 1 are
+ * already exchanged - every hardware-validated caller swaps them first.  A
+ * caller that did not was the striping defect: the sampler read every pair of
+ * rows the other way round. */
+static uint32_t
+p3d_texture_swap_y01(uint32_t y)
+{
+	return (y & ~3u) | ((y & 1u) << 1) | ((y & 2u) >> 1);
+}
+
 uint32_t
 p3d_texture_tile_offset_chip(uint32_t x, uint32_t y, uint32_t pitch,
 			     unsigned cpp, uint32_t chip_id,
 			     uint32_t tile_layout)
 {
 	if (p3d_texture_uses_native_64x16(chip_id, tile_layout, cpp))
-		return p3d_texture_tile_offset_64x16(x, y, pitch);
+		return p3d_texture_tile_offset_64x16(
+			x, p3d_texture_swap_y01(y), pitch);
 	if (p3d_texture_uses_p690_narrow(chip_id, tile_layout, cpp))
 		return p3d_texture_tile_offset_p690_narrow(x, y, pitch, cpp);
+	if (p3d_texture_uses_native_64x32(chip_id, tile_layout, cpp))
+		return p3d_texture_tile_offset_64x32(x, y, pitch);
 	return p3d_texture_tile_offset_cpp(x, y, pitch, cpp);
 }

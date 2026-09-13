@@ -28,6 +28,10 @@ struct ph_fs_program {
    /* Set when the shader reads an interpolated colour, so the draw path knows
     * it must fetch and pass the vertex colour attribute. */
    bool uses_color;
+   /* Set when it reads the second colour (v1), which carries the fog
+    * coordinate: the draw then needs the kind-6 attribute and the program
+    * that forwards it to output 2. */
+   bool uses_color1;
    bool valid;
 };
 

@@ -38,6 +38,9 @@ ph_mip_texel_offset_cpp(const struct ph_mip_layout *mip, unsigned level,
    if (native)
       return p3d_texture_tile_offset_64x16_at(image->offset, x, y,
                                               physical_pitch);
+   /* ph_mip_physical_coords() has already added the level's tail position. */
+   if (mip->native_64x32)
+      return image->offset + p3d_texture_tile_offset_64x32(x, y, image->pitch);
    if (mip->p690_narrow)
       return image->offset +
          p3d_texture_tile_offset_p690_narrow(x, y, image->pitch, cpp);

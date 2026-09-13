@@ -673,6 +673,9 @@ ph_resource_download_shadow_rows(struct parhelia_resource *r, unsigned y0,
                                       "render-shadow download", offset, size);
 }
 
+/* Each failure exit records where it left, for PARHELIA_TRACE. */
+#define PH_CREATE_FAIL() do { fail_line = __LINE__; goto fail; } while (0)
+
 static struct pipe_resource *
 ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *templ)
 {
@@ -721,6 +724,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
    const unsigned slices = templ->target == PIPE_TEXTURE_3D ? templ->depth0 :
                            cube_target ? 6u : 1u;
    unsigned mip_levels;
+   int fail_line = 0;
    if (!r)
       return NULL;
    r->linear_fd = -1;
@@ -739,7 +743,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       r->size = templ->width0;
       r->malloc_data = align_malloc(r->size, 64);
       if (!r->malloc_data)
-         goto fail;
+         PH_CREATE_FAIL();
       return &r->base;
    }
    /* A compressed image only has a native block layout; there is no 32-bit
@@ -761,7 +765,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
               templ->target, templ->format, templ->width0, templ->height0,
               templ->depth0, templ->array_size, templ->last_level + 1,
               templ->bind);
-      goto fail;
+      PH_CREATE_FAIL();
    }
    /* P690 uses the common vendor chain geometry with a native 64x16 base,
     * compact 32x32 child, and a shared <=16 native 64x16 tail.  The
@@ -772,13 +776,19 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * derives differently from the driver's samples the wrong storage.  A 1-D
     * chain needs no exception: --mip-address-probe W 1 walks every level of a
     * 64x1 and a 256x1 base, tail included, with no differing texel. */
-   mip_levels = p690_native_texture32 && slices == 1 &&
+   /* The original family's chain layout is measured for square, larger and
+    * rectangular chains (ph-glprobe mipmap mode, every level exact). */
+   const bool native_64x32_texture = sampler_storage && !block_bytes &&
+      p3d_texture_uses_native_64x32(screen->chip_id, screen->tile_layout,
+                                    cpp);
+   mip_levels = (p690_native_texture32 || native_64x32_texture) &&
+                slices == 1 &&
                 !(templ->width0 & (templ->width0 - 1)) &&
                 !(templ->height0 & (templ->height0 - 1)) ?
                    templ->last_level + 1 : 1;
    if (!ph_mip_layout_init_cpp(&r->mip, templ->width0, templ->height0,
                                mip_levels, true, p690_native_texture32, cpp))
-      goto fail;
+      PH_CREATE_FAIL();
    /* A compressed image is stored as 4x4 blocks in 32x16-texel macrotiles.
     * Its level pitch stays a texel count; only the byte size differs. */
    if (block_bytes) {
@@ -787,7 +797,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
        * for a power-of-two width. */
       if ((templ->width0 & (templ->width0 - 1)) ||
           (templ->height0 & (templ->height0 - 1)))
-         goto fail;
+         PH_CREATE_FAIL();
       r->mip.block_bytes = block_bytes;
       r->mip.level[0].pitch = MAX2(32u, ph_mip_next_pot(templ->width0));
       r->mip.size = ph_mip_align(ph_dxt_level_size(templ->width0,
@@ -817,6 +827,61 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
                                    ph_mip_align(templ->height0, 32) * 4,
                                    0x2000);
    }
+   /* The original's sampler reads single-level 32-bit storage in 64x32 tiles
+    * at a 32-aligned pitch; cover every tile its row bands reach. */
+   if (native_64x32_texture && slices == 1) {
+      /* Tail positions of the levels after the first one no larger than
+       * 32x32, inside that level's 64x32 tile. */
+      static const unsigned tail_x[] = { 32, 48, 56, 48, 56 };
+      static const unsigned tail_y[] = { 0, 0, 0, 8, 8 };
+      size_t next = 0, tail_base = 0;
+      unsigned tail = 0;
+      bool tail_started = false;
+
+      r->mip.native_64x32 = true;
+      /* Levels wider or taller than 32 texels lie back to back in whole
+       * tile rows.  The first level no larger than 32x32 takes the left
+       * half of one tile and the smaller ones sit beside it, like the P690
+       * tail shifted right by 32 (glprobe mipmap mode, 256x256 chain,
+       * every level's base measured). */
+      for (unsigned l = 0; l < mip_levels; l++) {
+         struct ph_mip_level *level = &r->mip.level[l];
+         const size_t rows = MAX2(1u, ph_mip_align(level->height, 32) / 32);
+
+         if (level->width <= 32 && level->height <= 32) {
+            if (!tail_started) {
+               tail_base = next;
+               next += 0x2000;
+               tail_started = true;
+               level->tail_x = level->tail_y = 0;
+            } else if (tail < ARRAY_SIZE(tail_x)) {
+               level->tail_x = tail_x[tail];
+               level->tail_y = tail_y[tail++];
+            } else {
+               PH_CREATE_FAIL();
+            }
+            level->pitch = 64;
+            level->offset = tail_base;
+            level->bytes = 0x2000;
+            continue;
+         }
+         level->pitch = MAX2(32u, ph_mip_align(level->width, 32));
+         level->offset = next;
+         level->tail_x = 0;
+         level->tail_y = 0;
+         level->bytes = (rows * level->pitch + 63) / 64 * 0x2000;
+         next += level->bytes;
+      }
+      r->mip.size = MAX2(r->mip.size, next);
+      if (ph_env("PARHELIA_TRACE"))
+         for (unsigned l = 0; l < mip_levels; l++)
+            fprintf(stderr,
+                    "parhelia: 64x32 level %u %ux%u pitch %u offset %#zx tail %u,%u bytes %#zx (size %#zx)\n",
+                    l, r->mip.level[l].width, r->mip.level[l].height,
+                    r->mip.level[l].pitch, r->mip.level[l].offset,
+                    r->mip.level[l].tail_x, r->mip.level[l].tail_y,
+                    r->mip.level[l].bytes, r->mip.size);
+   }
    /* One level image per cube face, or one per volume slice; the chain above
     * already describes a single image. */
    if (slices > 1) {
@@ -843,7 +908,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       mip_levels = 1;
       if (!ph_mip_layout_init_chip(&r->mip, templ->width0, templ->height0,
                                    mip_levels, true, p690_native_texture32))
-         goto fail;
+         PH_CREATE_FAIL();
       if (p690_native_texture32) {
          r->mip.native_64x16_32 = true;
          if (templ->width0 > 32)
@@ -857,6 +922,11 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * 8/16-bit image whose byte size no longer follows width0*height0*4, asks
     * for the rows of that wider shape which cover its storage. */
    const unsigned create_pitch = MAX2(r->mip.level[0].pitch, 64u);
+   /* The kernel allocates original-family texture rows at its own pitch,
+    * max(32, align(width, 32)); asking for rows of a wider pitch halved the
+    * storage of 32-wide chains (32x64 failed the size check below). */
+   const unsigned row_pitch = native_64x32_texture ?
+      MAX2(ph_mip_align(templ->width0, 32), 32u) : create_pitch;
    struct drm_parhelia_create_render create = {
       .width = p690_native_texture32 ? MAX2(templ->width0, 64u) :
                cpp != 4 || block_bytes ? create_pitch : templ->width0,
@@ -865,9 +935,9 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
        * reserves more rows than it has, which a one-row 1-D image always
        * does: the P690 order quantises the base level to 32 rows. */
       .height = mip_levels > 1 || cpp != 4 || block_bytes || slices > 1 ||
-                r->mip.size > (size_t)create_pitch * 4 * templ->height0 ?
-         (r->mip.size + (size_t)create_pitch * 4 - 1) /
-         ((size_t)create_pitch * 4) :
+                r->mip.size > (size_t)row_pitch * 4 * templ->height0 ?
+         (r->mip.size + (size_t)row_pitch * 4 - 1) /
+         ((size_t)row_pitch * 4) :
          templ->height0,
       /* The sampler classes keep their own 32-bit row ABI; only a native
        * render or depth surface allocates at two bytes per pixel.  Zero is
@@ -886,7 +956,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
        !screen->texture_upload) {
       fprintf(stderr,
               "parhelia: safe P690 texture upload ABI is unavailable\n");
-      goto fail;
+      PH_CREATE_FAIL();
    }
    if (sampler_storage)
       create.flags = PARHELIA_CREATE_RENDER_TEXTURE;
@@ -925,7 +995,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
        ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &create)) {
       fprintf(stderr, "parhelia: create render %ux%u failed: %s\n",
               templ->width0, templ->height0, strerror(errno));
-      goto fail;
+      PH_CREATE_FAIL();
    }
    r->handle = create.handle;
    r->handle_owned = true;
@@ -934,24 +1004,30 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * descriptor and p3d_tile_offset_layout() both consume pitch in pixels. */
    if ((create.pitch & 3) || create.pitch < templ->width0 * r->cpp ||
        create.pitch % r->cpp)
-      goto fail;
+      PH_CREATE_FAIL();
    /* Layout 2 uses a power-of-two texel pitch, which can exceed the current
     * allocation ABI's 64-pixel pitch for NPOT images.  Reject any object
     * whose reported storage cannot contain the software-swizzled image. */
    if ((create.flags & PARHELIA_CREATE_RENDER_TEXTURE) &&
        create.size < r->mip.size)
-      goto fail;
+      PH_CREATE_FAIL();
    r->stride = create.pitch / r->cpp;
    r->mmap_offset = create.mmap_offset;
    r->upload_texture = screen->texture_upload &&
                        create.flags == PARHELIA_CREATE_RENDER_TEXTURE;
    if (r->upload_texture) {
       if (create.mmap_offset)
-         goto fail;
+         PH_CREATE_FAIL();
       r->map = align_malloc(r->size, 64);
       if (!r->map)
-         goto fail;
+         PH_CREATE_FAIL();
       memset(r->map, 0, r->size);
+      /* PARHELIA_TEX_ADDRESS_FILL=1 (diagnostic): every unwritten dword
+       * names its own offset, so a sampler read outside the stored texels
+       * shows where it went instead of black. */
+      if (ph_env("PARHELIA_TEX_ADDRESS_FILL"))
+         for (size_t i = 0; i < r->size / 4; i++)
+            ((uint32_t *)r->map)[i] = 0xfff00000u | (uint32_t)(i & 0xfffff);
       r->upload_dirty = true;
    } else if (native_depth || native_color) {
       /* Compact P690 target classes live above the raw 16-MiB host window.
@@ -959,22 +1035,22 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
        * which already have a CPU-visible linear companion use GPU BITBLT;
        * direct CPU transfers on a private class target remain unavailable. */
       if (create.mmap_offset)
-         goto fail;
+         PH_CREATE_FAIL();
       if (screen->render_transfer) {
          r->map = align_malloc(r->size, 64);
          if (!r->map)
-            goto fail;
+            PH_CREATE_FAIL();
          memset(r->map, 0, r->size);
          r->transfer_shadow = true;
       }
    } else {
       if (!r->mmap_offset)
-         goto fail;
+         PH_CREATE_FAIL();
       r->map = mmap(NULL, r->size, PROT_READ | PROT_WRITE, MAP_SHARED,
                     ph_screen(pscreen)->fd, r->mmap_offset);
       if (r->map == MAP_FAILED) {
          r->map = NULL;
-         goto fail;
+         PH_CREATE_FAIL();
       }
    }
    /* A compressed image has no linear companion: layout 5 is the only
@@ -991,7 +1067,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
       if (!ph_mip_layout_init_cpp(&r->linear_mip, templ->width0,
                                   templ->height0, mip_levels, false, false,
                                   cpp))
-         goto fail;
+         PH_CREATE_FAIL();
       struct drm_parhelia_create_render linear = {
          .width = ALIGN_POT(templ->width0, 32),
          .height = mip_levels > 1 || cpp != 4 ?
@@ -1006,7 +1082,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
          r->linear_stride = r->linear_mip.level[0].pitch * cpp;
          r->linear_map = align_malloc(r->linear_size, 64);
          if (!r->linear_map)
-            goto fail;
+            PH_CREATE_FAIL();
          memset(r->linear_map, 0, r->linear_size);
       } else {
          if (ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER,
@@ -1014,24 +1090,24 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
             fprintf(stderr,
                     "parhelia: create linear shadow %ux%u failed: %s\n",
                     linear.width, linear.height, strerror(errno));
-            goto fail;
+            PH_CREATE_FAIL();
          }
          r->linear_handle = linear.handle;
          r->linear_size = linear.size;
          r->linear_stride = linear.pitch;
          if (r->linear_stride < ALIGN_POT(templ->width0, 32) * 4 ||
              (r->linear_stride & 3))
-            goto fail;
+            PH_CREATE_FAIL();
          if ((mip_levels > 1 || cpp != 4) &&
              linear.size < r->linear_mip.size)
-            goto fail;
+            PH_CREATE_FAIL();
          r->linear_handle_owned = true;
          r->linear_map = mmap(NULL, r->linear_size, PROT_READ | PROT_WRITE,
                               MAP_SHARED, ph_screen(pscreen)->fd,
                               linear.mmap_offset);
          if (r->linear_map == MAP_FAILED) {
             r->linear_map = NULL;
-            goto fail;
+            PH_CREATE_FAIL();
          }
       }
    }
@@ -1045,6 +1121,12 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
               r->linear_stride, r->tile_layout);
    return &r->base;
 fail:
+   if (ph_env("PARHELIA_TRACE"))
+      fprintf(stderr,
+              "parhelia: create %ux%u format=%s bind=%#x failed at parhelia_screen.c:%d (%s)\n",
+              templ->width0, templ->height0,
+              util_format_short_name(templ->format), templ->bind,
+              fail_line, strerror(errno));
    if (r->upload_texture)
       align_free(r->linear_map);
    else if (r->linear_map)

@@ -54,10 +54,15 @@ struct ph_fs_ctx {
    unsigned max_instructions;
    unsigned sampler_mask;
    bool uses_color;
+   bool uses_color1;
    bool failed;
    /* Register liveness: bit 0 = r0, bit 1 = r1. */
    uint8_t live;
    struct ph_fs_half *half;
+   /* The operand a rejection was about, for the trace only. */
+   const char *reject_op;
+   unsigned reject_index;
+   struct ph_fs_value reject_value;
 };
 
 static void
@@ -86,6 +91,8 @@ ph_fs_alloc(struct ph_fs_ctx *ctx, uint8_t *out)
          return true;
       }
    }
+   if (getenv("PARHELIA_TRACE_FS"))
+      fprintf(stderr, "  fs: both combiner registers are live\n");
    ph_fs_fail(ctx);
    return false;
 }
@@ -167,9 +174,11 @@ ph_fs_leaf(struct ph_fs_ctx *ctx, nir_def *def, struct ph_fs_value *out)
          if (deref->var->data.location == VARYING_SLOT_COL0)
             out->reg = P3D_COMB_V0;
          else if (deref->var->data.location == VARYING_SLOT_COL1 ||
-                  deref->var->data.location == VARYING_SLOT_FOGC)
+                  deref->var->data.location == VARYING_SLOT_FOGC) {
             /* The vertex side puts the fog coordinate in colour 1. */
             out->reg = P3D_COMB_V1;
+            ctx->uses_color1 = true;
+         }
          else
             return false;
          ctx->uses_color = true;
@@ -196,9 +205,11 @@ ph_fs_leaf(struct ph_fs_ctx *ctx, nir_def *def, struct ph_fs_value *out)
 
          if (location == VARYING_SLOT_COL0)
             out->reg = P3D_COMB_V0;
-         else if (location == VARYING_SLOT_COL1 || location == VARYING_SLOT_FOGC)
+         else if (location == VARYING_SLOT_COL1 ||
+                  location == VARYING_SLOT_FOGC) {
             out->reg = P3D_COMB_V1;
-         else
+            ctx->uses_color1 = true;
+         } else
             return false;
          ctx->uses_color = true;
          return true;
@@ -339,6 +350,20 @@ static bool ph_fs_value(struct ph_fs_ctx *ctx, nir_def *def, bool alpha,
 /* Read one ALU operand, folding its swizzle into a replicate code.  The
  * hardware has no general swizzle: a source is read either naturally or with
  * one channel replicated across all four. */
+/* Name a rejection so a shader that does not compile says why. */
+static bool
+ph_fs_operand_reject(struct ph_fs_ctx *ctx, const char *why)
+{
+   if (getenv("PARHELIA_TRACE_FS"))
+      fprintf(stderr, "  fs: %s (%s src%u: reg %u rep %u comp %u%s%s)\n", why,
+              ctx->reject_op ? ctx->reject_op : "?", ctx->reject_index,
+              ctx->reject_value.reg, ctx->reject_value.rep,
+              ctx->reject_value.component,
+              ctx->reject_value.is_register ? " register" : "",
+              ctx->reject_value.is_constant ? " constant" : "");
+   return false;
+}
+
 static bool
 ph_fs_operand(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, unsigned index,
               bool alpha, struct ph_fs_value *out)
@@ -349,6 +374,9 @@ ph_fs_operand(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, unsigned index,
 
    if (!ph_fs_value(ctx, src->src.ssa, alpha, out))
       return false;
+   ctx->reject_op = nir_op_infos[alu->op].name;
+   ctx->reject_index = index;
+   ctx->reject_value = *out;
 
    if (alpha) {
       /* The alpha pipe reads component 3, or the only component of a scalar
@@ -356,11 +384,13 @@ ph_fs_operand(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, unsigned index,
       channel = src->swizzle[components >= 4 ? 3 : components - 1] +
                 out->component;
       if (channel > 3)
-         return false;
+         return ph_fs_operand_reject(ctx, "alpha channel past the vec4");
       if (channel == 3 && !out->component)
          return true;
+      /* A replicated source already holds one channel in all four, so
+       * selecting a channel of it again is the identity. */
       if (out->rep != P3D_COMB_REP_NONE)
-         return false;
+         return true;
       out->rep = ph_fs_replicate(channel);
       if (out->rep == P3D_COMB_REP_A)
          out->rep = P3D_COMB_REP_NONE;
@@ -369,14 +399,18 @@ ph_fs_operand(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, unsigned index,
 
    if (components >= 3 && src->swizzle[0] == 0 && src->swizzle[1] == 1 &&
        src->swizzle[2] == 2)
-      return !out->component;            /* natural rgb read */
+      return out->component ?
+             ph_fs_operand_reject(ctx, "rgb read of a shifted vec4") : true;
+
+   if (out->rep != P3D_COMB_REP_NONE)
+      return true;			/* already one channel in all four */
    channel = src->swizzle[0];
    for (unsigned i = 1; i < components && i < 3; i++)
       if (src->swizzle[i] != channel)
-         return false;
+         return ph_fs_operand_reject(ctx, "rgb swizzle is not a replicate");
    channel += out->component;
-   if (channel > 3 || out->rep != P3D_COMB_REP_NONE)
-      return false;
+   if (channel > 3)
+      return ph_fs_operand_reject(ctx, "rgb channel past the vec4");
    out->rep = ph_fs_replicate(channel);
    return true;
 }
@@ -405,6 +439,68 @@ ph_fs_try_invert(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, bool alpha,
       out->mod = P3D_COMB_MOD_INVERT;
       return true;
    }
+   return false;
+}
+
+/* The def @c is the complement of, when it has the shape fadd(1.0, fneg(c)).
+ * Returns NULL otherwise. */
+static nir_def *
+ph_fs_complement_of(nir_def *def)
+{
+   const nir_alu_instr *add, *neg;
+
+   if (nir_def_instr(def)->type != nir_instr_type_alu)
+      return NULL;
+   add = nir_instr_as_alu(nir_def_instr(def));
+   if (add->op != nir_op_fadd)
+      return NULL;
+   for (unsigned i = 0; i < 2; i++) {
+      if (!nir_src_is_const(add->src[i].src) ||
+          nir_src_comp_as_float(add->src[i].src, add->src[i].swizzle[0]) !=
+             1.0f)
+         continue;
+      if (nir_def_instr(add->src[1 - i].src.ssa)->type != nir_instr_type_alu)
+         continue;
+      neg = nir_instr_as_alu(nir_def_instr(add->src[1 - i].src.ssa));
+      if (neg->op != nir_op_fneg)
+         continue;
+      return neg->src[0].src.ssa;
+   }
+   return NULL;
+}
+
+/* a * c + b * (1 - c) is the combiner's LRP, which is how GL fog and every
+ * other mix arrives once Mesa has lowered flrp into multiplies.  Matching it
+ * turns five instructions into one and is what brings a fogged draw inside
+ * the five-slot quantum. */
+static bool
+ph_fs_try_lrp(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, bool alpha,
+              struct ph_fs_value *out)
+{
+   const nir_alu_instr *mul[2];
+   struct ph_fs_value src[3];
+
+   for (unsigned i = 0; i < 2; i++) {
+      if (nir_def_instr(alu->src[i].src.ssa)->type != nir_instr_type_alu)
+         return false;
+      mul[i] = nir_instr_as_alu(nir_def_instr(alu->src[i].src.ssa));
+      if (mul[i]->op != nir_op_fmul)
+         return false;
+   }
+   /* One multiply carries the factor and the other its complement. */
+   for (unsigned i = 0; i < 2; i++)
+      for (unsigned j = 0; j < 2; j++)
+         for (unsigned k = 0; k < 2; k++) {
+            nir_def *factor = mul[i]->src[j].src.ssa;
+
+            if (ph_fs_complement_of(mul[1 - i]->src[k].src.ssa) != factor)
+               continue;
+            if (!ph_fs_operand(ctx, mul[i], 1 - j, alpha, &src[0]) ||
+                !ph_fs_operand(ctx, mul[1 - i], 1 - k, alpha, &src[1]) ||
+                !ph_fs_value(ctx, factor, alpha, &src[2]))
+               return false;
+            return ph_fs_emit(ctx, P3D_COMB_LRP, src, 3, out);
+         }
    return false;
 }
 
@@ -440,6 +536,10 @@ ph_fs_alu(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, bool alpha,
       break;
    case nir_op_fadd:
       if (ph_fs_try_invert(ctx, alu, alpha, out))
+         return true;
+      if (ctx->failed)
+         return false;
+      if (ph_fs_try_lrp(ctx, alu, alpha, out))
          return true;
       if (ctx->failed)
          return false;
@@ -846,6 +946,7 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
    }
    out->sampler_mask = ctx.sampler_mask;
    out->uses_color = ctx.uses_color;
+   out->uses_color1 = ctx.uses_color1;
    out->valid = true;
    return true;
 }

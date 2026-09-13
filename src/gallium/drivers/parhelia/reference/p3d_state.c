@@ -39,16 +39,37 @@ p3d_primword(enum p3d_prim prim)
 	       ((uint32_t)p3d_prim_tab[prim].topo << 12) | 0x60000u;
 }
 
+/* A fog colour component: the ICD packs (int)(c * 255 + 0.5). */
+static uint32_t
+p3d_fog_byte(float c)
+{
+	float v = c < 0.0f ? 0.0f : c > 1.0f ? 1.0f : c;
+
+	return (uint32_t)(v * 255.0f + 0.5f) & 0xffu;
+}
+
+/* Fog start and end are 24-bit depths: value * 16777215. */
+static uint32_t
+p3d_fog_depth(float v)
+{
+	float c = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+
+	return (uint32_t)(c * 16777215.0f + 0.5f) & 0x00ffffffu;
+}
+
 /* DWGCTL for a 3D primitive: the captured base with the class nibble. */
 uint32_t
 p3d_dwgctl(const struct p3d_state *st)
 {
 	const uint32_t rop = st->logicop_enable ? st->logicop & 0xfu : 0xcu;
+	const uint32_t cls = st->prim == P3D_POINTS && st->point_class ?
+			     st->point_class : p3d_prim_class(st->prim);
+	const uint32_t nibble = st->prim == P3D_POINTS && st->point_nibble ?
+				st->point_nibble : p3d_dwg_nibble[cls];
 
 	/* [7:4] is the raster op; 0xC is GXcopy, the engine's default and the
 	 * only code that leaves blending enabled. */
-	return (0x00a60ec4u & ~0xffu) | (rop << 4) |
-	       p3d_dwg_nibble[p3d_prim_class(st->prim)];
+	return (0x00a60ec4u & ~0xffu) | (rop << 4) | nibble;
 }
 
 uint32_t
@@ -165,7 +186,7 @@ p3d_emit_constant_group(struct p3d_cs *cs, const struct p3d_state *st,
 {
 	/* Three loads: the program's own block, the viewport pair and the
 	 * raster block's copy of it. */
-	uint32_t buf[3 * 5 + (64 + 4) * 4];
+	uint32_t buf[4 * 5 + (64 + 4 + 64) * 4];
 	unsigned m = st->const_mask ? st->const_mask : 7u;
 	size_t n = 0, cap = sizeof buf / sizeof buf[0];
 
@@ -200,6 +221,9 @@ p3d_emit_constant_group(struct p3d_cs *cs, const struct p3d_state *st,
 				   vp, 2);
 	if (m & 4u)
 		n = blockload_into(buf, n, cap, 0x160, vp, 2);
+	if ((m & 8u) && st->aux_const && st->aux_const_vec4s)
+		n = blockload_into(buf, n, cap, st->aux_const_slot,
+				   st->aux_const, st->aux_const_vec4s);
 	if (n)
 		p3d_raw(cs, buf, n);
 }
@@ -302,13 +326,30 @@ p3d_vtxcap(unsigned dw_per_vertex)
 	return 0x321000u / (dw_per_vertex * 4);
 }
 
+/* A position carrying 1/w: the vendor's pre-transformed vertex is
+ * [x][y][z][1/w] with descriptor mask xyzw, so the position widens to four
+ * components and every later attribute moves one dword on (offset [11:4]). */
+static void
+p3d_descriptors_add_w(struct p3d_rw *desc, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (!desc[i].val)
+			continue;
+		if (i == 0)
+			desc[i].val |= 0x03c00000u;
+		else
+			desc[i].val += 1u << 4;
+	}
+}
+
 /* The attribute descriptors, by vertex layout.  Bit fields: [2:0] stream,
  * [11:4] dword offset, [19:16] attribute KIND, [25:22] component mask,
  * [31] last.  Every capture terminates the burst with a zero descriptor. */
 static size_t
 p3d_descriptors(struct p3d_rw *out, int textured, int with_z,
 		uint32_t pos_override, uint32_t col_override, int no_colour,
-		unsigned ntex, int vertex_alpha, int texcoord3)
+		unsigned ntex, int vertex_alpha, int texcoord3,
+		int vertex_colour1)
 {
 	const int two_tex = ntex >= 2;
 	size_t n = 0;
@@ -391,6 +432,9 @@ p3d_descriptors(struct p3d_rw *out, int textured, int with_z,
 				out[n].val = vertex_alpha ? 0xa0c70070u : 0xa0c70060u;
 				n++;
 			}
+		} else if (vertex_colour1) {
+			out[n].reg = P3D_R_DESC; out[n].val = 0x21c50030u; n++;
+			out[n].reg = P3D_R_DESC; out[n].val = 0xa1c60060u; n++;
 		} else {
 			out[n].reg = P3D_R_DESC;
 			out[n].val = vertex_alpha ? 0xa3c50030u : 0xa1c50030u;
@@ -418,6 +462,13 @@ p3d_descriptors(struct p3d_rw *out, int textured, int with_z,
 			out[n].val = vertex_alpha ? 0xa0c70060u : 0xa0c70050u;
 			n++;
 		}
+	} else if (vertex_colour1) {
+		/* A second colour: attribute kind 6, the specular slot the
+		 * fixed-function numbering gives WARP input v6, three dwords
+		 * after the first colour.  It is what carries the fog
+		 * coordinate to the combiner's v1. */
+		out[n].reg = P3D_R_DESC; out[n].val = 0x21c50020u; n++;
+		out[n].reg = P3D_R_DESC; out[n].val = 0xa1c60050u; n++;
 	} else {
 		out[n].reg = P3D_R_DESC; out[n].val = 0xa1c50020u; n++;
 	}
@@ -622,7 +673,13 @@ p3d_emit_texenv(struct p3d_cs *cs, uint32_t slot, unsigned unit, int first,
 void
 p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 {
-	uint32_t cls = p3d_prim_class(st->prim);
+	/* The raster class and the WARP class are not the same thing for a wide
+	 * point: 0x1130 and DWGCTL carry class 3, while the WARP mode latch and
+	 * the bind packet stay at the primitive's own class.  Raising the WARP
+	 * class with them drops the primitive outright (measured). */
+	const uint32_t warp_cls = p3d_prim_class(st->prim);
+	uint32_t cls = st->prim == P3D_POINTS && st->point_class ?
+		       st->point_class : warp_cls;
 	uint32_t pipectl, dwgctl;
 	struct p3d_rw rw[10], desc[6];
 	const int lx = st->lx_pipe_route && st->single_texture_pipe == 1;
@@ -630,7 +687,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 
 	/* 0x1130: set only the decoded fields and keep the captured remainder */
 	pipectl = (0x0200200cu & ~0x03001001u) | (cls << 24) |
-		  (st->flat ? 0x1000u : 0u) | ((uint32_t)st->cull & 3u);
+		  (st->flat ? 0x1000u : 0u) | ((uint32_t)st->cull & 3u) |
+		  st->pipectl_extra;
 	dwgctl  = p3d_dwgctl(st);
 
 	/* -- raster / ROP ------------------------------------------------- */
@@ -645,7 +703,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	/* The vendor's own unit-point draw uses the class-0 raster image.  The
 	 * ordinary triangle/line surface image is different even though the
 	 * decoded low control bits agree. */
-	rw[2].val = st->prim == P3D_POINTS ? 0x04000024u : 0x0bb80024u;
+	rw[2].val = st->point_rastermode ? st->point_rastermode :
+		    st->prim == P3D_POINTS ? 0x04000024u : 0x0bb80024u;
 	rw[3].reg = 0x12f8;            rw[3].val = 0x007fe000u;	/* AA threshold */
 	p3d_reglist(cs, rw, 4);
 
@@ -673,6 +732,34 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 		rw[0].reg = st->probe_reg;
 		rw[0].val = st->probe_val;
 		p3d_reglist(cs, rw, 1);
+	}
+
+	/* The fog unit.  The vendor emits these three together, and a disabled
+	 * fog still states them so a register another client left set cannot
+	 * tint this draw. */
+	{
+		const unsigned r = p3d_fog_byte(st->fog_colour[0]);
+		const unsigned g = p3d_fog_byte(st->fog_colour[1]);
+		const unsigned b = p3d_fog_byte(st->fog_colour[2]);
+
+		rw[0].reg = P3D_R_FOG;
+		rw[0].val = st->fog ? 1u | ((st->fog_mode & 3u) << 1) |
+				      (b << 6) | (g << 15) | (r << 24) : 0u;
+		rw[1].reg = P3D_R_FOG_START;
+		rw[1].val = st->fog ? p3d_fog_depth(st->fog_start) : 0u;
+		rw[2].reg = P3D_R_FOG_END;
+		rw[2].val = st->fog ? p3d_fog_depth(st->fog_end) : 0x00ffffffu;
+		p3d_reglist(cs, rw, 3);
+		if (st->fog && st->fog_table) {
+			struct p3d_rw tab[64];
+			size_t k;
+
+			for (k = 0; k < 64; k++) {
+				tab[k].reg = P3D_R_FOG_TABLE;
+				tab[k].val = st->fog_table[k];
+			}
+			p3d_reglist(cs, tab, 64);
+		}
 	}
 
 	rw[0].reg = P3D_R_BLEND; rw[0].val = p3d_blendctl(st);
@@ -725,7 +812,11 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	 * The 0x41 block loads go between the control binds and the vertex
 	 * format group.  c8/c9 are free only while vertex blending is off; the
 	 * clip/raster block reads its own copy at 0x160. */
-	if (st->transform) {
+	/* Transformed vertices always need the matrix and viewport blocks; a
+	 * state that binds the loader and names the blocks it wants gets those
+	 * without also claiming a transformed vertex layout, which is what a
+	 * program reading a plain constant needs. */
+	if (st->transform || (st->const_loader_entry && st->const_mask)) {
 		float vp[8];
 		size_t i;
 
@@ -803,9 +894,16 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			     st->tex && st->tex->env == P3D_TEXENV_REPLACE,
 			     st->second_texcoord_probe && !st->tex1 ? 2u :
 			     p3d_state_units(st),
-			     st->vertex_alpha, st->texcoord3);
+			     st->vertex_alpha, st->texcoord3,
+			     st->vertex_colour1);
+	if (st->oow)
+		p3d_descriptors_add_w(desc, nd);
 
-	rw[0].reg = P3D_R_ATTR_PRESENT; rw[0].val = p3d_attr_present(desc, nd);
+	/* Interpolant 5 is the fog factor and 0x1114's nibble 5 already sources
+	 * it from o2, so the fog unit needs only its presence bit here. */
+	rw[0].reg = P3D_R_ATTR_PRESENT;
+	rw[0].val = p3d_attr_present(desc, nd) | (st->fog ? 0x20u : 0u) |
+		    st->attr_present_extra;
 	rw[1].reg = P3D_R_ATTR_MAP0;    rw[1].val = 0x00287210u;
 	rw[2].reg = P3D_R_ATTR_MAP1;    rw[2].val = 0x00006543u;
 	p3d_reglist(cs, rw, 3);
@@ -819,15 +917,15 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	rw[0].reg = P3D_R_WARP_ENTRY;  rw[0].val = st->warp_entry;
 	rw[1].reg = P3D_R_WARP_ENTRY2; rw[1].val = st->warp_entry;
 	rw[2].reg = P3D_R_WARP_PAGE;   rw[2].val = 2;
-	p3d_bindpacket(cs, 0x20000000u | cls, rw, 3, 1);
+	p3d_bindpacket(cs, 0x20000000u | warp_cls, rw, 3, 1);
 
 	rw[0].reg = P3D_R_STROBE;    rw[0].val = 0;
-	rw[1].reg = P3D_R_WARP_MODE; rw[1].val = 0x20000000u | cls;
-	rw[2].reg = P3D_R_WARP_MODE; rw[2].val = 0x20000000u | cls;
-	rw[3].reg = P3D_R_WARP_MODE; rw[3].val = cls;
+	rw[1].reg = P3D_R_WARP_MODE; rw[1].val = 0x20000000u | warp_cls;
+	rw[2].reg = P3D_R_WARP_MODE; rw[2].val = 0x20000000u | warp_cls;
+	rw[3].reg = P3D_R_WARP_MODE; rw[3].val = warp_cls;
 	rw[4].reg = P3D_R_PIPECTL;   rw[4].val = pipectl;
 	rw[5].reg = 0x111c;          rw[5].val = 0x00000fdbu;
-	rw[6].reg = 0x1144;          rw[6].val = 0;
+	rw[6].reg = 0x1144;          rw[6].val = st->vertex_out_extra;
 	p3d_reglist(cs, rw, 7);
 
 	/* -- vertex fetch -------------------------------------------------- */
@@ -884,13 +982,15 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	rw[4].reg = P3D_R_TEX_ENABLE+12;rw[4].val = 0;
 	p3d_reglist(cs, rw, 5);
 
-	/* 0x11e8 is a global texture-cache partition latch, not a member of the
-	 * windowed per-unit state above.  Diagnostic and vendor-style clients can
-	 * program 0x00500000, while the hardware-proven production GL path uses
-	 * zero.  Every complete state image must therefore write the requested
-	 * value, including zero, so a later context cannot inherit another
-	 * client's cache mode. */
-	if (!(lx && st->tex)) {
+	/* 0x11e8 is the texture-cache partition latch.  Diagnostic and
+	 * vendor-style clients can program 0x00500000, while the hardware-proven
+	 * production GL path uses zero, so a complete state image writes the
+	 * requested value including zero and a later context cannot inherit
+	 * another client's cache mode.  Only the LX family has the latch: the
+	 * original Parhelia's texture engine stops retiring once it is written,
+	 * and no vendor capture on that chip writes it at all. */
+	if ((st->tex_cache_latch || st->texture_cache_probe) &&
+	    !(lx && st->tex)) {
 		rw[0].reg = P3D_R_TEX_CACHE;
 		rw[0].val = st->texture_cache_probe;
 		p3d_reglist(cs, rw, 1);
@@ -1204,7 +1304,10 @@ p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 			     st->pos_desc, st->col_desc,
 			     st->tex && st->tex->env == P3D_TEXENV_REPLACE,
 			     p3d_state_units(st),
-			     !!st->vertex_alpha, !!st->texcoord3);
+			     !!st->vertex_alpha, !!st->texcoord3,
+			     !!st->vertex_colour1);
+	if (st->oow)
+		p3d_descriptors_add_w(desc, nd);
 	p3d_reglist(cs, desc, nd);
 
 	for (i = 0; i < nprim; i++)

@@ -71,6 +71,8 @@ struct ph_mip_layout {
    bool p690_narrow;
    bool tiled;
    bool native_64x16_32;
+   /* The original Parhelia's 32-bit sampler order: 64x32-texel tiles. */
+   bool native_64x32;
 };
 
 static inline unsigned

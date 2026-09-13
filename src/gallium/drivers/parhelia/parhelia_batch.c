@@ -657,8 +657,16 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 	        (!input->tex || input->tex1 || input->has_depth ||
 	         input->vertex_alpha || input->transform)) ||
 	       (input->dw_per_vertex != 5u + !!p3d_position_has_z(input) +
+	        !!input->oow +
 	        2 * (!!input->tex + !!input->tex1 +
-	             !!input->second_texcoord_probe) + !!input->vertex_alpha) ||
+	             !!input->second_texcoord_probe) + !!input->vertex_alpha +
+	        3u * !!input->vertex_colour1) ||
+	       /* 1/w follows z; the second colour and the three-coordinate
+	        * and probe layouts do not carry it. */
+	       (input->oow && (input->vertex_colour1 || input->texcoord3 ||
+	                       input->second_texcoord_probe)) ||
+	       /* The second colour is only wired for untextured draws. */
+	       (input->vertex_colour1 && (input->tex || input->vertex_alpha)) ||
 	       (input->sampled_alpha_companion &&
 	        (!input->tex || !input->tex1 || input->single_texture_pipe != 1 ||
 	         input->vertex_alpha || input->transform || input->comb_op ||
@@ -712,7 +720,19 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 	         input->depth_alpha_test_probe)) ||
 	       (input->depth_vertex_alpha_add &&
 	        (!input->depth_vertex_alpha || input->depth_alpha_test_probe)) ||
-       (input->transform && (!input->mvp || !input->const_loader_entry)) ||
+       /* The constants may come from the fixed-function matrix or from a
+        * compiled program's own uniform block; either satisfies transform. */
+       (input->transform &&
+        ((!input->mvp && !(input->vs_const && input->vs_const_vec4s)) ||
+         !input->const_loader_entry)) ||
+       /* Constants without a transform: the loader has to be bound and the
+        * wanted blocks named, since the default mask asks for the viewport
+        * pair a non-transforming program never set. */
+       (!input->transform && input->const_loader_entry &&
+        (!input->const_mask ||
+         (!(input->vs_const && input->vs_const_vec4s) &&
+          !(input->aux_const && input->aux_const_vec4s)))) ||
+       (input->aux_const && input->aux_const_vec4s > 63) ||
        input->base_reg_entry ||
        (input->bound_ranges && input->prim != P3D_TRIANGLES) ||
        /* The two surface slots carry independent pitches; a 16 bpp colour

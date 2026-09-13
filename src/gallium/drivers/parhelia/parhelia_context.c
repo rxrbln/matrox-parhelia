@@ -243,6 +243,19 @@ struct ph_context {
    unsigned warp_program_instructions;
    unsigned warp_program_slots;
    unsigned warp_programs_held;
+   /* A point wider than one pixel is rasterised by the hardware: the program
+    * states the extent as o9 = (x-r, y-r, x+r, y+r) and 0x1130 carries
+    * primitive class 3 (parhelia-point-size-re.md section 12).  The radius is
+    * constant c0.x, so a batch holds points of one size and @point_radius is
+    * the size the staged points carry. */
+   bool colour1;		/* the staged stream carries a second colour */
+   bool oow;		/* the staged stream carries 1/w after z */
+   uint32_t warp_sized_point;
+   uint32_t warp_sized_point_slot;
+   /* Pass-through plus "mov o2, v6": the second colour reaches the combiner
+    * as v1, which is where a lowered GL fog expression reads its coordinate. */
+   uint32_t warp_colour1;
+   float point_radius;
    bool tcl_available;
    bool tcl_forced_off;
    bool tcl_multitexture;
@@ -1687,6 +1700,145 @@ ph_use_alpha_micro_cutout(struct ph_context *ctx, bool textured,
        sampler->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR);
 }
 
+static bool ph_auto_tiled_texture(const struct ph_context *ctx,
+                                  const struct parhelia_resource *texture,
+                                  const struct pipe_sampler_state *sampler);
+
+/* A native import with no linear companion, presented onto tiled storage,
+ * on a chip that cannot sample it directly. */
+static bool
+ph_present_tiled_source(const struct ph_context *ctx,
+                        const struct parhelia_resource *src,
+                        const struct parhelia_resource *dst)
+{
+   return !ph_auto_tiled_texture(ctx, src, NULL) &&
+          src->native_shared && src->handle && !src->linear_handle &&
+          src->stride && src->stride <= 0x3fff &&
+          dst->handle && dst->stride && dst->stride <= 0x3fff &&
+          !dst->upload_texture && !dst->transfer_shadow &&
+          !dst->mip.block_bytes;
+}
+
+struct ph_present_rect {
+   int x0, y0, x1, y1, offx, offy;
+};
+
+/* Dwords per staged vertex of a plain textured stream, and where S,T sit:
+ * x, y[, z, 1/w], r, g, b, s, t. */
+static unsigned
+ph_stream_stride(const struct ph_context *ctx)
+{
+   return ctx->oow ? 9 : 7;
+}
+
+/* Quad @q of glamor's copy: an integer rectangle whose texels are a 1:1
+ * translation of its pixels, clipped to the scissor and both surfaces. */
+static const char *
+ph_present_quad_rect(const struct ph_context *ctx, unsigned q,
+                     const struct parhelia_resource *src,
+                     const struct parhelia_resource *dst,
+                     struct ph_present_rect *r)
+{
+   const unsigned stride = ph_stream_stride(ctx), st = stride - 2;
+   const float *quad = &ctx->vertices[q * 6 * stride];
+   const float sw = src->base.width0, sh = src->base.height0;
+   float minx = INFINITY, miny = INFINITY, maxx = -INFINITY, maxy = -INFINITY;
+
+   for (unsigned v = 0; v < 6; v++) {
+      minx = MIN2(minx, quad[v * stride]);
+      miny = MIN2(miny, quad[v * stride + 1]);
+      maxx = MAX2(maxx, quad[v * stride]);
+      maxy = MAX2(maxy, quad[v * stride + 1]);
+   }
+   r->x0 = lrintf(minx);
+   r->y0 = lrintf(miny);
+   r->x1 = lrintf(maxx);
+   r->y1 = lrintf(maxy);
+   r->offx = lrintf(quad[st] * sw - quad[0]);
+   r->offy = lrintf(quad[st + 1] * sh - quad[1]);
+   if (fabsf(minx - r->x0) > 0.01f || fabsf(miny - r->y0) > 0.01f ||
+       fabsf(maxx - r->x1) > 0.01f || fabsf(maxy - r->y1) > 0.01f)
+      return "fractional rectangle";
+   for (unsigned v = 0; v < 6; v++) {
+      const float *p = &quad[v * stride];
+
+      if ((fabsf(p[0] - minx) > 0.01f && fabsf(p[0] - maxx) > 0.01f) ||
+          (fabsf(p[1] - miny) > 0.01f && fabsf(p[1] - maxy) > 0.01f))
+         return "not an axis-aligned rectangle";
+      if (fabsf(p[st] * sw - p[0] - r->offx) > 0.05f ||
+          fabsf(p[st + 1] * sh - p[1] - r->offy) > 0.05f)
+         return "texture coordinates are not a 1:1 translation";
+   }
+   if (ctx->rasterizer && ctx->rasterizer->scissor) {
+      r->x0 = MAX2(r->x0, (int)ctx->scissor.minx);
+      r->y0 = MAX2(r->y0, (int)ctx->scissor.miny);
+      r->x1 = MIN2(r->x1, (int)ctx->scissor.maxx);
+      r->y1 = MIN2(r->y1, (int)ctx->scissor.maxy);
+   }
+   r->x0 = MAX2(r->x0, MAX2(0, -r->offx));
+   r->y0 = MAX2(r->y0, MAX2(0, -r->offy));
+   r->x1 = MIN2(r->x1, MIN2((int)dst->base.width0, (int)sw - r->offx));
+   r->y1 = MIN2(r->y1, MIN2((int)dst->base.height0, (int)sh - r->offy));
+   return NULL;
+}
+
+/* A native import has only its tiled storage.  The surface-to-surface
+ * BITBLT copies it exactly (--tiled-blit-probe) and runs after the client's
+ * queued rendering. */
+static bool
+ph_present_tiled_quads(struct ph_context *ctx, struct parhelia_resource *dst,
+                       struct parhelia_resource *src)
+{
+   const unsigned quads = ctx->triangles / 2;
+   struct ph_present_rect r;
+   unsigned copied = 0;
+
+   for (unsigned q = 0; q < quads; q++) {
+      const char *why = ph_present_quad_rect(ctx, q, src, dst, &r);
+
+      if (why) {
+         if (ph_env("PARHELIA_TRACE"))
+            fprintf(stderr, "parhelia: tiled present quad %u/%u rejected: %s\n",
+                    q, quads, why);
+         return false;
+      }
+   }
+   if (ctx->aggregate_batches && ph_drain_batch(ctx))
+      return false;
+   for (unsigned q = 0; q < quads; q++) {
+      struct parhelia_batch *batch = &ctx->build_batch;
+      int ret;
+
+      ph_present_quad_rect(ctx, q, src, dst, &r);
+      if (r.x0 >= r.x1 || r.y0 >= r.y1)
+         continue;
+      ret = parhelia_batch_blit(batch, dst->handle, dst->stride, 2, r.x0, r.y0,
+                                src->handle, src->stride, 2,
+                                r.x0 + r.offx, r.y0 + r.offy,
+                                r.x1 - r.x0, r.y1 - r.y0);
+      if (!ret)
+         ret = parhelia_batch_submit(ph_screen(ctx->base.screen)->fd,
+                                     batch, NULL, 0, &ctx->fence);
+      if (ph_env("PARHELIA_TRACE"))
+         fprintf(stderr,
+                 "parhelia: GPU tiled present src=%u dst=%u rect=%d,%d %dx%d from %d,%d ret=%d\n",
+                 src->handle, dst->handle, r.x0, r.y0, r.x1 - r.x0,
+                 r.y1 - r.y0, r.x0 + r.offx, r.y0 + r.offy, ret);
+      if (ret) {
+         ctx->submit_error = ret;
+         return true;
+      }
+      copied++;
+   }
+   if (copied) {
+      dst->tiled_dirty = false;
+      dst->linear_dirty = !!dst->linear_map;
+      dst->mip_defined |= BITFIELD_BIT(0);
+      dst->content_generation++;
+   }
+   return true;
+}
+
 static bool
 ph_copy_present_quad(struct ph_context *ctx,
                      struct parhelia_resource *dst,
@@ -1695,16 +1847,20 @@ ph_copy_present_quad(struct ph_context *ctx,
    float minx = INFINITY, miny = INFINITY;
    float maxx = -INFINITY, maxy = -INFINITY;
    int x0, y0, width, height;
+   const unsigned stride = ph_stream_stride(ctx), st = stride - 2;
 
    /* This is the exact 1:1 GL_REPLACE quad emitted by glamor Present.  Keep
     * the recognition strict so arbitrary application texture draws continue
     * through the recovered hardware sampler path. */
-   if (ctx->triangles != 2 || !ctx->fs || ctx->fs->uses_color ||
+   if ((src->linear_map ? ctx->triangles != 2 :
+                          !ctx->triangles || ctx->triangles % 2) ||
+       !ctx->fs || ctx->fs->uses_color ||
        !(dst->base.bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET)) ||
        dst->cpp != 4 || src->cpp != 4 ||
-       !src->linear_map || (!dst->map && !dst->linear_map))
+       (!src->linear_map && !ph_present_tiled_source(ctx, src, dst)) ||
+       (!dst->map && !dst->linear_map))
       return false;
-   /* Only the plain 7-dword XY/RGB/ST stream, and no fragment state which
+   /* Only the plain XY[ZW]/RGB/ST stream, and no fragment state which
     * would make the result differ from a copy. */
    if (ctx->vertex_alpha || ctx->alpha_micro || ctx->alpha_micro_cutout ||
        ctx->cpu_alpha_cutout || ctx->rgb_alpha_two_pass ||
@@ -1714,10 +1870,12 @@ ph_copy_present_quad(struct ph_context *ctx,
                        ctx->blend->rt[0].colormask != PIPE_MASK_RGBA)) ||
        (ctx->dsa && (ctx->dsa->alpha_enabled ||
                      ctx->dsa->stencil[0].enabled)) ||
-       (ctx->rasterizer && ctx->rasterizer->scissor))
+       (src->linear_map && ctx->rasterizer && ctx->rasterizer->scissor))
       return false;
+   if (!src->linear_map)
+      return ph_present_tiled_quads(ctx, dst, src);
    for (unsigned v = 0; v < 6; v++) {
-      const float *p = &ctx->vertices[v * 7];
+      const float *p = &ctx->vertices[v * stride];
       minx = MIN2(minx, p[0]);
       miny = MIN2(miny, p[1]);
       maxx = MAX2(maxx, p[0]);
@@ -1738,10 +1896,10 @@ ph_copy_present_quad(struct ph_context *ctx,
    /* The copy places texel (s,t) at (x0 + s*w, y0 + t*h): every vertex must
     * carry exactly that texture coordinate, unflipped. */
    for (unsigned v = 0; v < 6; v++) {
-      const float *p = &ctx->vertices[v * 7];
+      const float *p = &ctx->vertices[v * stride];
 
-      if (fabsf(p[5] - (p[0] - x0) / width) > 0.001f ||
-          fabsf(p[6] - (p[1] - y0) / height) > 0.001f)
+      if (fabsf(p[st] - (p[0] - x0) / width) > 0.001f ||
+          fabsf(p[st + 1] - (p[1] - y0) / height) > 0.001f)
          return false;
    }
    /* A render-shadow target has no linear companion for the GPU copy, and
@@ -1813,22 +1971,21 @@ ph_copy_present_quad(struct ph_context *ctx,
 }
 
 static void
-ph_pack_multitex_vertices(struct ph_context *ctx, bool second, bool depth)
+ph_pack_multitex_vertices(struct ph_context *ctx, bool second, bool depth,
+                          bool oow)
 {
-   const unsigned src_dpv = depth ? 10 : 9;
-   const unsigned dst_dpv = depth ? 8 : 7;
-   const unsigned st = depth ? (second ? 8 : 6) : (second ? 7 : 5);
+   /* x, y[, z[, 1/w]], r, g, b, s0, t0, s1, t1 */
+   const unsigned pos = oow ? 4 : depth ? 3 : 2;
+   const unsigned src_dpv = pos + 7;
+   const unsigned dst_dpv = pos + 5;
+   const unsigned st = pos + 3 + (second ? 2 : 0);
 
    for (unsigned v = 0; v < ctx->triangles * 3; v++) {
       const float *src = &ctx->vertices[v * src_dpv];
       float *dst = &ctx->packed_vertices[v * dst_dpv];
-      *dst++ = src[0];
-      *dst++ = src[1];
-      if (depth)
-         *dst++ = src[2];
-      *dst++ = src[depth ? 3 : 2];
-      *dst++ = src[depth ? 4 : 3];
-      *dst++ = src[depth ? 5 : 4];
+
+      for (unsigned i = 0; i < pos + 3; i++)
+         *dst++ = src[i];
       *dst++ = src[st];
       *dst++ = src[st + 1];
    }
@@ -3413,6 +3570,20 @@ ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
    state.screen_h = ctx->fb.height;
    state.prim = prim;
    state.warp_entry = ctx->warp_passthrough;
+   /* Wide points: the sized program states the extent and 0x1130 carries
+    * class 3.  The WARP class stays at the primitive's own, which the state
+    * emitter handles. */
+   const float point_const[4] = { ctx->point_radius, ctx->point_radius,
+                                  ctx->point_radius, ctx->point_radius };
+   if (prim == P3D_POINTS && ctx->point_radius > 0.0f &&
+       ctx->warp_sized_point) {
+      state.warp_entry = ctx->warp_sized_point;
+      state.point_class = 3;
+      state.const_loader_entry = ctx->warp_constant_loader;
+      state.vs_const = point_const;
+      state.vs_const_vec4s = 1;
+      state.const_mask = 1;
+   }
    state.dither = !ctx->blend || ctx->blend->dither;
    state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
    state.has_depth = depth != NULL;
@@ -3450,10 +3621,117 @@ ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
               prim == P3D_POINTS ? "points" : "lines", count,
               color->handle, depth ? depth->handle : 0);
 out:
-   if (prim == P3D_POINTS)
+   if (prim == P3D_POINTS) {
       ctx->points = 0;
-   else
+      ctx->point_radius = 0.0f;
+   } else {
       ctx->lines = 0;
+   }
+}
+
+/* The pass-through with one move that forwards the second colour attribute to
+ * output 2, so the combiner sees it as v1.  Uploaded once per context, on the
+ * first draw whose fragment program reads it. */
+static bool
+ph_colour1_program(struct ph_context *ctx)
+{
+   static const uint32_t head[] = {
+      0x00083e00, 0x00440000, 0xb89a2249,
+      0x0800bebf, 0x00440215, 0xba9a2249,
+      0x08087e00, 0x00440015, 0xb89a2249,
+   };
+   static const uint32_t tail[] = {
+      0x00000200, 0x00040000, 0x14c00000,
+      0x00080200, 0x00440000, 0x301a21a2,
+   };
+   struct drm_parhelia_warp_program program = {0};
+   struct p3d_warp_inst move = {
+      .op = P3D_WARP_WRA,
+      .sop = P3D_WARP_SOP_MOV,
+      .sdst_file = P3D_WARP_FILE_DST_O,
+      .sdst_index = 2,
+      .sdst_mask = 0xf,
+      .nsrc = 3,
+   };
+   uint32_t code[18];
+
+   if (ctx->warp_colour1)
+      return true;
+   if (!ctx->warp_program_instructions)
+      return false;
+   for (unsigned i = 0; i < 3; i++) {
+      move.src[i].file = P3D_WARP_FILE_V;
+      move.src[i].index = P3D_WARP_V_COLOUR1;
+      move.src[i].swizzle = P3D_WARP_SWZ_IDENTITY;
+   }
+   memcpy(code, head, sizeof head);
+   p3d_warp_encode(&move, code + 9);
+   memcpy(code + 12, tail, sizeof tail);
+   program.code = (uintptr_t)code;
+   program.count = 6;
+   if (ioctl(ph_screen(ctx->base.screen)->fd, DRM_IOCTL_PARHELIA_WARP_PROGRAM,
+             &program))
+      return false;
+   ctx->warp_colour1 = (uint32_t)program.entry;
+   return true;
+}
+
+/* The sized-point program: the kernel's pass-through with two adds that state
+ * the point's extent as o9 = (x - r, y - r, x + r, y + r), r from c0.x.  It is
+ * uploaded once per context, on the first wide point, because the upload
+ * drains the engine and most contexts never draw one. */
+static bool
+ph_sized_point_program(struct ph_context *ctx)
+{
+   /* add o0, v0, v0.0000 | mul T2, v5, r1.0000 | mov o11, v0 |
+    * add o1, v5, r1.0000 ... end | wra */
+   static const uint32_t head[] = {
+      0x00083e00, 0x00440000, 0xb89a2249,
+      0x0800bebf, 0x00440215, 0xba9a2249,
+      0x08087e00, 0x00440015, 0xb89a2249,
+   };
+   static const uint32_t tail[] = {
+      0x00000200, 0x00040000, 0x14c00000,
+      0x00080200, 0x00440000, 0x301a21a2,
+   };
+   struct drm_parhelia_warp_program program = {0};
+   struct p3d_warp_inst add = {
+      .op = P3D_WARP_ADD,
+      .dst_file = P3D_WARP_FILE_DST_O,
+      .dst_index = 9,
+      .nsrc = 2,
+   };
+   uint32_t code[21];		/* seven bundles of three dwords */
+
+   if (ctx->warp_sized_point)
+      return true;
+   if (!ctx->warp_constant_loader || !ctx->warp_program_instructions)
+      return false;
+
+   add.src[0].file = P3D_WARP_FILE_V;
+   add.src[0].index = 0;
+   add.src[0].swizzle = P3D_WARP_SWZ(0, 1, 0, 1);
+   add.src[1].file = P3D_WARP_FILE_C;
+   add.src[1].index = 0;
+   add.src[1].swizzle = P3D_WARP_SWZ(0, 0, 0, 0);
+
+   memcpy(code, head, sizeof head);
+   add.dst_mask = 0x3;
+   add.src[1].neg = 1;
+   p3d_warp_encode(&add, code + 9);
+   add.dst_mask = 0xc;
+   add.src[1].neg = 0;
+   p3d_warp_encode(&add, code + 12);
+   memcpy(code + 15, tail, sizeof tail);
+
+   program.code = (uintptr_t)code;
+   program.count = 7;
+   if (ioctl(ph_screen(ctx->base.screen)->fd, DRM_IOCTL_PARHELIA_WARP_PROGRAM,
+             &program))
+      return false;
+   ctx->warp_sized_point = (uint32_t)program.entry;
+   ctx->warp_sized_point_slot = program.slot;
+   return true;
 }
 
 /* Pick the WARP program: the transforming variants when the batch carries
@@ -3587,12 +3865,24 @@ ph_submit_vertices(struct ph_context *ctx)
       ctx->submit_error = -EINVAL;
       goto out;
    }
+   /* A native import this chip cannot sample has no linear handle; its
+    * only valid use here is the present copy. */
+   if (texture && !texture_tiled && !texture->linear_handle && !texture1 &&
+       !depth && !ctx->transform && ph_copy_present_quad(ctx, color, texture))
+      goto out;
    if ((texture && (!(texture_tiled ? texture->handle : texture->linear_handle) ||
                     texture->base.width0 > 0x3fff)) ||
        (texture1 && (!(texture1_tiled ? texture1->handle : texture1->linear_handle) ||
                      texture1->base.width0 > 0x3fff)) ||
        (texture1 && !ph_screen(ctx->base.screen)->single_texture_pipe &&
         !ctx->warp_textured_multitex)) {
+      if (ph_env("PARHELIA_TRACE"))
+         fprintf(stderr,
+                 "parhelia: reject textured draw tex=%u/%u tiled=%u native_shared=%u tex1=%p depth=%p transform=%u\n",
+                 texture ? texture->handle : 0,
+                 texture ? texture->linear_handle : 0, texture_tiled,
+                 texture ? texture->native_shared : 0, (void *)texture1,
+                 (void *)depth, ctx->transform);
       ctx->submit_error = -EINVAL;
       goto out;
    }
@@ -3751,12 +4041,24 @@ ph_submit_vertices(struct ph_context *ctx)
 		state.vp_scale[3] = 1.0f;
 		state.vp_offset[3] = 2.0f * fabsf(ctx->viewport.scale[1]);
 	}
-	zpos = depth != NULL || state.transform;
+	state.oow = ctx->oow && texture && !ctx->native_sampled_alpha &&
+	            !state.transform;
+	zpos = depth != NULL || state.transform || state.oow;
 	state.dw_per_vertex = texture ?
 	                              ((texture1 || ctx->native_sampled_alpha) ?
 	                               (zpos ? 10 : 9) :
 	                               (zpos ? 8 : 7)) :
 	                               (zpos ? 6 : 5);
+	if (state.oow)
+		state.dw_per_vertex++;
+	/* The staged stream carries a second colour: declare the kind-6
+	 * attribute and bind the program that forwards it to output 2, so the
+	 * combiner sees it as v1. */
+	if (ctx->colour1 && !texture && ctx->warp_colour1) {
+		state.vertex_colour1 = 1;
+		state.dw_per_vertex += 3;
+		state.warp_entry = ctx->warp_colour1;
+	}
 	/* ph_stage_tri selected the exact one-texture MODULATE source-alpha
 	 * predicate.  Re-evaluate it against the resolved depth/texture resources,
 	 * then label the Z-bound 9-dword form explicitly for batch validation. */
@@ -3781,6 +4083,10 @@ ph_submit_vertices(struct ph_context *ctx)
    state.texture_cache_probe = ph_env("PARHELIA_TEX_CACHE") ?
       (uint32_t)strtoul(getenv("PARHELIA_TEX_CACHE"), NULL, 0) : 0;
    state.lx_family = ph_env("PARHELIA_LX_GUARD_BAND") &&
+      ph_lx_family(ph_screen(ctx->base.screen)->chip_id);
+   /* The 0x11e8 latch is an LX-family register; writing it on the original
+    * Parhelia stops its texture engine retiring. */
+   state.tex_cache_latch =
       ph_lx_family(ph_screen(ctx->base.screen)->chip_id);
    state.lx_pipe_route = ph_screen(ctx->base.screen)->chip_id == 0x2539 &&
                          !ph_env("PARHELIA_NO_LX_PIPES");
@@ -3983,7 +4289,7 @@ ph_submit_vertices(struct ph_context *ctx)
        !one_pass_multitexture) {
       struct p3d_state lightmap = state;
       struct p3d_texture lightmap_tex = tex1;
-      unsigned packed_dpv = zpos ? 8 : 7;
+      unsigned packed_dpv = (zpos ? 8 : 7) + !!state.oow;
 
       submitted = true;
 
@@ -3999,7 +4305,7 @@ ph_submit_vertices(struct ph_context *ctx)
          lightmap.tex1 = NULL;
          lightmap.dw_per_vertex = packed_dpv;
          lightmap.warp_entry = ph_warp_entry(ctx, true, false, true);
-         ph_pack_multitex_vertices(ctx, true, zpos);
+         ph_pack_multitex_vertices(ctx, true, zpos, state.oow);
          ret = ph_batch_primitives(ctx, batch, &lightmap, color->handle,
                                    depth ? depth->handle : 0, texture1_handle,
                                    0, ctx->triangles);
@@ -4012,7 +4318,7 @@ ph_submit_vertices(struct ph_context *ctx)
          state.dw_per_vertex = packed_dpv;
          state.warp_entry = ph_warp_entry(ctx, true, false,
                                           !ctx->fs->uses_color);
-         ph_pack_multitex_vertices(ctx, false, zpos);
+         ph_pack_multitex_vertices(ctx, false, zpos, state.oow);
          ret = ph_batch_primitives(ctx, batch, &state, color->handle,
                                    depth ? depth->handle : 0, texture_handle,
                                    0, ctx->triangles);
@@ -4046,7 +4352,7 @@ ph_submit_vertices(struct ph_context *ctx)
             lightmap.depth_write = false;
             lightmap.depth_func = P3D_CMP_EQUAL;
          }
-         ph_pack_multitex_vertices(ctx, true, zpos);
+         ph_pack_multitex_vertices(ctx, true, zpos, state.oow);
          ret = ph_batch_primitives(ctx, batch, &lightmap, color->handle,
                                    depth ? depth->handle : 0, texture1_handle,
                                    0, ctx->triangles);
@@ -4091,6 +4397,10 @@ out:
    ctx->triangles = 0;
    ctx->stat_kind = PH_STAT_OTHER;
    ctx->stat_pixels = 0;
+	/* The second colour describes the stream that was just submitted; a
+	 * later draw that stages five dwords while this still says eight
+	 * declares an attribute the stream does not carry. */
+	ctx->colour1 = false;
 	ctx->vertex_alpha = false;
 	ctx->alpha_micro = false;
 	ctx->alpha_micro_cutout = false;
@@ -4308,7 +4618,10 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	bool rgb_alpha_two_pass;
 	bool native_sampled_alpha;
 	unsigned dpv;
+	bool oow = false;
+	bool colour1;
    float *dst;
+   const int fogc = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_FOG, 0);
 
    /* The hardware exposes only one-face cull selectors.  FRONT_AND_BACK has
     * no packet encoding and must reject the polygon before staging it. */
@@ -4423,12 +4736,56 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	                                  (depth ? 6 : 5);
 	if (vertex_alpha)
 	   dpv++;
+	/* A fragment program that reads the second colour - a lowered GL fog
+	 * expression is the one that does - needs the kind-6 attribute and the
+	 * program that forwards it to output 2.  Untextured draws only.
+	 *
+	 * It rides with the fragment compiler, because the carrier is only
+	 * useful when the compiled combiner is the thing that reads v1; with
+	 * the fixed-function combiner it would widen the stream for nothing.
+	 * PARHELIA_NO_FOG_COLOUR1 turns it off on its own. */
+	colour1 = ph_env("PARHELIA_FS_COMPILER") &&
+	          !ph_env("PARHELIA_NO_FOG_COLOUR1") &&
+	          !textured && !vertex_alpha && ctx->fs &&
+	          ctx->fs->program.valid && ctx->fs->program.uses_color1 &&
+	          fogc >= 0;
+	if (colour1 && !ctx->warp_colour1) {
+	   /* Uploading a program drains the engine, so never do it with
+	    * vertices already staged: the batch under construction would be
+	    * submitted around the stall and the draws after it read stale
+	    * state. */
+	   if (ctx->triangles || ctx->points || ctx->lines) {
+	      ph_submit_vertices(ctx);
+	      if (ctx->submit_error)
+	         return;
+	   }
+	   colour1 = ph_colour1_program(ctx);
+	}
+	if (ph_env("PARHELIA_TRACE_FOG"))
+	   fprintf(stderr,
+	           "parhelia: fog carrier want=%u fs=%p valid=%u uses_v1=%u fogc=%d textured=%u entry=%#x\n",
+	           colour1, (void *)ctx->fs,
+	           ctx->fs ? ctx->fs->program.valid : 0,
+	           ctx->fs ? ctx->fs->program.uses_color1 : 0, fogc, textured,
+	           ctx->warp_colour1);
+	if (colour1)
+	   dpv += 3;
 	if (cpu_alpha_cutout || rgb_alpha_two_pass)
 	   dpv = 10; /* Internal XYZOOW,RGBA,ST; packed to 7/8 GPU dwords later. */
+	/* The textured stream carries z and 1/w, so the setup unit interpolates
+	 * perspective-correctly (ph-glprobe perspective, exact on the 0528). */
+	/* PARHELIA_NO_OOW=1 (diagnostic) keeps the affine stream. */
+	oow = textured && !native_sampled_alpha && !colour1 &&
+	      !cpu_alpha_cutout && !rgb_alpha_two_pass && !alpha_micro &&
+	      !alpha_micro_cutout && !three_coord && !ph_env("PARHELIA_NO_OOW");
+	if (oow)
+	   dpv = (multitextured ? 10 : 8) + 1 + !!vertex_alpha;
 	/* A state setter normally drains a batch before reaching this point.  The
 	 * extra guard keeps a future draw-stage change from mixing 7- and 8-dword
 	 * streams if the exact blend predicate changes within a primitive list. */
-	if (ctx->triangles && (ctx->vertex_alpha != vertex_alpha ||
+	if (ctx->triangles && (ctx->colour1 != colour1 ||
+	                       ctx->oow != oow ||
+	                       ctx->vertex_alpha != vertex_alpha ||
 	                       ctx->alpha_micro != alpha_micro ||
 	                       ctx->alpha_micro_cutout != alpha_micro_cutout ||
 	                       ctx->cpu_alpha_cutout != cpu_alpha_cutout ||
@@ -4472,6 +4829,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
    if (ctx->submit_error || pos < 0 || (textured && texcoord < 0) ||
        (multitextured && texcoord1 < 0))
       return;
+	ctx->colour1 = colour1;
+	ctx->oow = oow;
 	ctx->vertex_alpha = vertex_alpha;
 	ctx->alpha_micro = alpha_micro;
 	ctx->alpha_micro_cutout = alpha_micro_cutout;
@@ -4559,13 +4918,24 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 		}
       *dst++ = p[0];
       *dst++ = p[1];
-      if (depth)
+      if (depth || oow)
          *dst++ = CLAMP(p[2], 0.0f, 1.0f);
+      if (oow)
+         *dst++ = p[3];
 		*dst++ = c[0];
 		*dst++ = c[1];
 		*dst++ = c[2];
 		if (vertex_alpha)
 			*dst++ = c[3];
+      if (colour1) {
+         /* The fog coordinate, broadcast: the combiner reads v1 as a colour
+          * and the lowered expression selects one channel of it. */
+         const float f = prim->v[v]->data[fogc][0];
+
+         *dst++ = f;
+         *dst++ = f;
+         *dst++ = f;
+      }
       if (textured) {
          const float *tc = prim->v[v]->data[texcoord];
          *dst++ = tc[0];
@@ -4764,10 +5134,37 @@ ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
               rast ? rast->point_size_per_vertex : 0, has_texture,
               rast ? rast->point_smooth : 0, rast ? rast->cull_face : 0,
               ctx->derived_triangles);
-   if (has_texture || roundf(size) > 1.0f ||
+   /* The vendor's ICD splits on a plain inequality against 1.0, with no
+    * rounding: glPointSize(1.2) takes the wide path there while roundf()
+    * kept it on the unit-point one (parhelia-point-size-re.md section 11). */
+   const bool wide = size != 1.0f;
+   const bool native_wide = wide && !has_texture &&
+                            !(rast && (rast->point_smooth ||
+                                       rast->point_quad_rasterization)) &&
+                            ph_sized_point_program(ctx);
+
+   if (has_texture || (wide && !native_wide) ||
        (rast && (rast->point_smooth || rast->point_quad_rasterization))) {
       ph_expand_point(stage, prim, size, rast && rast->point_smooth);
       return;
+   }
+   /* The radius rides in one constant, so a batch carries one size. */
+   if (native_wide) {
+      const float radius = 0.5f * CLAMP(size, 1.0f, 2048.0f);
+
+      if (ctx->points && ctx->point_radius != radius) {
+         ph_submit_vertices(ctx);
+         if (ctx->submit_error)
+            return;
+      }
+      ctx->point_radius = radius;
+   } else if (ctx->points && ctx->point_radius != 0.0f) {
+      ph_submit_vertices(ctx);
+      if (ctx->submit_error)
+         return;
+      ctx->point_radius = 0.0f;
+   } else {
+      ctx->point_radius = 0.0f;
    }
 
    if (ctx->triangles || ctx->lines) {
@@ -4789,8 +5186,21 @@ ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
    const float white[4] = {1, 1, 1, 1};
    const float *c = col < 0 ? white : prim->v[0]->data[col];
 
-   *dst++ = p[0];
-   *dst++ = p[1];
+   /* A wide point's corners are the staged centre plus and minus the radius,
+    * so the centre has to be snapped here exactly as the expansion path
+    * snaps it: an even size centres on a pixel corner, an odd one on a pixel
+    * centre.  Without this a point at a half-pixel centre lands a pixel off. */
+   if (ctx->point_radius > 0.0f) {
+      const float s = 2.0f * ctx->point_radius;
+      const float bias = rast && !rast->half_pixel_center ? 0.5f : 0.0f;
+      const bool odd = (unsigned)s & 1;
+
+      *dst++ = ph_point_centre(p[0] + bias, odd, false) - bias;
+      *dst++ = ph_point_centre(p[1] + bias, odd, ctx->viewport_y_flip) - bias;
+   } else {
+      *dst++ = p[0];
+      *dst++ = p[1];
+   }
    if (depth)
       *dst++ = CLAMP(p[2], 0.0f, 1.0f);
    *dst++ = c[0];
@@ -5880,6 +6290,16 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    if (info->primitive_restart || info->instance_count != 1 ||
        !ph_tcl_layout(ctx, &lay) || !ph_tcl_matrix(ctx, mvp))
       goto fallback;
+   /* An unsampleable native import can only be presented by copy, which
+    * matches the window-space quad of the software path. */
+   if (ph_samples_unit0(ctx)) {
+      const struct parhelia_resource *t =
+         ph_resource(ctx->sampler_views[0]->texture);
+
+      if (t->native_shared && !t->linear_handle &&
+          !ph_auto_tiled_texture(ctx, t, NULL))
+         goto fallback;
+   }
    if (lay.program) {
       entry = ctx->vs->prog_entry;
       if (!ph_tcl_program_constants(ctx, ctx->vs, &vs_const_vec4s))
@@ -8085,9 +8505,8 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
       if (r->map) {
          for (unsigned z = 0; z < MAX2(transfer->box.depth, 1); z++)
          for (int y = 0; y < transfer->box.height; y++)
-            for (int x = 0; x < transfer->box.width; x++)
-            ph_copy_texel_to_gpu((uint8_t *)r->map +
-                                  (ph_resource_uses_sampler_layout(r) ?
+            for (int x = 0; x < transfer->box.width; x++) {
+            const size_t off = (ph_resource_uses_sampler_layout(r) ?
                                    (r->mip.levels ?
                                     ph_mip_layer_texel_offset(&r->mip, transfer->level,
                                                         transfer->box.z + z,
@@ -8104,10 +8523,28 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
                                    p3d_tile_offset_layout_cpp(
                                       transfer->box.x + x,
                                       transfer->box.y + y, r->stride,
-                                      r->tile_layout, r->cpp)),
+                                      r->tile_layout, r->cpp));
+
+            /* A layout that addresses past the storage would corrupt the
+             * heap; refuse the texel and say where. */
+            if (off + cpp > r->size) {
+               static bool said;
+
+               if (!said) {
+                  said = true;
+                  fprintf(stderr,
+                          "parhelia: texel %d,%d level %u at %#zx is outside the %zu-byte storage of %ux%u\n",
+                          transfer->box.x + x, transfer->box.y + y,
+                          transfer->level, off, (size_t)r->size,
+                          r->base.width0, r->base.height0);
+               }
+               continue;
+            }
+            ph_copy_texel_to_gpu((uint8_t *)r->map + off,
                                     (uint8_t *)t->staging +
                                        z * transfer->layer_stride +
                                        y * transfer->stride + x * cpp, swap_rb, cpp);
+            }
       }
       /* Both representations were updated when a presentation/sampler
        * backing exists; otherwise the tiled render image is authoritative.

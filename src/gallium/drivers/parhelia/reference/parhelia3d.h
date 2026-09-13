@@ -90,6 +90,10 @@
 #define P3D_R_ZINIT		0x12b4	/* Z-init clear value, packed like FCOL */
 #define P3D_R_EOBTAG		0x12b8	/* end-of-batch, constant 0x00070601 */
 #define P3D_R_FENCE		0x12bc	/* batch fence COUNTER, steps by 8 */
+#define P3D_R_FOG		0x12d4	/* enable, mode and colour */
+#define P3D_R_FOG_START		0x12d8
+#define P3D_R_FOG_END		0x12dc
+#define P3D_R_FOG_TABLE		0x12e0	/* 64-dword table port */
 #define P3D_R_GUARDBAND		0x12f4
 #define P3D_R_RASTERMODE	0x12fc
 #define P3D_R_DWGCTL		0x1300	/* [3:0] primitive class nibble */
@@ -291,6 +295,16 @@ enum p3d_warp_op {
 	P3D_WARP_DP3 = 0x78,
 	P3D_WARP_SMUL = 0x89,	/* dst.c = s1.c * (1 / s0.w): perspective divide */
 	P3D_WARP_RSQ = 0x8a,	/* dst.c = s1.c * rsq(s0.w) */
+	/* The fixed-function light accumulator.  Neither ACC opcode encodes a
+	 * destination: they commit into r10 (diffuse) and r11 (specular). */
+	P3D_WARP_ACC_START = 0x82,
+	P3D_WARP_ACC = 0x81,
+	P3D_WARP_ACC_READ = 0x84,	/* diffuse total -> a write port */
+	/* User clip planes: a dp4 against a plane, accumulating a clip code
+	 * that 0x6d publishes to o10.x. */
+	P3D_WARP_CLIP_FIRST = 0x7a,
+	P3D_WARP_CLIP_NEXT = 0x79,
+	P3D_WARP_CLIP_EMIT = 0x6d,
 };
 
 #define P3D_WARP_SOP_MOV 1
@@ -301,6 +315,7 @@ enum p3d_warp_op {
  * attribute descriptors use. */
 #define P3D_WARP_V_POSITION	0
 #define P3D_WARP_V_COLOUR	5
+#define P3D_WARP_V_COLOUR1	6	/* specular, and the fog carrier */
 #define P3D_WARP_V_TEXCOORD0	7
 
 struct p3d_warp_src {
@@ -337,10 +352,83 @@ struct p3d_warp_shape {
 	unsigned viewport_scale_slot, viewport_offset_slot;
 	int	 light;
 	unsigned light_slot, material_slot, ambient_slot;
+	/* Lights beyond the first.  Light i takes its direction from
+	 * @light_slot + 2*i and its colour from @material_slot + 2*i, so one
+	 * pair of constants per light, and the diffuse terms accumulate.
+	 * Zero or one keeps the single-light program byte for byte. */
+	unsigned lights;
+	/* Emit the accumulating light terms as a separate multiply and add
+	 * instead of one MAD, which is under measurement. */
+	int	 split_mad;
+	/* Write the N.L dot product to one component and replicate it, which
+	 * is the only shape the vendor library ever emits.  A full-mask dp3
+	 * broadcasts, but its semantics are unproven. */
+	int	 masked_dp3;
+	/* Use the hardware light accumulator instead of summing in registers:
+	 * 0x82 starts the walk, 0x81 adds each further light, and the diffuse
+	 * total is read out of r10.  This is how the vendor library does it -
+	 * it never chains MADs - and it is the only shape that accumulates
+	 * correctly (parhelia-fog-points-implementation-leads.md). */
+	int	 accumulator;
+	/* Positional lights with distance attenuation.  Light i then reads a
+	 * position rather than a direction, and its three coefficients
+	 * (constant, linear, quadratic) from @atten_slot + i.  The term
+	 * becomes max(0, N.L) / (k0 + k1*d + k2*d*d). */
+	int	 attenuation;
+	unsigned atten_slot;
+	/* GL_SPOT_CUTOFF: light i reads its spot direction from
+	 * @spot_slot + i, with the cosine of the cutoff in .w.  The term is
+	 * gated off outside the cone.  Needs @attenuation, which is what
+	 * computes the direction to the light. */
+	int	 spot;
+	unsigned spot_slot;
+	/* GL_CLIP_PLANE.  @clip_planes equations, each already transformed by
+	 * transpose(inverse(view * projection)) host-side and compacted so the
+	 * enabled ones are consecutive from @clip_slot.  The program dp4s the
+	 * clip-space position against each and publishes the accumulated code
+	 * to o10.x, which is the only thing that writes that output. */
+	unsigned clip_planes;
+	unsigned clip_slot;
+	/* GL_LIGHT_MODEL_TWO_SIDE.  The whole light walk runs a second time
+	 * with the normal reversed and the back material, and its result goes
+	 * to o7 instead of o1 - the hardware picks between them by facing, so
+	 * one draw covers both.  The back colours come from
+	 * @back_material_slot + 2*i, matching the front layout. */
+	int	 two_sided;
+	unsigned back_material_slot;
+	/* Vertex blending.  @bones matrices of four rows each from
+	 * @bone_slot, blended by a weight the vertex carries in its colour x,
+	 * with the last weight the implicit 1 - sum.  The blended position
+	 * then feeds the ordinary model-view-projection transform.  Absolute
+	 * constants, so no index register and no base-relative addressing. */
+	unsigned bones;
+	unsigned bone_slot;
+	/* glPolygonOffset.  The depth bias is applied by the vertex program,
+	 * not by setup - which is why loading c[0x178] alone measured inert.
+	 * @offset_slot holds (0, 0, units, 0) in window-depth units and is
+	 * added to the viewport-transformed z.  The slope-scaled term needs a
+	 * per-primitive gradient a vertex program cannot see, so only the
+	 * constant term is generated here. */
+	int	 polygon_offset;
+	unsigned offset_slot;
+	/* Specular.  Light i reads its halfway vector from @specular_slot + 2*i
+	 * and its specular colour from @specular_slot + 2*i + 1, and the term
+	 * is max(0, N.H) raised to 2^@shininess_log2 by repeated squaring -
+	 * this ISA has no POW, so the exponent is a power of two. */
+	int	 specular;
+	unsigned specular_slot;
+	unsigned shininess_log2;
 	int	 colour_white;	/* GL_REPLACE: force the vertex colour to 1 */
 	int	 write_t2;
 	int	 clip_copy;	/* o11 <- the pre-viewport position */
 	unsigned texcoords;	/* o3 <- v7, o4 <- v8, ... */
+	/* GL_TEXTURE_GEN: coordinate sets whose bit is set here take their s
+	 * and t from a plane equation against the vertex position instead of
+	 * from the fetched attribute, which is GL_OBJECT_LINEAR.  Set i reads
+	 * its two planes from @texgen_slot + 2*i.  Eye-linear is the same
+	 * program with the planes already transformed host-side. */
+	unsigned texgen_mask;
+	unsigned texgen_slot;
 };
 
 /* Returns the instruction count including END and its padding word, or 0 when
@@ -587,6 +675,48 @@ struct p3d_state {
 	 * parhelia-blend-alpha-encoding.md section 198). */
 	int		   logicop_enable;
 	unsigned	   logicop;
+	/* A point wider than one pixel.  The extent reaches the setup unit as
+	 * WARP output o10.z (parhelia-point-size-re.md, confirmed here: a unit
+	 * point disappears once o10.z exceeds one).  Which raster image states
+	 * a wide point is still open, so the three registers that select it
+	 * stay separate until measured: class 3 alone draws nothing.  Zero in
+	 * any of them keeps the unit-point choice. */
+	/* The hardware fog unit.  The vertex program states the fog factor in
+	 * o2.w, interpolant 5 is sourced from o2 (0x1114 nibble 5, already 2 in
+	 * the value this driver writes), 0x1110 bit 5 turns that interpolant
+	 * on, and 0x12d4 carries the enable, the mode and the fog colour:
+	 * [0] enable, [2:1] mode, [13:6] blue, [22:15] green, [31:24] red, each
+	 * (int)(c * 255 + 0.5).  0x12d8 and 0x12dc are start and end as
+	 * value * 16777215, and 0x00ffffff in 0x12dc is the off state.  Decoded
+	 * byte-exact from the vendor's own GL_FOG capture
+	 * (parhelia-pixel-pipeline-complete.md section 3.6, confirmed).
+	 * No combiner slot is used: the unit blends after the combiner. */
+	/* Extra bits ORed into 0x1110.  The vendor's own low byte is 0x27 and
+	 * only bits [11:8] are decoded here, so an output a program adds
+	 * beyond the fetched attributes may need advertising. */
+	uint32_t	   attr_present_extra;
+	/* Extra bits ORed into 0x1130.  The vendor's own control words carry
+	 * 0x300c where this driver writes 0x200c, so bit 12 is set in paths
+	 * where we clear it; our map calls it flat shading. */
+	uint32_t	   pipectl_extra;
+	/* 0x1144, which the vendor emits in the same packet as 0x111c and this
+	 * driver hardcodes to zero.  A candidate for the word that says which
+	 * vertex outputs the setup unit consumes. */
+	uint32_t	   vertex_out_extra;
+	int		   fog;
+	unsigned	   fog_mode;		/* 0 linear, 1 and 2 exponential */
+	float		   fog_colour[4];
+	float		   fog_start, fog_end;
+	/* 64 dwords streamed to the 0x12e0 table port.  A unit whose table was
+	 * never written is one candidate for fog having no effect at all. */
+	const uint32_t	  *fog_table;
+	/* A second colour attribute (kind 6, WARP input v6).  The combiner
+	 * reads it as v1, which is where a lowered GL fog expression expects
+	 * its fog coordinate; it costs three more dwords per vertex. */
+	int		   vertex_colour1;
+	unsigned	   point_class;
+	unsigned	   point_nibble;
+	uint32_t	   point_rastermode;
 	/* GL_LINE_STIPPLE.  0x1028 carries (repeat << 16) | pattern, where the
 	 * repeat is GL's factor and the pattern its sixteen bits, bit 0 first
 	 * (parhelia-fragment-ops.md section 2, CONFIRMED).  A disabled stipple
@@ -642,6 +772,13 @@ struct p3d_state {
 	 * the viewport pair at @vp_slot / @vp_slot + 1 rather than c8/c9. */
 	const float	  *vs_const;
 	unsigned	   vs_const_vec4s;
+	/* A further block at an arbitrary slot, for constants the fixed setup
+	 * reads rather than the program: the vendor keeps the point size at
+	 * c[0x172].w and its clamp at c[0x173] (parhelia-point-size-re.md).
+	 * Selected by const_mask bit 3. */
+	const float	  *aux_const;
+	unsigned	   aux_const_vec4s;
+	uint32_t	   aux_const_slot;
 	unsigned	   vp_slot;
 	float		   vp_scale[4], vp_offset[4];
 	/* descriptor overrides, for probing the attribute port: 0 = use the
@@ -669,6 +806,16 @@ struct p3d_state {
 	 * context state; the isolated RGBA cutout probe uses the vendor one-stage
 	 * image (0x00500000) while tracing texture-alpha propagation. */
 	uint32_t	   texture_cache_probe;
+	/* The texture-cache partition latch 0x11e8 belongs to the LX family
+	 * (0x2537/0x2538/0x2539) alone.  The original Parhelia's vendor drivers
+	 * never write it on any path, and a write latches this chip's texture
+	 * engine: the draw stops retiring and the engine has to be reset
+	 * (parhelia-gl-features.md "zeroes the draw and latches the engine. No
+	 * capture ever writes it; do not write it", engine-context-bringup 17.1).
+	 * The 0528-proven emitter in xf86-video-parhelia/src/parhelia3d never
+	 * writes it either.  texture_cache_probe still forces a write, so the
+	 * latch stays reproducible on purpose. */
+	int		   tex_cache_latch;
 	unsigned	   depth_slot;	/* surface slot for Z; 1 = 0x1228 */
 	uint32_t	   screen_w, screen_h;
 	int		   scissor;
@@ -711,6 +858,9 @@ struct p3d_state {
 	 * shape drops the colour attribute; the combiner takes its primary
 	 * colour from the WARP replace program's constant instead. */
 	int		   texcoord3;
+	/* The position carries 1/w as a fourth component (descriptor mask
+	 * xyzw), and every later attribute sits one dword further on. */
+	int		   oow;
 	/* 1 selects the P690-proven single live pipe.  Value 2 is diagnostic
 	 * only: it additionally retains the vendor's disabled unit-1 pipe mask
 	 * (0x0001000c), while issuing no second sampler descriptor. */
@@ -824,11 +974,12 @@ void	 p3d_emit_constant_group(struct p3d_cs *cs, const struct p3d_state *st,
 void	 p3d_viewport(struct p3d_state *st, float x0, float y0,
 		      float w, float h, float zn, float zf);
 size_t	 p3d_warp_transform(uint32_t *out, size_t cap);
-/* A transforming program reads an object-space position, so its vertices
- * always carry z even when no depth buffer is bound. */
+/* A transforming program reads an object-space position, and a position
+ * carrying 1/w has z before it, so both carry z even when no depth buffer is
+ * bound. */
 static inline int p3d_position_has_z(const struct p3d_state *st)
 {
-	return st->has_depth || st->transform;
+	return st->has_depth || st->transform || st->oow;
 }
 size_t	 p3d_warp_lighting(uint32_t *out, size_t cap);
 /* GL_REPLACE: writes a constant white colour so MUL(TEX, PREV) passes TEX */
@@ -900,6 +1051,9 @@ uint32_t p3d_texture_tile_offset_p690_narrow(uint32_t x, uint32_t y,
 					     uint32_t pitch, unsigned cpp);
 bool p3d_texture_uses_p690_narrow(uint32_t chip_id, uint32_t tile_layout,
 				  unsigned cpp);
+uint32_t p3d_texture_tile_offset_64x32(uint32_t x, uint32_t y, uint32_t pitch);
+bool p3d_texture_uses_native_64x32(uint32_t chip_id, uint32_t tile_layout,
+				   unsigned cpp);
 bool p3d_texture_uses_native_64x16(uint32_t chip_id, uint32_t tile_layout,
                                   unsigned cpp);
 uint32_t p3d_texture_tile_offset_chip(uint32_t x, uint32_t y, uint32_t pitch,
