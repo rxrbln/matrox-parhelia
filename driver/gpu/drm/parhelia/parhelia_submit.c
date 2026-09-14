@@ -23,6 +23,8 @@
 #include <drm/drm_file.h>
 #include <drm/drm_gem_vram_helper.h>
 #include <drm/ttm/ttm_bo.h>
+#include <drm/ttm/ttm_device.h>
+#include <drm/ttm/ttm_resource.h>
 
 #include "parhelia_drv.h"
 #include "parhelia_packets.h"
@@ -125,8 +127,47 @@ static int parhelia_submit_stats_show(struct seq_file *m, void *data)
 	return 0;
 }
 
+static void parhelia_vram_bo_show_list(struct seq_file *m,
+				       struct list_head *head, const char *tag)
+{
+	struct ttm_lru_item *item;
+
+	list_for_each_entry(item, head, link) {
+		struct ttm_resource *res;
+		struct ttm_buffer_object *bo;
+
+		if (!ttm_lru_item_is_res(item))
+			continue;
+		res = ttm_lru_item_to_res(item);
+		bo = res->bo;
+		if (!bo || res->mem_type != TTM_PL_VRAM)
+			continue;
+		seq_printf(m, "%s 0x%08lx pages %zu pin %u gem_ref %u handles %u dmabuf %d import %d\n",
+			   tag, res->start, res->size >> PAGE_SHIFT,
+			   bo->pin_count, kref_read(&bo->base.refcount),
+			   bo->base.handle_count, !!bo->base.dma_buf,
+			   !!drm_gem_is_imported(&bo->base));
+	}
+}
+
+static int parhelia_vram_bos_show(struct seq_file *m, void *data)
+{
+	struct drm_info_node *node = m->private;
+	struct ttm_device *bdev = &node->minor->dev->vram_mm->bdev;
+	struct ttm_resource_manager *man = ttm_manager_type(bdev, TTM_PL_VRAM);
+	unsigned int i;
+
+	spin_lock(&bdev->lru_lock);
+	for (i = 0; man && i < TTM_MAX_BO_PRIORITY; i++)
+		parhelia_vram_bo_show_list(m, &man->lru[i], "lru");
+	parhelia_vram_bo_show_list(m, &bdev->unevictable, "pinned");
+	spin_unlock(&bdev->lru_lock);
+	return 0;
+}
+
 static const struct drm_info_list parhelia_submit_debugfs_list[] = {
 	{ "parhelia_submit_stats", parhelia_submit_stats_show, 0 },
+	{ "parhelia_vram_bos", parhelia_vram_bos_show, 0 },
 };
 
 void parhelia_submit_debugfs_init(struct drm_minor *minor)
@@ -4791,20 +4832,22 @@ out_unpin:
 		dma_fence_put(&async_slot->out_fence->base);
 		async_slot->out_fence = NULL;
 	}
+out_unlock:
+	parhelia_submit_unlock(pdev);
+out_relocs:
+	parhelia_async_file_turn_cancel(pdev, &file_waiter);
+	/* Every exit after pinning lands here, including a slot wait interrupted
+	 * by a signal: the restarted ioctl pins its targets again. */
 	if (mode7.index_copy) {
 		parhelia_vram_unpin(mode7.index_copy);
 		drm_gem_object_put(&mode7.index_copy->bo.base);
 	}
-	for (i = 0; i < args->reloc_count; i++) {
+	for (i = 0; objects && pinned && i < args->reloc_count; i++) {
 		if (pinned[i])
 			parhelia_vram_unpin(pinned[i]);
 		if (objects[i])
 			drm_gem_object_put(objects[i]);
 	}
-out_unlock:
-	parhelia_submit_unlock(pdev);
-out_relocs:
-	parhelia_async_file_turn_cancel(pdev, &file_waiter);
 	kfree(objects);
 	kfree(pinned);
 	kfree(call_boundaries);
