@@ -3220,23 +3220,21 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 				PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
 				PARHELIA_CREATE_RENDER_NATIVE_SCANOUT))
 		parhelia_bo_force_unmappable(bo);
-	/* A new object is zeroed through the driver's own aperture window,
-	 * because TTM's CPU clear over BAR0 lands wherever that translated
-	 * window currently points.  The pin is held for the clear only:
+	/* A new object is zeroed through the driver's own aperture window on
+	 * every family, because TTM's CPU clear over BAR0 lands wherever that
+	 * translated window currently points.  The pin is held for the clear only:
 	 * parhelia_ttm_move() copies through the aperture too, so TTM may
 	 * evict these objects afterwards instead of failing an allocation. */
-	if (pdev->pdev->device == PARHELIA_P690) {
-		ret = parhelia_vram_pin(bo);
-		if (ret) {
-			drm_gem_object_put(&bo->bo.base);
-			return ret;
-		}
-		ret = parhelia_vram_clear(pdev, bo);
-		parhelia_vram_unpin(bo);
-		if (ret) {
-			drm_gem_object_put(&bo->bo.base);
-			return ret;
-		}
+	ret = parhelia_vram_pin(bo);
+	if (ret) {
+		drm_gem_object_put(&bo->bo.base);
+		return ret;
+	}
+	ret = parhelia_vram_clear(pdev, bo);
+	parhelia_vram_unpin(bo);
+	if (ret) {
+		drm_gem_object_put(&bo->bo.base);
+		return ret;
 	}
 	ret = drm_gem_handle_create(file, &bo->bo.base, &handle);
 	if (!ret && !(args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
@@ -3635,7 +3633,8 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 		/* Pair a draw's depth with the colour bound before it.  A clear
 		 * binds one surface into both slots, so its 0x1228 names the
 		 * 0x1220 object and is not a pair. */
-		if (pdev->pdev->device != PARHELIA_P690 && !depth &&
+		if ((pdev->pdev->device == PARHELIA_512 ||
+		     pdev->pdev->device == PARHELIA_8X) && !depth &&
 		    parhelia_reloc_target_reg(commands, command_dwords, packets,
 					      packet_count, &relocs[i], &reg)) {
 			if (reg == 0x1220) {

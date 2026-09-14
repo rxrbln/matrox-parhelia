@@ -528,12 +528,12 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 				   pdev->vram_size);
 	if (ret)
 		return ret;
-	if (pci->device == PARHELIA_P690) {
-		pdev->ttm_funcs = *drm->vram_mm->bdev.funcs;
-		pdev->ttm_helper_move = pdev->ttm_funcs.move;
-		pdev->ttm_funcs.move = parhelia_ttm_move;
-		drm->vram_mm->bdev.funcs = &pdev->ttm_funcs;
-	}
+	/* BAR0 is descriptor translated on every classic family, so TTM's CPU
+	 * clear and copy over it land in whatever the window points at. */
+	pdev->ttm_funcs = *drm->vram_mm->bdev.funcs;
+	pdev->ttm_helper_move = pdev->ttm_funcs.move;
+	pdev->ttm_funcs.move = parhelia_ttm_move;
+	drm->vram_mm->bdev.funcs = &pdev->ttm_funcs;
 
 	ret = drmm_mutex_init(drm, &pdev->submit_lock);
 	if (ret)
