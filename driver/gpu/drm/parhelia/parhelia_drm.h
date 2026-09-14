@@ -402,6 +402,8 @@ enum drm_parhelia_m9_reloc_kind {
 	PARHELIA_M9_RELOC_FENCE,
 	PARHELIA_M9_RELOC_QUERY,
 	PARHELIA_M9_RELOC_SPECIAL,
+	/* Index 0x6c: 0x80-aligned linked VS+FS record; kernel adds tag bit 0. */
+	PARHELIA_M9_RELOC_PROGRAM_LINK,
 };
 
 struct drm_parhelia_m9_reloc {
