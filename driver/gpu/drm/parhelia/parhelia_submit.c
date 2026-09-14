@@ -3391,8 +3391,10 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 			pdev->raw_aperture_owned && pdev->vram_size >= SZ_128M;
 		break;
 	case PARHELIA_PARAM_RENDER_TRANSFER:
-		args->value = pdev->pdev->device == PARHELIA_P690 &&
-			pdev->raw_aperture_owned;
+		/* Both families: on the original board BAR0 is descriptor
+		 * translated too, so a render object's mmap offset does not reach
+		 * its VRAM and the aperture copy is the only CPU view that does. */
+		args->value = pdev->raw_aperture_owned;
 		break;
 	default:
 		return -EINVAL;

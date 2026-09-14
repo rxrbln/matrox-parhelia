@@ -1124,6 +1124,8 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 	bo = to_parhelia_bo(gem);
 	if (!parhelia_gem_is_owned(gem) ||
 	    !((bo->layout == PARHELIA_BO_LAYOUT_TEXTURE && texture_upload_probe) ||
+	      (pdev->pdev->device != PARHELIA_P690 &&
+	       bo->layout == PARHELIA_BO_LAYOUT_NATIVE_64X32) ||
 	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_COLOR ||
 	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_DEPTH ||
 	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_SCANOUT) ||
