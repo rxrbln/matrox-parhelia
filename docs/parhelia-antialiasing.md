@@ -913,8 +913,16 @@ non-FAA exit, 0x9E3CE).  The device-level fragment buffer object
 
 ### 9a.6 Still open
 
-* The bulk emitter of the `0x1214`-mirrored range, which would confirm
-  `0x12b4`/`0x12b8` for the AA control word and threshold (9a.1).
+* The emitter of the AA control word `[blk+0xA0]` and `ThresholdAA`
+  `[blk+0xA4]` (9a.1).  Ruled out on 2026-09-14: every static packet header
+  (only 0x2C49E and the Z-init loads name `0xad`/`0xae`); the register-index
+  immediates at 0x7FFB0/0x80027, which belong to a per-register accounting
+  loop over indices `0xaa..0xaf`, `0xc8` feeding `sub_7AC90`, not to emission;
+  the paired `+0xA0`/`+0xA4` read at 0x170752, which loads WARP `0x117c`/
+  `0x1180` vertex coordinates through `sub_170E10`; and every `+0xA0`/`+0xA4`
+  access in 0x30000..0x90000 and 0x170000..0x19A000, which are surface
+  descriptors.  The dispatch in `sub_2EC10` (pre-passes `sub_2D270`,
+  `sub_2EB80` -> `sub_2E760`/`sub_2E960`/`sub_2C8D0`) is where to look next.
 * How the fragment buffer is bound while fragments accumulate: only the
   retirement pass (9a.4) binds it, through depth slot `0x1228`.
 * The meaning of the eight state words in `0x1340..0x134c` and
