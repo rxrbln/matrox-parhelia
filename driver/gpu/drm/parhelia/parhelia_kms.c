@@ -20,9 +20,36 @@
 #include <drm/drm_vblank.h>
 
 #include "parhelia_drv.h"
+#include "../matrox_common/matrox_kms_common.h"
 
 static bool parhelia_clock_solve(struct parhelia_device *pdev, u32 clock,
 				 u32 *word, u32 *actual);
+static u32 parhelia_vblank_mask(struct parhelia_device *pdev);
+
+static u32 parhelia_common_read(void *cookie, u32 reg)
+{
+	return parhelia_read(cookie, reg);
+}
+
+static void parhelia_common_write(void *cookie, u32 reg, u32 value)
+{
+	parhelia_write(cookie, reg, value);
+}
+
+static struct matrox_kms_irq
+parhelia_kms_irq_desc(struct parhelia_device *pdev)
+{
+	return (struct matrox_kms_irq) {
+		.cookie = pdev,
+		.read = parhelia_common_read,
+		.write = parhelia_common_write,
+		.raw_reg = PARHELIA_MMIO_IRQ_STATUS,
+		.ack_reg = PARHELIA_MMIO_IRQ_ACK,
+		.mask_reg = PARHELIA_MMIO_IRQ_MASK,
+		.owned_mask = PARHELIA_IRQ_ENGINE | parhelia_vblank_mask(pdev),
+		.vblank_mask = parhelia_vblank_mask(pdev),
+	};
+}
 
 static inline struct parhelia_output *
 to_parhelia_output(struct drm_connector *connector)
@@ -139,28 +166,18 @@ static void parhelia_pipe_load_gamma(struct drm_simple_display_pipe *pipe,
 				     const struct drm_property_blob *blob)
 {
 	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
-	const struct drm_color_lut *lut = blob ? blob->data : NULL;
 	u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
-	unsigned int i;
 
 	/* No vendor path brackets the LUT with a gate byte, and dc + 0x1aa is not
 	 * a gate: at dc 0x1800 it is byte 2 of 0x19a8, the *second* controller's
 	 * DC_CTRL, so the pair of writes set and cleared that controller's bit 19
 	 * (parhelia-p690-output-path-re.md section 5.9). */
-	for (i = 0; i < 256; i++) {
-		u16 red = lut ? lut[i].red : i * 257;
-		u16 green = lut ? lut[i].green : i * 257;
-		u16 blue = lut ? lut[i].blue : i * 257;
-		u32 r = red & PARHELIA_DC_LUT_COMPONENT_MASK;
-		u32 g = green & PARHELIA_DC_LUT_COMPONENT_MASK;
-		u32 b = blue & PARHELIA_DC_LUT_COMPONENT_MASK;
-
-		parhelia_write(pdev, dc + PARHELIA_DC_LUT_INDEX, i);
-		parhelia_write(pdev, dc + PARHELIA_DC_LUT_R, r);
-		parhelia_write(pdev, dc + PARHELIA_DC_LUT_G, g);
-		parhelia_write(pdev, dc + PARHELIA_DC_LUT_B,
-			       b | PARHELIA_DC_LUT_LATCH);
-	}
+	matrox_kms_write_lut(pdev, parhelia_common_write,
+			       dc + PARHELIA_DC_LUT_INDEX,
+			       dc + PARHELIA_DC_LUT_R,
+			       dc + PARHELIA_DC_LUT_G,
+			       dc + PARHELIA_DC_LUT_B,
+			       PARHELIA_DC_LUT_LATCH, true, blob);
 }
 
 /* HSLPARUpdatePriorityLevels, the last call of the vendor's mode set.  Each
@@ -239,28 +256,18 @@ static const struct drm_connector_helper_funcs parhelia_connector_helper_funcs =
 	.detect_ctx = parhelia_connector_detect,
 };
 
-static const struct drm_connector_funcs parhelia_connector_funcs = {
-	.reset = drm_atomic_helper_connector_reset,
-	.fill_modes = drm_helper_probe_single_connector_modes,
-	.destroy = drm_connector_cleanup,
-	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
-	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
-};
-
 static enum drm_mode_status
 parhelia_mode_valid(struct drm_simple_display_pipe *pipe,
 			    const struct drm_display_mode *mode)
 {
 	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
+	enum drm_mode_status status;
 	u32 word, actual;
 
-	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
-		return MODE_NO_INTERLACE;
-	if (mode->hdisplay < 320 || mode->vdisplay < 200 ||
-	    mode->hdisplay > 2048 || mode->vdisplay > 2048)
-		return MODE_BAD;
-	if (mode->clock < 25000 || mode->clock > pdev->chip->max_pixel_clock_khz)
-		return MODE_CLOCK_RANGE;
+	status = matrox_kms_mode_geometry_valid(mode, 2048, 2048, 25000,
+						 pdev->chip->max_pixel_clock_khz);
+	if (status != MODE_OK)
+		return status;
 	if (!parhelia_clock_solve(pdev, mode->clock, &word, &actual))
 		return MODE_CLOCK_RANGE;
 	return MODE_OK;
@@ -936,105 +943,91 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	drm_crtc_vblank_on(&pipe->crtc);
 }
 
-static void parhelia_pipe_disable(struct drm_simple_display_pipe *pipe)
+static void parhelia_pipe_disable_hw(struct drm_simple_display_pipe *pipe)
 {
 	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
 	u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
 
-	drm_crtc_vblank_off(&pipe->crtc);
 	parhelia_write(pdev, dc + PARHELIA_DC_CTRL,
 		       parhelia_read(pdev, dc + PARHELIA_DC_CTRL) & ~1);
+}
+
+static void parhelia_pipe_disable(struct drm_simple_display_pipe *pipe)
+{
+	matrox_kms_pipe_disable(pipe, parhelia_pipe_disable_hw);
+}
+
+static void
+parhelia_pipe_update_scanout(struct drm_simple_display_pipe *pipe,
+			     struct drm_plane_state *old_state)
+{
+	struct drm_plane_state *state = pipe->plane.state;
+	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
+
+	/* A dirty update only publishes WC writes already made through the
+	 * surface's linear aperture.  A real framebuffer change selects the new
+	 * native surface and is latched by the normal atomic/vblank path.
+	 */
+	if (!old_state->fb || old_state->fb != state->fb) {
+		struct drm_gem_object *gem = drm_gem_fb_get_obj(state->fb, 0);
+		struct parhelia_bo *bo = gem ? to_parhelia_bo(gem) : NULL;
+		u32 address;
+
+		if (gem && !parhelia_scanout_address(pdev, gem, &address)) {
+			u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
+			u32 cpp = state->fb->format->cpp[0];
+			u32 format =
+				parhelia_dc_surface_code(state->fb->format->format) |
+				0x00030000u | (bo->gpu_pitch / cpp);
+
+			parhelia_write(pdev, dc + PARHELIA_DC_START,
+				       address & parhelia_dc_start_mask(pdev));
+			parhelia_write(pdev, dc + PARHELIA_DC_FORMAT, format);
+		}
+	}
 }
 
 static void parhelia_pipe_update(struct drm_simple_display_pipe *pipe,
 				  struct drm_plane_state *old_state)
 {
-	struct drm_plane_state *state = pipe->plane.state;
-	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
-	struct drm_pending_vblank_event *event;
-
-	if (state->fb && pipe->crtc.state->active) {
-		/* A dirty update only publishes WC writes already made through the
-		 * surface's linear aperture.  A real framebuffer change selects the
-		 * new native surface and is latched by the normal atomic/vblank path.
-		 */
-		wmb();
-		if (!old_state->fb || old_state->fb != state->fb) {
-			struct drm_gem_object *gem = drm_gem_fb_get_obj(state->fb, 0);
-			struct parhelia_bo *bo = gem ? to_parhelia_bo(gem) : NULL;
-			u32 address;
-
-			if (gem && !parhelia_scanout_address(pdev, gem, &address)) {
-				u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
-				u32 cpp = state->fb->format->cpp[0];
-				u32 format =
-					parhelia_dc_surface_code(state->fb->format->format) |
-					0x00030000u | (bo->gpu_pitch / cpp);
-
-				parhelia_write(pdev, dc + PARHELIA_DC_START,
-					       address &
-					       parhelia_dc_start_mask(pdev));
-				parhelia_write(pdev, dc + PARHELIA_DC_FORMAT, format);
-			}
-		}
-	}
-	if (pipe->crtc.state->color_mgmt_changed)
-		parhelia_pipe_load_gamma(pipe, pipe->crtc.state->gamma_lut);
-
-	/* DC_START latches at retrace.  Transfer the atomic event to DRM's
-	 * vblank queue before commit_hw_done(), then the IRQ path timestamps and
-	 * completes it on the matching retrace. */
-	spin_lock_irq(&pipe->crtc.dev->event_lock);
-	event = pipe->crtc.state->event;
-	pipe->crtc.state->event = NULL;
-	if (event) {
-		if (drm_crtc_vblank_get(&pipe->crtc) == 0)
-			drm_crtc_arm_vblank_event(&pipe->crtc, event);
-		else
-			drm_crtc_send_vblank_event(&pipe->crtc, event);
-	}
-	spin_unlock_irq(&pipe->crtc.dev->event_lock);
+	matrox_kms_pipe_update(pipe, old_state,
+				 parhelia_pipe_update_scanout,
+				 parhelia_pipe_load_gamma);
 }
 
 static int parhelia_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
 {
 	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
-	u32 mask;
+	struct matrox_kms_irq irq = parhelia_kms_irq_desc(pdev);
 
-	u32 vblank = parhelia_vblank_mask(pdev);
-
-	parhelia_write(pdev, PARHELIA_MMIO_IRQ_ACK, vblank);
-	mask = parhelia_read(pdev, PARHELIA_MMIO_IRQ_MASK) |
-	       vblank;
-	parhelia_write(pdev, PARHELIA_MMIO_IRQ_MASK, mask);
-	return 0;
+	return matrox_kms_enable_vblank(&irq);
 }
 
 static void parhelia_pipe_disable_vblank(struct drm_simple_display_pipe *pipe)
 {
 	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
+	struct matrox_kms_irq irq = parhelia_kms_irq_desc(pdev);
 
-	u32 vblank = parhelia_vblank_mask(pdev);
-
-	parhelia_write(pdev, PARHELIA_MMIO_IRQ_MASK,
-		       parhelia_read(pdev, PARHELIA_MMIO_IRQ_MASK) &
-		       ~vblank);
-	parhelia_write(pdev, PARHELIA_MMIO_IRQ_ACK, vblank);
+	matrox_kms_disable_vblank(&irq);
 }
 
 irqreturn_t parhelia_irq_handler(int irq, void *arg)
 {
 	struct parhelia_device *pdev = arg;
-	u32 status = parhelia_read(pdev, PARHELIA_MMIO_IRQ_STATUS);
+	struct matrox_kms_irq irq_desc = parhelia_kms_irq_desc(pdev);
+	u32 active = matrox_kms_active_irq(&irq_desc);
 
-	if (!status || status == ~0u)
+	if (!active)
 		return IRQ_NONE;
-	parhelia_write(pdev, PARHELIA_MMIO_IRQ_ACK, status);
-	if (status & parhelia_vblank_mask(pdev))
+	/* W1C only sources enabled and owned by this driver.  Masked sources can
+	 * legitimately remain pending and a shared IRQ handler must not consume
+	 * another owner's status. */
+	parhelia_write(pdev, PARHELIA_MMIO_IRQ_ACK, active);
+	if (active & irq_desc.vblank_mask)
 		drm_crtc_handle_vblank(&pdev->pipe.crtc);
 	/* Fence waiters re-read FENCE_DONE themselves; retirement needs the
 	 * submit mutex and runs from the workqueue. */
-	if (status & PARHELIA_IRQ_ENGINE) {
+	if (active & PARHELIA_IRQ_ENGINE) {
 		atomic64_inc(&pdev->submit_stats.engine_irqs);
 		wake_up_all(&pdev->submit_waitq);
 		mod_delayed_work(system_wq, &pdev->retire_work, 0);
@@ -1050,6 +1043,11 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	struct drm_gem_object *gem;
 	struct parhelia_bo *bo;
 	u32 cpp, pitch_pixels;
+	int ret;
+
+	ret = matrox_kms_plane_geometry_check(plane_state, crtc_state);
+	if (ret)
+		return ret;
 
 	if (crtc_state->color_mgmt_changed) {
 		if (crtc_state->gamma_lut &&
@@ -1084,18 +1082,6 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	 * resulting controller address before programming DC_START.
 	 */
 	return 0;
-}
-
-static int parhelia_pipe_begin_fb_access(struct drm_simple_display_pipe *pipe,
-					 struct drm_plane_state *plane_state)
-{
-	return drm_gem_vram_plane_helper_prepare_fb(&pipe->plane, plane_state);
-}
-
-static void parhelia_pipe_end_fb_access(struct drm_simple_display_pipe *pipe,
-					struct drm_plane_state *plane_state)
-{
-	drm_gem_vram_plane_helper_cleanup_fb(&pipe->plane, plane_state);
 }
 
 /* An asynchronous flip only reprograms the surface address.  The P690 latches
@@ -1197,32 +1183,14 @@ static const struct drm_simple_display_pipe_funcs parhelia_pipe_funcs = {
 	.update = parhelia_pipe_update,
 	.enable_vblank = parhelia_pipe_enable_vblank,
 	.disable_vblank = parhelia_pipe_disable_vblank,
-	.begin_fb_access = parhelia_pipe_begin_fb_access,
-	.end_fb_access = parhelia_pipe_end_fb_access,
+	.begin_fb_access = matrox_kms_pipe_begin_fb_access,
+	.end_fb_access = matrox_kms_pipe_end_fb_access,
 };
 
 static const uint32_t parhelia_formats[] = {
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_RGB565,
 	DRM_FORMAT_XRGB2101010,
-};
-
-static int parhelia_fb_dirty(struct drm_framebuffer *fb,
-			     struct drm_file *file, unsigned int flags,
-			     unsigned int color, struct drm_clip_rect *clips,
-			     unsigned int num_clips)
-{
-	/* The framebuffer is already the scanout surface.  DIRTYFB is only the
-	 * CPU-write publication point and must never enter an atomic commit tail.
-	 */
-	wmb();
-	return 0;
-}
-
-static const struct drm_framebuffer_funcs parhelia_fb_funcs = {
-	.destroy = drm_gem_fb_destroy,
-	.create_handle = drm_gem_fb_create_handle,
-	.dirty = parhelia_fb_dirty,
 };
 
 static struct drm_framebuffer *
@@ -1255,7 +1223,7 @@ parhelia_fb_create(struct drm_device *drm, struct drm_file *file,
 		goto out_put;
 	}
 	fb = drm_gem_fb_create_with_funcs(drm, file, info, mode_cmd,
-					  &parhelia_fb_funcs);
+					  &matrox_kms_fb_funcs);
 out_put:
 	drm_gem_object_put(gem);
 	return fb;
@@ -1398,7 +1366,7 @@ static int parhelia_output_init(struct parhelia_device *pdev,
 		return ret;
 
 	ret = drm_connector_init_with_ddc(drm, &output->connector,
-					  &parhelia_connector_funcs,
+					  &matrox_kms_connector_funcs,
 					  desc->connector_type, &output->ddc);
 	if (ret)
 		return ret;
