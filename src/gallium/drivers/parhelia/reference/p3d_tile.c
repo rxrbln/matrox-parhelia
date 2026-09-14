@@ -148,6 +148,49 @@ p3d_tile_position_16bpp(uint32_t offset, uint32_t pitch, uint32_t *x,
 	*y = trow * 16u + (b[5] | b[7] << 1 | b[8] << 2 | b[10] << 3);
 }
 
+/* A 16 bpp render target on the original Parhelia halves the 64x32 tile to
+ * 4096 bytes and keeps its pixel extent.  Measured over four tile columns and
+ * four tile rows with parhelia-drm-test --narrow-target-probe on the 0528; x
+ * bit 5 carries the tile-row parity. */
+static uint32_t
+p3d_tile_offset_16bpp_64x32(uint32_t x, uint32_t y, uint32_t pitch)
+{
+	uint32_t tpr = pitch / P3D_TILE_W, tcol = x / P3D_TILE_W;
+	uint32_t trow = y / P3D_TILE_H;
+	uint32_t ix = x % P3D_TILE_W, iy = y % P3D_TILE_H;
+	uint32_t x5 = ((ix >> 5) & 1) ^ (trow & 1);
+
+	return (trow * tpr + tcol) * 4096u |
+	       ( ix        & 1) << 1  |
+	       ((ix >> 1)  & 1) << 2  |
+	       ((ix >> 2)  & 1) << 3  |
+	       ((ix >> 3)  & 1) << 4  |
+	       ((iy >> 1)  & 1) << 5  |
+	       ((ix >> 4)  & 1) << 6  |
+	       ((iy >> 2)  & 1) << 7  |
+	       ( iy        & 1) << 8  |
+	       x5               << 9  |
+	       ((iy >> 3)  & 1) << 10 |
+	       ((iy >> 4)  & 1) << 11;
+}
+
+static void
+p3d_tile_position_16bpp_64x32(uint32_t offset, uint32_t pitch, uint32_t *x,
+			      uint32_t *y)
+{
+	uint32_t tpr = pitch / P3D_TILE_W;
+	uint32_t t = offset / 4096u, i = offset % 4096u;
+	uint32_t trow = t / tpr, tcol = t % tpr;
+	uint32_t b[12], k;
+
+	for (k = 0; k < 12; k++)
+		b[k] = (i >> k) & 1;
+	*x = tcol * P3D_TILE_W + (b[1] | b[2] << 1 | b[3] << 2 | b[4] << 3 |
+				  b[6] << 4 | (b[9] ^ (trow & 1)) << 5);
+	*y = trow * P3D_TILE_H + (b[8] | b[5] << 1 | b[7] << 2 | b[10] << 3 |
+				  b[11] << 4);
+}
+
 /* Byte offset of a pixel in a native render target of @cpp bytes per pixel. */
 uint32_t
 p3d_tile_offset_layout_cpp(uint32_t x, uint32_t y, uint32_t pitch,
@@ -157,6 +200,8 @@ p3d_tile_offset_layout_cpp(uint32_t x, uint32_t y, uint32_t pitch,
 		return p3d_tile_offset_layout(x, y, pitch, layout);
 	if (cpp == 2 && layout == PARHELIA_TILE_64X16_4K)
 		return p3d_tile_offset_16bpp(x, y, pitch);
+	if (cpp == 2 && layout == PARHELIA_TILE_64X32_8K)
+		return p3d_tile_offset_16bpp_64x32(x, y, pitch);
 	return UINT32_MAX;
 }
 
@@ -168,6 +213,8 @@ p3d_tile_position_layout_cpp(uint32_t offset, uint32_t pitch, uint32_t layout,
 		p3d_tile_position_layout(offset, pitch, layout, x, y);
 	else if (cpp == 2 && layout == PARHELIA_TILE_64X16_4K)
 		p3d_tile_position_16bpp(offset, pitch, x, y);
+	else if (cpp == 2 && layout == PARHELIA_TILE_64X32_8K)
+		p3d_tile_position_16bpp_64x32(offset, pitch, x, y);
 	else
 		*x = *y = UINT32_MAX;
 }
