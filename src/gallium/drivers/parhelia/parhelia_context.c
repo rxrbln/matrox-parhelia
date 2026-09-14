@@ -226,6 +226,12 @@ struct ph_context {
    unsigned num_sampler_views;
    struct pipe_resource *constants[MESA_SHADER_STAGES];
    const void *user_constants[MESA_SHADER_STAGES];
+   /* A hardware-transform batch ran since the last grouped passthrough
+    * triangle packet; see ph_restore_after_transform(). */
+   bool restore_after_transform;
+   /* The fragment constants the staged draws were issued with. */
+   uint8_t *fs_const_snap;
+   unsigned fs_const_snap_size, fs_const_snap_cap;
    unsigned constant_offset[MESA_SHADER_STAGES];
    unsigned constant_size[MESA_SHADER_STAGES];
    uint32_t warp_passthrough;
@@ -727,7 +733,8 @@ ph_write_batch(FILE *dump, const struct parhelia_batch *batch,
 
 /* PARHELIA_DUMP_BATCHES=path appends every submitted batch's packets. */
 static void
-ph_dump_batch(const struct parhelia_batch *batch)
+ph_dump_batch(const struct parhelia_batch *batch, const void *vertices,
+              unsigned vertex_dwords)
 {
    static FILE *dump;
    static unsigned serial;
@@ -742,6 +749,15 @@ ph_dump_batch(const struct parhelia_batch *batch)
    if (!dump && !(dump = fopen(path, "a")))
       return;
    ph_write_batch(dump, batch, serial++, 0);
+   /* The vertex stream too, as dwords, when PARHELIA_DUMP_VERTICES is set. */
+   if (vertices && ph_env("PARHELIA_DUMP_VERTICES")) {
+      const uint32_t *v = vertices;
+
+      fprintf(dump, " vertices %u:", vertex_dwords);
+      for (unsigned i = 0; i < vertex_dwords; i++)
+         fprintf(dump, "%s%08x", i % 16 ? " " : "\n  ", v[i]);
+      fputc('\n', dump);
+   }
    fflush(dump);
 }
 
@@ -820,7 +836,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
    int ret;
 
    if (ph_env("PARHELIA_DUMP_BATCHES"))
-      ph_dump_batch(batch);
+      ph_dump_batch(batch, vertices, vertex_dwords);
 
    if (!ctx->stats_sync) {
       ret = ph_submit_batch_now_untimed(ctx, batch, vertices, vertex_dwords);
@@ -3425,6 +3441,59 @@ ph_pack_rgb_alpha_pass(struct ph_context *ctx, bool depth, bool attenuation,
 /* Build the state batch for a run of @primitives primitives of @state->prim,
  * grouping them into as few draw packets as the tuned packet size allows.
  * Either texture handle may be zero. */
+static int ph_batch_primitives(struct ph_context *ctx, struct parhelia_batch *batch,
+                               struct p3d_state *state, uint32_t colour_handle,
+                               uint32_t depth_handle, uint32_t texture0_handle,
+                               uint32_t texture1_handle, unsigned primitives);
+
+/* After a hardware-transform batch, a software-clipped textured draw rendered
+ * nothing (Q3's view weapon near walls and looking down;
+ * parhelia-gl-depthrange-test case 15).  Measured on the 0528: an untextured
+ * passthrough draw of two triangles in ONE draw packet ahead of it makes the
+ * frame identical to the software-transform reference; the same triangles as
+ * one-primitive packets left half the weapon hidden, whatever their colour,
+ * depth, size or position.  The command streams were otherwise identical.
+ * So queue that draw, masked, with the depth target bound under the current
+ * test and writes off, before the next batch that does not transform. */
+static int
+ph_restore_after_transform(struct ph_context *ctx,
+                           struct parhelia_resource *color,
+                           struct parhelia_resource *depth)
+{
+   static const float with_z[36] = {
+      0, 0, 0.5f, 1, 1, 1,  1, 0, 0.5f, 1, 1, 1,  0, 1, 0.5f, 1, 1, 1,
+      0, 0, 0.5f, 1, 1, 1,  1, 0, 0.5f, 1, 1, 1,  0, 1, 0.5f, 1, 1, 1,
+   };
+   static const float without_z[30] = {
+      0, 0, 1, 1, 1,  1, 0, 1, 1, 1,  0, 1, 1, 1, 1,
+      0, 0, 1, 1, 1,  1, 0, 1, 1, 1,  0, 1, 1, 1, 1,
+   };
+   struct parhelia_batch restore;
+   struct p3d_state st = {
+      .colour = {.pitch = color->stride, .fmt = color->surf_fmt},
+      .screen_w = ctx->fb.width, .screen_h = ctx->fb.height,
+      .prim = P3D_TRIANGLES, .warp_entry = ctx->warp_passthrough,
+      .dw_per_vertex = 5, .mask_explicit = true, .dither = 1,
+   };
+   int ret;
+
+   if (depth) {
+      st.depth.pitch = depth->stride;
+      st.depth.fmt = depth->surf_fmt;
+      st.depth_slot = 1;
+      st.has_depth = 1;
+      st.depth_test = ctx->dsa && ctx->dsa->depth_enabled;
+      st.depth_func = ctx->dsa ? ph_compare(ctx->dsa->depth_func) : 0;
+      st.dw_per_vertex = 6;
+   }
+   ret = ph_batch_primitives(ctx, &restore, &st, color->handle,
+                             depth ? depth->handle : 0, 0, 0, 2);
+   if (!ret)
+      ret = ph_submit_batch(ctx, &restore, depth ? with_z : without_z,
+                            st.dw_per_vertex * 6, color, depth, NULL, NULL);
+   return ret;
+}
+
 static int
 ph_batch_primitives(struct ph_context *ctx, struct parhelia_batch *batch,
                     struct p3d_state *state, uint32_t colour_handle,
@@ -3447,6 +3516,12 @@ ph_batch_primitives(struct ph_context *ctx, struct parhelia_batch *batch,
    state->vertices_per_packet = group * per_prim;
    if (ctx->stats)
       ctx->stat.draw_packets += (primitives + group - 1) / group;
+   /* Only a grouped passthrough triangle packet ends the condition. */
+   if (state->transform)
+      ctx->restore_after_transform = true;
+   else if (state->warp_entry == ctx->warp_passthrough &&
+            state->prim == P3D_TRIANGLES && group >= 2)
+      ctx->restore_after_transform = false;
    return parhelia_batch_state_run(batch, colour_handle, depth_handle,
                                    texture0_handle, texture1_handle, state,
                                    primitives * per_prim);
@@ -4003,6 +4078,11 @@ ph_submit_vertices(struct ph_context *ctx)
    if (ctx->aggregate_batches && color->linear_dirty && ph_drain_batch(ctx))
       goto out;
    ph_resource_upload_tiled(color);
+   /* PARHELIA_NO_T2_RESTORE=1 (diagnostic) leaves the restore draw out. */
+   if (!ctx->transform && ctx->restore_after_transform &&
+       ctx->warp_passthrough && !ph_env("PARHELIA_NO_T2_RESTORE") &&
+       (ctx->submit_error = ph_restore_after_transform(ctx, color, depth)))
+      goto out;
 
    state.colour.pitch = color->stride;
    state.colour.fmt = color->surf_fmt;
@@ -4273,6 +4353,14 @@ ph_submit_vertices(struct ph_context *ctx)
 	one_pass_multitexture = (texture1 || ctx->native_sampled_alpha) &&
 	                        ctx->p690_multitexture && ctx->fs &&
 	                        ctx->fs->serial_op == PH_SERIAL_MODULATE;
+	if (!texture && ph_env("PARHELIA_TRACE") && ctx->triangles) {
+		const float *v = ctx->vertices;
+
+		fprintf(stderr, "parhelia: untextured vertices dpv=%u", dpv);
+		for (unsigned i = 0; i < 3 * dpv; i++)
+			fprintf(stderr, "%s%g", i ? "," : " ", v[i]);
+		fputc('\n', stderr);
+	}
 	if (texture && ph_env("PARHELIA_TRACE") && ctx->triangles) {
 		const float *v0 = &ctx->vertices[0];
 		const float *v1 = &ctx->vertices[dpv];
@@ -5961,6 +6049,46 @@ ph_tcl_matrix(struct ph_context *ctx, float mvp[16])
  * in z, or outside the guard band in x and y, keeps the software clipper. */
 #define PH_TCL_GUARD_BAND 8160.0f
 
+/* A compiled combiner takes its runtime constants when the batch is built,
+ * and a state tracker may rewrite the same constant buffer in place before
+ * the next draw: three scissored glClears of different colours all came out
+ * in the last one's.  Submit the staged draws when the constants change, and
+ * keep the copy they were issued with. */
+static void
+ph_fs_snapshot_constants(struct ph_context *ctx)
+{
+   const uint8_t *base = NULL;
+   unsigned size = ctx->constant_size[MESA_SHADER_FRAGMENT];
+
+   if (ctx->user_constants[MESA_SHADER_FRAGMENT])
+      base = ctx->user_constants[MESA_SHADER_FRAGMENT];
+   else if (ctx->constants[MESA_SHADER_FRAGMENT])
+      base = ph_resource(ctx->constants[MESA_SHADER_FRAGMENT])->malloc_data;
+   if (base)
+      base += ctx->constant_offset[MESA_SHADER_FRAGMENT];
+   else
+      size = 0;
+   /* PARHELIA_FS_LIVE_CONSTANTS=1 (diagnostic): no submit on a change. */
+   if ((ctx->triangles || ctx->points || ctx->lines) &&
+       !ph_env("PARHELIA_FS_LIVE_CONSTANTS") &&
+       (size != ctx->fs_const_snap_size ||
+        (size && memcmp(ctx->fs_const_snap, base, size))))
+      ph_submit_vertices(ctx);
+   if (size > ctx->fs_const_snap_cap) {
+      uint8_t *grown = realloc(ctx->fs_const_snap, size);
+
+      if (!grown) {
+         ctx->fs_const_snap_size = 0;
+         return;
+      }
+      ctx->fs_const_snap = grown;
+      ctx->fs_const_snap_cap = size;
+   }
+   if (size)
+      memcpy(ctx->fs_const_snap, base, size);
+   ctx->fs_const_snap_size = size;
+}
+
 /* The fragment colour when it is a plain constant: GL's current colour, set
  * with glColor and not through a colour array, reaches the fragment stage as a
  * uniform rather than a COL0 varying.  The vertex shader then writes no
@@ -5973,21 +6101,15 @@ ph_fs_constant_colour(struct ph_context *ctx, float out[4])
 {
    static const float zero[4][4];
    struct ph_fs *fs = ctx->fs;
-   const uint8_t *base = NULL;
 
    if (!fs || !fs->program.valid || fs->program.sampler_mask ||
        fs->program.uses_color)
       return false;
    if (fs->program.const_ref_count) {
-      if (ctx->user_constants[MESA_SHADER_FRAGMENT])
-         base = ctx->user_constants[MESA_SHADER_FRAGMENT];
-      else if (ctx->constants[MESA_SHADER_FRAGMENT])
-         base = ph_resource(ctx->constants[MESA_SHADER_FRAGMENT])->malloc_data;
-      if (!base)
+      if (!ctx->fs_const_snap_size)
          return false;
-      ph_fs_update_constants(&fs->program,
-                             base + ctx->constant_offset[MESA_SHADER_FRAGMENT],
-                             ctx->constant_size[MESA_SHADER_FRAGMENT]);
+      ph_fs_update_constants(&fs->program, ctx->fs_const_snap,
+                             ctx->fs_const_snap_size);
    }
    ph_fs_eval(&fs->program.comb, zero, (const float (*)[4])zero, 1.0f, out);
    return true;
@@ -6474,6 +6596,7 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    if (!num_draws || indirect || ctx->submit_error)
       return;
+   ph_fs_snapshot_constants(ctx);
    ph_update_effective_views(ctx);
    for (unsigned i = 0; i < ctx->draw->pt.nr_vertex_buffers; i++) {
       const struct pipe_vertex_buffer *vb = &ctx->draw->pt.vertex_buffer[i];
@@ -6836,7 +6959,6 @@ static const struct p3d_comb_program *
 ph_compiled_combiner(struct ph_context *ctx, bool two_units)
 {
    struct ph_fs *fs = ctx->fs;
-   const uint8_t *base = NULL;
 
    if (!fs || !fs->program.valid || ph_env("PARHELIA_FS_TEXENV"))
       return NULL;
@@ -6851,15 +6973,34 @@ ph_compiled_combiner(struct ph_context *ctx, bool two_units)
        ctx->rgb_alpha_two_pass)
       return NULL;
    if (fs->program.const_ref_count) {
+      const uint8_t *live = NULL;
+
       if (ctx->user_constants[MESA_SHADER_FRAGMENT])
-         base = ctx->user_constants[MESA_SHADER_FRAGMENT];
+         live = ctx->user_constants[MESA_SHADER_FRAGMENT];
       else if (ctx->constants[MESA_SHADER_FRAGMENT])
-         base = ph_resource(ctx->constants[MESA_SHADER_FRAGMENT])->malloc_data;
-      if (!base)
+         live = ph_resource(ctx->constants[MESA_SHADER_FRAGMENT])->malloc_data;
+      if (live)
+         live += ctx->constant_offset[MESA_SHADER_FRAGMENT];
+      /* PARHELIA_TRACE_FS_CONST=1 (diagnostic): name a draw whose snapshot
+       * differs from the live constants at submit. */
+      if (ph_env("PARHELIA_TRACE_FS_CONST") &&
+          (!live || ctx->fs_const_snap_size !=
+                       ctx->constant_size[MESA_SHADER_FRAGMENT] ||
+           memcmp(ctx->fs_const_snap, live, ctx->fs_const_snap_size)))
+         fprintf(stderr, "parhelia: fs=%p constants snapshot %u bytes, live %p %u bytes, differ\n",
+                 (void *)fs, ctx->fs_const_snap_size, (void *)live,
+                 ctx->constant_size[MESA_SHADER_FRAGMENT]);
+      if (ph_env("PARHELIA_FS_LIVE_CONSTANTS")) {
+         if (!live)
+            return NULL;
+         ph_fs_update_constants(&fs->program, live,
+                                ctx->constant_size[MESA_SHADER_FRAGMENT]);
+         return &fs->program.comb;
+      }
+      if (!ctx->fs_const_snap_size)
          return NULL;
-      ph_fs_update_constants(&fs->program,
-                             base + ctx->constant_offset[MESA_SHADER_FRAGMENT],
-                             ctx->constant_size[MESA_SHADER_FRAGMENT]);
+      ph_fs_update_constants(&fs->program, ctx->fs_const_snap,
+                             ctx->fs_const_snap_size);
    }
    return &fs->program.comb;
 }
@@ -8543,6 +8684,7 @@ ph_destroy_context(struct pipe_context *p)
    free(ctx->tcl_elts);
    free(ctx->vs_const);
    free(ctx->vs_const_pending);
+   free(ctx->fs_const_snap);
    draw_destroy(ctx->draw);
    FREE(ctx);
 }
