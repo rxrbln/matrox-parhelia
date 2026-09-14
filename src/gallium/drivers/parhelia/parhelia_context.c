@@ -778,7 +778,13 @@ static void
 ph_hang_record(const struct parhelia_batch *batch, const void *vertices,
                unsigned vertex_dwords, uint32_t fence)
 {
-   unsigned slot = ph_hang.next++ % PH_HANG_HISTORY;
+   unsigned slot;
+
+   /* Copying every batch and its vertices cost a fifth of Q3's CPU time at
+    * 1280x1024; keep the history only when PARHELIA_HANG_DUMP asks for it. */
+   if (!ph_env("PARHELIA_HANG_DUMP"))
+      return;
+   slot = ph_hang.next++ % PH_HANG_HISTORY;
 
    if (!ph_hang.batch[slot] &&
        (!(ph_hang.batch[slot] = MALLOC(sizeof(*batch))) ||
@@ -1836,9 +1842,13 @@ ph_present_tiled_quads(struct ph_context *ctx, struct parhelia_resource *dst,
                                 src->handle, src->stride, 2,
                                 r.x0 + r.offx, r.y0 + r.offy,
                                 r.x1 - r.x0, r.y1 - r.y0);
+      /* Queue behind the client's rendering and sleep on this copy's fence:
+       * a synchronous copy waits for an empty kernel queue, which a busy
+       * client never leaves, and the server's next access expects it done. */
       if (!ret)
-         ret = parhelia_batch_submit(ph_screen(ctx->base.screen)->fd,
-                                     batch, NULL, 0, &ctx->fence);
+         ret = ph_submit_batch_now_untimed(ctx, batch, NULL, 0);
+      if (!ret)
+         ret = ph_wait_async(ctx);
       if (ph_env("PARHELIA_TRACE"))
          fprintf(stderr,
                  "parhelia: GPU tiled present src=%u dst=%u rect=%d,%d %dx%d from %d,%d ret=%d\n",
@@ -1947,8 +1957,9 @@ ph_copy_present_quad(struct ph_context *ctx,
                                    src->linear_stride / 4,
                                    1, 0, 0, width, height);
          if (!ret)
-            ret = parhelia_batch_submit(ph_screen(ctx->base.screen)->fd,
-                                        batch, NULL, 0, &ctx->fence);
+            ret = ph_submit_batch_now_untimed(ctx, batch, NULL, 0);
+         if (!ret)
+            ret = ph_wait_async(ctx);
       }
       if (!ret) {
          dst->tiled_dirty = false;
