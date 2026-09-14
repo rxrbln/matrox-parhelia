@@ -733,6 +733,33 @@ Re-read from `scratchpad/pard.asm` with the DMA packet grammar of §4.2
 This section supersedes the [OPEN] statements of §4.1, §4.3 and §5.4 where it
 disagrees with them.
 
+### 9a.0 Correction: most DWGCTL 0x0a/0x08 traffic is the Z unit, not FAA  [C]
+
+`parhelia-p690-zcompression-clear-banks-re.md` §2 decodes the `mtxpserd.dll`
+twins of these routines, and the `MTXPARD.dll` code matches them instruction
+for instruction:
+
+| `MTXPARD.dll` | `mtxpserd.dll` | what it is |
+|---|---|---|
+| `sub_9DCC0` | `0x9f270` | Z tile tracking mode: `0x00a` off, `0x20a` on, `0xa0a` decompress |
+| `sub_9DBB0` | `0x9f160` | Z tile state reset: `0x108` (compressed) / `0x308` |
+| `sub_9F470` -> `sub_9DA40` / `sub_9D480` | `0x9eff0` | Z-init load: `0x12b4 = packed clear value`, `DWGCTL 0x008`/`0x208`, or reset `0x108`/`0x308` |
+| `sub_9FCE0` -> `sub_9F4B0` | `0xa0a60` | D3D Clear for `caps & 0x7fc00` |
+| `sub_9DE00`, `0x9F74F` | `0x9f3b0` and the Z-init block | ownership of the Z compression (`pDev+0xA670`) and Z-init (`pDev+0xA674`) surfaces |
+
+`sub_9AC70`, which produces the value `sub_9F4B0` hands to `0x12b4`, is the
+depth clear packer (D16 `z16 | z16<<16`, Z24 with stencil).  Therefore:
+
+* §4.2 "AA enable/disable command" and the call-site list of §5.2 describe the
+  Z unit's tracking mode, as `parhelia-p690-fast-depth-clear.md` measured on
+  P690 silicon.  `0x20a` is not "enter fragment accumulation".
+* `pDev+0xA670`/`+0xA674` are the Z compression / Z-init owner surfaces, not
+  "the surface accumulating fragments" and "the current render target".
+* `0x12b4` is the Z-init value register.  The FAA code below issues the tracking
+  commands because it has to leave the Z unit in a defined state around its
+  own passes; what is FAA-specific is everything keyed on the fragment context
+  (`fragctx+0xC4` state 1/2 from `sub_9E690`, `fragctx+0xE8`).
+
 ### 9a.1 The state block is a register mirror  [C for the slots, I for 0x12b4/0x12b8]
 
 `sub_2EC10` (SetupHardware) emits the surface slots straight from the state
@@ -751,30 +778,32 @@ The depth/stencil group mirrors linearly at `0x1214 + offset` [C]: the save
 code at 0x9D210 copies `[blk+0xb4]`, `+0xb8`, `+0xbc` into `fragctx+0x100..0x108`,
 and `sub_2E360`/`sub_2E560` write exactly those three values back to `0x12c8`,
 `0x12cc`, `0x12d0`.  Extending that mirror places the AA control word
-`[blk+0xA0]` at **`0x12b4`** (index `0xad`) and `ThresholdAA` `[blk+0xA4]` at
-**`0x12b8`** (index `0xae`) [I].  The bulk emitter of that range is still not
-identified, so the two register numbers remain inferred.  Consistent with it:
-the engine initialiser at 0x2C49E writes `0x12b8 = 1`, or `0x70601` on
-capability bits `0x38`/`0x7ffc0` [C], and `0x12b4` is the parameter register of
-the fragment command below.
+`[blk+0xA0]` at `0x12b4` (index `0xad`) and `ThresholdAA` `[blk+0xA4]` at
+`0x12b8` (index `0xae`).  That extrapolation is **not** supported: `0x12b4` is
+the Z-init value register (9a.0), and the only other `0x12b8` write is the
+engine initialiser at 0x2C49E (`1`, or `0x70601` on capability bits
+`0x38`/`0x7ffc0`) [C].  No packet header anywhere in the binary names index
+`0xad` or `0xae` except those two sites, so the AA control word and threshold
+reach the chip through an emitter that is still not identified [OPEN].
 
-### 9a.2 Publishing a target to the fragment unit — `sub_9F470`  [C]
+### 9a.2 The Z-init load — `sub_9F470`  [C, not FAA]
 
-`sub_9F470(cmdbuf, value, surface_word, rt, unbind)` marks `rt+0x28 -> +0x368
-|= 8` and dispatches by silicon: `caps & 0x7fc00` (LX/P690 class) jumps to
+Kept for the record because an earlier reading took it for an FAA target bind.
+`sub_9F470(cmdbuf, value, clear_depth, zsurf, reset)` marks `zsurf+0x28 ->
++0x368 |= 8` and dispatches by silicon: `caps & 0x7fc00` (LX/P690 class) jumps to
 `sub_9DA40`, otherwise to `sub_9D480`.  Both emit:
 
 | case | packets |
 |---|---|
-| `unbind != 0` | `DWGCTL 0x1300 = 0x108 [| 0x200]`, then restore DWGCTL |
-| `unbind == 0` | `[rt+0x78] = surface_word`; `0x12b4 = value`, `DWGCTL = 0x008 [| 0x200]`, restore DWGCTL |
+| `reset != 0` | `DWGCTL 0x1300 = 0x108 [| 0x200]`, then restore DWGCTL |
+| `reset == 0` | `[zsurf+0x78] = clear_depth`; `0x12b4 = value`, `DWGCTL = 0x008 [| 0x200]`, restore DWGCTL |
 
 `sub_9DA40` first emits `DWGCTL = 0x207` with a fence pair (`0x12bc = tag|1`,
-`tag`) while FAA is live (`ds:0x1EBE18 != 0`), and adds `0x200` to the command
-while it is not; the last command is cached in `ds:0x1D1F28`.  Callers: the
-per-render-target path at 0x9F86C and 0x9FB31 (after `sub_9E860`), and the
-teardown paths 0xA3363 / 0xA3515 with `unbind = 1` when FAA is off.
-`sub_9DBB0` is the unbind-only twin (`0x108 | 0x200` rule, same fence).
+`tag`) while Z compression is active for the clear (`ds:0x1EBE18 != 0`), and
+adds `0x200` ("not compressed") otherwise; the last word is cached in
+`ds:0x1D1F28`.  `value` is the packed clear word from `sub_9AC70`.  Callers: the
+clear at 0x9F86C and 0x9FB31 (inside `sub_9F4B0`, reached from the D3D Clear
+`sub_9FCE0`), and the teardown paths 0xA3363 / 0xA3515 with `reset = 1`.
 
 ### 9a.3 The fragment buffer as a surface  [C]
 
@@ -795,7 +824,7 @@ After allocation the first 0x40 dwords of the buffer are cleared (0x9E52F).
 
 Run when a fragment target is retired (§5.4).  In order:
 
-1. AA off (`sub_9DCC0(.., 0, 0)`, `DWGCTL = 0x00A`) if it was on.
+1. Z tracking off (`sub_9DCC0(.., 0, 0)`, `DWGCTL = 0x00A`) if it was on.
 2. State block overrides, then SetupHardware (`sub_2EC10`) emits them:
    `[blk+0xA0] = fragctx+0xFC | 3` (AA control, enabled);
    `[blk+0xB4] (0x12c8) = (old & ~0x000e0000) | 0x0010000e`;
@@ -809,15 +838,19 @@ Run when a fragment target is retired (§5.4).  In order:
    `0x1160, 0x1174, 0x1178, 0x1180 = 1.0, 0.5, 0.25, 0.25`;
    `0x1164, 0x1174, 0x1178, 0x1180 = 1.0, 0.5, 0.25, 3.5`;
    `0x1168, 0x1174, 0x117c, 0x1180 = 1.0, 0.5, 1.25, 0.25`.
+   With the vertex layout the Z-uncompress pass uses (`0x1174` = Z, `0x1178` /
+   `0x117c` = y, `0x1180` = x; zcompression doc §3.4) this is one small
+   triangle at depth 0.5 spanning x 0.25..3.5, y 0.25..1.25 [I].
 5. `DWGCTL 0x1300 = 0x207`, fence `0x12bc = tag|1`, `tag`, restore DWGCTL.
 6. Lock the fragment buffer, read dwords 0..3 and 32..35 (`& 0x3ffff`) into
    `fragctx+0xC8..0xE4`, and zero them — per-pass counters kept in the buffer
    head.
-7. AA back on if it was on; `[blk+0xB4] = (old & ~0xc) | 2`.
+7. Z tracking back on if it was on; `[blk+0xB4] = (old & ~0xc) | 2`.
 
-So the merge is a hardware pass that reads the fragment buffer through the
-depth slot, driven by DWGCTL `0x207`; the WARP constants and the counter words
-are its only parameters.
+So retirement draws one small triangle with the fragment buffer bound as the
+depth slot and the AA control word enabled, fences it with DWGCTL `0x207`, and
+collects eight counters from the buffer head [C for the sequence].  Whether
+that primitive is the merge trigger or a flush sentinel is [OPEN].
 
 ### 9a.5 Restoring the target — `sub_9E860`, `sub_2E360`, `sub_2E560`  [C]
 
@@ -848,9 +881,8 @@ state word as `fragctx+0xFC`.
 
 * The bulk emitter of the `0x1214`-mirrored range, which would confirm
   `0x12b4`/`0x12b8` for the AA control word and threshold (9a.1).
-* What `value` the per-target path passes to `0x12b4` with `DWGCTL = 8`
-  (stack argument `[esp+0x30]` of the caller at 0x9F86C), and so whether that
-  command binds the fragment buffer during accumulation or selects the target.
+* How the fragment buffer is bound while fragments accumulate: only the
+  retirement pass (9a.4) binds it, through depth slot `0x1228`.
 * The meaning of the eight counter words of 9a.4.
 * A capture with `AAMode = 0x53` remains the only way to validate any of it on
   hardware; none of this is exercised by the open driver.
@@ -878,8 +910,8 @@ state word as `fragctx+0xFC`.
 
 ## 10. What would settle the rest
 
-Items 1, 2 and 4 are largely answered by §9a (2026-09-14); what remains is
-listed in §9a.6.
+§9a (2026-09-14) answers item 4 and part of item 2 and corrects the command
+readings of §4.2/§5.2; what remains is listed in §9a.6.
 
 1. **The AA control/threshold register index.**  The values are staged at
    `[ctx[0x2C] + 0xA0]` and `+0xA4` (§4.1) and no fixed-displacement reader
