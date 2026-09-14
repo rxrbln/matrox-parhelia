@@ -2250,7 +2250,7 @@ ph_auto_tiled_texture(const struct ph_context *ctx,
 {
    (void)sampler;
    return texture &&
-       ph_screen(ctx->base.screen)->chip_id == 0x2539 &&
+       ph_lx_family(ph_screen(ctx->base.screen)->chip_id) &&
        (texture->base.target == PIPE_TEXTURE_2D ||
         texture->base.target == PIPE_TEXTURE_1D ||
         texture->base.target == PIPE_TEXTURE_3D ||
@@ -4183,7 +4183,7 @@ ph_submit_vertices(struct ph_context *ctx)
     * Parhelia stops its texture engine retiring. */
    state.tex_cache_latch =
       ph_lx_family(ph_screen(ctx->base.screen)->chip_id);
-   state.lx_pipe_route = ph_screen(ctx->base.screen)->chip_id == 0x2539 &&
+   state.lx_pipe_route = ph_lx_family(ph_screen(ctx->base.screen)->chip_id) &&
                          !ph_env("PARHELIA_NO_LX_PIPES");
    /* The kernel advertises this only under its independent default-off
     * module gate.  CREATE_VERTEX mmap success is also required, keeping the

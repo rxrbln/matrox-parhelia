@@ -258,7 +258,7 @@ ph_gigacolor_sampler(const struct pipe_screen *s)
 {
    const struct parhelia_screen *ps = ph_screen((struct pipe_screen *)s);
 
-   return ps->texture_upload &&
+   return ps->texture_upload && ps->chip_id == 0x2539 &&
           p3d_texture_uses_native_64x16(ps->chip_id, ps->tile_layout, 4) &&
           ph_env("PARHELIA_GIGACOLOR");
 }
@@ -955,10 +955,11 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * well (bind=0xa), although it never binds its 16..512px atlases as a
     * target.  Treat this measured sampler extent as texture storage; the
     * actual 640x480 colour/depth images remain in the bank-separated class. */
-   if (sampler_storage && screen->chip_id == 0x2539 &&
-       !screen->texture_upload) {
+   if (sampler_storage && !screen->texture_upload &&
+       (screen->chip_id == 0x2537 || screen->chip_id == 0x2538 ||
+        screen->chip_id == 0x2539)) {
       fprintf(stderr,
-              "parhelia: safe P690 texture upload ABI is unavailable\n");
+              "parhelia: safe LX texture upload ABI is unavailable\n");
       PH_CREATE_FAIL();
    }
    if (sampler_storage)
@@ -1589,7 +1590,7 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * slice and of all six cube faces at the GL level.  See
     * docs/parhelia-p690-volume-cube-targets.md.  PARHELIA_NO_VOLUME_TARGETS=1
     * returns the driver to 2-D and 1-D only. */
-   s->volume_targets = s->texture_upload &&
+   s->volume_targets = s->texture_upload && s->chip_id == 0x2539 &&
       p3d_texture_uses_native_64x16(s->chip_id, s->tile_layout, 4) &&
       !ph_env("PARHELIA_NO_VOLUME_TARGETS");
    s->cube_targets = s->volume_targets;

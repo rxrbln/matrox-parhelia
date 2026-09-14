@@ -436,8 +436,10 @@ bool
 p3d_texture_uses_native_64x16(uint32_t chip_id, uint32_t tile_layout,
 			      unsigned cpp)
 {
-	return chip_id == 0x2539 && tile_layout == PARHELIA_TILE_64X16_4K &&
-	       cpp == 4;
+	/* One vendor layout handler serves the whole LX class; the order was
+	 * measured on the P690. */
+	return (chip_id == 0x2537 || chip_id == 0x2538 || chip_id == 0x2539) &&
+	       tile_layout == PARHELIA_TILE_64X16_4K && cpp == 4;
 }
 
 bool
