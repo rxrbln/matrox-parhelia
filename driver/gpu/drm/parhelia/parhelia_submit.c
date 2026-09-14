@@ -3124,10 +3124,10 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	    args->handle || args->pitch || args->size || args->mmap_offset)
 		return -EINVAL;
 	cpp = args->cpp ? args->cpp : 4;
-	/* The 16 bpp tile geometry is measured only for the 64x16 layout, and
-	 * the sampler keeps its own storage order for narrow texture images. */
-	if (cpp == 2 && (pdev->chip->tile_layout != PARHELIA_TILE_64X16_4K ||
-			 (args->flags & PARHELIA_CREATE_RENDER_TEXTURE)))
+	/* The sampler keeps its own storage order for narrow texture images.
+	 * 16 bpp targets on the 64x32 layout exist to measure their order;
+	 * userspace takes the order from p3d, which knows only the 64x16 one. */
+	if (cpp == 2 && (args->flags & PARHELIA_CREATE_RENDER_TEXTURE))
 		return -EOPNOTSUPP;
 	if (!to_parhelia(drm)->raw_aperture_owned)
 		return -EOPNOTSUPP;
