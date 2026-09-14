@@ -726,6 +726,137 @@ failure sets `fragbuf[0xC4] = 4` rather than degrading gracefully in software.
 
 ---
 
+## 9a. 2026-09-14: the FAA command stream in `MTXPARD.dll`
+
+Re-read from `scratchpad/pard.asm` with the DMA packet grammar of §4.2
+(`MMIO = 0x1000 + index*4`, index byte `0x20` = pad `0x1080`, `0x21` = unused).
+This section supersedes the [OPEN] statements of §4.1, §4.3 and §5.4 where it
+disagrees with them.
+
+### 9a.1 The state block is a register mirror  [C for the slots, I for 0x12b4/0x12b8]
+
+`sub_2EC10` (SetupHardware) emits the surface slots straight from the state
+block `[ctx+0x2C]` [C]:
+
+```
+count 0xf/0xd, indices 88 89 8c 8d:  0x1220=[blk+0xaa4] 0x1224=[blk+0xab4]
+                                     0x1230=[blk+0xaac] 0x1234=[blk+0xabc]
+count 0xa,     indices 8a 8b c5 ..:  0x1228=[blk+0xaa8] 0x122c=[blk+0xab8]
+```
+
+so the slot addresses mirror at `+0xaa4/+0xaa8/+0xaac` and their configuration
+words at `+0xab4/+0xab8/+0xabc`.
+
+The depth/stencil group mirrors linearly at `0x1214 + offset` [C]: the save
+code at 0x9D210 copies `[blk+0xb4]`, `+0xb8`, `+0xbc` into `fragctx+0x100..0x108`,
+and `sub_2E360`/`sub_2E560` write exactly those three values back to `0x12c8`,
+`0x12cc`, `0x12d0`.  Extending that mirror places the AA control word
+`[blk+0xA0]` at **`0x12b4`** (index `0xad`) and `ThresholdAA` `[blk+0xA4]` at
+**`0x12b8`** (index `0xae`) [I].  The bulk emitter of that range is still not
+identified, so the two register numbers remain inferred.  Consistent with it:
+the engine initialiser at 0x2C49E writes `0x12b8 = 1`, or `0x70601` on
+capability bits `0x38`/`0x7ffc0` [C], and `0x12b4` is the parameter register of
+the fragment command below.
+
+### 9a.2 Publishing a target to the fragment unit — `sub_9F470`  [C]
+
+`sub_9F470(cmdbuf, value, surface_word, rt, unbind)` marks `rt+0x28 -> +0x368
+|= 8` and dispatches by silicon: `caps & 0x7fc00` (LX/P690 class) jumps to
+`sub_9DA40`, otherwise to `sub_9D480`.  Both emit:
+
+| case | packets |
+|---|---|
+| `unbind != 0` | `DWGCTL 0x1300 = 0x108 [| 0x200]`, then restore DWGCTL |
+| `unbind == 0` | `[rt+0x78] = surface_word`; `0x12b4 = value`, `DWGCTL = 0x008 [| 0x200]`, restore DWGCTL |
+
+`sub_9DA40` first emits `DWGCTL = 0x207` with a fence pair (`0x12bc = tag|1`,
+`tag`) while FAA is live (`ds:0x1EBE18 != 0`), and adds `0x200` to the command
+while it is not; the last command is cached in `ds:0x1D1F28`.  Callers: the
+per-render-target path at 0x9F86C and 0x9FB31 (after `sub_9E860`), and the
+teardown paths 0xA3363 / 0xA3515 with `unbind = 1` when FAA is off.
+`sub_9DBB0` is the unbind-only twin (`0x108 | 0x200` rule, same fence).
+
+### 9a.3 The fragment buffer as a surface  [C]
+
+`sub_9E3F0` builds the fragment buffer's surface descriptor in the globals
+`ds:0x1D1F30..0x1D1F40` and copies it (five dwords) into the allocation object
+at `+0x30`:
+
+```
++0 (0x1D1F30) address  = [fragbuf+0x78] after allocation (VRAM offset), low 2 bits clear
++4 (0x1D1F34) config   = (old & 0xc020 | 0x20) & 0xf6fbffff | 0x36030000   ; code 0x36, type 3
++8 (0x1D1F38) layout   = (old & 0xc002 | 2) & 0xf001ffff | 0x10000
++0x10 (0x1D1F40)       = [rt+0x1c] (silicon capability word)
+```
+
+After allocation the first 0x40 dwords of the buffer are cleared (0x9E52F).
+
+### 9a.4 The resolve pass — `sub_9E000`  [C]
+
+Run when a fragment target is retired (§5.4).  In order:
+
+1. AA off (`sub_9DCC0(.., 0, 0)`, `DWGCTL = 0x00A`) if it was on.
+2. State block overrides, then SetupHardware (`sub_2EC10`) emits them:
+   `[blk+0xA0] = fragctx+0xFC | 3` (AA control, enabled);
+   `[blk+0xB4] (0x12c8) = (old & ~0x000e0000) | 0x0010000e`;
+   slot 0 config `0x1224 = (old & 0xc020) | 0x20`;
+   **slot 1 `0x1228 = fragment-buffer address`, `0x122c = its 0x36/type-3
+   config`** (the globals of 9a.3); slot 2 `0x1230/0x1234` = the saved
+   `fragctx+0x114/+0x124`; `[blk+0x8c] = 5`, `[blk+0x8e] = 3`; dirty
+   `0x24000000`.
+3. Stamp through `sub_9D560(.., 0xc00)`.
+4. WARP constants, one 14-dword packet:
+   `0x1160, 0x1174, 0x1178, 0x1180 = 1.0, 0.5, 0.25, 0.25`;
+   `0x1164, 0x1174, 0x1178, 0x1180 = 1.0, 0.5, 0.25, 3.5`;
+   `0x1168, 0x1174, 0x117c, 0x1180 = 1.0, 0.5, 1.25, 0.25`.
+5. `DWGCTL 0x1300 = 0x207`, fence `0x12bc = tag|1`, `tag`, restore DWGCTL.
+6. Lock the fragment buffer, read dwords 0..3 and 32..35 (`& 0x3ffff`) into
+   `fragctx+0xC8..0xE4`, and zero them — per-pass counters kept in the buffer
+   head.
+7. AA back on if it was on; `[blk+0xB4] = (old & ~0xc) | 2`.
+
+So the merge is a hardware pass that reads the fragment buffer through the
+depth slot, driven by DWGCTL `0x207`; the WARP constants and the counter words
+are its only parameters.
+
+### 9a.5 Restoring the target — `sub_9E860`, `sub_2E360`, `sub_2E560`  [C]
+
+After a retirement `sub_9E860` re-emits the saved slot descriptors (`0x1220,
+0x1224, 0x1230, 0x1234`, then `0x1228, 0x122c`) and calls the family restore
+(`caps & 0x7fc00` -> `sub_2E560`, else `sub_2E360`) with the saved
+`fragctx+0xFC, +0x100, +0x104, +0x108`:
+
+| register | original board (`sub_2E360`) | LX/P690 class (`sub_2E560`) |
+|---|---|---|
+| PLNWT `0x1324` | `0xffffffff` | same |
+| `0x12cc`, `0x12d0` | saved `+0x104`, `+0x108` | same |
+| DWGCTL `0x1300` | `0x0c4` | `0x2000c4` |
+| scissor `0x132c` / `0x1328` | `0x0fff0fff` / 0 | same |
+| `0x12c8` | saved `+0x100` | same |
+| `0x12fc` | saved `+0xFC` | same |
+| guardband `0x12f4` | not written | `31.0f` |
+| WARP `0x116c..0x1198` | 34-dword packet, zeros except `0x1168 = 0x1188 = 1/16` | same |
+
+then marks the block dirty (`0x6400000f` / `0x7400000f`) and emits `DWGCTL = 9`
+with the two surface stamps (`sub_9D6E0`, flags `0x100`/`0x200`).  The saved
+values come from `sub_9D1B0`, which snapshots `[blk+0xB4..0xBC]` and all slot
+descriptors `[blk+0xAA4..0xAD0]` into `fragctx+0x100..0x138` when FAA starts on
+a target (`fragctx+0xA4 == 3`), and from 0xA062C, which stores the render
+state word as `fragctx+0xFC`.
+
+### 9a.6 Still open
+
+* The bulk emitter of the `0x1214`-mirrored range, which would confirm
+  `0x12b4`/`0x12b8` for the AA control word and threshold (9a.1).
+* What `value` the per-target path passes to `0x12b4` with `DWGCTL = 8`
+  (stack argument `[esp+0x30]` of the caller at 0x9F86C), and so whether that
+  command binds the fragment buffer during accumulation or selects the target.
+* The meaning of the eight counter words of 9a.4.
+* A capture with `AAMode = 0x53` remains the only way to validate any of it on
+  hardware; none of this is exercised by the open driver.
+
+---
+
 ## 9. What an open driver should do
 
 1. **Do not implement FAA.**  Report `GL_SAMPLE_BUFFERS = 0`; do not advertise
@@ -746,6 +877,9 @@ failure sets `fragbuf[0xC4] = 4` rather than degrading gracefully in software.
 ---
 
 ## 10. What would settle the rest
+
+Items 1, 2 and 4 are largely answered by §9a (2026-09-14); what remains is
+listed in §9a.6.
 
 1. **The AA control/threshold register index.**  The values are staged at
    `[ctx[0x2C] + 0xA0]` and `+0xA4` (§4.1) and no fixed-displacement reader
