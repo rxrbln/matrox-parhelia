@@ -394,7 +394,8 @@ enum drm_parhelia_m9_reloc_kind {
 	PARHELIA_M9_RELOC_COLOR,
 	PARHELIA_M9_RELOC_DEPTH,
 	PARHELIA_M9_RELOC_TEXTURE,
-	PARHELIA_M9_RELOC_PROGRAM,
+	/* Index 0x69: live GL resolves this to drawable backing. */
+	PARHELIA_M9_RELOC_RESOURCE_69,
 	PARHELIA_M9_RELOC_DRAW32_START,
 	PARHELIA_M9_RELOC_DRAW32_END,
 	PARHELIA_M9_RELOC_DRAW16_START,
@@ -402,8 +403,8 @@ enum drm_parhelia_m9_reloc_kind {
 	PARHELIA_M9_RELOC_FENCE,
 	PARHELIA_M9_RELOC_QUERY,
 	PARHELIA_M9_RELOC_SPECIAL,
-	/* Index 0x6c: 0x80-aligned linked VS+FS record; kernel adds tag bit 0. */
-	PARHELIA_M9_RELOC_PROGRAM_LINK,
+	/* Index 0x6c: 0x80-aligned system-resource record; add tag bit 0. */
+	PARHELIA_M9_RELOC_RESOURCE_6C,
 };
 
 struct drm_parhelia_m9_reloc {
