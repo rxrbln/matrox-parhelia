@@ -984,10 +984,13 @@ ph_fs_texture(struct ph_fs_ctx *ctx, const nir_tex_instr *tex, int sel,
    if (bias >= 0 && (!nir_src_is_const(tex->src[bias].src) ||
                      nir_src_as_float(tex->src[bias].src) != 0.0f))
       return ph_fs_fail(ctx, "a per-fragment level bias");
-   if (nir_tex_instr_src_index(tex, nir_tex_src_comparator) >= 0 ||
-       nir_tex_instr_src_index(tex, nir_tex_src_projector) >= 0 ||
-       nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0)
-      return ph_fs_fail(ctx, "a shadow, projected or offset lookup");
+   /* Fixed-function lookups always carry the coordinate's q as projector;
+    * the vertex stream takes s and t only, so q other than 1 is not honoured
+    * by any path. */
+   if (nir_tex_instr_src_index(tex, nir_tex_src_comparator) >= 0)
+      return ph_fs_fail(ctx, "a shadow comparison");
+   if (nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0)
+      return ph_fs_fail(ctx, "a texel offset");
    if (tex->sampler_index > 3)
       return ph_fs_fail(ctx, "a sampler beyond the four pipes");
    ctx->sampler_mask |= 1u << tex->sampler_index;

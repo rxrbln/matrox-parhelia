@@ -1139,11 +1139,16 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			 * PARD's P690 two-unit route, logical unit 1 occupies physical
 			 * pipe 2 (0x1204 = 0x40104), and live hardware proved that the
 			 * TA Areg field must select that physical pipe as well. */
-			uint32_t ta_source = st->single_texture_pipe ? 2u : 0u;
+			/* The source names physical pipes.  The P690 route puts unit 1
+			 * alone on pipe 2 (pipe 1 is idle and reads zero); the original
+			 * board gangs it over pipes 2+3, merged as the vendor's mask-0xc
+			 * ADD t2, t2, t3.  Either result lands in t1. */
+			uint32_t ta_sources = st->single_texture_pipe ?
+					      0x00004040u : 0x0000c040u;
 			rw[0].reg = P3D_R_COMB_RGB;
-			rw[0].val = 0x00004002u | (ta_source << 5);
+			rw[0].val = ta_sources | 2u;
 			rw[1].reg = P3D_R_COMB_ALPHA;
-			rw[1].val = 0x00004000u | (ta_source << 5);
+			rw[1].val = ta_sources;
 			rw[2].reg = 0x126c;           rw[2].val = 0x00100c00u;
 			rw[3].reg = 0x1268;           rw[3].val = 0x00100c00u;
 			rw[4].reg = 0x1278; rw[4].val = 0;

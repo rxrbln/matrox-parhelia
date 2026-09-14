@@ -1705,7 +1705,9 @@ static bool ph_auto_tiled_texture(const struct ph_context *ctx,
                                   const struct pipe_sampler_state *sampler);
 
 /* A native import with no linear companion, presented onto tiled storage,
- * on a chip that cannot sample it directly. */
+ * on a chip that cannot sample it directly.  On the original board every
+ * render object keeps a transfer shadow; the copy writes VRAM and CPU access
+ * downloads the shadow first, so it may take such a destination. */
 static bool
 ph_present_tiled_source(const struct ph_context *ctx,
                         const struct parhelia_resource *src,
@@ -1715,7 +1717,9 @@ ph_present_tiled_source(const struct ph_context *ctx,
           src->native_shared && src->handle && !src->linear_handle &&
           src->stride && src->stride <= 0x3fff &&
           dst->handle && dst->stride && dst->stride <= 0x3fff &&
-          !dst->upload_texture && !dst->transfer_shadow &&
+          !dst->upload_texture &&
+          (!dst->transfer_shadow ||
+           !ph_lx_family(ph_screen(ctx->base.screen)->chip_id)) &&
           !dst->mip.block_bytes;
 }
 
@@ -4818,12 +4822,19 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
                                                  TGSI_SEMANTIC_TEXCOORD, 1);
       }
    }
+   /* A program that samples only unit 1 - GL1's unit-1 REPLACE - leaves
+    * unit 0 without a coordinate set, and the draw was dropped.  Stage unit
+    * 1's set in its place; unit 0's sample is not read. */
+   if (textured && texcoord < 0 && texcoord1 >= 0 && ctx->fs &&
+       ctx->fs->program.valid &&
+       !(ctx->fs->program.sampler_mask & BITFIELD_BIT(0)))
+      texcoord = texcoord1;
    if (textured && texcoord < 0 && ph_env("PARHELIA_TRACE")) {
       const struct tgsi_shader_info *info = draw_get_shader_info(stage->draw);
-      fprintf(stderr, "parhelia: no real texture varying; VS has %u outputs\\n",
+      fprintf(stderr, "parhelia: no real texture varying; VS has %u outputs\n",
               info->num_outputs);
       for (unsigned i = 0; i < info->num_outputs; i++)
-         fprintf(stderr, "parhelia: vs output %u semantic=%u/%u\\n", i,
+         fprintf(stderr, "parhelia: vs output %u semantic=%u/%u\n", i,
                  info->output_semantic_name[i], info->output_semantic_index[i]);
    }
    if (ctx->submit_error || pos < 0 || (textured && texcoord < 0) ||

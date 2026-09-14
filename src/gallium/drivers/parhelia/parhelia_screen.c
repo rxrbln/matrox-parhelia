@@ -1043,6 +1043,16 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
          memset(r->map, 0, r->size);
          r->transfer_shadow = true;
       }
+   } else if (screen->render_transfer && !screen->native_rt_classes) {
+      /* The original board's BAR0 is descriptor translated as well, so a
+       * render object's mmap offset does not reach its VRAM: glReadPixels
+       * returned zeros.  Keep a CPU shadow moved through the kernel's
+       * aperture copy, as the P690's class targets do. */
+      r->map = align_malloc(r->size, 64);
+      if (!r->map)
+         PH_CREATE_FAIL();
+      memset(r->map, 0, r->size);
+      r->transfer_shadow = true;
    } else {
       if (!r->mmap_offset)
          PH_CREATE_FAIL();
@@ -1645,10 +1655,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    /* The fragment pipeline evaluates only what the combiner can express, and
     * there is no software fragment fallback.  The data-flow compiler covers
     * the fixed-function environments and the GLSL 1.20 shapes of
-    * tools/parhelia-gl-combiner-test; PARHELIA_FS_TEXENV=1 returns to the
-    * fixed-function words and reports 1.10. */
-   caps->glsl_feature_level = caps->glsl_feature_level_compatibility =
-      ph_env("PARHELIA_FS_TEXENV") ? 110 : 120;
+    * tools/parhelia-gl-combiner-test.  GL 2.1 needs 1.20: reporting 1.10
+    * makes Mesa fail shading_language_version(). */
+   caps->glsl_feature_level = caps->glsl_feature_level_compatibility = 120;
    caps->essl_feature_level = 100;
    caps->npot_textures = true;
    /* The address unit's 3-bit mode per axis covers repeat, clamp-to-edge,
