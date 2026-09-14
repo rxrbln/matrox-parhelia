@@ -15,12 +15,22 @@ config DRM_PARHELIA
 	  the primary display controller, VRAM GEM objects and a validated DMA
 	  submission interface for the WARP 3D engine.
 
-	  The same module contains an isolated, default-off clean-room bring-up
-	  backend for M9/Phoenix device 102b:0540.  It does not share engine
-	  packets or initialization with the P-series path.  m9_enable=1 exposes
-	  its DMA32 GEM and validate-only render interface; m9_render_diag=1 is
-	  additionally required for the kernel-owned writeback-fence diagnostic.
 	  Requires the locally extracted parhelia/mtx*.bin resident firmware
 	  files in /lib/firmware (also in the initramfs for early loading).
 
 	  If compiled as a module, it will be called parhelia.
+
+config DRM_M9X
+	tristate "Matrox M9/Phoenix clean-room render driver"
+	depends on DRM && PCI
+	select DRM_GEM_DMA_HELPER
+	help
+	  Independent, render-only clean-room bring-up driver for Matrox
+	  M9/Phoenix device 102b:0540.  It has no dependency on the Parhelia
+	  P-series module and provides no display support yet.
+
+	  m9_enable=1 is required before the driver binds.  It exposes DMA32 GEM
+	  and a validate-only command interface.  m9_render_diag=1 is additionally
+	  required for the kernel-owned writeback-fence diagnostic.
+
+	  If compiled as a module, it will be called m9x_drm.

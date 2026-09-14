@@ -222,12 +222,6 @@ static void parhelia_postclose(struct drm_device *drm, struct drm_file *file)
 	parhelia_warp_postclose(to_parhelia(drm), file);
 }
 
-static void parhelia_m9_drm_postclose(struct drm_device *drm,
-				      struct drm_file *file)
-{
-	parhelia_m9_postclose(to_parhelia(drm), file);
-}
-
 static const struct drm_ioctl_desc parhelia_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(PARHELIA_GET_PARAM, parhelia_traced_get_param,
 			  DRM_RENDER_ALLOW),
@@ -261,25 +255,6 @@ static const struct drm_driver parhelia_driver = {
 	.dumb_map_offset = parhelia_traced_dumb_map_offset,
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,
-	.major = 1,
-	.minor = 0,
-};
-
-static const struct drm_ioctl_desc parhelia_m9_ioctls[] = {
-	DRM_IOCTL_DEF_DRV(PARHELIA_M9_CREATE_BO, parhelia_m9_create_bo_ioctl,
-			  DRM_RENDER_ALLOW),
-	DRM_IOCTL_DEF_DRV(PARHELIA_M9_SUBMIT, parhelia_m9_submit_ioctl,
-			  DRM_RENDER_ALLOW),
-};
-
-static const struct drm_driver parhelia_m9_driver = {
-	.driver_features = DRIVER_GEM | DRIVER_RENDER,
-	.fops = &parhelia_fops,
-	.postclose = parhelia_m9_drm_postclose,
-	.ioctls = parhelia_m9_ioctls,
-	.num_ioctls = ARRAY_SIZE(parhelia_m9_ioctls),
-	.name = DRIVER_NAME,
-	.desc = "Matrox M9 clean-room bring-up",
 	.major = 1,
 	.minor = 0,
 };
@@ -334,23 +309,10 @@ static const struct parhelia_chip_info parhelia_p690_info = {
 	.max_pixel_clock_khz = 300000,
 };
 
-static const struct parhelia_chip_info parhelia_m9_info = {
-	.device = PARHELIA_M9, .name = "M9/Phoenix",
-	/* These common fields are deliberately unused by the M9 engine path. */
-	.tile_layout = PARHELIA_TILE_64X16_4K, .texture_units = 4,
-	.texture_pipe_mode = PARHELIA_TEXTURE_PIPES_SINGLE,
-	.mc_family = PARHELIA_MC_SUN90, .clock_family = PARHELIA_CLOCK_SUN90,
-	.output_family = PARHELIA_OUTPUT_P690,
-	.reset_family = PARHELIA_RESET_SUNEX,
-	.max_pixel_clock_khz = 300000,
-	.engine_family = PARHELIA_ENGINE_M9,
-};
-
 static int parhelia_validate_chip_info(struct pci_dev *pci,
 				       const struct parhelia_chip_info *chip)
 {
 	if (!chip || chip->device != pci->device || !chip->name ||
-	    chip->engine_family > PARHELIA_ENGINE_M9 ||
 	    chip->tile_layout > PARHELIA_TILE_64X16_4K ||
 	    chip->texture_pipe_mode > PARHELIA_TEXTURE_PIPES_SINGLE ||
 	    chip->mc_family > PARHELIA_MC_SUN90 ||
@@ -359,9 +321,6 @@ static int parhelia_validate_chip_info(struct pci_dev *pci,
 	    chip->reset_family > PARHELIA_RESET_SUNEX ||
 	    !chip->texture_units || !chip->max_pixel_clock_khz)
 		return -EINVAL;
-	if (chip->engine_family == PARHELIA_ENGINE_M9)
-		return chip->device == PARHELIA_M9 ? 0 : -EINVAL;
-
 	/* These are architectural pairings, not optional feature guesses.  Fail
 	 * closed rather than letting a corrupt/new table entry select a foreign
 	 * memory-controller or clock register block. */
@@ -396,7 +355,6 @@ static const struct pci_device_id parhelia_pci_table[] = {
 	PARHELIA_PCI_INFO(PARHELIA_LX, parhelia_lx_info),
 	PARHELIA_PCI_INFO(PARHELIA_LX2, parhelia_lx2_info),
 	PARHELIA_PCI_INFO(PARHELIA_P690, parhelia_p690_info),
-	PARHELIA_PCI_INFO(PARHELIA_M9, parhelia_m9_info),
 	{ }
 };
 MODULE_DEVICE_TABLE(pci, parhelia_pci_table);
@@ -409,26 +367,15 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	unsigned int mmio_bar;
 	bool posted;
 	int ret;
-	const struct parhelia_chip_info *chip =
-		(const struct parhelia_chip_info *)ent->driver_data;
-
-	if (chip->engine_family == PARHELIA_ENGINE_M9 && !parhelia_m9_enabled())
-		return dev_err_probe(&pci->dev, -ENODEV,
-			"M9 clean-room backend is disabled; use m9_enable=1 for bring-up\n");
 
 	posted = parhelia_firmware_initialized(pci);
-	if (!posted && chip->engine_family == PARHELIA_ENGINE_M9)
-		return dev_err_probe(&pci->dev, -ENODEV,
-			"M9 was not POSTed; cold memory/clock bring-up is unavailable\n");
 	if (!posted && !bind_uninitialized)
 		return dev_err_probe(&pci->dev, -ENODEV,
 			"firmware left this device uninitialized (PCI memory decode off): its memory controller and clocks are unprogrammed and any frame-buffer access resets the machine, so cold bring-up is required; override with bind_uninitialized=1\n");
 
-	if (chip->engine_family != PARHELIA_ENGINE_M9) {
-		ret = aperture_remove_conflicting_pci_devices(pci, DRIVER_NAME);
-		if (ret)
-			return ret;
-	}
+	ret = aperture_remove_conflicting_pci_devices(pci, DRIVER_NAME);
+	if (ret)
+		return ret;
 
 	ret = pcim_enable_device(pci);
 	if (ret)
@@ -448,9 +395,6 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	 * or driver-owned DMA allocations exist at this point.
 	 */
 	if (reset_on_probe) {
-		if (chip->engine_family == PARHELIA_ENGINE_M9)
-			return dev_err_probe(&pci->dev, -EOPNOTSUPP,
-				"reset_on_probe is not available for M9\n");
 		/* Driver core already holds the device lock during probe. */
 		ret = pci_reset_function_locked(pci);
 		if (ret)
@@ -458,9 +402,7 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 		dev_info(&pci->dev, "PCI function reset completed\n");
 	}
 
-	pdev = devm_drm_dev_alloc(&pci->dev,
-				 chip->engine_family == PARHELIA_ENGINE_M9 ?
-				 &parhelia_m9_driver : &parhelia_driver,
+	pdev = devm_drm_dev_alloc(&pci->dev, &parhelia_driver,
 				 struct parhelia_device, drm);
 	if (IS_ERR(pdev))
 		return PTR_ERR(pdev);
@@ -485,28 +427,10 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	 * pci_map_rom() may temporarily enable the legacy shadow aperture and the
 	 * PCI resource checker otherwise reports overlapping active mappings. */
 	parhelia_bios_init(pdev);
-	pdev->vram = parhelia_is_m9(pdev) ? NULL : pcim_iomap(pci, 0, 0);
+	pdev->vram = pcim_iomap(pci, 0, 0);
 	pdev->mmio = pcim_iomap(pci, mmio_bar, 0);
-	if ((!pdev->vram && !parhelia_is_m9(pdev)) || !pdev->mmio)
+	if (!pdev->vram || !pdev->mmio)
 		return dev_err_probe(&pci->dev, -ENOMEM, "cannot map BARs\n");
-	if (parhelia_is_m9(pdev)) {
-		if (pci_resource_len(pci, mmio_bar) < 0x2000)
-			return dev_err_probe(&pci->dev, -ENODEV,
-					     "M9 MMIO BAR is too small\n");
-		dev_info(&pci->dev,
-			 "%s: mapped %pa-byte framebuffer aperture BAR0 and MMIO BAR%u\n",
-			 pdev->chip->name, &pdev->vram_size, mmio_bar);
-		ret = parhelia_m9_init(pdev);
-		if (ret)
-			return ret;
-		ret = drm_dev_register(drm, 0);
-		if (ret) {
-			parhelia_m9_fini(pdev);
-			return ret;
-		}
-		pci_set_drvdata(pci, drm);
-		return 0;
-	}
 	dev_info(&pci->dev,
 		 "%s: mapped %pa-byte VRAM BAR0 and MMIO BAR%u, tile layout %u, "
 		 "MC %s, clock %s, output %u, reset %s\n",
@@ -613,10 +537,6 @@ static void parhelia_pci_remove(struct pci_dev *pci)
 	struct drm_device *drm = pci_get_drvdata(pci);
 
 	drm_dev_unregister(drm);
-	if (parhelia_is_m9(to_parhelia(drm))) {
-		parhelia_m9_fini(to_parhelia(drm));
-		return;
-	}
 	drm_atomic_helper_shutdown(drm);
 	if (to_parhelia(drm)->irq_installed) {
 		parhelia_write(to_parhelia(drm), PARHELIA_MMIO_IRQ_MASK, 0);

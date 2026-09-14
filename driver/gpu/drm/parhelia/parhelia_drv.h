@@ -36,12 +36,6 @@ struct drm_gem_vram_object;
 #define PARHELIA_LX		0x2537
 #define PARHELIA_LX2		0x2538
 #define PARHELIA_P690		0x2539
-#define PARHELIA_M9		0x0540
-
-enum parhelia_engine_family {
-	PARHELIA_ENGINE_CLASSIC,
-	PARHELIA_ENGINE_M9,
-};
 
 enum parhelia_mc_family {
 	PARHELIA_MC_HSLPAR,
@@ -75,41 +69,6 @@ struct parhelia_chip_info {
 	enum parhelia_output_family output_family;
 	enum parhelia_reset_family reset_family;
 	u32 max_pixel_clock_khz;
-	enum parhelia_engine_family engine_family;
-};
-
-#define PARHELIA_M9_COMMAND_BYTES	SZ_32K
-#define PARHELIA_M9_MAX_RELOCS		128u
-#define PARHELIA_M9_MAX_BOS		128u
-
-struct parhelia_m9_bo {
-	struct drm_gem_dma_object dma;
-	struct list_head link;
-	struct drm_file *file;
-	u32 flags;
-};
-
-struct parhelia_m9_fence {
-	struct dma_fence base;
-	spinlock_t lock;
-};
-
-struct parhelia_m9 {
-	struct mutex lock;
-	struct list_head bos;
-	void *requester_cpu;
-	dma_addr_t requester_bus;
-	void *command_cpu;
-	dma_addr_t command_bus;
-	void *fence_cpu;
-	dma_addr_t fence_bus;
-	u64 fence_context;
-	u32 next_fence;
-	u32 last_fence;
-	u32 fence_epoch;
-	u32 generation;
-	bool transport_armed;
-	bool wedged;
 };
 
 enum parhelia_output_route {
@@ -676,8 +635,6 @@ struct parhelia_device {
 	/* Private mode-7 index snapshot retained when a batch times out. */
 	struct drm_gem_vram_object *quarantine_mode7_index;
 	u32 quarantine_count;
-	/* M9 has a different requester, packets, fences and engine state. */
-	struct parhelia_m9 m9;
 };
 
 static inline u32 parhelia_warp_entry(struct parhelia_device *pdev, u32 offset)
@@ -835,21 +792,4 @@ void parhelia_state_shadow_invalidate(struct parhelia_device *pdev,
 				      const char *reason);
 void parhelia_submit_postclose(struct parhelia_device *pdev,
 			   struct drm_file *file);
-bool parhelia_is_m9(const struct parhelia_device *pdev);
-bool parhelia_m9_enabled(void);
-bool parhelia_m9_render_diagnostic(void);
-int parhelia_m9_init(struct parhelia_device *pdev);
-void parhelia_m9_fini(struct parhelia_device *pdev);
-void parhelia_m9_postclose(struct parhelia_device *pdev,
-			   struct drm_file *file);
-int parhelia_m9_create_bo_ioctl(struct drm_device *drm, void *data,
-				struct drm_file *file);
-int parhelia_m9_submit_ioctl(struct drm_device *drm, void *data,
-			     struct drm_file *file);
-int parhelia_m9_submit_noop(struct parhelia_device *pdev, u64 *point);
-int parhelia_m9_submit_selftest(void);
-struct parhelia_m9_bo *parhelia_m9_bo_lookup(struct parhelia_device *pdev,
-					      struct drm_file *file,
-					      u32 handle);
-
 #endif
