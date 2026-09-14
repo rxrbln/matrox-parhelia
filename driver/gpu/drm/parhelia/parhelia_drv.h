@@ -405,6 +405,7 @@ struct parhelia_submit_slot {
 	unsigned long submitted;
 	u64 submit_ns;
 	struct parhelia_dma_block *blocks;
+	u32 blocks_used;
 	/* A single compact coherent secondary heap backs every packet in one
 	 * request. The CPU-only block index may exceed the hardware CALL count
 	 * while adjacent packet descriptors are being compacted.

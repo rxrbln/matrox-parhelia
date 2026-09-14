@@ -2165,8 +2165,9 @@ static int parhelia_async_slot_prepare(struct parhelia_device *pdev,
 		}
 		slot->secondary_dwords = dwords;
 	}
-	memset(slot->blocks, 0,
-	       array_size(PARHELIA_DMA_BLOCK_CAPACITY, sizeof(*slot->blocks)));
+	/* Only blocks handed out by the previous request need clearing. */
+	memset(slot->blocks, 0, array_size(slot->blocks_used, sizeof(*slot->blocks)));
+	slot->blocks_used = 0;
 	slot->secondary_put = 0;
 	return 0;
 }
@@ -2182,6 +2183,7 @@ static int parhelia_async_block_assign(struct parhelia_submit_slot *slot,
 	block->bus = slot->secondary_bus + slot->secondary_put * sizeof(u32);
 	block->dwords = dwords;
 	slot->secondary_put += dwords;
+	slot->blocks_used = max_t(u32, slot->blocks_used, block - slot->blocks + 1);
 	return 0;
 }
 
