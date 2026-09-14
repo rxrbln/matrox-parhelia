@@ -833,7 +833,10 @@ Run when a fragment target is retired (§5.4).  In order:
    config`** (the globals of 9a.3); slot 2 `0x1230/0x1234` = the saved
    `fragctx+0x114/+0x124`; `[blk+0x8c] = 5`, `[blk+0x8e] = 3`; dirty
    `0x24000000`.
-3. Stamp through `sub_9D560(.., 0xc00)`.
+3. `sub_9D560(.., 0xc00)`: `0x400` prepends `DWGCTL = 4`, `DWGCTL = 0x407`
+   with a fence pair; the main packet is `DWGCTL = 0xc07`, fence `tag|1`,
+   `tag`, restore DWGCTL (the `0x100`/`0x200` surface stamps only apply to
+   attached surfaces, none here) [C].
 4. WARP constants, one 14-dword packet:
    `0x1160, 0x1174, 0x1178, 0x1180 = 1.0, 0.5, 0.25, 0.25`;
    `0x1164, 0x1174, 0x1178, 0x1180 = 1.0, 0.5, 0.25, 3.5`;
@@ -843,8 +846,9 @@ Run when a fragment target is retired (§5.4).  In order:
    triangle at depth 0.5 spanning x 0.25..3.5, y 0.25..1.25 [I].
 5. `DWGCTL 0x1300 = 0x207`, fence `0x12bc = tag|1`, `tag`, restore DWGCTL.
 6. Lock the fragment buffer, read dwords 0..3 and 32..35 (`& 0x3ffff`) into
-   `fragctx+0xC8..0xE4`, and zero them — per-pass counters kept in the buffer
-   head.
+   `fragctx+0xC8..0xE4`, and zero them.  These are the fragment unit's state
+   words, which `sub_9D790` loads back into registers `0x1340..0x134c` and
+   `0x13c0..0x13cc` (9a.7).
 7. Z tracking back on if it was on; `[blk+0xB4] = (old & ~0xc) | 2`.
 
 So retirement draws one small triangle with the fragment buffer bound as the
@@ -877,13 +881,45 @@ descriptors `[blk+0xAA4..0xAD0]` into `fragctx+0x100..0x138` when FAA starts on
 a target (`fragctx+0xA4 == 3`), and from 0xA062C, which stores the render
 state word as `fragctx+0xFC`.
 
+### 9a.7 Context switch: the fragment unit's saved state  [C]
+
+The per-draw context validator at 0x101000 (twin of `mtxpserd.dll`'s
+`0x102c80`) keeps one FAA owner per device in `pDev+0xA9E4`.  When another D3D
+context draws, it retires the previous owner's fragment context
+(`sub_9E000` on `owner+0x2dcc`, 9a.4), activates the new one with
+`sub_9D790(retire_result)`, stores the new owner, turns Z tracking back on
+(`0x20a`) and flushes the full state block (`sub_2EC10(block, 0, 1)`).
+
+`sub_9D790`, only while `fragctx+0xC4` is 1 or 2:
+
+```
+if (retire_result == 0) sub_9D560(.., 0xc00)       ; DWGCTL 0x407/0xc07 with fences
+count 9:
+  indices d0 d1 d2 d3: 0x1340 = fragctx+0xC8   0x1344 = +0xCC
+                       0x1348 = +0xD0          0x134c = +0xD4
+  indices f0 f1 f2 f3: 0x13c0 = +0xD8          0x13c4 = +0xDC
+                       0x13c8 = +0xE0          0x13cc = +0xE4
+```
+
+No other packet in the binary addresses indices `0xd0..0xd3` or `0xf0..0xf3`.
+So the fragment unit keeps eight 18-bit state words (masked `0x3ffff` when
+read back) in `0x1340..0x134c` and `0x13c0..0x13cc`; the hardware mirrors them
+into the first and ninth dwords of each group of the fragment buffer head,
+from where retirement saves them and clears them, and activation reloads them
+[C for the software; the per-word meaning is OPEN].  A fresh fragment context
+starts from zeroed saved words (`sub_9E000`'s `fragctx+0xC8..0xE4 = 0` on the
+non-FAA exit, 0x9E3CE).  The device-level fragment buffer object
+`pDev+0xA9E0` is freed at device teardown (0x101667).
+
 ### 9a.6 Still open
 
 * The bulk emitter of the `0x1214`-mirrored range, which would confirm
   `0x12b4`/`0x12b8` for the AA control word and threshold (9a.1).
 * How the fragment buffer is bound while fragments accumulate: only the
   retirement pass (9a.4) binds it, through depth slot `0x1228`.
-* The meaning of the eight counter words of 9a.4.
+* The meaning of the eight state words in `0x1340..0x134c` and
+  `0x13c0..0x13cc` (9a.7), and whether any of them is the fragment buffer base
+  that accumulation uses.
 * A capture with `AAMode = 0x53` remains the only way to validate any of it on
   hardware; none of this is exercised by the open driver.
 
