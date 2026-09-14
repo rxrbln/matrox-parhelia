@@ -353,8 +353,11 @@ to two, GL_DOT3_RGB to three (its DP3 must fill both halves, so the alpha
 result follows it).  Control flow, explicit-level lookups and programs past
 the quantum are refused.
 
-**Not measured on hardware yet** - both targets were unreachable when this
-landed; `tools/parhelia-gl-combiner-test` group 4 measures each:
+**Measured on the 0528 (2026-09-14)**, every pixel of each 62x62 interior:
+CMP via `max()` and `abs()`, the result scale on an intermediate, DP3 with
+the SIGNED modifier, and `(texture + colour) * 0.5` exact - so an
+intermediate holds values beyond 1.  BIAS alone and a texture-pipe register
+as a temporary are still unexercised.  The list as it stood before the run:
 
 * CMP (`0x3e`) and the BIAS and SIGNED modifiers, BIN only;
 * the result scale on an intermediate;
