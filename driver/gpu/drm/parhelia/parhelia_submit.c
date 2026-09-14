@@ -3429,6 +3429,11 @@ static bool parhelia_reloc_target_reg(const u32 *commands, u32 command_dwords,
 					 packet->length, reloc->dword, reg);
 }
 
+static bool trace_depth_window;
+module_param(trace_depth_window, bool, 0644);
+MODULE_PARM_DESC(trace_depth_window,
+	"Log each original-Parhelia colour/depth window pairing (diagnostic)");
+
 /* The original Parhelia's depth unit takes the upper bits of the Z surface
  * address from the colour target: Z only lands in the 16 MiB engine window
  * directly above the colour target's (glprobe, every other window mixes both
@@ -3458,6 +3463,16 @@ static int parhelia_pin_depth_window(struct parhelia_device *pdev,
 			"no depth window above colour target %#x\n", gpu);
 		return parhelia_vram_pin(depth);
 	}
+	if (trace_depth_window) {
+		u32 before = 0;
+
+		parhelia_vram_gpu_addr(pdev, depth, 0, depth->bo.base.size, &before);
+		dev_info_ratelimited(&pdev->pdev->dev,
+			"depth window: colour %#x+%#zx depth %#x+%#zx pinned %u window %#llx-%#llx\n",
+			gpu, colour->bo.base.size, before, depth->bo.base.size,
+			depth->bo.pin_count, (unsigned long long)lo,
+			(unsigned long long)hi);
+	}
 	for (tries = 0; tries < 4; tries++) {
 		ret = parhelia_vram_pin_range(depth, lo >> PAGE_SHIFT,
 					      hi >> PAGE_SHIFT);
@@ -3468,6 +3483,14 @@ static int parhelia_pin_depth_window(struct parhelia_device *pdev,
 			return ret;
 		parhelia_submit_unlock(pdev);
 	}
+	if (trace_depth_window) {
+		u32 after = 0;
+
+		parhelia_vram_gpu_addr(pdev, depth, 0, depth->bo.base.size, &after);
+		dev_info_ratelimited(&pdev->pdev->dev,
+			"depth window: result %d after %d tries, depth now %#x\n",
+			ret, tries, after);
+	}
 	if (ret == -EBUSY || ret == -ENOMEM || ret == -ENOSPC) {
 		dev_warn_ratelimited(&pdev->pdev->dev,
 			"depth surface kept outside window %#llx: %d\n",
@@ -3475,6 +3498,73 @@ static int parhelia_pin_depth_window(struct parhelia_device *pdev,
 		return parhelia_vram_pin(depth);
 	}
 	return ret;
+}
+
+/* Move an unpinned colour target into the window below its depth surface.
+ * A client's back buffers otherwise sit in different windows and each swap
+ * moves the depth surface to the other one: Q3 at 1280x1024 moved 5 MiB of
+ * depth every frame and corrupted the game and X's front buffer, while at
+ * 1024x768 both buffers shared a window and it rendered clean.  With the
+ * colour following the depth, the back buffers converge on one window. */
+static void parhelia_move_colour_below_depth(struct parhelia_device *pdev,
+					     struct drm_gem_vram_object *colour,
+					     struct drm_gem_vram_object *depth)
+{
+	struct ttm_operation_ctx ctx = { false, false };
+	u64 bank_size = pdev->vram_size >> 1;
+	u64 dphys, cphys, dgpu, cgpu, window, lo;
+	u64 moved = 0;
+	int ret = -EBUSY;
+
+	/* drm_gem_vram_offset() refuses unpinned objects, and both usually are
+	 * between frames: read the placements under their reservations. */
+	if (ttm_bo_reserve(&depth->bo, true, false, NULL))
+		return;
+	if (!depth->bo.resource || depth->bo.resource->mem_type != TTM_PL_VRAM) {
+		ttm_bo_unreserve(&depth->bo);
+		return;
+	}
+	dphys = (u64)depth->bo.resource->start << PAGE_SHIFT;
+	ttm_bo_unreserve(&depth->bo);
+	dgpu = dphys < bank_size ? dphys :
+	       PARHELIA_LOCAL_BANK_B_BASE + dphys - bank_size;
+	window = ALIGN_DOWN(dgpu, SZ_16M);
+	if (window < SZ_16M)
+		return;
+	lo = window - SZ_16M;
+	if (lo >= PARHELIA_LOCAL_BANK_B_BASE)
+		lo = lo - PARHELIA_LOCAL_BANK_B_BASE + bank_size;
+	else if (lo + SZ_16M > bank_size)
+		return;
+	if (ttm_bo_reserve(&colour->bo, true, false, NULL))
+		return;
+	if (!colour->bo.resource || colour->bo.resource->mem_type != TTM_PL_VRAM) {
+		ttm_bo_unreserve(&colour->bo);
+		return;
+	}
+	cphys = (u64)colour->bo.resource->start << PAGE_SHIFT;
+	cgpu = cphys < bank_size ? cphys :
+	       PARHELIA_LOCAL_BANK_B_BASE + cphys - bank_size;
+	if (ALIGN_DOWN(cgpu, SZ_16M) + SZ_16M == window) {
+		ttm_bo_unreserve(&colour->bo);
+		return;
+	}
+	if (!colour->bo.pin_count) {
+		ret = parhelia_vram_placement_range(colour, pdev->vram_size,
+						    false, lo >> PAGE_SHIFT,
+						    (lo + SZ_16M) >> PAGE_SHIFT);
+		if (!ret)
+			ret = ttm_bo_validate(&colour->bo, &colour->placement,
+					      &ctx);
+	}
+	if (colour->bo.resource)
+		moved = (u64)colour->bo.resource->start << PAGE_SHIFT;
+	ttm_bo_unreserve(&colour->bo);
+	if (trace_depth_window)
+		dev_info_ratelimited(&pdev->pdev->dev,
+			"depth window: colour %#llx below depth %#llx -> %#llx: %d\n",
+			(unsigned long long)cphys, (unsigned long long)dphys,
+			(unsigned long long)moved, ret);
 }
 
 static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
@@ -3514,6 +3604,10 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 			}
 		}
 	}
+	if (colour && depth)
+		parhelia_move_colour_below_depth(pdev,
+						 drm_gem_vram_of_gem(colour),
+						 drm_gem_vram_of_gem(depth));
 	for (i = 0; i < count; i++) {
 		if (!objects[i] || (depth && objects[i] == depth))
 			continue;
