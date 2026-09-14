@@ -26,6 +26,8 @@
 #define DRM_PARHELIA_UPLOAD_RENDER	0x06
 #define DRM_PARHELIA_DOWNLOAD_RENDER	0x07
 #define DRM_PARHELIA_WARP_PROGRAM	0x08
+#define DRM_PARHELIA_M9_CREATE_BO	0x09
+#define DRM_PARHELIA_M9_SUBMIT		0x0a
 
 #define DRM_IOCTL_PARHELIA_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_PARHELIA_GET_PARAM, \
@@ -54,6 +56,75 @@
 #define DRM_IOCTL_PARHELIA_WARP_PROGRAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_PARHELIA_WARP_PROGRAM, \
 		 struct drm_parhelia_warp_program)
+
+/* M9 is a different 3-D architecture.  Keep its deliberately small initial
+ * ABI separate from the classic Parhelia packet ABI above. */
+#define DRM_IOCTL_PARHELIA_M9_CREATE_BO \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_PARHELIA_M9_CREATE_BO, \
+		 struct drm_parhelia_m9_create_bo)
+#define DRM_IOCTL_PARHELIA_M9_SUBMIT \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_PARHELIA_M9_SUBMIT, \
+		 struct drm_parhelia_m9_submit)
+
+struct drm_parhelia_m9_create_bo {
+	__u64 size;
+	__u64 mmap_offset;
+	__u32 flags;
+	__u32 handle;
+};
+
+#define PARHELIA_M9_BO_COMMAND (1u << 0)
+#define PARHELIA_M9_BO_READ    (1u << 1)
+#define PARHELIA_M9_BO_WRITE   (1u << 2)
+
+struct drm_parhelia_m9_bo_ref {
+	__u32 handle;
+	__u32 flags;
+};
+
+enum drm_parhelia_m9_reloc_kind {
+	PARHELIA_M9_RELOC_REQUESTER,
+	PARHELIA_M9_RELOC_COLOR,
+	PARHELIA_M9_RELOC_DEPTH,
+	PARHELIA_M9_RELOC_TEXTURE,
+	PARHELIA_M9_RELOC_PROGRAM,
+	PARHELIA_M9_RELOC_DRAW32_START,
+	PARHELIA_M9_RELOC_DRAW32_END,
+	PARHELIA_M9_RELOC_DRAW16_START,
+	PARHELIA_M9_RELOC_DRAW16_END,
+	PARHELIA_M9_RELOC_FENCE,
+	PARHELIA_M9_RELOC_QUERY,
+	PARHELIA_M9_RELOC_SPECIAL,
+	/* Index 0x6c: 0x80-aligned linked VS+FS record; kernel adds tag bit 0. */
+	PARHELIA_M9_RELOC_PROGRAM_LINK,
+};
+
+struct drm_parhelia_m9_reloc {
+	__u32 command_dword;
+	__u32 handle;
+	__u64 target_offset;
+	__u32 kind;
+	__u32 flags;
+	__u32 pad[2];
+};
+
+#define PARHELIA_M9_SUBMIT_VALIDATE_ONLY (1u << 0)
+#define PARHELIA_M9_SUBMIT_NOOP_FENCE    (1u << 1)
+
+struct drm_parhelia_m9_submit {
+	__u32 context_id;
+	__u32 command_handle;
+	__u64 command_offset;
+	__u32 command_length;
+	__u32 relocation_count;
+	__u64 relocations_ptr;
+	__u32 bo_count;
+	__u32 flags;
+	__u64 bos_ptr;
+	__u32 out_syncobj;
+	__u32 pad;
+	__u64 out_point;
+};
 
 /* Linear storage does not use the tiled render-target address decoder and
  * therefore needs only the native surface alignment, not a 32 MiB SUN90

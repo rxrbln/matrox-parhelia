@@ -26,6 +26,9 @@
 #include "parhelia_internal.h"
 #include "parhelia_public.h"
 #include "parhelia_texel.h"
+#include "m9_screen.h"
+#include "m9_internal.h"
+#include "m9_chip.h"
 
 static void ph_resource_destroy(struct pipe_screen *pscreen,
                                 struct pipe_resource *pres);
@@ -1447,7 +1450,8 @@ ph_fence_finish(struct pipe_screen *screen, struct pipe_context *ctx,
 struct pipe_screen *
 parhelia_screen_create(int fd, const struct pipe_screen_config *config)
 {
-   struct parhelia_screen *s = CALLOC_STRUCT(parhelia_screen);
+   struct parhelia_screen *s;
+   drmDevicePtr drm_device = NULL;
    struct drm_parhelia_get_param chip = {.param = PARHELIA_PARAM_CHIP_ID};
    struct drm_parhelia_get_param tile = {.param = PARHELIA_PARAM_TILE_LAYOUT};
    struct drm_parhelia_get_param units = {
@@ -1490,6 +1494,15 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param max_packets = {
       .param = PARHELIA_PARAM_MAX_PACKETS,
    };
+   if (!drmGetDevice2(fd, 0, &drm_device)) {
+      bool is_m9 = drm_device->bustype == DRM_BUS_PCI &&
+                   m9_is_pci_device(drm_device->deviceinfo.pci->vendor_id,
+                                    drm_device->deviceinfo.pci->device_id);
+      drmFreeDevice(&drm_device);
+      if (is_m9)
+         return m9_screen_create(fd, config);
+   }
+   s = CALLOC_STRUCT(parhelia_screen);
    (void)config;
    if (!s)
       return NULL;
