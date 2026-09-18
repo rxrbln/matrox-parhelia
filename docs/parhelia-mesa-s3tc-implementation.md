@@ -1,5 +1,10 @@
 # Native S3TC in the Mesa Parhelia driver
 
+**This note is Parhelia/P690 only.**  The M-Series uses a different code
+space - DXT1 `0x10`, DXT2/3 `0x15`, DXT4/5 `0x17` - and a different tiling;
+see `parhelia-m9-s3tc-compressed-textures.md`.  Do not carry the `0x08`,
+`0x0a`, `0x0c` codes or the 32x16-texel macrotile across.
+
 This note is a source-level implementation recipe for adding native DXT1,
 DXT3 and DXT5 sampling to the current Gallium driver.  Its hardware claims are
 derived only from the binary drivers and documentation kept in this tree.  No

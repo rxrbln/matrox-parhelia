@@ -1,5 +1,10 @@
 # Parhelia GigaColor and 10-bit textures
 
+**This note is Parhelia/P690 only.**  The M-Series has two real
+`A2*10*10*10` formats, codes `0x68` and `0x6a`, with alpha - not the
+alpha-less `0x34` described here, which on the M9 is `A32B32G32R32F`.  See
+`parhelia-m9-gigacolor-10bit.md`.
+
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
