@@ -75,3 +75,19 @@ The implementation uses `drmm_universal_plane_alloc()` so plane cleanup occurs
 before its managed allocation is released. The private image has a later DRM
 managed release action, which unmaps, unpins, and drops the GEM object before
 the cursor-plane container is freed.
+
+
+## Correction (2026-09-13)
+
+`DC+0x88 = 0x16` is **not** the general cursor composite gate.  The vendor's
+single-screen cursor path (mtx_drv.so `MTXHWCursorInit` default pair mtx68 /
+mtx69) never writes DC+0x88 on any chip; `0x16` is reached only through the
+TripleHead/QuadHead callbacks or the `THI`/`QHI` options.  The cursor is
+switched on by its own control register (`DC+0xc4`, 4 for ARGB / 16-colour).
+On the original Parhelia (0528) bit 4 of DC+0x88 delays the whole scanout by
+8 pixels (measured: picture shifted left, columns 0-7 wrapped to the right
+edge, removed by clearing only bit 4), and `captures/cursor-*-0528.txt` read
+`0x1a88 = 0` with the vendor hardware cursor visible.  The KMS driver now
+writes nothing there on the original family and keeps `0x16` on the P690,
+where it was tested.  The cursor image must be uploaded through a host
+aperture descriptor on the 0528; a raw BAR0 vmap write does not reach VRAM.

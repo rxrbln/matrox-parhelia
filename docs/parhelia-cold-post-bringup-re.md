@@ -1766,3 +1766,11 @@ before it is accepted; the first one that locks is the answer.
 * [`parhelia-engine-and-context-init-complete.md`](parhelia-engine-and-context-init-complete.md)
   — everything that happens after §6, i.e. the ring, descriptor bank, WARP
   upload and per-context defaults.
+
+
+## Correction (2026-09-13)
+
+Section 6.1 annotates `0x8198 rd8 0x1c19 ; or cl,0x94 ; wr8` as `0x1c00` bits
+15:8.  `si = 0x1c19` is byte 1 of **`0x1c18`** (DAC1), not `0x1c00`.  That
+misreading is why a driver init set `0x1c00` bits 15/23, which the board's
+VBIOS never sets (POST reads `0x1c00 = 0x...60c2`).

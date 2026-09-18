@@ -399,3 +399,12 @@ operation sequences, submitted either by direct MMIO (simplest) or the DMA
 pushbuffer (faster). The **cursor** register map is immediately usable. **Xv**
 can reuse the DPS blit + procamp. Full **3D** is a large separate effort and is
 documented here only as a map.
+
+
+## Correction (2026-09-13)
+
+The cursor image base (`0x18cc`/`0x1acc`) is a raw byte address on the 0528,
+not `byte_offset >> 3`: the vendor capture reads `0x07f60000`, which as
+8-byte units would lie far beyond the 256 MiB of VRAM.  `DC+0x88 = 0x16` is a
+TripleHead/QuadHead-only value, not the primary cursor enable - see the
+correction in `parhelia-drm-hardware-cursor.md`.

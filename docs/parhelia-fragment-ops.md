@@ -189,7 +189,7 @@ Bank 0x0c (MMIO `0x1000 + 4*index`):
 | **0x1068** | **0x1a** | **dither enable** | 0/1 | CONFIRMED |
 | 0x106c | 0x1b | blend enable | 0/1 | CONFIRMED |
 | 0x1070 | 0x1c | fog enable | 0/1 | CONFIRMED |
-| 0x1074 | 0x1d | separate specular colour | 0/1 | CONFIRMED |
+| 0x1074 | 0x1d | separate specular colour | 0/1 | **REFUTED, see below** |
 | **0x10d0** | 0x34 | stencil test enable | 0/1 | CONFIRMED |
 | **0x10d4** | 0x35 | stencil **fail** op | 1..8 (§5) | CONFIRMED |
 | **0x10d8** | 0x36 | stencil **z-fail** op | 1..8 | CONFIRMED |
@@ -786,3 +786,29 @@ bank5[0x0b] = dst_alpha_factor              1..0x11
 and the clear is a block operation, not a register sequence:
 `mask (1=colour, 2=depth, 4=stencil, 0x10=accum), ARGB8888 colour, float depth,
 int stencil, ARGB8888 accum, x, y, w, h`.
+
+## Correction to section 2: the MMIO column is not evidence (2026-09-13)
+
+The addresses in section 2 were derived from the `reg = 0x1000 + 4 * index`
+rule, which `parhelia-3d-integrated.md` section 8 already refutes, and at
+least one row is demonstrably wrong.
+
+**`0x1074` is not a register.** Decoding every register write in
+`captures/gl-matrix/{base,light,fog}-secs.txt`, the complete set of 3D
+registers the vendor kernel ever touches is `0x1000-0x1064`, `0x1090/0x1094`,
+`0x10b0-0x1130`, `0x1164-0x1198`, `0x11c0-0x123c` and `0x1260-0x138c`:
+**nothing between `0x1068` and `0x108c` is written on any path**.
+`parhelia-span-decoded-complete.md` agrees. Writing `0x1074` to enable the
+separate specular colour was measured to do nothing, which is consistent.
+
+The rule is refuted by construction at exactly this index block: ICD bank-C
+index **0x22** is the fog colour, and it lands at **`0x12d4`**, not `0x1088`.
+The same bad row appears in `parhelia-draw-recipe.md:432`.
+
+Section 11.3's warning against writing bank-C `0x22`-`0x27` as `0x108c`/
+`0x1090`/`0x109c` therefore stands and is now explained: those indices are not
+those addresses, and the DMA-control collision it feared cannot arise because
+the vendor never uses those addresses as bank-C targets.
+
+The index column is unaffected: it comes from the ICD and is still good. Treat
+every MMIO address in section 2 as unverified unless a capture shows the write.

@@ -3,6 +3,16 @@
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
+> **The "never been shown to observe anything" section below is superseded.**
+> `parhelia-p690-warp-isa-re.md` §7 has a verified constant readback on the
+> P690: the port is addressed per component, `0x0910 = (3 << 24) | (comp << 16)
+> | (bank << 9) | slot`, `0x0938 = 0xfffffffc`, then four settling reads of
+> `0x0914` (`parhelia_warp.c:683`). This file's scans used one address per vec4
+> and so read three components' worth of nothing. What still stands: **kind 3
+> only**, and the port addresses the WARP constant/source file — a vertex-unit
+> resource. It is not a window onto engine status or statistics; see
+> `parhelia-occlusion-query-re.md` §1.3.
+
 The card exposes a CPU-side readback path into the WARP register space.  It is
 the only instrument we have that observes engine state without rendering, so
 everything decoded through it depends on knowing exactly what it can and cannot

@@ -65,7 +65,7 @@ Last revised 2026-09-05.
 | Anti-aliasing / multisample | DECODED | |
 | Point size / line width | DECODED | CPU path is forced by **policy**: `caps[0x1c]`/`caps[0x1d]` hard-coded 0. Says nothing about the silicon |
 | GL_POINT_SIZE_MAX | SOLVED | slot 0xa6 / reg 0x1298 = 2048.0f. Was mislabelled "guard band / viewport scale" — retracted |
-| Occlusion query | **absent** | no vendor stack exposes it (kernel, GL ICD, Windows D3D all checked). Not proof of missing silicon |
+| Occlusion query | **absent — closed** | `parhelia-occlusion-query-re.md`. No counter register exists: the complete MMIO read set of both Windows D3D HALs (27 offsets, 12 of them in the 3D block and all identity read-modify-writes) and of the Linux kernel HAL (14 offsets, **none** in `0x1000..0x13ff`) is enumerated, and no value is accumulated or differenced anywhere. Both D3D drivers refuse queries three ways: `GETD3DQUERYCOUNT`/`GETD3DQUERY` → `DDERR_CURRENTLYNOTAVAIL` (`MTXPARD 0x3e705`), DP2 `CREATEQUERY`/`ISSUEQUERY` are skip stubs (`0x16a4c0`), `D3dGetDriverState` is an unconditional `E_NOTIMPL` (`0xff990`). No GL ICD for the family — Linux **or** Windows — has a single query entry point, while `MSerX/MxMGLX.dll` (`DEV_0540` only) in the same installer has all eight |
 
 ## Shaders
 

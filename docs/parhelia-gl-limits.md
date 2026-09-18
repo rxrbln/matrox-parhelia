@@ -922,7 +922,20 @@ through `GetCaps()` at **`0x364ec0`** (vtable slot +0x48; singleton at
 | +0x18 | `0x15ca60`, `0x17cf8f` | max vertices per submitted batch | constant **0xffff** |
 | +0x1c | `0x1bee63` | hardware line path (reason bit 0) | **constant 0** |
 | +0x1d | `0x1bedf1` | hardware wide-line path (reason bit 1) | **constant 0** |
-| +0x1e | `0x1bf064` | line-smooth path (reason bit 8) | undetermined |
+| +0x1e | `0x1bf064` | line-smooth path (reason bit 8) | **uninitialised — see below** |
+
+**Correction, 2026-09-13: the kernel writes nothing past `+0x1d`.** The
+ICD-link-create handler `mtx1775` (`mtx_parhelia.o` `.text+0x1a50`) copies the
+caller's 56-byte packet onto an unzeroed stack frame, fills the blob at packet
+`+0x10`, and copies all 56 bytes back. Its complete store list is `+0x00`
+(`0x1b50`), `+0x01` (`0x1b4c`, constant 1), `+0x02` (`0x1b61`), `+0x03`
+(`0x1b71`), `+0x04`/`+0x08` (`0x1b83`/`0x1b86`), `+0x0c`/`+0x10`
+(`0x1b93`/`0x1b96`), `+0x14` (`0x1ba6`), `+0x18` (`0x1bb0`), `+0x1c` (`0x1b89`),
+`+0x1d` (`0x1b8d`). **`+0x1e`, `+0x1f` and `+0x20..+0x27` are never written**,
+and the ICD (`0x358c30`) does not zero its own 64-byte packet either — it
+initialises only `+0x00` — so those ten bytes round-trip as the ICD's own stack
+garbage. Whatever `0x1bf064` reads at `+0x1e`, it is not a kernel-supplied
+capability. [CONFIRMED]
 
 Two consequences worth acting on. **The wide-line software fallback is a kernel
 policy, not a hardware limit** — `caps[0x1d]` is a hard-coded 0. And the

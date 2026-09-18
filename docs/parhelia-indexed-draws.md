@@ -835,13 +835,31 @@ promotes §2.3 from "the arithmetic says so" to settled. **[BIN]×2**
   exists — remains open. The `0,1,3,7,0xf` head of that table is itself
   suggestive: it is a *component-count → mask* table, the same mask alphabet
   as descriptor bits [25:22]. **[BIN][INF]**
-* Not found: `D3dDrawPrimitives2` itself. `DdGetDriverInfo` @`0x3e770`
-  answers `GUID_D3DCallbacks3` from `*(pdev+0x6f10) + 0xa8`, so
-  `D3dDrawPrimitives2 = *(blob + 0xbc)` — but the constructor at `0x86760`
-  only zeroes those slots, so the pointer is installed elsewhere and the
-  `D3DDP2OP_*` dispatch was not located (303 jump tables checked, none with a
-  DP2-shaped bound). The packet emitters were reached bottom-up instead,
-  which is why the encodings above are nonetheless solid.
+* ~~Not found: `D3dDrawPrimitives2` itself.~~ **Found, 2026-09-13** — see
+  `parhelia-occlusion-query-re.md` §2.2. `DdGetDriverInfo` @`0x3e770` answers
+  `GUID_D3DCallbacks3` from `*(pdev+0x6f10) + 0xa8`, so
+  `D3dDrawPrimitives2 = *(blob + 0xbc)`; the constructor at `0x86760` only
+  zeroes those slots because the pointers are installed later, by the callbacks
+  builder at **`0x87a70`**: `[blob+0xbc] = 0xffd20` (`D3dDrawPrimitives2`,
+  `0x87ad2`), `[blob+0xb8] = 0xffe50` (`ValidateTextureStageState`),
+  `[blob+0xac] = 0xc` (`dwFlags`). The `D3DDP2OP_*` dispatch is not a jump table,
+  which is why 303 jump tables did not find it — it is an indirect call through a
+  256-entry **function-pointer table** at `.data 0x1efff0`, dispatched at
+  `0x16b681`:
+
+  ```
+  16b681  mov  eax,[ebx+0x10]          ; bCommand
+          cmp  eax,0x100
+          jge  0x16b6a8                ; -> error 0x169820
+          call DWORD PTR [eax*4+0x1efff0]
+  ```
+
+  The table is `rep stos`-filled by `0x16da40` / `0x16dd60` with the fallback
+  `0x169640`, which forwards to `D3DParseUnknownCommandCallback`
+  (`capsobj+0x7f0`, stored at `0x3eabf`). Highest opcode with a real handler is
+  96 `SURFACEBLT` (`0x16d7b0`). `mtxpserd.dll`: table `0x1f1ff0`, default
+  `0x16b600`. The packet emitters had already been reached bottom-up, which is
+  why the encodings above were solid without it.
 
 ---
 

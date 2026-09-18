@@ -63,10 +63,15 @@ LSB ramp bias on odd rows is interpolation, not addressing.
 --transfer-probe: set up transfer probe: Operation not supported
 ```
 
-`parhelia_transfer_render_ioctl()` refuses anything but `0x2539`, because the
-8 KiB aperture window it copies through exists for the P690's *translated*
-BAR0.  This generation's BAR0 is a linear view of VRAM, so the same ioctls can
-be served by a direct copy, and until they are, every probe built on
+`parhelia_transfer_render_ioctl()` refuses anything but `0x2539`.
+**Correction (2026-09-13):** the reason originally given here - that this
+generation's BAR0 is a linear view of VRAM - is wrong.  BAR0 is translated by
+the same 20-slot host-aperture descriptor bank as on the P690 (MMIO
+`0x0000..0x013f`); with only the slot-0 identity descriptor live it shows raw
+tiled VRAM bytes 1:1, which is what the earlier measurement saw.  The vendor
+stack on this board copies exactly as on the P690 (`captures/mmio-draw-0528.txt`,
+`captures/mmio-gltri-0528.txt`), so the P690 aperture transfer path applies here
+unchanged and only its device gate has to go.  Until it does, every probe built on
 UPLOAD_RENDER/DOWNLOAD_RENDER - the texture format, mip address, wrap and
 volume batteries - cannot run on this card at all.  That is the single largest
 coverage hole for this generation.

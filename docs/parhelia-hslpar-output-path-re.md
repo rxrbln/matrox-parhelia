@@ -1496,3 +1496,25 @@ The cheapest discriminator is that they predict different outcomes:
 
 Run them separately, in that order, and the answer falls out of which one
 lights the monitor.
+
+
+## Corrections from hardware measurement (2026-09-13)
+
+* **DVO2 clock (sections 9 and 13):** on 0x0527/0x0528 both serializers take
+  their clock from `0x1c00` `[14:13]` + bit 27 with the gate at bit 12.  The
+  `0x1c04` `[17:15]` / bit 14 branch in `HSLPARSetDVOClock` is unreachable for
+  `devid - 0x527 <= 1` (mtx926 `aef3c`/`aefd0`/`af14d`), the board's VBIOS clock
+  routine (ROM `0x9e37`) writes only `0x1c00` for both, and writes to
+  `0x1c04[17:15]` are dropped by the hardware.
+* **Connector wiring (sections 8 and 14):** measured on the retail board, DDC
+  pins 3/1 carry DVO1/DAC1 and pins 2/0 carry DVO2/DAC2; §14 item 1's
+  derivation from the index resolvers does not match the hardware.
+* **Crossbar sync bits (section 6):** the 0x0528 enable path forces bits 3 and
+  5 of the serializer byte clear (`or $0x14; and $0xffffffd7`); the VBIOS only
+  touches them from a separate polarity routine.
+* **Enable order:** both the HAL and the VBIOS gate the DVO clock and power the
+  serializer down, write the crossbar byte, then ungate and power up, with the
+  display controller already enabled.
+* **`0x1c58` bit 6 (line ~243):** on this family `HSLPAREnableDVO` sets it
+  (`b0b59 -> b0db1`); the clear at `b0b5f` needs `board_flag != 0`, which is
+  always 0 for 0x0527/0x0528.
