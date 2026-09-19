@@ -63,6 +63,26 @@ target only after exact packed-word clear and WARP readback tests pass.
 
 ## 2. FAA is a fragment buffer with an explicit command, not ordinary MSAA
 
+> **Correction, 2026-09-19.**  Everything in this section is the **older
+> Parhelia-512** driver and **none of it carries to the M9**.  See
+> `parhelia-m9-faa-re.md` section 5 for the counted evidence:
+>
+> * the `FragSize * max(w*h/786432, sqrt(w*w+h*h)/1280) * 1 MiB` formula, the
+>   2 MiB retry, the 6 MiB floor and the 8/16/32 MiB clamps exist only in
+>   `MtxPar/MTXPARD.dll`; the M-series miniport `MxMM.sys` contains no FAA
+>   string, allocator or command at all;
+> * `0x1300 = 0x20a / 0x00a` is the Parhelia **Z unit's** tile-tracking mode,
+>   not fragment accumulation (`parhelia-antialiasing.md` section 9a.0), and
+>   index `c0` is written 558 times in the saved M9 streams, always zero;
+> * **`0x12f8` is not a threshold register on the M9.**  On Parhelia-512
+>   index `be` carries exactly `02800000` and `007fe000`; on the M9 the same
+>   index carries a VRAM backing address, 0 of 2633 writes carry either
+>   word, and no M9 register anywhere is written with `0x007fe000`.
+>
+> The M9's multisample state is two dwords at indices `ad` and `af` plus a
+> three-bit mode field in index `ef` bits 31:29, and its storage is a
+> separate buffer group of about 16.55 bytes a pixel.
+
 The Windows D3D driver has a real sort-independent fragment-AA path [C].  It
 uses a separate linear VRAM allocation, not N full colour/depth samples per
 pixel.  Its size is exactly:
