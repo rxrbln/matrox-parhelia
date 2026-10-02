@@ -348,6 +348,11 @@ struct ph_context {
    bool oow;		/* the staged stream carries 1/w after z */
    bool proj;		/* set 0 carries s,t,r,q for the projective mode */
    bool colour_alpha;	/* the staged colour carries alpha: RGBA, not RGB */
+   /* A smooth line's coverage rides in the colour's alpha: the staged
+    * triangles carry their final colour and bypass the fragment program. */
+   bool line_coverage;
+   bool ov_valid;		/* ph_stage_tri takes ov_colour, not the vertex's */
+   float ov_colour[3][4];
    uint32_t warp_sized_point;
    uint32_t warp_sized_point_slot;
    /* Pass-through plus "mov o2, v6": the second colour reaches the combiner
@@ -4352,8 +4357,9 @@ ph_submit_vertices(struct ph_context *ctx)
    state.warp_entry = ph_warp_entry(ctx, false, false, false);
    /* An untextured draw can still need a compiled fragment program - fixed
     * function fog is a mix between the fragment colour and a constant - as
-    * long as that program samples nothing. */
-   state.comb = ph_fs_untextured_program(ctx) ?
+    * long as that program samples nothing.  A smooth line's triangles carry
+    * their final colour and take the plain colour combiner. */
+   state.comb = ph_fs_untextured_program(ctx) && !ctx->line_coverage ?
                 ph_compiled_combiner(ctx, false) : NULL;
    state.dither = !ctx->blend || ctx->blend->dither;
    state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
@@ -4772,6 +4778,7 @@ out:
 	ctx->vertex_alpha = false;
 	ctx->stencil_back = false;
 	ctx->colour_alpha = false;
+	ctx->line_coverage = false;
 	ctx->alpha_micro = false;
 	ctx->alpha_micro_cutout = false;
 	ctx->cpu_alpha_cutout = false;
@@ -5245,6 +5252,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	if (ctx->triangles && (ctx->colour1 != colour1 ||
 	                       ctx->oow != oow || ctx->proj != proj ||
 	                       ctx->colour_alpha != colour_alpha ||
+	                       ctx->line_coverage != ctx->ov_valid ||
 	                       ctx->vertex_alpha != vertex_alpha ||
 	                       ctx->alpha_micro != alpha_micro ||
 	                       ctx->alpha_micro_cutout != alpha_micro_cutout ||
@@ -5292,6 +5300,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	ctx->oow = oow;
 	ctx->proj = proj;
 	ctx->colour_alpha = colour_alpha;
+	ctx->line_coverage = ctx->ov_valid;
 	ctx->vertex_alpha = vertex_alpha;
 	ctx->alpha_micro = alpha_micro;
 	ctx->alpha_micro_cutout = alpha_micro_cutout;
@@ -5316,7 +5325,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
    for (unsigned v = 0; v < 3; v++) {
       const float *p = prim->v[v]->data[pos];
       const float white[4] = {1, 1, 1, 1};
-      const float *c = col < 0 ? white : prim->v[v]->data[col];
+      const float *c = ctx->ov_valid ? ctx->ov_colour[v] :
+                       col < 0 ? white : prim->v[v]->data[col];
 		if (cpu_alpha_cutout || rgb_alpha_two_pass) {
 			const float *tc = prim->v[v]->data[texcoord];
 			*dst++ = p[0];
@@ -5510,6 +5520,121 @@ ph_expand_point(struct draw_stage *stage, struct prim_header *prim,
    ph_stage_fan(stage, src, (const float (*)[2])xy, n, NULL);
 }
 
+static bool ph_fs_constant_colour(struct ph_context *ctx, float out[4]);
+
+/* The colour a smooth line's fragments get, when it can be staged as the
+ * final colour: an untextured program that is a constant or the vertex
+ * colour itself.  The alpha has to reach the blender or the alpha test. */
+static bool
+ph_line_coverage_colours(struct ph_context *ctx, const struct prim_header *prim,
+                         int col, float out[2][4])
+{
+   const struct ph_fs *fs = ctx->fs;
+
+   if (!fs || !fs->program.valid || fs->program.sampler_mask ||
+       fs->program.uses_color1 || ph_samples_unit0(ctx) ||
+       !ph_colour_alpha_observable(ctx))
+      return false;
+   if (!fs->program.uses_color) {
+      if (!ph_fs_constant_colour(ctx, out[0]))
+         return false;
+      memcpy(out[1], out[0], sizeof(out[0]));
+      return true;
+   }
+   if (fs->program.cls != PH_FS_CLASS_COLOUR || col < 0)
+      return false;
+   for (unsigned v = 0; v < 2; v++)
+      memcpy(out[v], prim->v[v]->data[col], sizeof(out[v]));
+   if (ctx->rasterizer && ctx->rasterizer->flatshade)
+      memcpy(out[!ctx->rasterizer->flatshade_first],
+             out[!!ctx->rasterizer->flatshade_first], sizeof(out[0]));
+   return true;
+}
+
+/* One quad of a smooth line, corners in order, each with its own colour. */
+static void
+ph_stage_coverage_quad(struct draw_stage *stage, struct prim_header *prim,
+                       const float (*xy)[2], const float (*rgba)[4])
+{
+   struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   const int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
+   static const unsigned corner[2][3] = { {0, 1, 2}, {0, 2, 3} };
+   static const unsigned from[4] = { 0, 1, 1, 0 };
+
+   ctx->ov_valid = true;
+   for (unsigned t = 0; t < 2 && !ctx->submit_error; t++) {
+      struct prim_header tri = {0};
+
+      for (unsigned k = 0; k < 3; k++) {
+         const unsigned c = corner[t][k];
+         struct vertex_header *v = dup_vert(stage, prim->v[from[c]], k);
+
+         v->data[pos][0] = xy[c][0];
+         v->data[pos][1] = xy[c][1];
+         memcpy(ctx->ov_colour[k], rgba[c], sizeof(rgba[c]));
+         tri.v[k] = v;
+      }
+      ph_stage_tri(stage, &tri);
+   }
+   ctx->ov_valid = false;
+}
+
+/* A smooth line as coverage in alpha: a full-alpha core of width w - 1 and a
+ * one-pixel ramp to zero on either side, so each column across the line sums
+ * to the line's width - GL's area coverage, filtered by a tent. */
+static bool
+ph_coverage_line(struct draw_stage *stage, struct prim_header *prim,
+                 float width)
+{
+   struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   const int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
+   const int col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
+   const float *p0 = prim->v[0]->data[pos], *p1 = prim->v[1]->data[pos];
+   const float dx = p1[0] - p0[0], dy = p1[1] - p0[1];
+   const float len = sqrtf(dx * dx + dy * dy);
+   const float h = 0.5f * CLAMP(width, 1.0f, 2048.0f);
+   const float inner = h - 0.5f, outer = h + 0.5f;
+   float c[2][4], nx, ny;
+
+   if (len <= 0.0f || !ph_line_coverage_colours(ctx, prim, col, c))
+      return false;
+   nx = -dy / len;
+   ny = dx / len;
+   for (int side = -1; side <= 1; side += 2) {
+      const float xy[4][2] = {
+         { p0[0] + side * nx * inner, p0[1] + side * ny * inner },
+         { p1[0] + side * nx * inner, p1[1] + side * ny * inner },
+         { p1[0] + side * nx * outer, p1[1] + side * ny * outer },
+         { p0[0] + side * nx * outer, p0[1] + side * ny * outer },
+      };
+      const float rgba[4][4] = {
+         { c[0][0], c[0][1], c[0][2], c[0][3] },
+         { c[1][0], c[1][1], c[1][2], c[1][3] },
+         { c[1][0], c[1][1], c[1][2], 0.0f },
+         { c[0][0], c[0][1], c[0][2], 0.0f },
+      };
+
+      ph_stage_coverage_quad(stage, prim, xy, rgba);
+   }
+   if (inner > 0.0f) {
+      const float xy[4][2] = {
+         { p0[0] - nx * inner, p0[1] - ny * inner },
+         { p1[0] - nx * inner, p1[1] - ny * inner },
+         { p1[0] + nx * inner, p1[1] + ny * inner },
+         { p0[0] + nx * inner, p0[1] + ny * inner },
+      };
+      const float rgba[4][4] = {
+         { c[0][0], c[0][1], c[0][2], c[0][3] },
+         { c[1][0], c[1][1], c[1][2], c[1][3] },
+         { c[1][0], c[1][1], c[1][2], c[1][3] },
+         { c[0][0], c[0][1], c[0][2], c[0][3] },
+      };
+
+      ph_stage_coverage_quad(stage, prim, xy, rgba);
+   }
+   return true;
+}
+
 /* Aliased lines use the draw module's wide-line quad (minor-axis offset and
  * half-pixel end adjustment); smooth lines use the vendor's perpendicular
  * +-width/2 displacement. */
@@ -5532,6 +5657,8 @@ ph_expand_line(struct draw_stage *stage, struct prim_header *prim,
 
    if (rast && rast->flatshade)
       provoking = rast->flatshade_first ? prim->v[0] : prim->v[1];
+   if (smooth && ph_coverage_line(stage, prim, width))
+      return;
    if (smooth) {
       const float len = sqrtf(dx * dx + dy * dy);
       const float h = 0.5f * CLAMP(width, 1.0f, 2048.0f);
