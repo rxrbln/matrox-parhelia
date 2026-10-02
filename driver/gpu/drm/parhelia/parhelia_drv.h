@@ -186,6 +186,8 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 #define PARHELIA_HOST_APERTURE_FIRST	(2 * PARHELIA_HOST_APERTURE_ALIGN)
 /* A descriptor's VRAM address drops its low five bits (MEASURED, P690). */
 #define PARHELIA_APERTURE_ADDR_UNIT	32
+/* Kernel-built requests only: @delta is a class-3 bus address. */
+#define PARHELIA_RELOC_KERNEL_BUS	0x80000000u
 #define PARHELIA_DC_LUT_INDEX		0x038
 #define PARHELIA_DC_LUT_R		0x03c
 #define PARHELIA_DC_LUT_G		0x040
@@ -556,6 +558,11 @@ struct parhelia_device {
 	 * connector in the table could ever light up. */
 	struct parhelia_output *active_output;
 	struct mutex ddc_lock;
+	/* Coherent class-3 buffer the 2-D engine copies render data through. */
+	struct mutex staging_lock;
+	void *staging_cpu;
+	dma_addr_t staging_bus;
+	size_t staging_size;
 	/* Slots 1..19 and their BAR0 ranges are global hardware state. */
 	struct mutex aperture_lock;
 	struct drm_mm aperture_mm;
@@ -811,6 +818,10 @@ int parhelia_vram_clear_range(struct parhelia_device *pdev,
 			      u64 len);
 int parhelia_bo_clear(struct parhelia_device *pdev, struct drm_file *file,
 		      struct drm_gem_vram_object *gbo);
+int parhelia_engine_transfer(struct parhelia_device *pdev,
+			     struct drm_file *file,
+			     struct drm_gem_vram_object *gbo, u64 offset,
+			     void *data, u64 size, bool download);
 int parhelia_vram_write(struct parhelia_device *pdev,
 			struct drm_gem_vram_object *gbo, u64 offset,
 			const void *src, size_t len);

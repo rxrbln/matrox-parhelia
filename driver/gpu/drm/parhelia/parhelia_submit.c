@@ -4289,6 +4289,17 @@ retry_slot:
 			bound_range.stream_bo = vertex_bo;
 			continue;
 		}
+		if (reloc->type == PARHELIA_RELOC_KERNEL_BUS) {
+			if (!kernel_objects || reloc->dword >= packet->length ||
+			    (packet_cmd[0] >> 24) != 0x00 ||
+			    !parhelia_is_vram_operand(packet_cmd, packet->length,
+						      reloc->dword)) {
+				ret = -EINVAL;
+				goto out_unpin;
+			}
+			packet_cmd[reloc->dword] = reloc->delta | 3;
+			continue;
+		}
 		if (reloc->type != PARHELIA_RELOC_VRAM || reloc->dword >= packet->length ||
 		    (packet_cmd[0] >> 24) != 0x00 ||
 		    !parhelia_is_vram_operand(packet_cmd, packet->length, reloc->dword)) {
@@ -5036,6 +5047,161 @@ int parhelia_bo_clear(struct parhelia_device *pdev, struct drm_file *file,
 		return parhelia_vram_clear(pdev, gbo);
 	}
 	return parhelia_vram_clear_range(pdev, gbo, offset, size - offset);
+}
+
+static int parhelia_staging_get(struct parhelia_device *pdev)
+{
+	size_t size;
+
+	lockdep_assert_held(&pdev->staging_lock);
+	if (pdev->staging_cpu)
+		return 0;
+	for (size = SZ_4M; size >= SZ_64K; size >>= 1) {
+		pdev->staging_cpu = dmam_alloc_coherent(&pdev->pdev->dev, size,
+				&pdev->staging_bus, GFP_KERNEL | __GFP_NOWARN);
+		if (pdev->staging_cpu) {
+			pdev->staging_size = size;
+			return 0;
+		}
+	}
+	return -ENOMEM;
+}
+
+/* One linear 32 bpp BITBLT row band: GXcopy from slot 2 to slot 0, the
+ * vendor's mtx3388 readback form (SURF0 = page bus address | 3). */
+static u32 *parhelia_emit_linear_blit(u32 *cmd, u32 x, u32 y, u32 w, u32 h)
+{
+	/* type 1 (linear), format 0x30, 1024-pixel pitch: one 4 KiB row */
+	const u32 cfg = 1024 | (1u << 16) | (0x30u << 24);
+
+	cmd[0] = 11;
+	cmd[1] = 0x8d8c8988;	/* SURF0 base/cfg, SURF2 base/cfg */
+	cmd[2] = 0;
+	cmd[3] = cfg;
+	cmd[4] = 0;
+	cmd[5] = cfg;
+	cmd[6] = 0xc2c1c0c9;	/* PLNWT, DWGCTL, SRC, DSTXY */
+	cmd[7] = 0xffffffff;
+	cmd[8] = 0x2c2;
+	cmd[9] = (y << 16) | x;
+	cmd[10] = (y << 16) | x;
+	cmd[11] = 0x212121e3;	/* LEN fires */
+	cmd[12] = (h << 16) | w;
+	return cmd + 13;
+}
+
+/* Move [@offset, @offset + @size) of a VRAM object to or from @data with the
+ * 2-D engine and a coherent class-3 staging buffer, instead of uncached CPU
+ * accesses through the aperture (downloads ran at 18 MB/s).  Both ends are
+ * linear grids of 4 KiB rows anchored at the page holding @offset; a range
+ * is a partial head row, whole rows and a partial tail row. */
+int parhelia_engine_transfer(struct parhelia_device *pdev,
+			     struct drm_file *file,
+			     struct drm_gem_vram_object *gbo, u64 offset,
+			     void *data, u64 size, bool download)
+{
+	u64 done = 0;
+	int ret;
+
+	if (!IS_ALIGNED(offset, 4) || !IS_ALIGNED(size, 4) ||
+	    offset > gbo->bo.base.size || size > gbo->bo.base.size - offset)
+		return -EINVAL;
+	mutex_lock(&pdev->staging_lock);
+	ret = parhelia_staging_get(pdev);
+	while (!ret && done < size) {
+		struct drm_parhelia_submit args = { };
+		struct drm_parhelia_packet *packets;
+		struct drm_parhelia_reloc *relocs;
+		struct drm_gem_object *objects[8] = { };
+		u64 pos = offset + done, anchor = ALIGN_DOWN(pos, SZ_4K);
+		u32 skew = pos - anchor, bytes, x, y, w, rows, n = 0, i;
+		u32 *commands, *cmd;
+
+		bytes = min_t(u64, size - done,
+			      pdev->staging_size - SZ_4K - skew);
+		packets = kvcalloc(4, sizeof(*packets), GFP_KERNEL);
+		commands = kvcalloc(4 * 13, sizeof(*commands), GFP_KERNEL);
+		relocs = kvcalloc(8, sizeof(*relocs), GFP_KERNEL);
+		if (!packets || !commands || !relocs) {
+			kvfree(packets);
+			kvfree(commands);
+			kvfree(relocs);
+			ret = -ENOMEM;
+			break;
+		}
+		if (!download)
+			memcpy((u8 *)pdev->staging_cpu + skew, (u8 *)data + done,
+			       bytes);
+		cmd = commands;
+		x = skew / 4;
+		y = 0;
+		for (i = 0; i < bytes / 4; i += w * rows) {
+			u32 left = bytes / 4 - i;
+
+			if (x) {
+				w = min(1024 - x, left);
+				rows = 1;
+			} else if (left >= 1024) {
+				w = 1024;
+				rows = left / 1024;
+			} else {
+				w = left;
+				rows = 1;
+			}
+			cmd = parhelia_emit_linear_blit(cmd, x, y, w, rows);
+			packets[n].offset = n * 13;
+			packets[n].length = 13;
+			/* SURF0 is the destination, SURF2 the source. */
+			relocs[2 * n] = (struct drm_parhelia_reloc){
+				.packet = n, .dword = download ? 2 : 4,
+				.delta = lower_32_bits(pdev->staging_bus),
+				.type = PARHELIA_RELOC_KERNEL_BUS };
+			relocs[2 * n + 1] = (struct drm_parhelia_reloc){
+				.packet = n, .dword = download ? 4 : 2,
+				.delta = anchor, .type = PARHELIA_RELOC_VRAM };
+			objects[2 * n + 1] = &gbo->bo.base;
+			n++;
+			x = (x + w) % 1024;
+			y += x ? 0 : rows;
+		}
+		/* The engine's last ~2 KiB of class-3 writes were still in flight
+		 * at the fence (MEASURED): push them out with one row into the
+		 * staging scratch page, as the vendor's one-row-late readback
+		 * (mtx3388) implicitly does. */
+		cmd = parhelia_emit_linear_blit(cmd, 0, 0, 1024, 1);
+		packets[n].offset = n * 13;
+		packets[n].length = 13;
+		relocs[2 * n] = (struct drm_parhelia_reloc){
+			.packet = n, .dword = 2,
+			.delta = lower_32_bits(pdev->staging_bus +
+					       pdev->staging_size - SZ_4K),
+			.type = PARHELIA_RELOC_KERNEL_BUS };
+		relocs[2 * n + 1] = (struct drm_parhelia_reloc){
+			.packet = n, .dword = 4, .delta = anchor,
+			.type = PARHELIA_RELOC_VRAM };
+		objects[2 * n + 1] = &gbo->bo.base;
+		n++;
+		args.command_dwords = n * 13;
+		args.packet_count = n;
+		args.reloc_count = n * 2;
+		ret = parhelia_submit_check(&args);
+		if (!ret)
+			ret = parhelia_submit_run(pdev, file, &args, packets,
+						  commands, relocs, objects);
+		else {
+			kvfree(packets);
+			kvfree(commands);
+			kvfree(relocs);
+		}
+		if (ret)
+			break;
+		if (download)
+			memcpy((u8 *)data + done,
+			       (u8 *)pdev->staging_cpu + skew, bytes);
+		done += bytes;
+	}
+	mutex_unlock(&pdev->staging_lock);
+	return ret;
 }
 
 static bool parhelia_fence_is_issued_locked(struct parhelia_device *pdev,

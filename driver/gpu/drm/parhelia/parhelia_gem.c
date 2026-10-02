@@ -69,6 +69,22 @@ MODULE_PARM_DESC(texture_upload_trace,
 
 static atomic_t texture_upload_trace_count = ATOMIC_INIT(0);
 
+static bool engine_transfer = true;
+module_param(engine_transfer, bool, 0644);
+MODULE_PARM_DESC(engine_transfer,
+	"P690: move UPLOAD/DOWNLOAD_RENDER data with the 2-D engine (default true)");
+
+/* Below these sizes one submit round trip costs more than the CPU copy. */
+static unsigned int engine_download_min = SZ_1K;
+module_param(engine_download_min, uint, 0644);
+MODULE_PARM_DESC(engine_download_min, "smallest engine download in bytes");
+/* Engine uploads lose writes: a narrow row band merged into a 32-byte unit
+ * came back with an earlier band's old dwords (MEASURED); the WC CPU path
+ * moves 600 MB/s meanwhile.  Off until that is understood. */
+static unsigned int engine_upload_min = U32_MAX;
+module_param(engine_upload_min, uint, 0644);
+MODULE_PARM_DESC(engine_upload_min, "smallest engine upload in bytes");
+
 static bool root_transition_trace;
 module_param(root_transition_trace, bool, 0400);
 MODULE_PARM_DESC(root_transition_trace,
@@ -1522,6 +1538,20 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 	    args->offset >= gem->size || args->size > gem->size - args->offset) {
 		ret = -EINVAL;
 		goto out_gem;
+	}
+
+	/* P690: the 2-D engine moves the data through class-3 staging. */
+	if (pdev->pdev->device == PARHELIA_P690 && engine_transfer &&
+	    !texture_upload_trace &&
+	    args->size >= (download ? engine_download_min : engine_upload_min)) {
+		ret = parhelia_engine_transfer(pdev, file, &bo->gbo, args->offset,
+					       buffer, args->size, download);
+		if (!ret || ret == -EINTR || ret == -ERESTARTSYS)
+			goto out_gem;
+		dev_warn_ratelimited(&pdev->pdev->dev,
+			"engine %s of %llu bytes failed (%d), using the aperture\n",
+			download ? "download" : "upload",
+			(unsigned long long)args->size, ret);
 	}
 
 	/* No submit may bind the target while its temporary predecessor mapping is
