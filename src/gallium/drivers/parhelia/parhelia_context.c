@@ -602,6 +602,33 @@ ph_serial_alpha_exact(const struct ph_context *ctx)
    return true;
 }
 
+/* The window position of a staged vertex for PARHELIA_STATS=sync.  An
+ * object-space vertex of the fixed-function transform goes through the
+ * batch's matrix and viewport; a compiled vertex program's output is not
+ * known on the CPU, so its triangles count as empty. */
+static void
+ph_stat_window_xy(const struct ph_context *ctx, const float *v, float out[2])
+{
+   const float *m = ctx->mvp;
+   float x, y, w;
+
+   if (!ctx->transform) {
+      out[0] = v[0];
+      out[1] = v[1];
+      return;
+   }
+   if (ctx->warp_program_entry) {
+      out[0] = out[1] = 0.0f;
+      return;
+   }
+   x = m[0] * v[0] + m[1] * v[1] + m[2] * v[2] + m[3];
+   y = m[4] * v[0] + m[5] * v[1] + m[6] * v[2] + m[7];
+   w = m[12] * v[0] + m[13] * v[1] + m[14] * v[2] + m[15];
+   w = w > 1e-6f ? w : 1e-6f;
+   out[0] = ctx->viewport.scale[0] * x / w + ctx->viewport.translate[0];
+   out[1] = ctx->viewport.scale[1] * y / w + ctx->viewport.translate[1];
+}
+
 /* Whether a draw may bind the second unit the fragment shader samples.  A
  * single-pipe chip runs only the classified two-unit shapes, and only when
  * every unit whose alpha the shape takes as 1.0 holds an alpha-less format. */
@@ -4691,11 +4718,14 @@ ph_submit_vertices(struct ph_context *ctx)
 		ctx->stat_pixels = 0;
 		for (unsigned t = 0; t < ctx->triangles; t++) {
 			const float *v = ctx->vertices + t * 3 * stride;
+			float p[3][2];
 
-			ctx->stat_pixels += fabsf((v[stride] - v[0]) *
-			                          (v[2 * stride + 1] - v[1]) -
-			                          (v[2 * stride] - v[0]) *
-			                          (v[stride + 1] - v[1])) * 0.5f;
+			for (unsigned i = 0; i < 3; i++)
+				ph_stat_window_xy(ctx, v + i * stride, p[i]);
+			ctx->stat_pixels += fabsf((p[1][0] - p[0][0]) *
+			                          (p[2][1] - p[0][1]) -
+			                          (p[2][0] - p[0][0]) *
+			                          (p[1][1] - p[0][1])) * 0.5f;
 		}
 		ctx->stat_kind = ctx->rgb_alpha_two_pass ? PH_STAT_ALPHA_TWO_PASS :
 		   (ctx->alpha_micro || ctx->alpha_micro_cutout) ?
