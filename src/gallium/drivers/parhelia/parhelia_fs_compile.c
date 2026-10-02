@@ -1252,6 +1252,12 @@ ph_fs_lower_leaf(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
    }
    case nir_instr_type_tex:
       return ph_fs_texture(ctx, nir_instr_as_tex(instr), sel, out);
+   case nir_instr_type_undef: {
+      /* An undefined value may be anything; zero is as good as any. */
+      static const float zero[3] = { 0 };
+
+      return ph_fs_literal(ctx, lane, zero, out);
+   }
    case nir_instr_type_intrinsic:
       return ph_fs_intrinsic(ctx, nir_instr_as_intrinsic(instr), lane, sel,
                              out);
@@ -1975,15 +1981,19 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
          }
       }
    }
-   if (!colour[0] || !colour[1] || !colour[2] || !colour[3]) {
-      ph_fs_fail(&ctx, "no complete colour write");
+   /* Channels the shader never writes are undefined; they read as zero. */
+   static const float zero[3] = { 0 };
+   const bool rgb_unwritten = !colour[0] && !colour[1] && !colour[2];
+
+   if (!rgb_unwritten && (!colour[0] || !colour[1] || !colour[2])) {
+      ph_fs_fail(&ctx, "an RGB write that leaves channels undefined");
       goto done;
    }
-   if (colour[0] != colour[1] || colour[1] != colour[2]) {
+   if (!rgb_unwritten && (colour[0] != colour[1] || colour[1] != colour[2])) {
       ph_fs_fail(&ctx, "RGB written from separate values");
       goto done;
    }
-   if (channel[0] == 0 && channel[1] == 1 && channel[2] == 2)
+   if (rgb_unwritten || (channel[0] == 0 && channel[1] == 1 && channel[2] == 2))
       rgb_sel = -1;
    else if (channel[0] == channel[1] && channel[1] == channel[2])
       rgb_sel = channel[0];
@@ -1991,8 +2001,10 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
       ph_fs_fail(&ctx, "an RGB write the replicates cannot express");
       goto done;
    }
-   if (!ph_fs_lower(&ctx, colour[0], PH_LANE_RGB, rgb_sel, &rgb) ||
-       !ph_fs_lower(&ctx, colour[3], PH_LANE_A, channel[3], &alpha) ||
+   if (!(rgb_unwritten ? ph_fs_literal(&ctx, PH_LANE_RGB, zero, &rgb) :
+                         ph_fs_lower(&ctx, colour[0], PH_LANE_RGB, rgb_sel, &rgb)) ||
+       !(colour[3] ? ph_fs_lower(&ctx, colour[3], PH_LANE_A, channel[3], &alpha) :
+                     ph_fs_literal(&ctx, PH_LANE_A, zero, &alpha)) ||
        !ph_fs_result(&ctx, PH_LANE_RGB, &rgb) ||
        !ph_fs_result(&ctx, PH_LANE_A, &alpha) ||
        !ph_fs_schedule(&ctx, MIN2(max_instructions, P3D_COMB_MAX_INSTRUCTIONS),
