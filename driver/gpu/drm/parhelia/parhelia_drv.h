@@ -509,6 +509,7 @@ struct parhelia_bo {
 	/* Demand-bound host-aperture views of a native class target, see
 	 * parhelia_host_view_fault(). */
 	struct list_head host_views;
+	struct list_head dead_link;
 	u32 width;
 	u32 height;
 	u32 gpu_pitch;
@@ -560,6 +561,9 @@ struct parhelia_device {
 	u8 aperture_mapping_count;
 	/* Evictable host views, least recently used first. */
 	struct list_head host_view_lru;
+	/* Freed objects whose views still await revocation under the park. */
+	struct list_head host_view_dead;
+	struct work_struct host_view_work;
 	bool aperture_live;
 	/* Default-off root corruption tracer.  The saved sample survives across
 	 * ioctl and mmap boundaries, so a userspace store between two kernel
