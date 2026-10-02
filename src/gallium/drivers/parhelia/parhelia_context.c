@@ -2198,6 +2198,12 @@ ph_sampler_wrap_axes(const struct pipe_sampler_state *sampler,
       return true;
    }
    tex->border_colour = ph_sampler_border_colour(sampler);
+   /* A 1-D image is one row of a 2-D surface and GL ignores t for it, so
+    * its T axis must never reach the border or a filtered neighbour row. */
+   if (target == PIPE_TEXTURE_1D) {
+      tex->wrap_t = P3D_WRAP_CLAMP_EDGE;
+      return ph_sampler_wrap(sampler->wrap_s, &tex->wrap_s);
+   }
    return ph_sampler_wrap(sampler->wrap_s, &tex->wrap_s) &&
           ph_sampler_wrap(sampler->wrap_t, &tex->wrap_t) &&
           (!three || ph_sampler_wrap(sampler->wrap_r, &tex->wrap_r));
