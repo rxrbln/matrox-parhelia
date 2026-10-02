@@ -120,6 +120,10 @@ struct ph_fs {
     * the vertex stage stages per vertex; see ph_fs_find_uniform_coords(). */
    struct ph_uniform_coord *ucoord;
    unsigned ucoord_count;
+   /* glDrawPixels(GL_DEPTH_COMPONENT)'s shader: the depth output is channel
+    * x of the sample of GL unit depth_unit, the colour the vertex colour. */
+   bool depth_from_texture;
+   unsigned depth_unit;
 };
 
 struct ph_uniform_coord {
@@ -240,7 +244,15 @@ struct ph_context {
    struct pipe_context base;
    struct draw_context *draw;
    /* The native rasterise stage, and the logic-op colour grid in front. */
-   struct draw_stage *hw_stage, *quant_stage;
+   struct draw_stage *hw_stage, *quant_stage, *zpix_stage;
+   /* A fragment shader stand-in that passes the vertex colour, bound while
+    * ph_zpix_stage feeds the native point path. */
+   struct ph_fs colour_fs;
+   struct pipe_transfer *zpix_transfer;
+   const uint8_t *zpix_map;
+   unsigned zpix_width, zpix_height;
+   enum pipe_format zpix_format;
+   bool zpix_unnormalized;
    struct pipe_framebuffer_state fb;
    struct pipe_rasterizer_state *rasterizer;
    struct pipe_depth_stencil_alpha_state *dsa;
@@ -7281,6 +7293,288 @@ ph_quant_prepare(struct ph_context *ctx, bool quantize)
       ph_logicop_grid(ctx, q->scale);
 }
 
+/* ------------------------------------------------ depth pixels as points
+ *
+ * The combiner cannot write depth.  The vendor ICD draws
+ * glDrawPixels(GL_DEPTH_COMPONENT) - and glCopyPixels(GL_DEPTH), which reads
+ * back and draws - as one GL_POINTS vertex per pixel with the pixel's depth
+ * as z (libGL 0x1bdbf0, DrawPixelsDepth row method 0xfc1c0; one quad per
+ * pixel at a pixel zoom other than 1), so the points take the depth,
+ * stencil, scissor and blend tests like any primitive.  Mesa's form of the
+ * same draw is a window-aligned quad whose shader writes the depth sample;
+ * this stage walks that quad's pixel centres and hands each one to the
+ * native point path at the depth of the texel it samples.
+ */
+static bool
+ph_nir_depth_from_texture(nir_shader *nir, unsigned *unit)
+{
+   nir_foreach_function_impl(impl, nir) {
+      if (exec_list_length(&impl->body) != 1)
+         return false;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_intrinsic_instr *in;
+            nir_def *value = NULL;
+            unsigned comp = 0;
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic == nir_intrinsic_store_deref) {
+               nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+
+               if (d && d->deref_type == nir_deref_type_var &&
+                   d->var->data.location == FRAG_RESULT_DEPTH) {
+                  value = in->src[1].ssa;
+                  comp = 0;
+               }
+            } else if (in->intrinsic == nir_intrinsic_store_output &&
+                       nir_intrinsic_io_semantics(in).location ==
+                       FRAG_RESULT_DEPTH) {
+               value = in->src[0].ssa;
+               comp = 0;
+            }
+            if (!value)
+               continue;
+            /* Through movs and vecs to the sample. */
+            for (unsigned hop = 0; hop < 8; hop++) {
+               nir_alu_instr *alu = nir_def_as_alu_or_null(value);
+
+               if (!alu || (alu->op != nir_op_mov &&
+                            !nir_op_is_vec(alu->op)))
+                  break;
+               if (alu->op == nir_op_mov) {
+                  comp = alu->src[0].swizzle[comp];
+                  value = alu->src[0].src.ssa;
+               } else {
+                  value = alu->src[comp].src.ssa;
+                  comp = alu->src[comp].swizzle[0];
+               }
+            }
+            if (comp || nir_def_instr(value)->type != nir_instr_type_tex)
+               return false;
+            {
+               nir_tex_instr *tex = nir_instr_as_tex(nir_def_instr(value));
+
+               if (tex->op != nir_texop_tex ||
+                   nir_tex_instr_src_index(tex, nir_tex_src_projector) >= 0 ||
+                   nir_tex_instr_src_index(tex, nir_tex_src_comparator) >= 0)
+                  return false;
+               *unit = tex->texture_index;
+               return true;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+/* One run of pixels [x0, x1) on row y at depth z, as the two triangles of
+ * its rectangle: an axis-aligned rectangle covers exactly its pixel centres
+ * under the fill rule, where a unit point at a centre is not placed
+ * reliably (MEASURED: the right column of a 60x60 image went missing). */
+static void
+ph_zpix_run(struct draw_stage *stage, const struct prim_header *prim, int pos,
+            int x0, int x1, int y, float z)
+{
+   struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   struct draw_stage *next = ctx->hw_stage;
+   const float cx[4] = { x0, x1, x1, x0 }, cy[4] = { y, y, y + 1, y + 1 };
+   struct vertex_header *v[4];
+   struct prim_header tri = *prim;
+
+   for (unsigned c = 0; c < 4; c++) {
+      v[c] = dup_vert(stage, prim->v[0], c);
+      v[c]->data[pos][0] = cx[c];
+      v[c]->data[pos][1] = cy[c];
+      v[c]->data[pos][2] = z;
+      v[c]->data[pos][3] = 1.0f;
+   }
+   tri.v[0] = v[0]; tri.v[1] = v[1]; tri.v[2] = v[2];
+   next->tri(next, &tri);
+   tri.v[0] = v[0]; tri.v[1] = v[2]; tri.v[2] = v[3];
+   next->tri(next, &tri);
+}
+
+static void
+ph_zpix_tri(struct draw_stage *stage, struct prim_header *prim)
+{
+   struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   const int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
+   int tc = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_TEXCOORD, 0);
+   const float k = (float)0xffffff / (float)0x1000000;
+   const unsigned cpp = util_format_get_blocksize(ctx->zpix_format);
+   const float *v[3];
+   float area;
+   int xmin, ymin, xmax, ymax;
+
+   if (tc < 0)
+      tc = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_GENERIC, 0);
+   if (pos < 0 || tc < 0 || !ctx->zpix_map)
+      return;
+   for (unsigned i = 0; i < 3; i++)
+      v[i] = prim->v[i]->data[pos];
+   area = ph_cpu_edge(v[0], v[1], v[2][0], v[2][1]);
+   if (ph_env("PARHELIA_TRACE_ZPIX"))
+      fprintf(stderr, "parhelia: zpix tri %.6f,%.6f %.6f,%.6f %.6f,%.6f st %.6f,%.6f %.6f,%.6f %.6f,%.6f\n",
+              v[0][0], v[0][1], v[1][0], v[1][1], v[2][0], v[2][1],
+              prim->v[0]->data[tc][0], prim->v[0]->data[tc][1],
+              prim->v[1]->data[tc][0], prim->v[1]->data[tc][1],
+              prim->v[2]->data[tc][0], prim->v[2]->data[tc][1]);
+   if (area == 0.0f)
+      return;
+   xmin = MAX2(0, (int)floorf(MIN3(v[0][0], v[1][0], v[2][0])));
+   ymin = MAX2(0, (int)floorf(MIN3(v[0][1], v[1][1], v[2][1])));
+   xmax = MIN2((int)ctx->fb.width - 1, (int)ceilf(MAX3(v[0][0], v[1][0], v[2][0])));
+   ymax = MIN2((int)ctx->fb.height - 1, (int)ceilf(MAX3(v[0][1], v[1][1], v[2][1])));
+   for (int y = ymin; y <= ymax; y++) {
+      int run = -1;
+      float run_z = 0.0f;
+
+      for (int x = xmin; x <= xmax + 1; x++) {
+         const float px = x + 0.5f, py = y + 0.5f;
+         float e[3], st[2], d, z = 0.0f;
+         bool inside = x <= xmax;
+         int tx, ty;
+
+         for (unsigned i = 0; inside && i < 3; i++) {
+            const float *a = v[(i + 1) % 3], *b = v[(i + 2) % 3];
+            /* Evaluate a shared edge in one vertex order for both of its
+             * triangles, so they see exactly opposite values and a centre on
+             * it is claimed by one of them. */
+            const bool swap = a[0] > b[0] || (a[0] == b[0] && a[1] > b[1]);
+            const float edge = swap ? -ph_cpu_edge(b, a, px, py) :
+                                      ph_cpu_edge(a, b, px, py);
+            const float side = area > 0.0f ? edge : -edge;
+
+            e[i] = edge / area;
+            inside = side > 0.0f ||
+                     (side == 0.0f && (area > 0.0f ? ph_cpu_top_left(a, b) :
+                                                     ph_cpu_top_left(b, a)));
+         }
+         if (inside) {
+            for (unsigned c = 0; c < 2; c++)
+               st[c] = e[0] * prim->v[0]->data[tc][c] +
+                       e[1] * prim->v[1]->data[tc][c] +
+                       e[2] * prim->v[2]->data[tc][c];
+            tx = (int)floorf(ctx->zpix_unnormalized ? st[0] :
+                             st[0] * ctx->zpix_width);
+            ty = (int)floorf(ctx->zpix_unnormalized ? st[1] :
+                             st[1] * ctx->zpix_height);
+            tx = CLAMP(tx, 0, (int)ctx->zpix_width - 1);
+            ty = CLAMP(ty, 0, (int)ctx->zpix_height - 1);
+            util_format_unpack_z_float(ctx->zpix_format, &d,
+                                       ctx->zpix_map +
+                                       (size_t)ty * ctx->zpix_transfer->stride +
+                                       (size_t)tx * cpp, 1);
+            /* On the Z grid ph_update_viewport puts fragment depths on. */
+            z = CLAMP(d, 0.0f, 1.0f) * k;
+         }
+         if (run >= 0 && (!inside || z != run_z)) {
+            ph_zpix_run(stage, prim, pos, run, x, y, run_z);
+            run = -1;
+         }
+         if (inside && run < 0) {
+            run = x;
+            run_z = z;
+         }
+      }
+   }
+}
+
+static void ph_zpix_line(struct draw_stage *s, struct prim_header *p)
+{ (void)s; (void)p; }
+static void ph_zpix_point(struct draw_stage *s, struct prim_header *p)
+{ (void)s; (void)p; }
+static void ph_zpix_flush(struct draw_stage *s, unsigned flags)
+{ (void)s; (void)flags; }
+static void ph_zpix_reset(struct draw_stage *s) { (void)s; }
+static void
+ph_zpix_destroy(struct draw_stage *stage)
+{
+   draw_free_temp_verts(stage);
+   FREE(stage);
+}
+
+static struct draw_stage *
+ph_zpix_create_stage(struct ph_context *ctx)
+{
+   struct ph_stage *z = CALLOC_STRUCT(ph_stage);
+
+   if (!z)
+      return NULL;
+   z->ctx = ctx;
+   z->base.draw = ctx->draw;
+   z->base.point = ph_zpix_point;
+   z->base.line = ph_zpix_line;
+   z->base.tri = ph_zpix_tri;
+   z->base.flush = ph_zpix_flush;
+   z->base.reset_stipple_counter = ph_zpix_reset;
+   z->base.destroy = ph_zpix_destroy;
+   if (!draw_alloc_temp_verts(&z->base, 4)) {
+      FREE(z);
+      return NULL;
+   }
+   return &z->base;
+}
+
+/* Draw a depth-writing quad as per-pixel native points; false when the draw
+ * is not that form. */
+static bool
+ph_draw_depth_points(struct ph_context *ctx, const struct pipe_draw_info *info,
+                     unsigned drawid_offset,
+                     const struct pipe_draw_start_count_bias *draws)
+{
+   struct ph_fs *fs = ctx->fs;
+   const unsigned unit = fs ? fs->depth_unit : 0;
+   struct pipe_sampler_view *view = fs && fs->depth_from_texture &&
+                                    unit < ctx->num_sampler_views ?
+                                    ctx->bound_views[unit] : NULL;
+   struct pipe_box box;
+   unsigned level;
+
+   if (!view || !view->texture ||
+       !util_format_has_depth(util_format_description(view->format)) ||
+       u_reduced_prim(info->mode) != MESA_PRIM_TRIANGLES)
+      return false;
+   if (!ctx->zpix_stage && !(ctx->zpix_stage = ph_zpix_create_stage(ctx)))
+      return false;
+   level = view->u.tex.first_level;
+   ctx->zpix_width = u_minify(view->texture->width0, level);
+   ctx->zpix_height = u_minify(view->texture->height0, level);
+   ctx->zpix_format = view->format;
+   ctx->zpix_unnormalized = view->target == PIPE_TEXTURE_RECT ||
+      (unit < ctx->num_samplers && ctx->samplers[unit] &&
+       ctx->samplers[unit]->unnormalized_coords);
+   u_box_2d(0, 0, ctx->zpix_width, ctx->zpix_height, &box);
+   ctx->zpix_map = ctx->base.texture_map(&ctx->base, view->texture, level,
+                                         PIPE_MAP_READ, &box,
+                                         &ctx->zpix_transfer);
+   if (!ctx->zpix_map)
+      return true;
+   if (ph_env("PARHELIA_TRACE")) {
+      float d0;
+
+      util_format_unpack_z_float(ctx->zpix_format, &d0, ctx->zpix_map, 1);
+      fprintf(stderr, "parhelia: depth pixels as points from %s %ux%u level %u, first depth %f\n",
+              util_format_short_name(ctx->zpix_format), ctx->zpix_width,
+              ctx->zpix_height, level, d0);
+   }
+   ph_submit_vertices(ctx);
+   ctx->fs = &ctx->colour_fs;
+   draw_set_rasterize_stage(ctx->draw, ctx->zpix_stage);
+   draw_vbo(ctx->draw, info, drawid_offset, NULL, draws, 1, 0);
+   draw_flush(ctx->draw);
+   draw_set_rasterize_stage(ctx->draw, ctx->hw_stage);
+   /* The points are staged against the stand-in; submit them under it. */
+   ph_submit_vertices(ctx);
+   ctx->fs = fs;
+   ctx->base.texture_unmap(&ctx->base, ctx->zpix_transfer);
+   ctx->zpix_map = NULL;
+   ctx->zpix_transfer = NULL;
+   return true;
+}
+
 static void
 ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
             unsigned drawid_offset, const struct pipe_draw_indirect_info *indirect,
@@ -7345,6 +7639,9 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    } else {
       draw_set_mapped_constant_buffer(ctx->draw, MESA_SHADER_VERTEX, 0, NULL, 0);
    }
+   if (ctx->fs && ctx->fs->depth_from_texture &&
+       ph_draw_depth_points(ctx, info, drawid_offset, draws))
+      goto unbind;
    derived = u_reduced_prim(info->mode) != MESA_PRIM_TRIANGLES ||
              (ctx->rasterizer &&
               (ctx->rasterizer->fill_front != PIPE_POLYGON_MODE_FILL ||
@@ -8233,6 +8530,10 @@ static void *ph_create_fs(struct pipe_context *p,
             if (compile_nir->info.fs.uses_discard)
                fs->kill = ph_fs_build_kill(compile_nir, budget);
             ph_fs_find_uniform_coords(fs, s->ir.nir);
+            if (s->ir.nir->info.outputs_written &
+                BITFIELD64_BIT(FRAG_RESULT_DEPTH))
+               fs->depth_from_texture =
+                  ph_nir_depth_from_texture(s->ir.nir, &fs->depth_unit);
             if (compile_nir != s->ir.nir)
                ralloc_free(compile_nir);
             if (ph_fs_program_must_drop(s->ir.nir, &fs->program))
@@ -10329,6 +10630,8 @@ ph_destroy_context(struct pipe_context *p)
    free(ctx->fs_const_snap);
    if (ctx->quant_stage)
       ctx->quant_stage->destroy(ctx->quant_stage);
+   if (ctx->zpix_stage)
+      ctx->zpix_stage->destroy(ctx->zpix_stage);
    draw_destroy(ctx->draw);
    FREE(ctx);
 }
@@ -10513,6 +10816,9 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       goto fail;
    draw_set_rasterize_stage(ctx->draw, stage);
    ctx->hw_stage = stage;
+   ctx->colour_fs.uses_color = true;
+   ctx->colour_fs.texenv = P3D_TEXENV_MODULATE;
+   ctx->colour_fs.serial_op = PH_SERIAL_UNSUPPORTED;
    /* Quad-rasterized (sprite) points become textured quads in the draw
     * module, which also generates their sprite coordinates. */
    draw_wide_point_sprites(ctx->draw, true);
