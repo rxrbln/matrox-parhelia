@@ -127,6 +127,8 @@ struct ph_fs {
    unsigned depth_unit;
    /* The vertex output each GL unit's samples take their coordinate from,
     * as ph_fs_find_coord_sources() traced it: unit k need not use set k. */
+   /* The unit is sampled as a rectangle: unnormalised texel coordinates. */
+   bool coord_rect[PIPE_MAX_SAMPLERS];
    bool coord_src_known[PIPE_MAX_SAMPLERS];
    uint8_t coord_src_name[PIPE_MAX_SAMPLERS];
    uint8_t coord_src_index[PIPE_MAX_SAMPLERS];
@@ -7049,6 +7051,10 @@ struct ph_quant_stage {
    unsigned coord_count;
    int coord_slot[P3D_MAX_TEXTURE_UNITS];
    float coord[P3D_MAX_TEXTURE_UNITS][4];
+   /* Rectangle coordinates scaled to the normalised ones the unit takes. */
+   unsigned rect_count;
+   int rect_slot[P3D_MAX_TEXTURE_UNITS];
+   float rect_scale[P3D_MAX_TEXTURE_UNITS][2];
 };
 
 static bool
@@ -7084,6 +7090,10 @@ ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
 
    for (unsigned i = 0; i < q->coord_count; i++)
       memcpy(out->data[q->coord_slot[i]], q->coord[i], sizeof(q->coord[i]));
+   for (unsigned i = 0; i < q->rect_count; i++) {
+      out->data[q->rect_slot[i]][0] *= q->rect_scale[i][0];
+      out->data[q->rect_slot[i]][1] *= q->rect_scale[i][1];
+   }
    for (unsigned i = 0; q->quantize && i < 2; i++) {
       if (q->slot[i] < 0)
          continue;
@@ -7337,6 +7347,9 @@ ph_fs_find_coord_sources(struct ph_fs *fs, nir_shader *nir)
                continue;
             tex = nir_instr_as_tex(instr);
             c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+            if (tex->texture_index < PIPE_MAX_SAMPLERS &&
+                tex->sampler_dim == GLSL_SAMPLER_DIM_RECT)
+               fs->coord_rect[tex->texture_index] = true;
             if (c < 0 || tex->texture_index >= PIPE_MAX_SAMPLERS ||
                 fs->coord_src_known[tex->texture_index] ||
                 (loc = ph_nir_coord_location(tex->src[c].src.ssa)) < 0)
@@ -7374,6 +7387,39 @@ ph_fix_coords(struct ph_context *ctx, struct ph_quant_stage *q)
                                         PH_UNIFORM_COORD_INDEX(u->unit));
    }
    return true;
+}
+
+/* Scale each rectangle unit's coordinate set by its image's extent; the
+ * texture unit only addresses normalised coordinates. */
+static void
+ph_fix_rects(struct ph_context *ctx, struct ph_quant_stage *q)
+{
+   q->rect_count = 0;
+   for (unsigned u = 0; ctx->fs && u < P3D_MAX_TEXTURE_UNITS; u++) {
+      const unsigned gl = ctx->fs->unit_remap ? ctx->fs->unit_source[u] : u;
+      const struct pipe_sampler_view *v;
+      int slot;
+
+      if (gl >= PIPE_MAX_SAMPLERS || !ctx->fs->coord_rect[gl] ||
+          gl >= ctx->num_sampler_views || !(v = ctx->bound_views[gl]) ||
+          !v->texture || (slot = ph_unit_texcoord(ctx, u)) < 0)
+         continue;
+      q->rect_slot[q->rect_count] = slot;
+      q->rect_scale[q->rect_count][0] =
+         1.0f / u_minify(v->texture->width0, v->u.tex.first_level);
+      q->rect_scale[q->rect_count][1] =
+         1.0f / u_minify(v->texture->height0, v->u.tex.first_level);
+      q->rect_count++;
+   }
+}
+
+static bool
+ph_fs_samples_rect(const struct ph_fs *fs)
+{
+   for (unsigned k = 0; fs && k < PIPE_MAX_SAMPLERS; k++)
+      if (fs->coord_rect[k])
+         return true;
+   return false;
 }
 
 static void
@@ -7749,7 +7795,8 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       ctx->derived_triangles = derived;
    }
    const bool quantize = ph_logicop_quantize(ctx);
-   const bool fix = (quantize || (ctx->fs && ctx->fs->ucoord_count)) &&
+   const bool fix = (quantize || (ctx->fs && ctx->fs->ucoord_count) ||
+                     ph_fs_samples_rect(ctx->fs)) &&
                     (ctx->quant_stage ||
                      (ctx->quant_stage = ph_quant_create_stage(ctx)));
    if (!derived && !fix && ph_draw_tcl(ctx, info, draws))
@@ -7760,6 +7807,7 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    ctx->transform = false;
    if (fix) {
       ph_quant_prepare(ctx, quantize);
+      ph_fix_rects(ctx, (struct ph_quant_stage *)ctx->quant_stage);
       if (!ph_fix_coords(ctx, (struct ph_quant_stage *)ctx->quant_stage)) {
          draw_remove_extra_vertex_attribs(ctx->draw);
          PH_REFUSE("a draw whose uniform texture coordinate cannot be evaluated is dropped\n");
