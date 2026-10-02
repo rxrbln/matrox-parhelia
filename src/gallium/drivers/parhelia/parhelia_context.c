@@ -95,6 +95,37 @@ enum ph_serial_op {
    PH_SERIAL_REPLACE1,
 };
 
+/* Why a draw stayed off the hardware transform (PARHELIA_STATS). */
+enum ph_tcl_reason {
+   PH_TCL_NO_UNAVAILABLE,     /* no WARP transform, no or uncompiled program */
+   PH_TCL_NO_PRIMITIVE,       /* points, lines or polygon-mode outlines */
+   PH_TCL_NO_FIXUP,           /* logic-op grid or uniform coordinate stage */
+   PH_TCL_NO_UNIT_REMAP,
+   PH_TCL_NO_TWO_SIDED_STENCIL,
+   PH_TCL_NO_CLIP_PLANES,
+   PH_TCL_NO_POLYGON_OFFSET,
+   PH_TCL_NO_FLATSHADE,
+   PH_TCL_NO_RASTER_STATE,    /* discard, half-z, depth clamp, cull both */
+   PH_TCL_NO_COLOUR1,         /* secondary colour or fog in v1 */
+   PH_TCL_NO_RGBA_COLOUR,
+   PH_TCL_NO_ALPHA_ROUTE,
+   PH_TCL_NO_PROGRAM_IO,
+   PH_TCL_NO_TEXCOORD,
+   PH_TCL_NO_MULTITEXTURE,
+   PH_TCL_NO_THREE_COORD,
+   PH_TCL_NO_DRAW_SHAPE,      /* restart, instancing, mode, vertex format */
+   PH_TCL_NO_CONSTANTS,
+   PH_TCL_REASONS
+};
+
+static const char *const ph_tcl_reason_names[PH_TCL_REASONS] = {
+   "unavailable", "points/lines/outlines", "vertex fix-up", "unit remap",
+   "two-sided stencil", "user clip planes", "polygon offset", "flat shading",
+   "raster state", "colour 1", "RGBA colour", "alpha route",
+   "program inputs/outputs", "texture coordinate", "multitexture",
+   "three-coordinate texture", "draw shape", "constants",
+};
+
 struct ph_fs {
    struct draw_fragment_shader *draw;
    bool uses_texture;
@@ -347,6 +378,8 @@ struct ph_context {
    uint32_t *tcl_elts;
    unsigned tcl_elts_cap;
    unsigned tcl_draws, tcl_fallbacks, tcl_clip_fallbacks;
+   unsigned tcl_reason[PH_TCL_REASONS];
+   enum ph_tcl_reason tcl_last_reason;
    unsigned tcl_program_draws;
    uint32_t fence;
    bool async_pending;
@@ -649,11 +682,18 @@ ph_stats_frame(struct ph_context *ctx)
               ctx->stat.submits / n, ctx->stat.vertex_dwords / n,
               ctx->stat.clears / n, ctx->stat.clear_pixels / n / 1e6,
               ctx->stat.waits / n, ctx->stat.wait_ns / n / 1e6);
-   if (ctx->stat.start_ns && (ctx->tcl_draws || ctx->tcl_fallbacks))
+   if (ctx->stat.start_ns && (ctx->tcl_draws || ctx->tcl_fallbacks ||
+                              ctx->tcl_reason[PH_TCL_NO_PRIMITIVE] ||
+                              ctx->tcl_reason[PH_TCL_NO_FIXUP]))
       fprintf(stderr,
               "parhelia stats/frame: %.1f hardware-transform draws (%.1f compiled vertex programs), %.1f not expressible, %.1f handed back to the software clipper\n",
               ctx->tcl_draws / n, ctx->tcl_program_draws / n,
               ctx->tcl_fallbacks / n, ctx->tcl_clip_fallbacks / n);
+   for (unsigned r = 0; ctx->stat.start_ns && r < PH_TCL_REASONS; r++)
+      if (ctx->tcl_reason[r])
+         fprintf(stderr, "  off the hardware transform: %-24s %.1f draws\n",
+                 ph_tcl_reason_names[r], ctx->tcl_reason[r] / n);
+   memset(ctx->tcl_reason, 0, sizeof(ctx->tcl_reason));
    ctx->tcl_draws = ctx->tcl_fallbacks = ctx->tcl_clip_fallbacks = 0;
    ctx->tcl_program_draws = 0;
    for (unsigned k = 0; ctx->stats_sync && k < PH_STAT_KINDS; k++)
@@ -6605,6 +6645,13 @@ struct ph_tcl_layout {
  * alpha work-arounds own the vertex layout, the software clipper owns user
  * clip planes, and polygon offset has no place in the WARP program. */
 static bool
+ph_tcl_no(struct ph_context *ctx, enum ph_tcl_reason reason)
+{
+   ctx->tcl_last_reason = reason;
+   return false;
+}
+
+static bool
 ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
 {
    const struct pipe_rasterizer_state *rs = ctx->rasterizer;
@@ -6620,33 +6667,40 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
 
    /* The transform stream feeds unit u from GL coordinate set u. */
    if (ctx->fs && ctx->fs->unit_remap)
-      return false;
+      return ph_tcl_no(ctx, PH_TCL_NO_UNIT_REMAP);
    if (!ctx->tcl_available || ctx->tcl_forced_off || !ctx->vs ||
        (!ctx->vs->ff_transform && !ctx->vs->hw_program) || !ctx->velems ||
-       ctx->derived_triangles || ph_two_sided_stencil(ctx) ||
+       ctx->derived_triangles ||
        !ctx->have_viewport || !ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture)
-      return false;
+      return ph_tcl_no(ctx, PH_TCL_NO_UNAVAILABLE);
+   if (ph_two_sided_stencil(ctx))
+      return ph_tcl_no(ctx, PH_TCL_NO_TWO_SIDED_STENCIL);
    lay->program = !ctx->vs->ff_transform;
    /* A compiled program always writes o1, so the fragment stage has an
     * interpolated colour whether the shader computed one or not. */
    colour = lay->program || ctx->vs->colour_input >= 0;
-   if (rs && (rs->clip_plane_enable || rs->offset_tri || rs->offset_line ||
-              rs->offset_point || rs->rasterizer_discard || rs->flatshade ||
+   if (rs && rs->clip_plane_enable)
+      return ph_tcl_no(ctx, PH_TCL_NO_CLIP_PLANES);
+   if (rs && (rs->offset_tri || rs->offset_line || rs->offset_point))
+      return ph_tcl_no(ctx, PH_TCL_NO_POLYGON_OFFSET);
+   if (rs && rs->flatshade)
+      return ph_tcl_no(ctx, PH_TCL_NO_FLATSHADE);
+   if (rs && (rs->rasterizer_discard ||
               rs->clip_halfz || !rs->depth_clip_near || !rs->depth_clip_far ||
               rs->fill_front != PIPE_POLYGON_MODE_FILL ||
               rs->fill_back != PIPE_POLYGON_MODE_FILL ||
               /* no packet encoding culls both faces; the draw module does */
               rs->cull_face == PIPE_FACE_FRONT_AND_BACK))
-      return false;
+      return ph_tcl_no(ctx, PH_TCL_NO_RASTER_STATE);
    /* v1 - the secondary colour or the fog coordinate - is carried only by
     * the window-space stream. */
    if (ctx->fs && ctx->fs->program.valid && ctx->fs->program.uses_color1)
-      return false;
-   /* An untextured colour with a visible alpha needs the RGBA stream, which
-    * is measured only in window space (x,y,z,r,g,b,a); the draw module
-    * stages it. */
+      return ph_tcl_no(ctx, PH_TCL_NO_COLOUR1);
+   /* An untextured colour with a visible alpha needs the RGBA stream: its
+    * transforming form drew right in --colour-alpha-probe but stopped the
+    * engine on a 100000-vertex GL_POLYGON, so the draw module stages it. */
    if (!textured && ph_colour_alpha_observable(ctx))
-      return false;
+      return ph_tcl_no(ctx, PH_TCL_NO_RGBA_COLOUR);
    /* The alpha routes below re-shape or replace the vertex stream. */
    if (ph_use_vertex_alpha(ctx, textured, multitextured, depth, colour) ||
        ph_use_alpha_micro(ctx, textured, multitextured, depth, colour) ||
@@ -6654,7 +6708,7 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
        ph_use_cpu_alpha_cutout(ctx, textured, multitextured, depth, colour) ||
        ph_use_rgb_alpha_two_pass(ctx, textured, multitextured, colour) ||
        ph_use_native_sampled_alpha(ctx, textured, multitextured, depth))
-      return false;
+      return ph_tcl_no(ctx, PH_TCL_NO_ALPHA_ROUTE);
    if (lay->program) {
       /* The program may only read fetch slots this stream declares, and the
        * hardware drops coordinate set 1 unless o4 is written. */
@@ -6668,12 +6722,12 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
 
       if ((ctx->vs->prog.input_mask & ~available) ||
           (ctx->vs->prog.output_mask & needed) != needed)
-         return false;
+         return ph_tcl_no(ctx, PH_TCL_NO_PROGRAM_IO);
       if (!ph_vs_upload_program(ctx, ctx->vs))
-         return false;
+         return ph_tcl_no(ctx, PH_TCL_NO_UNAVAILABLE);
    } else if ((textured && ctx->vs->texcoord_input[0] < 0) ||
               (multitextured && ctx->vs->texcoord_input[1] < 0)) {
-      return false;
+      return ph_tcl_no(ctx, PH_TCL_NO_TEXCOORD);
    }
    /* A two-set transformed draw wedges the engine: the GL test's two-unit
     * scene stopped the pipeline dead on 2026-09-11 (async fence 0x180 made no
@@ -6681,14 +6735,14 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
     * were pixel-identical to the software path.  Keep the route behind an
     * explicit opt-in until that is understood. */
    if (multitextured && !ctx->tcl_multitexture)
-      return false;
+      return ph_tcl_no(ctx, PH_TCL_NO_MULTITEXTURE);
    if (!lay->program &&
        ((multitextured && !ctx->warp_transform_multitex) ||
         (textured && !ctx->warp_transform_textured)))
-      return false;
+      return ph_tcl_no(ctx, PH_TCL_NO_UNAVAILABLE);
    /* A three-coordinate set does not fit the transform program's stream. */
    if (textured && ph_three_coord_texture(ctx))
-      return false;
+      return ph_tcl_no(ctx, PH_TCL_NO_THREE_COORD);
 
    lay->textured = textured;
    lay->multitextured = multitextured;
@@ -6885,6 +6939,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    uint32_t entry = 0;
    float mvp[16];
 
+   ctx->tcl_last_reason = PH_TCL_NO_DRAW_SHAPE;
    if (info->primitive_restart || info->instance_count != 1 ||
        !ph_tcl_layout(ctx, &lay) || !ph_tcl_matrix(ctx, mvp))
       goto fallback;
@@ -6900,8 +6955,10 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    }
    if (lay.program) {
       entry = ctx->vs->prog_entry;
-      if (!ph_tcl_program_constants(ctx, ctx->vs, &vs_const_vec4s))
+      if (!ph_tcl_program_constants(ctx, ctx->vs, &vs_const_vec4s)) {
+         ctx->tcl_last_reason = PH_TCL_NO_CONSTANTS;
          goto fallback;
+      }
    }
 
    key.output_stride = lay.dpv * sizeof(float);
@@ -7043,6 +7100,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    return true;
 fallback:
    ctx->tcl_fallbacks++;
+   ctx->tcl_reason[ctx->tcl_last_reason]++;
    return false;
 }
 
@@ -7820,6 +7878,8 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                      ph_fs_samples_rect(ctx->fs)) &&
                     (ctx->quant_stage ||
                      (ctx->quant_stage = ph_quant_create_stage(ctx)));
+   if (derived || fix)
+      ctx->tcl_reason[derived ? PH_TCL_NO_PRIMITIVE : PH_TCL_NO_FIXUP]++;
    if (!derived && !fix && ph_draw_tcl(ctx, info, draws))
       goto unbind;
    /* A software-transformed batch must not inherit an object-space one. */
