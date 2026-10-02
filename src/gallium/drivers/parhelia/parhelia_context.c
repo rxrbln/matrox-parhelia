@@ -6122,6 +6122,52 @@ ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
  * Textured and smooth lines are expanded to triangles: their fragment and
  * coverage semantics on the native line primitive are unproven.  Aliased
  * lines of width 1.5 and more arrive already expanded by the draw module. */
+/* A line end the clipper made on the viewport edge is not where the line
+ * ends: GL draws the edge pixel the line passes through.  Move such an end
+ * one pixel further along the line, extrapolating every attribute, and let
+ * the screen bounds trim the overhang.  Clipped vertices carry no vertex id
+ * (draw_pipe_clip.c). */
+static struct prim_header *
+ph_extend_clipped_line(struct draw_stage *stage, struct prim_header *prim,
+                       int pos, struct prim_header *out)
+{
+   struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   const float *t = ctx->viewport.translate, *sc = ctx->viewport.scale;
+   const float *p0 = prim->v[0]->data[pos], *p1 = prim->v[1]->data[pos];
+   const float dx = p1[0] - p0[0], dy = p1[1] - p0[1];
+   const float major = MAX2(fabsf(dx), fabsf(dy));
+   const unsigned attrs = draw_num_shader_outputs(stage->draw);
+   bool any = false;
+
+   if (major <= 0.0f)
+      return prim;
+   *out = *prim;
+   for (unsigned e = 0; e < 2; e++) {
+      const struct vertex_header *v = prim->v[e];
+      const float *p = v->data[pos];
+      const bool edge =
+         fabsf(p[0] - (t[0] - fabsf(sc[0]))) < 1e-3f ||
+         fabsf(p[0] - (t[0] + fabsf(sc[0]))) < 1e-3f ||
+         fabsf(p[1] - (t[1] - fabsf(sc[1]))) < 1e-3f ||
+         fabsf(p[1] - (t[1] + fabsf(sc[1]))) < 1e-3f;
+      struct vertex_header *x;
+      float k;
+
+      if (v->vertex_id != UNDEFINED_VERTEX_ID || !edge)
+         continue;
+      /* One pixel along the major axis, away from the other end. */
+      k = 1.0f / major;
+      x = dup_vert(stage, v, 3 + e);
+      for (unsigned a = 0; a < attrs; a++)
+         for (unsigned c = 0; c < 4; c++)
+            x->data[a][c] = v->data[a][c] +
+               k * (v->data[a][c] - prim->v[!e]->data[a][c]);
+      out->v[e] = x;
+      any = true;
+   }
+   return any ? out : prim;
+}
+
 static void
 ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
 {
@@ -6141,6 +6187,8 @@ ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
    col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
    if (pos < 0)
       return;
+   struct prim_header extended;
+   prim = ph_extend_clipped_line(stage, prim, pos, &extended);
    has_texture = ph_samples_unit0(ctx);
    if (ph_env("PARHELIA_TRACE_PRIM"))
       fprintf(stderr, "parhelia: line %g,%g-%g,%g width=%g tex=%u smooth=%u cull=%u derived=%u\n",
@@ -6222,8 +6270,8 @@ ph_create_stage(struct ph_context *ctx)
    s->base.flush = ph_stage_flush;
    s->base.reset_stipple_counter = ph_stage_reset;
    s->base.destroy = ph_stage_destroy;
-   /* One fan triangle at a time: ph_stage_tri copies each vertex out. */
-   if (!draw_alloc_temp_verts(&s->base, 3)) {
+   /* One fan triangle at a time (0..2), plus two extended line ends. */
+   if (!draw_alloc_temp_verts(&s->base, 5)) {
       FREE(s);
       return NULL;
    }
@@ -11817,6 +11865,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    /* Quad-rasterized (sprite) points become textured quads in the draw
     * module, which also generates their sprite coordinates. */
    draw_wide_point_sprites(ctx->draw, true);
+   /* Every line reaches ph_stage_line, which knows its clipped ends. */
+   draw_wide_line_threshold(ctx->draw, 2048.0f);
 
    ctx->base.destroy = ph_destroy_context;
    ctx->base.draw_vbo = ph_draw_vbo;
