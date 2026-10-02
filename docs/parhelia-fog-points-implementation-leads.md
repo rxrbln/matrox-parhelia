@@ -1079,3 +1079,13 @@ the compare against `1.0f` expects (pre-computed distance + 1 or a ratio),
 and the exact `0x111c`/`0x1130` arming.  The test needs the vendor link
 `0x13b, 0x13d, 0x13e, table, 0x136, 0x138/0x139` - not the resident
 `stage-c.bin` subset - and is lockup-risky.
+
+The plane equations: `mtx2522` (`.text+0x87790`) walks the six plane bits
+(`glstate[0xf] >> 1 & 0x3f`), and for each **enabled** plane, packed in
+order, copies its 16-byte equation (`ctx+0x3d00[k]`) into WARP constant
+`0x16c + k` (marked dirty through `mtx2702(ctx+0x7e8, 0x16c + k)` and
+`mtx2702(ctx+0x2218, ...)`), multiplied first by the 4x4 matrix at
+`ctx+0x1f4` (`out[i] = dot(M row i, plane)`; which matrix that is - the
+inverse projection, so the plane lands in clip space - is not yet proven).
+So the clipper's `dp4 T[a0.z+1], c[0x16c + k]` is a plane distance per edge
+vertex.
