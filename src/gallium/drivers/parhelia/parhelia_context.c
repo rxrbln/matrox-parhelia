@@ -2822,9 +2822,9 @@ ph_prepare_alpha_companions(struct ph_context *ctx,
       return 0;
    if (!texture->map || !texture->mip.levels)
       return -EINVAL;
-   /* A prior draw may still sample the existing companions asynchronously.
-    * UPLOAD_RENDER is a CPU write into their storage, so wait before refresh. */
-   if ((ret = ph_wait_async(ctx)))
+   /* The kernel orders UPLOAD_RENDER after every submitted draw (queued blit
+    * or drained aperture copy): only batched draws must go out first. */
+   if ((ret = ph_drain_batch(ctx)))
       return ret;
    texture->alpha_companion_generation = UINT64_MAX;
 
