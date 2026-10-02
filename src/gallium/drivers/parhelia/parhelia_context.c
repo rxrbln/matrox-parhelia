@@ -306,6 +306,15 @@ struct ph_context {
     * original family keeps its previous paths until measured there. */
    bool z_grid, logicop_grid, kill_alpha;
    bool broadcasting;      /* ph_draw_broadcast is replaying a draw */
+   /* The framebuffer as the state tracker set it, and the stand-in render
+    * resources for surfaces the engine cannot address in place (a mip level
+    * above 0 or a slice): ctx->fb binds the stand-ins. */
+   struct pipe_framebuffer_state fb_api;
+   struct ph_level_proxy {
+      struct pipe_resource *res, *proxy;
+      unsigned level, layer;
+   } proxy[PIPE_MAX_COLOR_BUFS + 1];
+   unsigned proxy_count;
    /* The native rasterise stage, and the logic-op colour grid in front. */
    struct draw_stage *hw_stage, *quant_stage, *zpix_stage;
    /* A fragment shader stand-in that passes the vertex colour, bound while
@@ -570,6 +579,8 @@ ph_fs_kill_route(struct ph_context *ctx, struct ph_fs_program **prog,
                  enum pipe_compare_func *func, uint8_t *ref);
 static bool ph_fs_untextured_program(struct ph_context *ctx);
 static bool ph_nir_def_uniform(nir_def *def, unsigned depth);
+static void ph_proxy_writeback(struct ph_context *ctx);
+static void ph_proxy_release(struct ph_context *ctx);
 static float ph_depth_window(double d, unsigned bits);
 
 static inline struct ph_context *
@@ -8502,6 +8513,10 @@ unbind:
       draw_set_mapped_vertex_buffer(ctx->draw, i, NULL, 0);
    if (indices)
       draw_set_indexes(ctx->draw, NULL, 0, 0);
+   if (ctx->proxy_count) {
+      ph_submit_vertices(ctx);
+      ph_proxy_writeback(ctx);
+   }
 }
 
 static void *ph_memdup(const void *src, size_t size)
@@ -9713,6 +9728,81 @@ ph_promote_target(struct ph_context *ctx, struct pipe_resource *res)
    return true;
 }
 
+/* The engine renders into the base image of a 2-D resource only.  A surface
+ * on a mip level above 0, a slice or a cube face is bound through a stand-in render
+ * resource of that level's size, loaded from the level when bound and
+ * written back after every draw and clear, so readers always see it. */
+static void
+ph_proxy_writeback(struct ph_context *ctx)
+{
+   for (unsigned i = 0; i < ctx->proxy_count; i++) {
+      const struct ph_level_proxy *x = &ctx->proxy[i];
+      struct pipe_box box;
+
+      u_box_3d(0, 0, 0, x->proxy->width0, x->proxy->height0, 1, &box);
+      if (ph_env("PARHELIA_TRACE_PROXY"))
+         fprintf(stderr, "parhelia: stand-in %ux%u -> level %u layer %u of %ux%ux%u target %u\n",
+                 x->proxy->width0, x->proxy->height0, x->level, x->layer,
+                 x->res->width0, x->res->height0, x->res->depth0,
+                 x->res->target);
+      ctx->base.resource_copy_region(&ctx->base, x->res, x->level, 0, 0,
+                                     x->layer, x->proxy, 0, &box);
+   }
+}
+
+static void
+ph_proxy_release(struct ph_context *ctx)
+{
+   ph_proxy_writeback(ctx);
+   for (unsigned i = 0; i < ctx->proxy_count; i++) {
+      pipe_resource_reference(&ctx->proxy[i].res, NULL);
+      pipe_resource_reference(&ctx->proxy[i].proxy, NULL);
+   }
+   ctx->proxy_count = 0;
+}
+
+static void
+ph_proxy_bind(struct ph_context *ctx, struct pipe_surface *surf)
+{
+   struct pipe_resource *res = surf->texture, templ, *proxy;
+   const bool zs = util_format_is_depth_or_stencil(surf->format);
+   struct ph_level_proxy *x;
+   struct pipe_box box;
+
+   /* A volume or cube map keeps sampler-only storage at every slice. */
+   if (!res || res->target == PIPE_BUFFER ||
+       (!surf->level && !surf->first_layer && !surf->last_layer &&
+        res->target != PIPE_TEXTURE_3D && res->target != PIPE_TEXTURE_CUBE) ||
+       ctx->proxy_count >= ARRAY_SIZE(ctx->proxy))
+      return;
+   memset(&templ, 0, sizeof(templ));
+   templ.target = PIPE_TEXTURE_2D;
+   templ.format = surf->format;
+   templ.width0 = u_minify(res->width0, surf->level);
+   templ.height0 = u_minify(res->height0, surf->level);
+   templ.depth0 = templ.array_size = 1;
+   templ.bind = zs ? PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET;
+   proxy = ctx->base.screen->resource_create(ctx->base.screen, &templ);
+   if (!proxy) {
+      fprintf(stderr, "parhelia: no %ux%u stand-in for a level %u surface\n",
+              templ.width0, templ.height0, surf->level);
+      return;
+   }
+   u_box_3d(0, 0, surf->first_layer, templ.width0, templ.height0, 1, &box);
+   ctx->base.resource_copy_region(&ctx->base, proxy, 0, 0, 0, 0, res,
+                                  surf->level, &box);
+   x = &ctx->proxy[ctx->proxy_count++];
+   x->res = NULL;
+   x->proxy = NULL;
+   pipe_resource_reference(&x->res, res);
+   x->proxy = proxy;
+   x->level = surf->level;
+   x->layer = surf->first_layer;
+   pipe_resource_reference(&surf->texture, proxy);
+   surf->level = 0;
+   surf->first_layer = surf->last_layer = 0;
+}
+
 static void
 ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *fb)
 {
@@ -9726,8 +9816,21 @@ ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *
    /* Gallium rebinds the same Q3 colour/depth pair frequently.  It is not a
     * rendering boundary: draining here turns otherwise batchable triangles
     * into tiny submits and forces async retirement pressure. */
-   if (util_framebuffer_state_equal(&ctx->fb, fb))
+   if (util_framebuffer_state_equal(&ctx->fb_api, fb))
       return;
+   ph_submit_vertices(ctx);
+   ph_proxy_release(ctx);
+   util_copy_framebuffer_state(&ctx->fb_api, fb);
+   struct pipe_framebuffer_state bound;
+
+   memset(&bound, 0, sizeof(bound));
+   if (fb) {
+      util_copy_framebuffer_state(&bound, fb);
+      for (unsigned i = 0; i < bound.nr_cbufs; i++)
+         ph_proxy_bind(ctx, &bound.cbufs[i]);
+      ph_proxy_bind(ctx, &bound.zsbuf);
+      fb = &bound;
+   }
    /* Only one depth surface may own the Z unit's tracked state.  A draw that
     * binds no depth surface at all leaves it alone (measured), so a
     * framebuffer without one is not a handover. */
@@ -9745,6 +9848,7 @@ ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *
    if (fb && fb->zsbuf.texture)
       draw_set_zs_format(ctx->draw, fb->zsbuf.format);
    ph_update_viewport(ctx);
+   util_unreference_framebuffer_state(&bound);
 }
 
 /* PLNWT bit planes of the colour components enabled in @colormask.  The fill
@@ -10338,6 +10442,8 @@ ph_clear(struct pipe_context *p, unsigned buffers, uint32_t color_mask,
          ph_clear_level(ctx, &ctx->fb.zsbuf, NULL, 0, buffers, depth,
                         stencil, stencil_mask, x0, y0, x1 - x0, y1 - y0);
    }
+   if (ctx->proxy_count)
+      ph_proxy_writeback(ctx);
 }
 
 /* The clear packet addresses the base image only. */
@@ -11684,6 +11790,8 @@ ph_destroy_context(struct pipe_context *p)
    }
    for (unsigned i = 0; i < MESA_SHADER_STAGES; i++)
       pipe_resource_reference(&ctx->constants[i], NULL);
+   ph_proxy_release(ctx);
+   util_unreference_framebuffer_state(&ctx->fb_api);
    util_unreference_framebuffer_state(&ctx->fb);
    if (p->stream_uploader)
       u_upload_destroy(p->stream_uploader);
