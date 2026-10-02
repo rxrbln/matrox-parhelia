@@ -279,7 +279,8 @@ struct ph_context {
    bool tcl_programs;
    bool have_viewport;
    struct ph_vs *vs;
-   struct pipe_viewport_state viewport;
+   struct pipe_viewport_state viewport;      /* depth range on the Z grid */
+   struct pipe_viewport_state api_viewport;  /* as the state tracker set it */
    /* Set while the pending batch carries object-space vertices.  mvp holds
     * the WARP c0..c3 rows, i.e. the transpose of the shader's matrix. */
    bool transform;
@@ -3287,7 +3288,7 @@ ph_cpu_cutout_triangle(const float *in, struct parhelia_resource *color,
          if (a < 128.0f)
             continue;
          z = CLAMP(l0 * v[0][2] + l1 * v[1][2] + l2 * v[2][2], 0.0f, 1.0f);
-         new_z = (uint32_t)lrintf(z * 16777215.0f) & 0x00ffffffu;
+         new_z = MIN2((uint32_t)(z * 16777216.0f), 0x00ffffffu);
          depth_pixel = ph_cpu_linear_pixel(depth, x, y);
          memcpy(&old_z, depth_pixel, sizeof(old_z));
          if (new_z > (old_z & 0x00ffffffu))
@@ -3371,7 +3372,7 @@ ph_cpu_alpha_blend_triangle(const float *in, struct parhelia_resource *color,
          if (dsa->depth_enabled) {
             uint8_t *depth_pixel;
             z = CLAMP(l0 * v[0][2] + l1 * v[1][2] + l2 * v[2][2], 0.0f, 1.0f);
-            new_z = (uint32_t)lrintf(z * 16777215.0f) & 0x00ffffffu;
+            new_z = MIN2((uint32_t)(z * 16777216.0f), 0x00ffffffu);
             depth_pixel = ph_cpu_linear_pixel(depth, x, y);
             memcpy(&old_z, depth_pixel, sizeof(old_z));
             if (!ph_cpu_depth_pass(dsa->depth_func, new_z, old_z & 0x00ffffffu))
@@ -7526,6 +7527,51 @@ ph_set_constant_buffer(struct pipe_context *p, mesa_shader_stage sh,
    ctx->constant_size[sh] = cb ? cb->buffer_size : 0;
 }
 
+/* The Z unit converts a window depth d to fixed point as d * 2^n (a 0.75
+ * quad stores 0xc00000 into Z24, MEASURED on the P690; D16 stores
+ * round(d * 65536)), where GL and every clear path use d * (2^n - 1), so an
+ * EQUAL test against a cleared 0.75 failed.  Scale the viewport's depth
+ * range by (2^n - 1) / 2^n for the bound depth buffer. */
+/* The code an n-bit Z buffer receives for window depth @d: d as the
+ * viewport transform of the default depth range produces it in single
+ * precision, scaled by (2^n - 1) / 2^n and truncated by the Z unit. */
+static uint32_t
+ph_depth_code(double d, unsigned bits)
+{
+   const float half = 0.5f * (float)((1u << bits) - 1) / (float)(1u << bits);
+   const float ndc = (float)(2.0 * CLAMP(d, 0.0, 1.0) - 1.0);
+   const float z = ndc * half + half;
+
+   return MIN2((uint32_t)(z * (float)(1u << bits)), (1u << bits) - 1);
+}
+
+static void
+ph_update_viewport(struct ph_context *ctx)
+{
+   struct pipe_viewport_state vp = ctx->api_viewport;
+   const enum pipe_format zf = ctx->fb.zsbuf.texture ? ctx->fb.zsbuf.format :
+                                                       PIPE_FORMAT_NONE;
+   const struct util_format_description *desc = util_format_description(zf);
+   const unsigned bits = desc && util_format_has_depth(desc) ?
+      desc->channel[desc->swizzle[0]].size : 0;
+
+   if (!ctx->have_viewport)
+      return;
+   if (bits && bits < 32) {
+      const float k = (float)((1u << bits) - 1) / (float)(1u << bits);
+
+      vp.scale[2] *= k;
+      vp.translate[2] *= k;
+   }
+   ctx->viewport_y_flip = vp.scale[1] < 0.0f;
+   /* c8/c9 are per batch: a transforming batch cannot span viewports. */
+   if (ctx->triangles && ctx->transform &&
+       memcmp(&ctx->viewport, &vp, sizeof ctx->viewport))
+      ph_submit_vertices(ctx);
+   ctx->viewport = vp;
+   draw_set_viewport_states(ctx->draw, 0, 1, &vp);
+}
+
 static void ph_set_viewport(struct pipe_context *p, unsigned start,
                             unsigned count, const struct pipe_viewport_state *vp)
 {
@@ -7538,16 +7584,12 @@ static void ph_set_viewport(struct pipe_context *p, unsigned start,
                  start + i, vp[i].scale[0], vp[i].scale[1], vp[i].scale[2],
                  vp[i].translate[0], vp[i].translate[1], vp[i].translate[2]);
    }
-   if (!start && count) {
-      ctx->viewport_y_flip = vp[0].scale[1] < 0.0f;
-      /* c8/c9 are per batch: a transforming batch cannot span viewports. */
-      if (ctx->triangles && ctx->transform &&
-          memcmp(&ctx->viewport, &vp[0], sizeof ctx->viewport))
-         ph_submit_vertices(ctx);
-      ctx->viewport = vp[0];
-      ctx->have_viewport = true;
-   }
    draw_set_viewport_states(ctx->draw, start, count, vp);
+   if (!start && count) {
+      ctx->api_viewport = vp[0];
+      ctx->have_viewport = true;
+      ph_update_viewport(ctx);
+   }
 }
 static void ph_set_clip(struct pipe_context *p, const struct pipe_clip_state *clip)
 { draw_set_clip_state(ph_context(p)->draw, clip); }
@@ -7650,6 +7692,7 @@ ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *
    util_copy_framebuffer_state(&ctx->fb, fb);
    if (fb && fb->zsbuf.texture)
       draw_set_zs_format(ctx->draw, fb->zsbuf.format);
+   ph_update_viewport(ctx);
 }
 
 /* PLNWT bit planes of the colour components enabled in @colormask.  The fill
@@ -8079,12 +8122,14 @@ ph_clear_zs(struct ph_context *ctx, const struct pipe_surface *surf,
       PH_REFUSE("a depth clear of format %u is dropped\n", surf->format);
       return;
    }
-   /* The vendor packs D16 as min(d * 65536, 0xffff), replicated for the
-    * dword fill (docs/parhelia-p690-zcompression-clear-banks-re.md 4.3). */
+   /* The Z unit stores a window depth d as trunc(d * 2^n) (the vendor packs
+    * D16 clears as min(d * 65536, 0xffff), docs/parhelia-p690-zcompression-
+    * clear-banks-re.md 4.3); ph_update_viewport scales d by (2^n - 1) / 2^n
+    * in single precision, so a clear stores what a fragment at d stores. */
    if (surf->format == PIPE_FORMAT_Z16_UNORM)
-      value = (uint32_t)MIN2(depth * 65536.0, 65535.0) * 0x10001u;
+      value = ph_depth_code(depth, 16) * 0x10001u;
    else
-      value = util_pack_z_stencil(surf->format, depth, stencil);
+      value = ph_depth_code(depth, 24) | (stencil & 0xffu) << 24;
    if (ph_zinit_clear(ctx, r, value, mask, x, y, width, height) ||
        ph_zinit_rect_clear(ctx, r, value, mask, x, y, width, height))
       return;
