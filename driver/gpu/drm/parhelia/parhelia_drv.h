@@ -565,6 +565,8 @@ struct parhelia_device {
 	struct list_head host_view_dead;
 	struct work_struct host_view_work;
 	bool aperture_live;
+	/* BAR0 address bits 27:25, part of every descriptor coordinate */
+	u32 aperture_coord_base;
 	/* Default-off root corruption tracer.  The saved sample survives across
 	 * ioctl and mmap boundaries, so a userspace store between two kernel
 	 * entries is reported at the next boundary. */

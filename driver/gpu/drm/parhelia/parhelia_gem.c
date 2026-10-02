@@ -191,6 +191,12 @@ void parhelia_host_aperture_init(struct parhelia_device *pdev)
 	drm_mm_init(&pdev->aperture_mm, PARHELIA_HOST_APERTURE_FIRST,
 		    PARHELIA_HOST_APERTURE_LIMIT - PARHELIA_HOST_APERTURE_FIRST);
 	INIT_LIST_HEAD(&pdev->aperture_mappings);
+	/* EmulMmSurfaceMapper keeps BAR0 bits 27:25 and ORs them into every
+	 * coordinate it publishes (mtx_drv.so .text+0x74bdd, +0x74cc9).
+	 * Without them the top descriptor shadowed all the others: the bank
+	 * appears to decode the largest coordinate not above the access. */
+	pdev->aperture_coord_base = lower_32_bits(pci_resource_start(pdev->pdev, 0)) &
+				    GENMASK(27, 25);
 	INIT_LIST_HEAD(&pdev->host_view_lru);
 	INIT_LIST_HEAD(&pdev->host_view_dead);
 	INIT_WORK(&pdev->host_view_work, parhelia_host_view_reap);
@@ -217,6 +223,7 @@ static void parhelia_aperture_program(struct parhelia_device *pdev, u8 slot,
 	parhelia_write(pdev, reg + 12, mapping->dims);
 	wmb();
 	parhelia_write(pdev, reg, PARHELIA_HOST_APERTURE_VALID |
+		       pdev->aperture_coord_base |
 		       lower_32_bits(mapping->node.start));
 	parhelia_read(pdev, reg);
 	parhelia_aperture_set_slot(mapping, slot);
@@ -226,7 +233,7 @@ static bool parhelia_host_view_evict_one_locked(struct parhelia_device *pdev);
 
 static int parhelia_aperture_try_alloc_locked(struct parhelia_device *pdev,
 					      struct parhelia_aperture_mapping *mapping,
-					      u32 map_size, bool type0)
+					      u32 map_size)
 {
 	u64 span;
 
@@ -246,9 +253,8 @@ static int parhelia_aperture_try_alloc_locked(struct parhelia_device *pdev,
 	INIT_LIST_HEAD(&mapping->link);
 	mapping->map_size = map_size;
 	return drm_mm_insert_node_generic(&pdev->aperture_mm, &mapping->node,
-					  span, PARHELIA_HOST_APERTURE_ALIGN, 0,
-					  type0 ? DRM_MM_INSERT_HIGH :
-						  DRM_MM_INSERT_LOW);
+					  span, PARHELIA_HOST_APERTURE_ALIGN,
+					  0, DRM_MM_INSERT_LOW);
 }
 
 static bool parhelia_engine_parked(struct parhelia_device *pdev)
@@ -261,47 +267,26 @@ static bool parhelia_engine_parked(struct parhelia_device *pdev)
  * parked may do it. */
 static int parhelia_aperture_alloc_locked(struct parhelia_device *pdev,
 					  struct parhelia_aperture_mapping *mapping,
-					  u32 map_size, bool type0)
+					  u32 map_size)
 {
 	int ret;
 
 	do {
-		ret = parhelia_aperture_try_alloc_locked(pdev, mapping, map_size,
-							 type0);
+		ret = parhelia_aperture_try_alloc_locked(pdev, mapping, map_size);
 	} while (ret == -ENOSPC && parhelia_engine_parked(pdev) &&
 		 parhelia_host_view_evict_one_locked(pdev));
 	return ret;
 }
 
-static bool parhelia_raw_views_evict_locked(struct parhelia_device *pdev,
-					    bool dry_run);
-
-/* Allocate a window for a caller that may not hold the engine parked.  Two
- * type-0 descriptors never coexist (a second one left the first undecoded,
- * reading 0xffffffff), so a type-0 window first revokes the raw views, and
- * either revocation parks the engine when the caller has not.  *parked tells
- * the caller to parhelia_submit_unlock() once its window is released. */
+/* For callers that do not park the engine themselves: park it and retry
+ * when only revoking host views can make room.  *parked tells the caller
+ * to parhelia_submit_unlock() once its window is released. */
 static int parhelia_aperture_alloc_window(struct parhelia_device *pdev,
 					  struct parhelia_aperture_mapping *mapping,
-					  u32 map_size, bool type0, bool *parked)
+					  u32 map_size, bool *parked)
 {
-	int ret;
+	int ret = parhelia_aperture_alloc_locked(pdev, mapping, map_size);
 
-	lockdep_assert_held(&pdev->aperture_lock);
-	if (type0 && !parhelia_engine_parked(pdev) &&
-	    parhelia_raw_views_evict_locked(pdev, true)) {
-		if (pdev->submit_owner == current)
-			return -EBUSY;
-		mutex_unlock(&pdev->aperture_lock);
-		ret = parhelia_submit_idle_lock(pdev);
-		mutex_lock(&pdev->aperture_lock);
-		if (ret)
-			return ret;
-		*parked = true;
-	}
-	if (type0)
-		parhelia_raw_views_evict_locked(pdev, false);
-	ret = parhelia_aperture_alloc_locked(pdev, mapping, map_size, type0);
 	if (ret != -ENOSPC || parhelia_engine_parked(pdev) ||
 	    pdev->submit_owner == current || list_empty(&pdev->host_view_lru))
 		return ret;
@@ -311,7 +296,7 @@ static int parhelia_aperture_alloc_window(struct parhelia_device *pdev,
 	if (ret)
 		return ret;
 	*parked = true;
-	return parhelia_aperture_alloc_locked(pdev, mapping, map_size, type0);
+	return parhelia_aperture_alloc_locked(pdev, mapping, map_size);
 }
 
 static void parhelia_aperture_free_unpublished_locked(
@@ -370,7 +355,7 @@ int parhelia_host_aperture_acquire(struct parhelia_device *pdev,
 	int ret;
 
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_locked(pdev, mapping, map_size, false);
+	ret = parhelia_aperture_alloc_locked(pdev, mapping, map_size);
 	if (!ret)
 		parhelia_aperture_publish_locked(pdev, mapping, surface, ctrl,
 						 dims, owner);
@@ -626,8 +611,7 @@ int parhelia_vram_copy_resources(struct parhelia_device *pdev,
 	if (!bounce)
 		return -ENOMEM;
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, true,
-					     &parked);
+	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, &parked);
 	for (done = 0; !ret && done < size; done += SZ_8K) {
 		u32 bytes = min_t(u64, size - done, SZ_8K);
 		u32 src, dst;
@@ -687,8 +671,7 @@ int parhelia_vram_move_pages(struct parhelia_device *pdev,
 		return -EINVAL;
 
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, true,
-					     &parked);
+	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, &parked);
 	for (done = 0; !ret && done < size; ) {
 		u32 bytes = min_t(u64, size - done, SZ_8K);
 		u32 surface_address, in_window = 0;
@@ -835,7 +818,7 @@ static void parhelia_host_vm_close(struct vm_area_struct *vma)
  * stays valid until the object moves, which drops it under the engine park.
  * Raw objects (linear storage, legacy targets) get untranslated type-0 views
  * of their bytes in the same way: a raw BAR0 mapping above 16 MiB folds onto
- * the live descriptor window instead of reaching the object.
+ * the descriptor window instead of reaching the object.
  */
 struct parhelia_host_view {
 	struct parhelia_aperture_mapping mapping;
@@ -846,14 +829,12 @@ struct parhelia_host_view {
 	u64 offset;
 	u32 size;
 	u32 vmap_count;
-	bool raw;
 };
 
-/* A type-3 view larger than 512 KiB is decoded shifted on the P690 (64x16:
- * 768 KiB read from 256 KiB further in, wherever it sits), so objects are
- * bound whole up to that size and in row bands of at most it beyond. */
-#define PARHELIA_HOST_VIEW_WHOLE	SZ_512K
-#define PARHELIA_HOST_VIEW_BAND		SZ_512K
+/* Objects whose CPU view fits this window are bound whole, larger ones in
+ * row bands of about a mebibyte. */
+#define PARHELIA_HOST_VIEW_WHOLE	SZ_4M
+#define PARHELIA_HOST_VIEW_BAND		SZ_1M
 /* The type-0 window shape the transfer paths use: 8 KiB of raw bytes. */
 #define PARHELIA_RAW_VIEW		SZ_8K
 #define PARHELIA_RAW_VIEW_CTRL		0x10000020
@@ -885,25 +866,6 @@ static void parhelia_host_view_destroy_locked(struct parhelia_device *pdev,
 	list_del(&view->lru_link);
 	parhelia_aperture_release_locked(pdev, &view->mapping);
 	kfree(view);
-}
-
-/* Revoke every raw (type-0) view; with @dry_run only report whether any. */
-static bool parhelia_raw_views_evict_locked(struct parhelia_device *pdev,
-					    bool dry_run)
-{
-	struct parhelia_host_view *view, *next;
-	bool found = false;
-
-	lockdep_assert_held(&pdev->aperture_lock);
-	list_for_each_entry_safe(view, next, &pdev->host_view_lru, lru_link) {
-		if (!view->raw)
-			continue;
-		found = true;
-		if (dry_run)
-			break;
-		parhelia_host_view_destroy_locked(pdev, view);
-	}
-	return found;
 }
 
 static bool parhelia_host_view_evict_one_locked(struct parhelia_device *pdev)
@@ -995,8 +957,6 @@ parhelia_host_view_create_locked(struct parhelia_device *pdev,
 		ctrl = (format << 24) | (3u << 16) | (bo->gpu_pitch / bo->cpp);
 		dims = BIT(16) | rows;
 	} else {
-		parhelia_raw_views_evict_locked(pdev, false);
-		view->raw = true;
 		view->offset = rounddown(offset, PARHELIA_RAW_VIEW);
 		view->size = min_t(u64, PARHELIA_RAW_VIEW,
 				   bo->gbo.bo.base.size - view->offset);
@@ -1009,7 +969,7 @@ parhelia_host_view_create_locked(struct parhelia_device *pdev,
 				     &surface);
 	if (!ret)
 		ret = parhelia_aperture_alloc_locked(pdev, &view->mapping,
-						     view->size, view->raw);
+						     view->size);
 	if (ret) {
 		kfree(view);
 		return ERR_PTR(ret);
@@ -1285,8 +1245,7 @@ int parhelia_vram_clear(struct parhelia_device *pdev,
 	int ret;
 
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, true,
-					     &parked);
+	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, &parked);
 	for (done = 0; !ret && done < size; done += SZ_8K) {
 		u32 bytes = min_t(u64, size - done, SZ_8K);
 		u32 surface_address;
@@ -1332,8 +1291,7 @@ int parhelia_vram_write(struct parhelia_device *pdev,
 	if (offset > gbo->bo.base.size || len > gbo->bo.base.size - offset)
 		return -EINVAL;
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, true,
-					     &parked);
+	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, &parked);
 	for (done = 0; !ret && done < len; done += SZ_8K) {
 		u32 bytes = min_t(u64, len - done, SZ_8K);
 		u32 surface_address;
@@ -1528,8 +1486,7 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 	if (ret)
 		goto out_submit_unlock;
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, true,
-					     &parked);
+	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, &parked);
 	if (ret)
 		goto out_aperture_unlock;
 
