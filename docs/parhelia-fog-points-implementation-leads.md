@@ -1005,3 +1005,33 @@ patches through `mtx2634(engine, kind, a, b)` (a patch list at
 in `mtx2884`, so the resident image is selected elsewhere (not yet found).
 Open: who selects `0x133`, how the clip variants map onto the registry, and
 what kind `0x1d` patches.
+
+### The variant-6 (stage-6) program the vendor builds on the P690
+
+Decoded from `mtx2884`/`mtx2788`/`mtx1567` (offline, no hardware run):
+
+* `engine[0xa3120]` is set by `mtx1567`/`mtx2051` to
+  `(dev[0x2440] & 0x7fc00) ? (mode == 0 || mode == 2) : (mode == 2)`, `mode`
+  being a virtual-call result kept at `engine[0xa311c]` - the clipping-type
+  selection (`reg3DClippingType`, 2 = Sundog) gated by the same capability
+  mask the guard-band setup tests.  With it set, `mtx2788` fills the
+  variant-6 table so that every key with `b + r15 = 4, r8 = 4` selects
+  `0x133` (`mtx847`) **independently of the user-plane class `c2c`**; with it
+  clear the same keys select `0x132` (`mtx1706`).
+* Variant 6 enters with `r8 = 4`, so with the flag set (`0xa5da0`) the
+  program is linked as: `0x13b` (`mtx2897`, the 2-instruction prefix);
+  `mtx569` if `0x30(%rsp) == 1` and `r13[9] & 1`; `0x13d` (`mtx4036`, 2);
+  `0x13e` (`mtx1591`, 41); the table entry (`0x133`); **with user planes**
+  (`c2c != 0`) a patch record `mtx2634(engine, 0x23, 1 << (n + 15), 0)` on
+  the last appended fragment followed by `0x136` (`mtx769`, 83); then
+  `0x139` if `r13[4] & 4` else `0x138`; `mtx2936` pads in front of the last
+  fragment to a 32-instruction boundary.
+* The shipped `stage-c.bin` holds only `0x13b + 0x133`, so it is a subset of
+  that link, not the vendor's complete program.  `stage-ab.bin` is
+  `mtx2817 (0x130)` + `mtx2648 (0x13c)` pieces of other variants.
+
+So a user-plane stage-6 image is constructible from symbol bodies plus one
+imm32 patch; still open before any hardware attempt: the exact target of the
+kind-`0x23` patch (`mtx3558`'s record format: instruction index and fragment),
+`mtx569`'s replay, the remaining key fields (`r9`, `c30`, `b`, `r15`), and the
+`0x111c`/`0x1130` field values from the earlier section.
