@@ -15,6 +15,7 @@
 
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_constant_expressions.h"
 #include "draw/draw_context.h"
 #include "draw/draw_fs.h"
 #include "draw/draw_pipe.h"
@@ -115,6 +116,16 @@ struct ph_fs {
    struct ph_fs_program program;
    /* A discard folded into the alpha test, see ph_fs_build_kill(). */
    struct ph_fs_kill *kill;
+   /* Samples whose coordinate is a uniform (a constant glTexCoord), which
+    * the vertex stage stages per vertex; see ph_fs_find_uniform_coords(). */
+   struct ph_uniform_coord *ucoord;
+   unsigned ucoord_count;
+};
+
+struct ph_uniform_coord {
+   nir_def *coord, *projector;
+   unsigned unit;          /* the GL unit, as ph_unit_texcoord() looks it up */
+   unsigned comps;
 };
 
 struct ph_transfer {
@@ -472,6 +483,7 @@ static enum ph_kill_route
 ph_fs_kill_route(struct ph_context *ctx, struct ph_fs_program **prog,
                  enum pipe_compare_func *func, uint8_t *ref);
 static bool ph_fs_untextured_program(struct ph_context *ctx);
+static bool ph_nir_def_uniform(nir_def *def, unsigned depth);
 
 static inline struct ph_context *
 ph_context(struct pipe_context *p)
@@ -6998,8 +7010,13 @@ fallback:
 struct ph_quant_stage {
    struct draw_stage base;
    struct ph_context *ctx;
+   bool quantize;
    int slot[2];
    float scale[4];
+   /* Constant coordinates staged into extra vertex attributes. */
+   unsigned coord_count;
+   int coord_slot[P3D_MAX_TEXTURE_UNITS];
+   float coord[P3D_MAX_TEXTURE_UNITS][4];
 };
 
 static bool
@@ -7033,7 +7050,9 @@ ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
    struct ph_quant_stage *q = (struct ph_quant_stage *)stage;
    struct vertex_header *out = dup_vert(stage, v, idx);
 
-   for (unsigned i = 0; i < 2; i++) {
+   for (unsigned i = 0; i < q->coord_count; i++)
+      memcpy(out->data[q->coord_slot[i]], q->coord[i], sizeof(q->coord[i]));
+   for (unsigned i = 0; q->quantize && i < 2; i++) {
       if (q->slot[i] < 0)
          continue;
       for (unsigned c = 0; c < 4; c++)
@@ -7116,14 +7135,150 @@ ph_quant_create_stage(struct ph_context *ctx)
    return &q->base;
 }
 
+/* Evaluate a value built only from constants and the fragment constant
+ * buffer (ph_nir_def_uniform), with NIR's own opcode semantics. */
+static bool
+ph_nir_eval_uniform(struct ph_context *ctx, nir_def *def,
+                    nir_const_value out[NIR_MAX_VEC_COMPONENTS], unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   if (depth > 16)
+      return false;
+   memset(out, 0, NIR_MAX_VEC_COMPONENTS * sizeof(*out));
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+      memcpy(out, nir_instr_as_load_const(instr)->value,
+             def->num_components * sizeof(*out));
+      return true;
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+      nir_const_value offset[NIR_MAX_VEC_COMPONENTS];
+      uint64_t base;
+
+      if ((in->intrinsic != nir_intrinsic_load_ubo &&
+           in->intrinsic != nir_intrinsic_load_ubo_vec4) ||
+          def->bit_size != 32 ||
+          !ph_nir_eval_uniform(ctx, in->src[1].ssa, offset, depth + 1))
+         return false;
+      base = in->intrinsic == nir_intrinsic_load_ubo ? offset[0].u32 :
+             ((uint64_t)nir_intrinsic_base(in) + offset[0].u32) * 16 +
+             nir_intrinsic_component(in) * 4;
+      for (unsigned c = 0; c < def->num_components; c++) {
+         const uint64_t at = base + 4 * c;
+
+         if (at + 4 > ctx->fs_const_snap_size)
+            return false;
+         memcpy(&out[c].u32, ctx->fs_const_snap + at, 4);
+      }
+      return true;
+   }
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      const nir_op_info *info = &nir_op_infos[alu->op];
+      nir_const_value src[NIR_ALU_MAX_INPUTS][NIR_MAX_VEC_COMPONENTS];
+      nir_const_value *srcs[NIR_ALU_MAX_INPUTS];
+      unsigned bit_size = 0;
+
+      if (!nir_alu_type_get_type_size(info->output_type))
+         bit_size = alu->def.bit_size;
+      for (unsigned i = 0; i < info->num_inputs; i++) {
+         nir_const_value v[NIR_MAX_VEC_COMPONENTS];
+
+         if (!ph_nir_eval_uniform(ctx, alu->src[i].src.ssa, v, depth + 1))
+            return false;
+         if (!bit_size && !nir_alu_type_get_type_size(info->input_types[i]))
+            bit_size = alu->src[i].src.ssa->bit_size;
+         for (unsigned c = 0; c < nir_ssa_alu_instr_src_components(alu, i); c++)
+            src[i][c] = v[alu->src[i].swizzle[c]];
+         srcs[i] = src[i];
+      }
+      nir_eval_const_opcode(alu->op, out, NULL, alu->def.num_components,
+                            bit_size ? bit_size : 32, srcs,
+                            ctx->fs->draw->base.ir.nir->info.float_controls_execution_mode);
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+/* Sample coordinates that are uniforms: a constant glTexCoord reaches the
+ * fragment shader as one, so the vertex stream carries no coordinate set
+ * and the draw had nothing to give the texture unit. */
 static void
-ph_quant_prepare(struct ph_context *ctx)
+ph_fs_find_uniform_coords(struct ph_fs *fs, nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_tex_instr *tex;
+            int c, q;
+
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            tex = nir_instr_as_tex(instr);
+            c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+            q = nir_tex_instr_src_index(tex, nir_tex_src_projector);
+            if (c < 0 || !ph_nir_def_uniform(tex->src[c].src.ssa, 0) ||
+                (q >= 0 && !ph_nir_def_uniform(tex->src[q].src.ssa, 0)) ||
+                fs->ucoord_count >= P3D_MAX_TEXTURE_UNITS)
+               continue;
+            fs->ucoord = realloc(fs->ucoord,
+                                 (fs->ucoord_count + 1) * sizeof(*fs->ucoord));
+            if (!fs->ucoord) {
+               fs->ucoord_count = 0;
+               return;
+            }
+            fs->ucoord[fs->ucoord_count++] = (struct ph_uniform_coord){
+               .coord = tex->src[c].src.ssa,
+               .projector = q >= 0 ? tex->src[q].src.ssa : NULL,
+               .unit = tex->texture_index,
+               .comps = tex->coord_components,
+            };
+         }
+      }
+   }
+}
+
+/* Give each uniform coordinate an extra vertex attribute and its value; false
+ * when one cannot be evaluated. */
+static bool
+ph_fix_coords(struct ph_context *ctx, struct ph_quant_stage *q)
+{
+   q->coord_count = 0;
+   for (unsigned i = 0; ctx->fs && i < ctx->fs->ucoord_count; i++) {
+      const struct ph_uniform_coord *u = &ctx->fs->ucoord[i];
+      nir_const_value v[NIR_MAX_VEC_COMPONENTS], w[NIR_MAX_VEC_COMPONENTS];
+      float *out = q->coord[q->coord_count];
+
+      if (draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_GENERIC, u->unit) >= 0 ||
+          draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_TEXCOORD, u->unit) >= 0)
+         continue;
+      if (!ph_nir_eval_uniform(ctx, u->coord, v, 0) ||
+          (u->projector && !ph_nir_eval_uniform(ctx, u->projector, w, 0)))
+         return false;
+      for (unsigned c = 0; c < 4; c++)
+         out[c] = c < u->comps ? v[c].f32 : c == 3 ? 1.0f : 0.0f;
+      if (u->projector)
+         out[3] = w[0].f32;
+      q->coord_slot[q->coord_count++] =
+         draw_alloc_extra_vertex_attrib(ctx->draw, TGSI_SEMANTIC_TEXCOORD,
+                                        u->unit);
+   }
+   return true;
+}
+
+static void
+ph_quant_prepare(struct ph_context *ctx, bool quantize)
 {
    struct ph_quant_stage *q = (struct ph_quant_stage *)ctx->quant_stage;
 
+   q->quantize = quantize;
    q->slot[0] = draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_COLOR, 0);
    q->slot[1] = draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_COLOR, 1);
-   ph_logicop_grid(ctx, q->scale);
+   if (quantize)
+      ph_logicop_grid(ctx, q->scale);
 }
 
 static void
@@ -7201,23 +7356,31 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
          ph_submit_vertices(ctx);
       ctx->derived_triangles = derived;
    }
-   const bool quantize = ph_logicop_quantize(ctx) &&
-                         (ctx->quant_stage ||
-                          (ctx->quant_stage = ph_quant_create_stage(ctx)));
-   if (!derived && !quantize && ph_draw_tcl(ctx, info, draws))
+   const bool quantize = ph_logicop_quantize(ctx);
+   const bool fix = (quantize || (ctx->fs && ctx->fs->ucoord_count)) &&
+                    (ctx->quant_stage ||
+                     (ctx->quant_stage = ph_quant_create_stage(ctx)));
+   if (!derived && !fix && ph_draw_tcl(ctx, info, draws))
       goto unbind;
    /* A software-transformed batch must not inherit an object-space one. */
    if (ctx->transform && ctx->triangles)
       ph_submit_vertices(ctx);
    ctx->transform = false;
-   if (quantize) {
-      ph_quant_prepare(ctx);
+   if (fix) {
+      ph_quant_prepare(ctx, quantize);
+      if (!ph_fix_coords(ctx, (struct ph_quant_stage *)ctx->quant_stage)) {
+         draw_remove_extra_vertex_attribs(ctx->draw);
+         PH_REFUSE("a draw whose uniform texture coordinate cannot be evaluated is dropped\n");
+         goto unbind;
+      }
       draw_set_rasterize_stage(ctx->draw, ctx->quant_stage);
    }
    draw_vbo(ctx->draw, info, drawid_offset, NULL, draws, num_draws, 0);
    draw_flush(ctx->draw);
-   if (quantize)
+   if (fix) {
       draw_set_rasterize_stage(ctx->draw, ctx->hw_stage);
+      draw_remove_extra_vertex_attribs(ctx->draw);
+   }
 unbind:
    for (unsigned i = 0; i < ctx->draw->pt.nr_vertex_buffers; i++)
       draw_set_mapped_vertex_buffer(ctx->draw, i, NULL, 0);
@@ -8069,6 +8232,7 @@ static void *ph_create_fs(struct pipe_context *p,
                fs->program.valid = false;
             if (compile_nir->info.fs.uses_discard)
                fs->kill = ph_fs_build_kill(compile_nir, budget);
+            ph_fs_find_uniform_coords(fs, s->ir.nir);
             if (compile_nir != s->ir.nir)
                ralloc_free(compile_nir);
             if (ph_fs_program_must_drop(s->ir.nir, &fs->program))
@@ -8139,6 +8303,7 @@ static void ph_delete_fs(struct pipe_context *p, void *s)
    if (fs) {
       draw_delete_fragment_shader(ph_context(p)->draw, fs->draw);
       FREE(fs->kill);
+      free(fs->ucoord);
    }
    FREE(fs);
 }
