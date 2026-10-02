@@ -227,6 +227,8 @@ ph_target_format(enum pipe_format format, uint32_t *code, unsigned *cpp)
       break;
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_R8_UNORM:      /* widened to the 32-bit texel */
+   case PIPE_FORMAT_R8G8_UNORM:
       break;
    default:
       native = util_format_get_blocksize(format) == 4 &&
@@ -411,11 +413,12 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
                                   PIPE_BIND_DEPTH_STENCIL));
             break;
          case PIPE_FORMAT_R8_UNORM:
-            /* Sampler-only, stored as the 32-bit texel (r, 0, 0, 1); the
-             * transfer paths widen it (ph_format_widened). */
-            supported = (bind & PIPE_BIND_SAMPLER_VIEW) &&
-                        !(bind & (PIPE_BIND_RENDER_TARGET |
-                                  PIPE_BIND_DEPTH_STENCIL |
+         case PIPE_FORMAT_R8G8_UNORM:
+            /* Stored as the 32-bit texel (r, g or 0, 0, 1), sampled and
+             * rendered as such; the transfer paths widen and narrow it and
+             * the write masks keep the missing channels (ph_format_widened).
+             * Not shareable: other clients would see the 32-bit word. */
+            supported = !(bind & (PIPE_BIND_DEPTH_STENCIL |
                                   PIPE_BIND_SCANOUT |
                                   PIPE_BIND_DISPLAY_TARGET |
                                   PIPE_BIND_SHARED));

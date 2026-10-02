@@ -228,12 +228,22 @@ ph_mip_layer_texel_offset(const struct ph_mip_layout *mip, unsigned level,
           (size_t)layer * mip->level[level].bytes;
 }
 
-/* A one-channel R8 image is stored as the native B8G8R8A8 texel (r, 0, 0, 1),
- * which the sampler decodes to exactly what GL_RED defines. */
+/* R8 and R8G8 are stored as the native B8G8R8A8 texel (r, g or 0, 0, 1),
+ * which the sampler decodes to exactly what GL_RED and GL_RG define; render
+ * and clear paths keep the missing channels at those values. */
 static bool
 ph_format_widened(enum pipe_format format)
 {
-   return format == PIPE_FORMAT_R8_UNORM;
+   return format == PIPE_FORMAT_R8_UNORM || format == PIPE_FORMAT_R8G8_UNORM;
+}
+
+/* The GL channels a colour target holds, for the write masks. */
+static unsigned
+ph_target_channels(enum pipe_format format)
+{
+   return ph_format_widened(format) ?
+          util_format_colormask(util_format_description(format)) :
+          PIPE_MASK_RGBA;
 }
 
 static unsigned
@@ -1623,10 +1633,14 @@ ph_apply_fragment_state(struct ph_context *ctx, struct p3d_state *state,
                                            ctx->blend_color.color[0]);
       state->blend_const_ba = ph_pack_2x10(ctx->blend_color.color[1],
                                            ctx->blend_color.color[2]);
-      state->mask_r = !!(blend->colormask & PIPE_MASK_R);
-      state->mask_g = !!(blend->colormask & PIPE_MASK_G);
-      state->mask_b = !!(blend->colormask & PIPE_MASK_B);
-      state->mask_a = !!(blend->colormask & PIPE_MASK_A);
+      const unsigned colormask = blend->colormask &
+         (ctx->fb.nr_cbufs ? ph_target_channels(ctx->fb.cbufs[0].format) :
+                             PIPE_MASK_RGBA);
+
+      state->mask_r = !!(colormask & PIPE_MASK_R);
+      state->mask_g = !!(colormask & PIPE_MASK_G);
+      state->mask_b = !!(colormask & PIPE_MASK_B);
+      state->mask_a = !!(colormask & PIPE_MASK_A);
       state->mask_explicit = true;
    }
    {
@@ -4595,10 +4609,14 @@ ph_submit_vertices(struct ph_context *ctx)
 		state.depth_vertex_alpha_add = state.depth_vertex_alpha &&
 			blend->rgb_dst_factor == PIPE_BLENDFACTOR_ONE &&
 			blend->alpha_dst_factor == PIPE_BLENDFACTOR_ONE;
-      state.mask_r = !!(blend->colormask & PIPE_MASK_R);
-      state.mask_g = !!(blend->colormask & PIPE_MASK_G);
-      state.mask_b = !!(blend->colormask & PIPE_MASK_B);
-      state.mask_a = !!(blend->colormask & PIPE_MASK_A);
+      const unsigned colormask = blend->colormask &
+         (ctx->fb.nr_cbufs ? ph_target_channels(ctx->fb.cbufs[0].format) :
+                             PIPE_MASK_RGBA);
+
+      state.mask_r = !!(colormask & PIPE_MASK_R);
+      state.mask_g = !!(colormask & PIPE_MASK_G);
+      state.mask_b = !!(colormask & PIPE_MASK_B);
+      state.mask_a = !!(colormask & PIPE_MASK_A);
       state.mask_explicit = true;
    }
    ph_apply_fragment_state(ctx, &state, depth != NULL);
@@ -6135,8 +6153,8 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
                               ph_resource_mip_levels(r) - 1);
    const bool depth = util_format_has_depth(util_format_description(r->base.format));
 
-   if ((!depth && util_format_get_blocksize(r->base.format) != 4) ||
-       first > last)
+   if ((!depth && util_format_get_blocksize(r->base.format) != 4 &&
+        !ph_format_widened(r->base.format)) || first > last)
       return NULL;
    if (!v->shadow_view) {
       struct pipe_resource templ = r->base, *shadow;
@@ -9743,14 +9761,24 @@ ph_clear_colour(struct ph_context *ctx, const struct pipe_surface *surf,
                 unsigned x, unsigned y, unsigned width, unsigned height)
 {
    struct parhelia_resource *r = ph_resource(surf->texture);
-   const enum pipe_format format = ph_storage_format(surf->format);
-   const uint32_t mask = ph_colour_write_mask(format, colormask);
+   const bool widened = ph_format_widened(surf->format);
+   const unsigned channels = ph_target_channels(surf->format);
+   const enum pipe_format format = widened ? PIPE_FORMAT_B8G8R8A8_UNORM :
+                                   ph_storage_format(surf->format);
+   /* A widened target's missing channels stay at 0, 0, 1: a clear of every
+    * channel it has writes the whole texel. */
+   const uint32_t mask = !widened ? ph_colour_write_mask(format, colormask) :
+      (colormask & channels) == channels ? 0xffffffffu :
+      ph_colour_write_mask(format, colormask & channels);
    union util_color packed;
    uint32_t value;
+   const float wide_colour[4] = {
+      color->f[0], (channels & PIPE_MASK_G) ? color->f[1] : 0.0f, 0.0f, 1.0f,
+   };
 
    if (!mask)
       return;
-   util_pack_color(color->f, format, &packed);
+   util_pack_color(widened ? wide_colour : color->f, format, &packed);
    /* The 2-D fill writes whole dwords, so a 16 bpp value has to appear in
     * both halves; the rectangle itself is honoured at pixel granularity. */
    value = r->cpp == 2 ? (packed.ui[0] & 0xffffu) * 0x10001u : packed.ui[0];
@@ -10952,19 +10980,22 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
    }
    if (widen) {
       const size_t texels = (size_t)box->width * box->height * layers;
-      uint8_t *narrow = MALLOC(MAX2(texels, 1));
+      uint8_t *narrow = MALLOC(MAX2(texels * util_format_get_blocksize(res->format), 1));
 
       if (!narrow) {
          FREE(t->staging);
          FREE(t);
          return NULL;
       }
+      const unsigned ncpp = util_format_get_blocksize(res->format);
+
       for (size_t n = 0; n < texels; n++)
-         narrow[n] = ((const uint8_t *)t->staging)[n * 4 + 2];
+         for (unsigned c = 0; c < ncpp; c++)   /* R from byte 2, G from 1 */
+            narrow[n * ncpp + c] = ((const uint8_t *)t->staging)[n * 4 + 2 - c];
       t->wide = t->staging;
       t->staging = narrow;
-      t->base.stride = box->width;
-      t->base.layer_stride = (uintptr_t)box->width * box->height;
+      t->base.stride = box->width * ncpp;
+      t->base.layer_stride = (uintptr_t)t->base.stride * box->height;
    }
    *out = &t->base;
    return t->staging;
@@ -10986,10 +11017,14 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
                             transfer->box.height * MAX2(transfer->box.depth, 1);
       uint8_t *wide = t->wide;
 
-      /* B, G, R, A = 0, 0, r, 1: the sampler reads GL_RED's (r, 0, 0, 1). */
+      const unsigned ncpp = util_format_get_blocksize(transfer->resource->format);
+      const uint8_t *narrow = t->staging;
+
+      /* B, G, R, A = 0, g or 0, r, 1: the sampler reads (r, g, 0, 1). */
       for (size_t n = 0; n < texels; n++) {
-         wide[n * 4 + 0] = wide[n * 4 + 1] = 0;
-         wide[n * 4 + 2] = ((const uint8_t *)t->staging)[n];
+         wide[n * 4 + 0] = 0;
+         wide[n * 4 + 1] = ncpp > 1 ? narrow[n * ncpp + 1] : 0;
+         wide[n * 4 + 2] = narrow[n * ncpp];
          wide[n * 4 + 3] = 0xff;
       }
       FREE(t->staging);
