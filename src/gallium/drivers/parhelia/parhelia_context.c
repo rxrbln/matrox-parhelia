@@ -9311,6 +9311,15 @@ ph_blit(struct pipe_context *p, const struct pipe_blit_info *info)
       return;
    ph_zinit_resolve(ctx, ph_resource(info->src.resource));
    ph_zinit_resolve(ctx, ph_resource(info->dst.resource));
+   if (ph_env("PARHELIA_TRACE_COPY"))
+      fprintf(stderr, "parhelia: blit %s t%u %d,%d,%d %dx%dx%d -> %s t%u %d,%d,%d %dx%dx%d\n",
+              util_format_short_name(info->src.format),
+              info->src.resource->target, info->src.box.x, info->src.box.y,
+              info->src.box.z, info->src.box.width, info->src.box.height,
+              info->src.box.depth, util_format_short_name(info->dst.format),
+              info->dst.resource->target, info->dst.box.x, info->dst.box.y,
+              info->dst.box.z, info->dst.box.width, info->dst.box.height,
+              info->dst.box.depth);
    if (info->src.format == info->dst.format &&
        info->src.format == info->src.resource->format &&
        info->dst.format == info->dst.resource->format &&
@@ -9318,14 +9327,28 @@ ph_blit(struct pipe_context *p, const struct pipe_blit_info *info)
        abs(info->src.box.height) == abs(info->dst.box.height) &&
        !info->scissor_enable &&
        (info->mask & PIPE_MASK_RGBA) == PIPE_MASK_RGBA &&
-       !util_format_is_depth_or_stencil(info->src.format))
+       !util_format_is_depth_or_stencil(info->src.format) &&
+       !info->src.box.z && !info->dst.box.z)
       copied = ph_copy_texture_box(ctx, info->dst.resource, info->dst.level,
                                    info->dst.box.x, info->dst.box.y,
                                    info->src.resource, info->src.level,
                                    &info->src.box, info->dst.box.width,
                                    info->dst.box.height);
-   if (!copied)
-      copied = ph_blit_cpu(p, info);
+   /* The CPU path converts one slice at a time; volume blits go slice by
+    * slice at their own z. */
+   if (!copied && abs(info->src.box.depth) == abs(info->dst.box.depth)) {
+      struct pipe_blit_info slice = *info;
+
+      copied = true;
+      for (int z = 0; copied && z < abs(info->dst.box.depth); z++) {
+         slice.src.box.z = info->src.box.z +
+                           (info->src.box.depth < 0 ? -1 - z : z);
+         slice.dst.box.z = info->dst.box.z +
+                           (info->dst.box.depth < 0 ? -1 - z : z);
+         slice.src.box.depth = slice.dst.box.depth = 1;
+         copied = ph_blit_cpu(p, &slice);
+      }
+   }
    if (!copied)
       fprintf(stderr,
               "parhelia: unsupported blit %s -> %s %dx%d -> %dx%d\n",
