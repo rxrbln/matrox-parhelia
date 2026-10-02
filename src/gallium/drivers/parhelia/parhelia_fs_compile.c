@@ -254,8 +254,15 @@ ph_fs_node(struct ph_fs_ctx *ctx, int lane, unsigned op,
       if (k == constants)
          seen[constants++] = copy[i].index;
    }
-   if (constants > 2)
-      return ph_fs_fail(ctx, "three constants in one instruction");
+   /* An instruction reads two constant registers; move any further constant
+    * through a temporary first. */
+   for (unsigned i = 0; constants > 2 && i < 3; i++) {
+      if (copy[i].kind != PH_SRC_CONST || copy[i].index == seen[0] ||
+          copy[i].index == seen[1])
+         continue;
+      if (!ph_fs_node(ctx, lane, P3D_COMB_MOV, &copy[i], NULL, NULL, &copy[i]))
+         return false;
+   }
    if (!PH_FS_GROW(ctx, node, nodes, node_cap))
       return ph_fs_fail(ctx, "out of memory");
    node = &ctx->node[ctx->nodes];
@@ -1015,6 +1022,74 @@ ph_fs_operand(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, unsigned i,
    return ph_fs_lower(ctx, alu->src[i].src.ssa, lane, req, out);
 }
 
+/* RGB channels taken from different values: each value, replicated or in
+ * its natural channels, is multiplied by a 0/1 mask of the channels it fills
+ * and accumulated with multiply-adds; the literal channels are added last. */
+static bool
+ph_fs_assemble(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, int lane,
+               float *literal, struct ph_fs_src *out)
+{
+   struct { nir_def *def; int sel; float mask[3]; } group[3];
+   unsigned groups = 0;
+   bool have_acc = false, have_literal = false;
+   struct ph_fs_src acc;
+
+   if (lane != PH_LANE_RGB)
+      return ph_fs_fail(ctx, "RGB assembled from separate values");
+   for (unsigned i = 0; i < 3; i++) {
+      nir_def *def = alu->src[i].src.ssa;
+      nir_instr *instr = nir_def_instr(def);
+      int sel = alu->src[i].swizzle[0] == i ? -1 : alu->src[i].swizzle[0];
+      unsigned g;
+
+      literal[i] = 0.0f;
+      if (instr->type == nir_instr_type_load_const) {
+         literal[i] = nir_const_value_as_float(
+            nir_instr_as_load_const(instr)->value[alu->src[i].swizzle[0]], 32);
+         have_literal |= literal[i] != 0.0f;
+         continue;
+      }
+      for (g = 0; g < groups; g++)
+         if (group[g].def == def && group[g].sel == sel)
+            break;
+      if (g == groups) {
+         memset(&group[g], 0, sizeof(group[g]));
+         group[g].def = def;
+         group[g].sel = sel;
+         groups++;
+      }
+      group[g].mask[i] = 1.0f;
+   }
+   if (!groups)
+      return ph_fs_literal(ctx, lane, literal, out);
+   for (unsigned g = 0; g < groups; g++) {
+      struct ph_fs_src term, mask;
+
+      if (!ph_fs_lower(ctx, group[g].def, lane, group[g].sel, &term))
+         return false;
+      if (group[g].mask[0] && group[g].mask[1] && group[g].mask[2]) {
+         acc = term;
+         have_acc = true;
+         continue;
+      }
+      if (!ph_fs_literal(ctx, lane, group[g].mask, &mask))
+         return false;
+      if (!(have_acc ? ph_fs_node(ctx, lane, P3D_COMB_MAD, &term, &acc, &mask, &acc) :
+                       ph_fs_node(ctx, lane, P3D_COMB_MUL, &term, NULL, &mask, &acc)))
+         return false;
+      have_acc = true;
+   }
+   if (have_literal) {
+      struct ph_fs_src lit;
+
+      if (!ph_fs_literal(ctx, lane, literal, &lit) ||
+          !ph_fs_node(ctx, lane, P3D_COMB_ADD, &acc, &lit, NULL, &acc))
+         return false;
+   }
+   *out = acc;
+   return true;
+}
+
 static bool
 ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
                 struct ph_fs_src *out)
@@ -1077,6 +1152,39 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
              ph_fs_operand(ctx, alu, 1, lane, sel, &b) &&
              ph_fs_operand(ctx, alu, 2, lane, sel, &c) &&
              ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &b, &c, out);
+   case nir_op_bcsel: {
+      /* Without native integers a boolean is 0.0 or 1.0 (b2b1 of a float),
+       * so b ? x : y is -b >= 0 ? y : x. */
+      nir_instr *cond = nir_def_instr(alu->src[0].src.ssa);
+      nir_alu_instr *b2b;
+      int req;
+
+      if (cond->type != nir_instr_type_alu)
+         return ph_fs_fail(ctx, "a select on a condition that is no boolean value");
+      b2b = nir_instr_as_alu(cond);
+      if (!ph_fs_translate(alu, 0, lane, sel, &req))
+         return ph_fs_fail(ctx, "a swizzle the replicates cannot express");
+      if (b2b->op == nir_op_flt || b2b->op == nir_op_fge) {
+         /* x < y ? b : c is x - y >= 0 ? c : b; x >= y ? b : c directly. */
+         if (!ph_fs_operand(ctx, b2b, 0, lane, req, &a) ||
+             !ph_fs_operand(ctx, b2b, 1, lane, req, &d) ||
+             !ph_fs_apply(ctx, lane, &d, P3D_COMB_MOD_NEG) ||
+             !ph_fs_node(ctx, lane, P3D_COMB_ADD, &a, &d, NULL, &a) ||
+             !ph_fs_operand(ctx, alu, 1, lane, sel, &b) ||
+             !ph_fs_operand(ctx, alu, 2, lane, sel, &c))
+            return false;
+         return b2b->op == nir_op_fge ?
+                ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &b, &c, out) :
+                ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &c, &b, out);
+      }
+      if (b2b->op != nir_op_b2b1)
+         return ph_fs_fail(ctx, "a select on a condition that is no boolean value");
+      return ph_fs_operand(ctx, b2b, 0, lane, req, &a) &&
+             ph_fs_operand(ctx, alu, 1, lane, sel, &b) &&
+             ph_fs_operand(ctx, alu, 2, lane, sel, &c) &&
+             ph_fs_apply(ctx, lane, &a, P3D_COMB_MOD_NEG) &&
+             ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &c, &b, out);
+   }
    case nir_op_fcsel_gt:
       /* a > 0 ? b : c is -a >= 0 ? c : b. */
       return ph_fs_operand(ctx, alu, 0, lane, sel, &a) &&
@@ -1113,16 +1221,7 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
          return ph_fs_lower(ctx, alu->src[sel].src.ssa, lane,
                             alu->src[sel].swizzle[0], out);
       }
-      /* Three RGB channels from different values: only literals combine. */
-      for (unsigned i = 0; i < 3; i++) {
-         nir_instr *instr = nir_def_instr(alu->src[i].src.ssa);
-
-         if (instr->type != nir_instr_type_load_const)
-            return ph_fs_fail(ctx, "RGB assembled from separate values");
-         value[i] = nir_const_value_as_float(
-            nir_instr_as_load_const(instr)->value[alu->src[i].swizzle[0]], 32);
-      }
-      return ph_fs_literal(ctx, lane, value, out);
+      return ph_fs_assemble(ctx, alu, lane, value, out);
    }
    default:
       return ph_fs_fail(ctx, nir_op_infos[alu->op].name);
