@@ -286,6 +286,11 @@ static const char *const ph_stat_kind_names[PH_STAT_KINDS] = {
 struct ph_context {
    struct pipe_context base;
    struct draw_context *draw;
+   /* Behaviour measured on the P690 only (chip 0x2539): the Z unit's
+    * trunc(d * 2^n) grid, the raster op's wide source colour, and the
+    * combiner alpha that carries a discard into the alpha test.  The
+    * original family keeps its previous paths until measured there. */
+   bool z_grid, logicop_grid, kill_alpha;
    /* The native rasterise stage, and the logic-op colour grid in front. */
    struct draw_stage *hw_stage, *quant_stage, *zpix_stage;
    /* A fragment shader stand-in that passes the vertex colour, bound while
@@ -3418,11 +3423,20 @@ ph_cpu_linear_pixel(struct parhelia_resource *r, int x, int y)
           (size_t)x * 4;
 }
 
+/* The Z24 code a CPU route stores for window depth @z, the way the Z unit
+ * converts it on a z_grid family (trunc(z * 2^24)) or as before. */
+static uint32_t
+ph_cpu_depth_code(float z, bool z_grid)
+{
+   return z_grid ? MIN2((uint32_t)(z * 16777216.0f), 0x00ffffffu) :
+                   (uint32_t)lrintf(z * 16777215.0f) & 0x00ffffffu;
+}
+
 static void
 ph_cpu_cutout_triangle(const float *in, struct parhelia_resource *color,
                        struct parhelia_resource *depth,
                        const struct parhelia_resource *texture,
-                       unsigned width, unsigned height)
+                       unsigned width, unsigned height, bool z_grid)
 {
    const float *v[3] = {in, in + 10, in + 20};
    float area = ph_cpu_edge(v[0], v[1], v[2][0], v[2][1]);
@@ -3473,7 +3487,7 @@ ph_cpu_cutout_triangle(const float *in, struct parhelia_resource *color,
          if (a < 128.0f)
             continue;
          z = CLAMP(l0 * v[0][2] + l1 * v[1][2] + l2 * v[2][2], 0.0f, 1.0f);
-         new_z = MIN2((uint32_t)(z * 16777216.0f), 0x00ffffffu);
+         new_z = ph_cpu_depth_code(z, z_grid);
          depth_pixel = ph_cpu_linear_pixel(depth, x, y);
          memcpy(&old_z, depth_pixel, sizeof(old_z));
          if (new_z > (old_z & 0x00ffffffu))
@@ -3511,7 +3525,7 @@ ph_cpu_alpha_blend_triangle(const float *in, struct parhelia_resource *color,
                             const struct parhelia_resource *texture,
                             const struct pipe_sampler_state *sampler,
                             const struct pipe_depth_stencil_alpha_state *dsa,
-                            unsigned width, unsigned height)
+                            unsigned width, unsigned height, bool z_grid)
 {
    const float *v[3] = {in, in + 10, in + 20};
    float area = ph_cpu_edge(v[0], v[1], v[2][0], v[2][1]);
@@ -3557,7 +3571,7 @@ ph_cpu_alpha_blend_triangle(const float *in, struct parhelia_resource *color,
          if (dsa->depth_enabled) {
             uint8_t *depth_pixel;
             z = CLAMP(l0 * v[0][2] + l1 * v[1][2] + l2 * v[2][2], 0.0f, 1.0f);
-            new_z = MIN2((uint32_t)(z * 16777216.0f), 0x00ffffffu);
+            new_z = ph_cpu_depth_code(z, z_grid);
             depth_pixel = ph_cpu_linear_pixel(depth, x, y);
             memcpy(&old_z, depth_pixel, sizeof(old_z));
             if (!ph_cpu_depth_pass(dsa->depth_func, new_z, old_z & 0x00ffffffu))
@@ -3609,7 +3623,8 @@ ph_cpu_alpha_blend(struct ph_context *ctx, struct parhelia_resource *color,
    }
    for (unsigned i = 0; i < ctx->triangles; i++)
       ph_cpu_alpha_blend_triangle(&ctx->vertices[i * 30], color, depth, texture,
-                                  sampler, ctx->dsa, ctx->fb.width, ctx->fb.height);
+                                  sampler, ctx->dsa, ctx->fb.width, ctx->fb.height,
+                                  ctx->z_grid);
    __sync_synchronize();
    color->tiled_dirty = false;
    color->linear_dirty = true;
@@ -3629,7 +3644,7 @@ ph_cpu_alpha_cutout(struct ph_context *ctx, struct parhelia_resource *color,
 {
    for (unsigned i = 0; i < ctx->triangles; i++)
       ph_cpu_cutout_triangle(&ctx->vertices[i * 30], color, depth, texture,
-                             ctx->fb.width, ctx->fb.height);
+                             ctx->fb.width, ctx->fb.height, ctx->z_grid);
    __sync_synchronize();
    color->tiled_dirty = false;
    color->linear_dirty = true;
@@ -7399,7 +7414,7 @@ struct ph_quant_stage {
 static bool
 ph_logicop_quantize(const struct ph_context *ctx)
 {
-   return ctx->blend && ctx->blend->logicop_enable &&
+   return ctx->logicop_grid && ctx->blend && ctx->blend->logicop_enable &&
           ctx->blend->logicop_func != PIPE_LOGICOP_COPY &&
           ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture;
 }
@@ -7948,7 +7963,7 @@ ph_zpix_tri(struct draw_stage *stage, struct prim_header *prim)
                                        (size_t)ty * ctx->zpix_transfer->stride +
                                        (size_t)tx * cpp, 1);
             /* On the Z grid ph_update_viewport puts fragment depths on. */
-            z = CLAMP(d, 0.0f, 1.0f) * k;
+            z = CLAMP(d, 0.0f, 1.0f) * (ctx->z_grid ? k : 1.0f);
          }
          if (run >= 0 && (!inside || z != run_z)) {
             ph_zpix_run(stage, prim, pos, run, x, y, run_z);
@@ -8528,7 +8543,7 @@ ph_fs_pack_units(struct ph_fs *fs, nir_shader *nir)
 /* The fixed-function words the special draw routes emit, from the algebra
  * the compiled program computes. */
 static void
-ph_fs_route_class(struct ph_fs *fs)
+ph_fs_route_class(struct ph_fs *fs, bool single_texture_pipe)
 {
    switch (fs->program.cls) {
    case PH_FS_CLASS_REPLACE:   fs->texenv = P3D_TEXENV_REPLACE; break;
@@ -8539,6 +8554,8 @@ ph_fs_route_class(struct ph_fs *fs)
    /* The serial MODULATE's first pass takes the texenv, REPLACE without a
     * vertex colour, so it leaves t0 for the DST_COLOR pass to scale. */
    case PH_FS_CLASS_MODULATE2_TEX:
+      if (!single_texture_pipe)
+         break;
       fs->texenv = P3D_TEXENV_REPLACE;
       fs->serial_op = PH_SERIAL_MODULATE;
       break;
@@ -8908,7 +8925,7 @@ ph_fs_kill_route(struct ph_context *ctx, struct ph_fs_program **prog,
    float a[4];
    uint8_t a8;
 
-   if (!ctx->fs || !ctx->fs->draw ||
+   if (!ctx->kill_alpha || !ctx->fs || !ctx->fs->draw ||
        ctx->fs->draw->base.type != PIPE_SHADER_IR_NIR ||
        !ctx->fs->draw->base.ir.nir->info.fs.uses_discard)
       return PH_KILL_NONE;
@@ -9037,7 +9054,7 @@ static void *ph_create_fs(struct pipe_context *p,
                fs->drop_reason = fs->program.reject ? fs->program.reject :
                                  "declared samplers";
             if (fs->program.valid)
-               ph_fs_route_class(fs);
+               ph_fs_route_class(fs, ph_screen(p->screen)->single_texture_pipe);
             else if (ph_env("PARHELIA_TRACE"))
                fprintf(stderr, "parhelia: fs=%p has no combiner program: %s\n",
                        (void *)fs, fs->program.reject ? fs->program.reject :
@@ -9190,7 +9207,7 @@ ph_update_viewport(struct ph_context *ctx)
 
    if (!ctx->have_viewport)
       return;
-   if (bits && bits < 32) {
+   if (ctx->z_grid && bits && bits < 32) {
       const float k = (float)((1u << bits) - 1) / (float)(1u << bits);
 
       vp.scale[2] *= k;
@@ -9762,7 +9779,11 @@ ph_clear_zs(struct ph_context *ctx, const struct pipe_surface *surf,
     * D16 clears as min(d * 65536, 0xffff), docs/parhelia-p690-zcompression-
     * clear-banks-re.md 4.3); ph_update_viewport scales d by (2^n - 1) / 2^n
     * in single precision, so a clear stores what a fragment at d stores. */
-   if (surf->format == PIPE_FORMAT_Z16_UNORM)
+   if (!ctx->z_grid)
+      value = surf->format == PIPE_FORMAT_Z16_UNORM ?
+              (uint32_t)MIN2(depth * 65536.0, 65535.0) * 0x10001u :
+              util_pack_z_stencil(surf->format, depth, stencil);
+   else if (surf->format == PIPE_FORMAT_Z16_UNORM)
       value = ph_depth_code(depth, 16) * 0x10001u;
    else
       value = ph_depth_code(depth, 24) | (stencil & 0xffu) << 24;
@@ -11324,6 +11345,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       goto fail;
    draw_set_rasterize_stage(ctx->draw, stage);
    ctx->hw_stage = stage;
+   ctx->z_grid = ctx->logicop_grid = ctx->kill_alpha =
+      ph_screen(screen)->chip_id == 0x2539;
    ctx->colour_fs.uses_color = true;
    ctx->colour_fs.texenv = P3D_TEXENV_MODULATE;
    ctx->colour_fs.serial_op = PH_SERIAL_UNSUPPORTED;
