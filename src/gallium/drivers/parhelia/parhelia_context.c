@@ -304,6 +304,7 @@ struct ph_context {
     * combiner alpha that carries a discard into the alpha test.  The
     * original family keeps its previous paths until measured there. */
    bool z_grid, logicop_grid, kill_alpha;
+   bool broadcasting;      /* ph_draw_broadcast is replaying a draw */
    /* The native rasterise stage, and the logic-op colour grid in front. */
    struct draw_stage *hw_stage, *quant_stage, *zpix_stage;
    /* A fragment shader stand-in that passes the vertex colour, bound while
@@ -8243,6 +8244,52 @@ ph_draw_depth_points(struct ph_context *ctx, const struct pipe_draw_info *info,
    return true;
 }
 
+/* A framebuffer with several colour buffers (GL_FRONT_AND_BACK binds the
+ * front and the back) is drawn once per buffer; the engine has one colour
+ * target.  The replay is exact while the draw writes no depth or stencil,
+ * since every pass then tests the same depth and stencil contents; one
+ * that writes them is drawn into the first buffer only. */
+static bool
+ph_draw_broadcast(struct ph_context *ctx, const struct pipe_draw_info *info,
+                  unsigned drawid_offset,
+                  const struct pipe_draw_start_count_bias *draws)
+{
+   const struct pipe_depth_stencil_alpha_state *dsa = ctx->dsa;
+   const bool zs_writes = ctx->fb.zsbuf.texture && dsa &&
+      ((dsa->depth_enabled && dsa->depth_writemask) ||
+       (dsa->stencil[0].enabled && dsa->stencil[0].writemask) ||
+       (dsa->stencil[1].enabled && dsa->stencil[1].writemask));
+   struct pipe_framebuffer_state saved = { 0 }, one;
+   unsigned bound = 0;
+
+   if (ctx->broadcasting || ctx->fb.nr_cbufs < 2)
+      return false;
+   for (unsigned i = 0; i < ctx->fb.nr_cbufs; i++)
+      bound += !!ctx->fb.cbufs[i].texture;
+   if (bound < 2 && ctx->fb.cbufs[0].texture)
+      return false;
+   if (zs_writes && bound > 1)
+      PH_REFUSE("a draw to several colour buffers that writes depth or "
+                "stencil reaches the first one only\n");
+   util_copy_framebuffer_state(&saved, &ctx->fb);
+   ctx->broadcasting = true;
+   for (unsigned i = 0; i < saved.nr_cbufs; i++) {
+      if (!saved.cbufs[i].texture)
+         continue;
+      one = saved;
+      one.nr_cbufs = 1;
+      one.cbufs[0] = saved.cbufs[i];
+      ctx->base.set_framebuffer_state(&ctx->base, &one);
+      ctx->base.draw_vbo(&ctx->base, info, drawid_offset, NULL, draws, 1);
+      if (zs_writes)
+         break;
+   }
+   ctx->base.set_framebuffer_state(&ctx->base, &saved);
+   ctx->broadcasting = false;
+   util_unreference_framebuffer_state(&saved);
+   return true;
+}
+
 static void
 ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
             unsigned drawid_offset, const struct pipe_draw_indirect_info *indirect,
@@ -8257,6 +8304,8 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       return;
    }
    if (!num_draws || indirect || ctx->submit_error)
+      return;
+   if (ph_draw_broadcast(ctx, info, drawid_offset, draws))
       return;
    /* An empty scissor rectangle passes nothing, but the engine reads a zero
     * maximum as no limit (0x132c is exclusive): skip the draw. */
@@ -10181,13 +10230,17 @@ ph_clear(struct pipe_context *p, unsigned buffers, uint32_t color_mask,
    }
    if (x0 >= x1 || y0 >= y1)
       return;
-   if ((buffers & PIPE_CLEAR_COLOR0) && ctx->fb.nr_cbufs &&
-       ctx->fb.cbufs[0].texture) {
-      if (ph_surface_is_base(&ctx->fb.cbufs[0]))
-         ph_clear_colour(ctx, &ctx->fb.cbufs[0], &color[0],
+   /* Every bound colour buffer: glDrawBuffer(GL_FRONT_AND_BACK) binds two. */
+   for (unsigned i = 0; i < ctx->fb.nr_cbufs; i++) {
+      const struct pipe_surface *cb = &ctx->fb.cbufs[i];
+
+      if (!(buffers & (PIPE_CLEAR_COLOR0 << i)) || !cb->texture)
+         continue;
+      if (ph_surface_is_base(cb))
+         ph_clear_colour(ctx, cb, &color[0],
                          color_mask & PIPE_MASK_RGBA, x0, y0, x1 - x0, y1 - y0);
       else
-         ph_clear_level(ctx, &ctx->fb.cbufs[0], &color[0], color_mask,
+         ph_clear_level(ctx, cb, &color[0], color_mask,
                         0, 0, 0, 0, x0, y0, x1 - x0, y1 - y0);
    }
    if ((buffers & PIPE_CLEAR_DEPTHSTENCIL) && ctx->fb.zsbuf.texture) {
