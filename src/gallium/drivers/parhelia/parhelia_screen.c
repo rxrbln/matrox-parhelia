@@ -725,7 +725,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
     * the ambiguous sampler+target combination outright. */
    const bool sampler_storage = !share_native && !target_class &&
       (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
-      templ->width0 <= 512 && templ->height0 <= 512 &&
+      templ->width0 <= 2048 && templ->height0 <= 2048 &&
       !(templ->bind & PIPE_BIND_DEPTH_STENCIL) &&
       !(narrow_target && (templ->bind & PIPE_BIND_RENDER_TARGET));
    struct ph_sampler_format native_format = { 0x32, 4, 0 };
@@ -935,7 +935,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
     * base (32x512 sampled level 0 at every level). */
    if (mip_levels > 1 &&
        (r->mip.size + (size_t)MAX2(r->mip.level[0].pitch, 64u) * 4 - 1) /
-       ((size_t)MAX2(r->mip.level[0].pitch, 64u) * 4) > 768) {
+       ((size_t)MAX2(r->mip.level[0].pitch, 64u) * 4) > 2048) {
       mip_levels = 1;
       if (!ph_mip_layout_init_chip(&r->mip, templ->width0, templ->height0,
                                    mip_levels, true, p690_native_texture32))
