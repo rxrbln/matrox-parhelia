@@ -1735,6 +1735,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    /* BLENDCTL has an equation field per pipe; the vendor writes both from
     * one GL enum, independent pipes are measured on the P690 only. */
    caps->blend_equation_separate = s->chip_id == 0x2539;
+   /* Colour and depth surfaces carry their own pitch and base, and draws and
+    * clears are bounded by the framebuffer state, the attachments' minimum. */
+   caps->mixed_framebuffer_sizes = s->chip_id == 0x2539;
    caps->alpha_test = true;
    caps->user_vertex_buffers = true;
    caps->vertex_color_unclamped = true;
