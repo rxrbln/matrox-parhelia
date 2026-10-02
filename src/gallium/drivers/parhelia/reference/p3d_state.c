@@ -821,8 +821,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	rw[2].reg = P3D_R_ZWRITE;
 	rw[2].val  = (st->stencil_test ? st->stencil_write_mask : 0xffu) |
 		     (st->depth_write ? 0x100u : 0u);
-	rw[3].reg = 0x12c0; rw[3].val = 0x80000000u;
-	rw[4].reg = 0x12c4; rw[4].val = 0x7fffffffu;
+	rw[3].reg = 0x12c0; rw[3].val = st->zclip_set ? st->zclip_min : 0x80000000u;
+	rw[4].reg = 0x12c4; rw[4].val = st->zclip_set ? st->zclip_max : 0x7fffffffu;
 	p3d_reglist(cs, rw, 5);
 
 	rw[0].reg = 0x12d4; rw[0].val = 0;
@@ -997,7 +997,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	 * vendor clamps this shadow one unit down on exactly that family
 	 * (KRN mtx2572, emitted by mtx2393). */
 	rw[0].reg = P3D_R_GUARDBAND;
-	rw[0].val = st->lx_family ? 0x41f80000u : 0x42000000u;
+	rw[0].val = st->guard_band_bits ? st->guard_band_bits :
+		    st->lx_family ? 0x41f80000u : 0x42000000u;
 	p3d_reglist(cs, rw, 1);
 
 	rw[0].reg = 0x121c;             rw[0].val = 0;

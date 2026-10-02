@@ -806,6 +806,11 @@ struct p3d_state {
 	/* A three-component position without a depth surface: the vendor's
 	 * x,y,z,r,g,b,a stream, the only measured untextured RGBA layout. */
 	int		   pos_z;
+	/* Probe overrides: the z-clip range 0x12c0/0x12c4 (default full) and
+	 * the 0x12f4 guard band (default the vendor's value). */
+	int		   zclip_set;
+	uint32_t	   zclip_min, zclip_max;
+	uint32_t	   guard_band_bits;
 	/* A depth-bound RGBA stream has a different descriptor and source stride.
 	 * The batch validator accepts it only for the verified one-texture,
 	 * MODULATE, source-alpha, depth-test shape. */
