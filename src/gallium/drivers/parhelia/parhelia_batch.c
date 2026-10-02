@@ -1482,6 +1482,8 @@ parhelia_batch_compact_reglists(struct parhelia_batch *dst,
 {
    struct parhelia_batch *out;
    unsigned packet_map[PH_BATCH_PACKETS];
+   bool packet_has_reloc[PH_BATCH_PACKETS] = { false };
+   bool in_place = dst == src;
    bool previous_compactable = false;
    int ret = 0;
 
@@ -1489,15 +1491,29 @@ parhelia_batch_compact_reglists(struct parhelia_batch *dst,
        src->packet_count > PH_BATCH_PACKETS ||
        src->reloc_count > PH_BATCH_RELOCS)
       return -EINVAL;
-   for (unsigned r = 0; r < src->reloc_count; r++)
+   for (unsigned r = 0; r < src->reloc_count; r++) {
       if (src->relocs[r].packet >= src->packet_count)
          return -EINVAL;
-   out = malloc(sizeof(*out));
+      packet_has_reloc[src->relocs[r].packet] = true;
+   }
+   for (unsigned i = 0, end = 0; i < src->packet_count; i++) {
+      const struct drm_parhelia_packet *packet = &src->packets[i];
+
+      if (packet->offset > src->command_count ||
+          packet->length > src->command_count - packet->offset)
+         return -EINVAL;
+      /* Compaction never grows the stream: packets in stream order can be
+       * rewritten in place without overtaking unread input. */
+      in_place &= packet->offset >= end;
+      end = packet->offset + packet->length;
+   }
+   const unsigned packet_count = src->packet_count;
+
+   out = in_place ? dst : malloc(sizeof(*out));
    if (!out)
       return -ENOMEM;
    out->command_count = 0;
    out->packet_count = 0;
-   out->reloc_count = 0;
 
    /* A range-stream relocation owns the first packet of an exact direct-fetch
     * tail.  That packet and every packet after it are already barriers (stream,
@@ -1505,20 +1521,14 @@ parhelia_batch_compact_reglists(struct parhelia_batch *dst,
     * byte-exact naturally.  Ordinary state packets before the tail may still
     * be joined; the relocation's packet owner is remapped below. */
 
-   for (unsigned i = 0; i < src->packet_count; i++) {
-      const struct drm_parhelia_packet *packet = &src->packets[i];
-      const uint32_t *cmd;
-      bool has_reloc = false, compactable, merge;
+   for (unsigned i = 0; i < packet_count; i++) {
+      const struct drm_parhelia_packet packet_copy = src->packets[i];
+      const struct drm_parhelia_packet *packet = &packet_copy;
+      const uint32_t *cmd = src->commands + packet->offset;
+      bool compactable, merge;
 
-      if (packet->offset > src->command_count ||
-          packet->length > src->command_count - packet->offset) {
-         ret = -EINVAL;
-         goto out_free;
-      }
-      cmd = src->commands + packet->offset;
-      for (unsigned r = 0; r < src->reloc_count; r++)
-         has_reloc |= src->relocs[r].packet == i;
-      compactable = !has_reloc && compact_reglist_packet(cmd, packet->length);
+      compactable = !packet_has_reloc[i] &&
+                    compact_reglist_packet(cmd, packet->length);
       merge = compactable && previous_compactable && out->packet_count &&
               out->packets[out->packet_count - 1].length <=
                  PH_COMPACT_REGLIST_DWORDS &&
@@ -1530,8 +1540,8 @@ parhelia_batch_compact_reglists(struct parhelia_batch *dst,
             &out->packets[out->packet_count - 1];
          uint32_t *previous_cmd = out->commands + previous->offset;
 
-         memcpy(out->commands + out->command_count, cmd + 1,
-                (packet->length - 1) * sizeof(cmd[0]));
+         memmove(out->commands + out->command_count, cmd + 1,
+                 (packet->length - 1) * sizeof(cmd[0]));
          out->command_count += packet->length - 1;
          previous->length += packet->length - 1;
          previous_cmd[0] = (previous_cmd[0] & 0xffff0000u) |
@@ -1548,8 +1558,8 @@ parhelia_batch_compact_reglists(struct parhelia_batch *dst,
             .offset = out->command_count,
             .length = packet->length,
          };
-         memcpy(out->commands + out->command_count, cmd,
-                packet->length * sizeof(cmd[0]));
+         memmove(out->commands + out->command_count, cmd,
+                 packet->length * sizeof(cmd[0]));
          out->command_count += packet->length;
       }
       previous_compactable = compactable;
@@ -1560,6 +1570,8 @@ parhelia_batch_compact_reglists(struct parhelia_batch *dst,
       out->relocs[r].packet = packet_map[src->relocs[r].packet];
    }
    out->reloc_count = src->reloc_count;
+   if (in_place)
+      return 0;
    memcpy(dst->commands, out->commands,
           out->command_count * sizeof(out->commands[0]));
    memcpy(dst->packets, out->packets,
@@ -1570,7 +1582,8 @@ parhelia_batch_compact_reglists(struct parhelia_batch *dst,
    dst->packet_count = out->packet_count;
    dst->reloc_count = out->reloc_count;
 out_free:
-   free(out);
+   if (!in_place)
+      free(out);
    return ret;
 }
 
