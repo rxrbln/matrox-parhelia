@@ -6238,8 +6238,9 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
 {
    struct parhelia_resource *r = ph_resource(v->base.texture);
    const unsigned first = v->base.u.tex.first_level;
-   const unsigned last = MIN2(MIN2(v->base.u.tex.last_level, r->base.last_level),
-                              ph_resource_mip_levels(r) - 1);
+   /* Levels past the target's storage live in host memory (ph_sw_level)
+    * and are copied like the others. */
+   const unsigned last = MIN2(v->base.u.tex.last_level, r->base.last_level);
    const bool depth = util_format_has_depth(util_format_description(r->base.format));
 
    if ((!depth && util_format_get_blocksize(r->base.format) != 4 &&
@@ -9979,6 +9980,64 @@ ph_clear_zs(struct ph_context *ctx, const struct pipe_surface *surf,
    ph_clear_surface(ctx, r, r->surf_fmt, value, mask, x, y, width, height);
 }
 
+static bool ph_surface_is_base(const struct pipe_surface *surf);
+
+/* A clear of a surface the clear packet cannot address (a mip level other
+ * than the base, a slice): the level's texels through the transfer path,
+ * honouring the colour mask. */
+static void
+ph_clear_level(struct ph_context *ctx, const struct pipe_surface *surf,
+               const union pipe_color_union *color, unsigned colormask,
+               unsigned zs_buffers, double depth, unsigned stencil,
+               uint8_t stencil_mask, unsigned x, unsigned y, unsigned width,
+               unsigned height)
+{
+   const enum pipe_format fmt = surf->format;
+   struct pipe_transfer *t;
+   struct pipe_box box;
+   uint8_t *map;
+
+   u_box_3d(x, y, surf->first_layer, width, height,
+            surf->last_layer - surf->first_layer + 1, &box);
+   map = ctx->base.texture_map(&ctx->base, surf->texture, surf->level,
+                               PIPE_MAP_READ | PIPE_MAP_WRITE, &box, &t);
+   if (!map)
+      return;
+   for (int z = 0; z < box.depth; z++)
+      for (int row = 0; row < box.height; row++) {
+         uint8_t *p = map + (size_t)z * t->layer_stride +
+                      (size_t)row * t->stride;
+
+         for (int col = 0; col < box.width; col++, p += util_format_get_blocksize(fmt)) {
+            if (color) {
+               float rgba[4];
+
+               util_format_unpack_rgba(fmt, rgba, p, 1);
+               for (unsigned c = 0; c < 4; c++)
+                  if (colormask & (PIPE_MASK_R << c))
+                     rgba[c] = color->f[c];
+               util_format_pack_rgba(fmt, p, rgba, 1);
+               continue;
+            }
+            if ((zs_buffers & PIPE_CLEAR_DEPTH) &&
+                util_format_has_depth(util_format_description(fmt))) {
+               const float d = (float)depth;
+
+               util_format_pack_z_float(fmt, p, &d, 1);
+            }
+            if ((zs_buffers & PIPE_CLEAR_STENCIL) &&
+                util_format_has_stencil(util_format_description(fmt))) {
+               uint8_t sv;
+
+               util_format_unpack_s_8uint(fmt, &sv, p, 1);
+               sv = (sv & ~stencil_mask) | (stencil & stencil_mask);
+               util_format_pack_s_8uint(fmt, p, &sv, 1);
+            }
+         }
+      }
+   ctx->base.texture_unmap(&ctx->base, t);
+}
+
 static void
 ph_clear(struct pipe_context *p, unsigned buffers, uint32_t color_mask,
          uint8_t stencil_mask, const struct pipe_scissor_state *scissor,
@@ -9997,12 +10056,22 @@ ph_clear(struct pipe_context *p, unsigned buffers, uint32_t color_mask,
    if (x0 >= x1 || y0 >= y1)
       return;
    if ((buffers & PIPE_CLEAR_COLOR0) && ctx->fb.nr_cbufs &&
-       ctx->fb.cbufs[0].texture)
-      ph_clear_colour(ctx, &ctx->fb.cbufs[0], &color[0],
-                      color_mask & PIPE_MASK_RGBA, x0, y0, x1 - x0, y1 - y0);
-   if ((buffers & PIPE_CLEAR_DEPTHSTENCIL) && ctx->fb.zsbuf.texture)
-      ph_clear_zs(ctx, &ctx->fb.zsbuf, buffers, stencil_mask, depth, stencil,
-                  x0, y0, x1 - x0, y1 - y0);
+       ctx->fb.cbufs[0].texture) {
+      if (ph_surface_is_base(&ctx->fb.cbufs[0]))
+         ph_clear_colour(ctx, &ctx->fb.cbufs[0], &color[0],
+                         color_mask & PIPE_MASK_RGBA, x0, y0, x1 - x0, y1 - y0);
+      else
+         ph_clear_level(ctx, &ctx->fb.cbufs[0], &color[0], color_mask,
+                        0, 0, 0, 0, x0, y0, x1 - x0, y1 - y0);
+   }
+   if ((buffers & PIPE_CLEAR_DEPTHSTENCIL) && ctx->fb.zsbuf.texture) {
+      if (ph_surface_is_base(&ctx->fb.zsbuf))
+         ph_clear_zs(ctx, &ctx->fb.zsbuf, buffers, stencil_mask, depth,
+                     stencil, x0, y0, x1 - x0, y1 - y0);
+      else
+         ph_clear_level(ctx, &ctx->fb.zsbuf, NULL, 0, buffers, depth,
+                        stencil, stencil_mask, x0, y0, x1 - x0, y1 - y0);
+   }
 }
 
 /* The clear packet addresses the base image only. */
