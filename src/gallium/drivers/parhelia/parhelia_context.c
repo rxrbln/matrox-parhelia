@@ -7883,9 +7883,8 @@ ph_nir_depth_from_texture(nir_shader *nir, unsigned *unit)
 }
 
 /* One run of pixels [x0, x1) on row y at depth z, as the two triangles of
- * its rectangle: an axis-aligned rectangle covers exactly its pixel centres
- * under the fill rule, where a unit point at a centre is not placed
- * reliably (MEASURED: the right column of a 60x60 image went missing). */
+ * its rectangle (PARHELIA_ZPIX_RUNS=1, the comparison form); by default
+ * each pixel is one native unit point, the vendor's form. */
 static void
 ph_zpix_run(struct draw_stage *stage, const struct prim_header *prim, int pos,
             int x0, int x1, int y, float z)
@@ -7917,6 +7916,7 @@ ph_zpix_tri(struct draw_stage *stage, struct prim_header *prim)
    int tc = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_TEXCOORD, 0);
    const float k = (float)0xffffff / (float)0x1000000;
    const unsigned cpp = util_format_get_blocksize(ctx->zpix_format);
+   const bool runs = ph_env("PARHELIA_ZPIX_RUNS");
    const float *v[3];
    float area;
    int xmin, ymin, xmax, ymax;
@@ -7982,6 +7982,20 @@ ph_zpix_tri(struct draw_stage *stage, struct prim_header *prim)
                                        (size_t)tx * cpp, 1);
             /* On the Z grid ph_update_viewport puts fragment depths on. */
             z = CLAMP(d, 0.0f, 1.0f) * (ctx->z_grid ? k : 1.0f);
+         }
+         if (!runs) {
+            if (inside) {
+               struct prim_header point = *prim;
+               struct vertex_header *vh = dup_vert(stage, prim->v[0], 0);
+
+               vh->data[pos][0] = px;
+               vh->data[pos][1] = py;
+               vh->data[pos][2] = z;
+               vh->data[pos][3] = 1.0f;
+               point.v[0] = vh;
+               ctx->hw_stage->point(ctx->hw_stage, &point);
+            }
+            continue;
          }
          if (run >= 0 && (!inside || z != run_z)) {
             ph_zpix_run(stage, prim, pos, run, x, y, run_z);
