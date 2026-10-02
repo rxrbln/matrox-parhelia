@@ -5701,6 +5701,47 @@ ph_create_stage(struct ph_context *ctx)
    return &s->base;
 }
 
+/* Level @src_level of the depth image behind @view, written into colour
+ * level @dst_level of @dst as the view's swizzle of (z, 0, 0, 1).  The
+ * sampler has no depth texel format the driver can program, so this is how
+ * GL_DEPTH_TEXTURE_MODE luminance, intensity and alpha reach it. */
+static bool
+ph_depth_to_colour(struct ph_context *ctx, const struct pipe_sampler_view *view,
+                   struct pipe_resource *dst, unsigned dst_level,
+                   unsigned src_level, const struct pipe_box *box)
+{
+   struct pipe_context *p = &ctx->base;
+   struct pipe_transfer *st = NULL, *dt = NULL;
+   const uint8_t swizzle[4] = { view->swizzle_r, view->swizzle_g,
+                                view->swizzle_b, view->swizzle_a };
+   const uint8_t *src = p->texture_map(p, view->texture, src_level,
+                                       PIPE_MAP_READ, box, &st);
+   uint8_t *out = src ? p->texture_map(p, dst, dst_level, PIPE_MAP_WRITE,
+                                        box, &dt) : NULL;
+   float *z = MALLOC(box->width * sizeof(float));
+   bool ok = src && out && z;
+
+   for (int y = 0; ok && y < box->height; y++) {
+      util_format_unpack_z_float(view->texture->format, z,
+                                 src + (size_t)y * st->stride, box->width);
+      for (int x = 0; x < box->width; x++) {
+         const float c[6] = { z[x], 0.0f, 0.0f, 1.0f, 0.0f, 1.0f };
+         float rgba[4];
+
+         for (unsigned i = 0; i < 4; i++)
+            rgba[i] = swizzle[i] <= PIPE_SWIZZLE_1 ? c[swizzle[i]] : 0.0f;
+         util_format_pack_rgba(dst->format, out + (size_t)y * dt->stride +
+                               x * 4, rgba, 1);
+      }
+   }
+   FREE(z);
+   if (dt)
+      p->texture_unmap(p, dt);
+   if (st)
+      p->texture_unmap(p, st);
+   return ok;
+}
+
 /* Levels first..last of @v's texture copied into a private chain whose
  * level 0 is the view's first level; rebuilt when the texture changes. */
 static struct pipe_sampler_view *
@@ -5710,13 +5751,24 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
    const unsigned first = v->base.u.tex.first_level;
    const unsigned last = MIN2(MIN2(v->base.u.tex.last_level, r->base.last_level),
                               ph_resource_mip_levels(r) - 1);
+   const bool depth = util_format_has_depth(util_format_description(r->base.format));
 
-   if (util_format_get_blocksize(r->base.format) != 4 || first > last)
+   if ((!depth && util_format_get_blocksize(r->base.format) != 4) ||
+       first > last)
       return NULL;
    if (!v->shadow_view) {
       struct pipe_resource templ = r->base, *shadow;
       struct pipe_sampler_view view = v->base;
 
+      /* A depth image is sampled as the colour its view's swizzle makes of
+       * the depth value (GL_DEPTH_TEXTURE_MODE). */
+      if (depth) {
+         templ.format = view.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+         view.swizzle_r = PIPE_SWIZZLE_X;
+         view.swizzle_g = PIPE_SWIZZLE_Y;
+         view.swizzle_b = PIPE_SWIZZLE_Z;
+         view.swizzle_a = PIPE_SWIZZLE_W;
+      }
       templ.width0 = u_minify(r->base.width0, first);
       templ.height0 = u_minify(r->base.height0, first);
       templ.last_level = last - first;
@@ -5741,6 +5793,12 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
 
          if (!(r->mip_defined & BITFIELD_BIT(l)))
             continue;
+         if (depth) {
+            if (!ph_depth_to_colour(ctx, &v->base, v->shadow_view->texture,
+                                    l - first, l, &box))
+               return NULL;
+            continue;
+         }
          if (!ph_copy_texture_box(ctx, v->shadow_view->texture, l - first,
                                   0, 0, &r->base, l, &box, w, h)) {
             /* Host-only levels go through the transfer paths. */
@@ -5758,6 +5816,10 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
 static bool
 ph_sampled_through_copy(const struct parhelia_resource *r)
 {
+   if (util_format_has_depth(util_format_description(r->base.format)))
+      return r->base.target == PIPE_TEXTURE_2D ||
+             r->base.target == PIPE_TEXTURE_RECT ||
+             r->base.target == PIPE_TEXTURE_1D;
    return r->transfer_shadow && !r->native_shared &&
           !ph_resource_uses_sampler_layout(r) &&
           !(r->base.bind & PIPE_BIND_DEPTH_STENCIL) &&
