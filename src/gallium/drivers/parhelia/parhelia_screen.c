@@ -1722,9 +1722,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    /* Match the vendor OpenGL driver's advertised limit; the register field
     * itself remains safely clamped over its wider recovered +/-4 range. */
    caps->max_texture_lod_bias = 2.0f;
-   /* The back-end has separate RGB/alpha factors but one shared blend
-    * equation, so Gallium must not expose the separate-equation extension. */
-   caps->blend_equation_separate = false;
+   /* BLENDCTL has an equation field per pipe; the vendor writes both from
+    * one GL enum, independent pipes are measured on the P690 only. */
+   caps->blend_equation_separate = s->chip_id == 0x2539;
    caps->alpha_test = true;
    caps->user_vertex_buffers = true;
    caps->vertex_color_unclamped = true;

@@ -696,7 +696,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 	            input->blend_dst.rgb ==
 	               P3D_BF_ONE_MINUS_SRC_ALPHA.rgb &&
 	            input->blend_dst.a == P3D_BF_ONE_MINUS_SRC_ALPHA.a &&
-	            input->blend_eq == P3D_BEQ_ADD)))) ||
+	            input->blend_eq == P3D_BEQ_ADD &&
+	            !input->blend_eq_alpha_separate)))) ||
 	       /* RGBA fetch is restricted to the verified one-texture MODULATE
 	        * source-alpha ADD form.  The depth+RGBA alpha-test combination is
 	        * deliberately test-only: it proves the descriptor and texture-alpha
@@ -722,7 +723,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 	                                   input->blend_dst.a != P3D_BF_ONE.a) :
 	                                  (input->blend_dst.rgb != P3D_BF_ONE_MINUS_SRC_ALPHA.rgb ||
 	                                   input->blend_dst.a != P3D_BF_ONE_MINUS_SRC_ALPHA.a)) ||
-	                                 input->blend_eq != P3D_BEQ_ADD)))) ||
+	                                 input->blend_eq != P3D_BEQ_ADD ||
+	                                 input->blend_eq_alpha_separate)))) ||
 	       (!input->vertex_alpha &&
 	        (input->depth_vertex_alpha || input->depth_vertex_alpha_add ||
 	         input->depth_alpha_test_probe)) ||

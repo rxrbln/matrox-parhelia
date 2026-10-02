@@ -1463,6 +1463,8 @@ ph_apply_fragment_state(struct ph_context *ctx, struct p3d_state *state,
       state->blend_src = (struct p3d_blend_factor){rgb_src.rgb, a_src.a};
       state->blend_dst = (struct p3d_blend_factor){rgb_dst.rgb, a_dst.a};
       state->blend_eq = ph_blend_equation(blend->rgb_func);
+      state->blend_eq_alpha = ph_blend_equation(blend->alpha_func);
+      state->blend_eq_alpha_separate = state->blend_eq_alpha != state->blend_eq;
       state->blend_const_rg = ph_pack_2x10(ctx->blend_color.color[0],
                                            ctx->blend_color.color[1]);
       state->blend_const_ba = ph_pack_2x10(ctx->blend_color.color[2],

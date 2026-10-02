@@ -120,11 +120,15 @@ p3d_blendctl(const struct p3d_state *st)
 	struct p3d_blend_factor s = st->blend ? st->blend_src : (struct p3d_blend_factor){ 1, 1 };
 	struct p3d_blend_factor d = st->blend ? st->blend_dst : (struct p3d_blend_factor){ 0, 0 };
 	uint32_t eq = (uint32_t)st->blend_eq & 7u;
+	uint32_t eq_a = st->blend_eq_alpha_separate ?
+		(uint32_t)st->blend_eq_alpha & 7u : eq;
 
 	/* The blend-factor fields are ignored by MIN and MAX, but the hardware
-	 * requires their canonical ONE encoding. */
+	 * requires their canonical ONE encoding, per pipe. */
 	if (st->blend && (eq == P3D_BEQ_MIN || eq == P3D_BEQ_MAX))
-		s = d = P3D_BF_ONE;
+		s.rgb = d.rgb = P3D_BF_ONE.rgb;
+	if (st->blend && (eq_a == P3D_BEQ_MIN || eq_a == P3D_BEQ_MAX))
+		s.a = d.a = P3D_BF_ONE.a;
 
 	/* A target with more than eight bits per component takes BOTH dither bits
 	 * low, which is a third state distinct from "dither off".  The vendor
@@ -138,12 +142,12 @@ p3d_blendctl(const struct p3d_state *st)
 		       ((uint32_t)(d.rgb & 0xf) << 5) |
 		       ((uint32_t)(s.a   & 0xf) << 9) |
 		       ((uint32_t)(d.a   & 0xf) << 13) |
-		       (eq << 17) | (eq << 20);
+		       (eq << 17) | (eq_a << 20);
 
 	return (st->blend ? 1u : 0u) |
 	       ((uint32_t)(s.rgb & 0xf) << 1) | ((uint32_t)(d.rgb & 0xf) << 5) |
 	       ((uint32_t)(s.a   & 0xf) << 9) | ((uint32_t)(d.a   & 0xf) << 13) |
-	       (eq << 17) | (eq << 20) | P3D_BLEND_DITHER |
+	       (eq << 17) | (eq_a << 20) | P3D_BLEND_DITHER |
 	       (st->dither ? 0u : P3D_BLEND_DITHER_DISABLE);
 }
 

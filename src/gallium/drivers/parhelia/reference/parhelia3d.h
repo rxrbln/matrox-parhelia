@@ -667,6 +667,10 @@ struct p3d_state {
 	int		   blend;	/* 0x12e8 bit 0 */
 	struct p3d_blend_factor blend_src, blend_dst;
 	enum p3d_blend_eq  blend_eq;
+	/* 0x12e8 carries one equation per pipe, [19:17] RGB and [22:20] alpha;
+	 * blend_eq feeds both unless the alpha pipe is given its own. */
+	int		   blend_eq_alpha_separate;
+	enum p3d_blend_eq  blend_eq_alpha;
 	/* Blend constants are two 10-bit unsigned components per register:
 	 * RG in 0x12ec and BA in 0x12f0. */
 	uint32_t	   blend_const_rg, blend_const_ba;
