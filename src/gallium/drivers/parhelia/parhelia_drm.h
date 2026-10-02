@@ -110,6 +110,7 @@ struct drm_parhelia_create_vertex {
 #define PARHELIA_BO_LAYOUT_NATIVE_64X32	1
 #define PARHELIA_BO_LAYOUT_NATIVE_64X16	2
 #define PARHELIA_BO_LAYOUT_TEXTURE		3
+/* The object's mmap is a CPU-linear host-aperture view of its native bytes. */
 #define PARHELIA_BO_INFO_HOST_APERTURE	(1u << 0)
 
 struct drm_parhelia_get_bo_info {
@@ -119,7 +120,9 @@ struct drm_parhelia_get_bo_info {
 	__u32 width;
 	__u32 height;
 	__u32 pitch; /* out: native GPU byte pitch, not dumb host pitch */
-	__u32 pad;
+	/* out: byte pitch of the CPU-linear mmap (MAP_DUMB offset) and of
+	 * framebuffers; zero when the object has no host-aperture view */
+	__u32 host_pitch;
 	__u64 size;
 };
 

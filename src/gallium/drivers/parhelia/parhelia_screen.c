@@ -1422,7 +1422,12 @@ ph_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *ctx,
          fprintf(stderr,
                  "parhelia: export native resource=%p handle=%u type=%u pitch_B=%u\n",
                  (void *)r, r->handle, whandle->type, r->stride * 4);
-      whandle->stride = r->stride * r->cpp;
+      struct drm_parhelia_get_bo_info info;
+
+      /* The DRI3/KMS stride is that of the kernel's CPU-linear view; the
+       * native pitch travels through GET_BO_INFO. */
+      whandle->stride = ph_query_bo(ph_screen(pscreen), r->handle, &info) &&
+                        info.host_pitch ? info.host_pitch : r->stride * r->cpp;
       whandle->offset = 0;
       /* The matching KMS and Xorg driver query the GEM layout explicitly.
        * INVALID must never be inferred as LINEAR for a Parhelia dma-buf. */
