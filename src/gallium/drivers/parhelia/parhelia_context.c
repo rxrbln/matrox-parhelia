@@ -8013,6 +8013,22 @@ static void *ph_create_fs(struct pipe_context *p,
                fprintf(stderr, "parhelia: fs=%p has no combiner program: %s\n",
                        (void *)fs, fs->program.reject ? fs->program.reject :
                                                         "declared samplers");
+            /* A linked program the combiner cannot express fails the link with
+             * the reason instead of rendering through the texenv fallback. */
+            if (!fs->program.valid && s->report_compile_error &&
+                !s->ir.nir->info.internal) {
+               char *msg = NULL;
+
+               if (asprintf(&msg, "parhelia: fragment shader exceeds the "
+                            "combiner: %s", fs->program.reject ?
+                            fs->program.reject :
+                            "samples undeclared texture units") < 0)
+                  msg = NULL;
+               ((struct pipe_shader_state *)s)->error_message = msg;
+               draw_delete_fragment_shader(ph_context(p)->draw, fs->draw);
+               FREE(fs);
+               return NULL;
+            }
          }
          if (ph_env("PARHELIA_TRACE")) {
             fprintf(stderr,
