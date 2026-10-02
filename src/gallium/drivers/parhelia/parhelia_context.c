@@ -5823,9 +5823,11 @@ ph_line_coverage_colours(struct ph_context *ctx, const struct prim_header *prim,
       return false;
    for (unsigned v = 0; v < 2; v++)
       memcpy(out[v], prim->v[v]->data[col], sizeof(out[v]));
-   if (ctx->rasterizer && ctx->rasterizer->flatshade)
-      memcpy(out[!ctx->rasterizer->flatshade_first],
-             out[!!ctx->rasterizer->flatshade_first], sizeof(out[0]));
+   if (ctx->rasterizer && ctx->rasterizer->flatshade) {
+      const unsigned pv = ctx->rasterizer->flatshade_first ? 0 : 1;
+
+      memcpy(out[!pv], out[pv], sizeof(out[0]));
+   }
    return true;
 }
 
