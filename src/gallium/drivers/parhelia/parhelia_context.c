@@ -2518,11 +2518,23 @@ ph_sampler_wrap_axes(const struct pipe_sampler_state *sampler,
           (!three || ph_sampler_wrap(sampler->wrap_r, &tex->wrap_r));
 }
 
+/* The LOD bias range the sampler is given: 0x11c0[24:16] is signed 4.4 with
+ * a -4.0 offset, so it reaches -12 .. +19.9; the vendor clamps to +/-4.  On
+ * the P690 biases to +/-5 are measured (tex-miplevel-selection) and the
+ * rest of the symmetric +/-12 follows the field; the original family keeps
+ * the vendor clamp. */
+static float
+ph_max_lod_bias(const struct ph_context *ctx)
+{
+   return ph_screen(ctx->base.screen)->chip_id == 0x2539 ? 12.0f : 4.0f;
+}
+
 static uint32_t
 ph_sampler_filter_word(const struct p3d_texture *texture,
-                       const struct pipe_sampler_state *sampler)
+                       const struct pipe_sampler_state *sampler,
+                       float max_bias)
 {
-   float bias = sampler ? CLAMP(sampler->lod_bias, -4.0f, 4.0f) : 0.0f;
+   float bias = sampler ? CLAMP(sampler->lod_bias, -max_bias, max_bias) : 0.0f;
    int fixed_bias = (int)((bias - 4.0f) * 16.0f);
    uint32_t word = 0x1000u |
       ((uint32_t)texture->min_filter & 3u) |
@@ -4607,7 +4619,7 @@ ph_submit_vertices(struct ph_context *ctx)
       tex.max_level = texture_mipped ?
          ph_view_mip_levels(texture, ctx->sampler_views[0]) - 1 : 0;
       ph_apply_view_base(texture, ctx->sampler_views[0], texture_tiled, &tex);
-      tex.filter = ph_sampler_filter_word(&tex, sampler);
+      tex.filter = ph_sampler_filter_word(&tex, sampler, ph_max_lod_bias(ctx));
       tex.wrap = ph_sampler_wrap_word(&tex, sampler);
       tex.env = ctx->fs->texenv;
       state.comb = ph_compiled_combiner(ctx, texture1 != NULL);
@@ -4653,7 +4665,7 @@ ph_submit_vertices(struct ph_context *ctx)
             ph_view_mip_levels(texture1, ctx->sampler_views[1]) - 1 : 0;
          ph_apply_view_base(texture1, ctx->sampler_views[1], texture1_tiled,
                             &tex1);
-         tex1.filter = ph_sampler_filter_word(&tex1, sampler1);
+         tex1.filter = ph_sampler_filter_word(&tex1, sampler1, ph_max_lod_bias(ctx));
          tex1.wrap = ph_sampler_wrap_word(&tex1, sampler1);
          /* Quake's base world pass is diffuse times lightmap. */
          tex1.env = P3D_TEXENV_MODULATE;

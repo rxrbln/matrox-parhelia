@@ -1761,9 +1761,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    caps->texture_mirror_clamp = false;
    caps->anisotropic_filter = true;
    caps->max_texture_anisotropy = 2.0f;
-   /* Match the vendor OpenGL driver's advertised limit; the register field
-    * itself remains safely clamped over its wider recovered +/-4 range. */
-   caps->max_texture_lod_bias = 2.0f;
+   /* The bias field reaches -12 .. +19.9 (ph_max_lod_bias): the P690 takes
+    * the symmetric +/-12 (measured to +/-5), the original family keeps the
+    * vendor OpenGL driver's advertised 2. */
+   caps->max_texture_lod_bias = s->chip_id == 0x2539 ? 12.0f : 2.0f;
    /* BLENDCTL has an equation field per pipe; the vendor writes both from
     * one GL enum, independent pipes are measured on the P690 only. */
    caps->blend_equation_separate = s->chip_id == 0x2539;
