@@ -398,6 +398,16 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
             supported = !(bind & (PIPE_BIND_RENDER_TARGET |
                                   PIPE_BIND_DEPTH_STENCIL));
             break;
+         case PIPE_FORMAT_R8_UNORM:
+            /* Sampler-only, stored as the 32-bit texel (r, 0, 0, 1); the
+             * transfer paths widen it (ph_format_widened). */
+            supported = (bind & PIPE_BIND_SAMPLER_VIEW) &&
+                        !(bind & (PIPE_BIND_RENDER_TARGET |
+                                  PIPE_BIND_DEPTH_STENCIL |
+                                  PIPE_BIND_SCANOUT |
+                                  PIPE_BIND_DISPLAY_TARGET |
+                                  PIPE_BIND_SHARED));
+            break;
          default: {
             /* The sampler and colour surfaces store 8-bit B,G,R,A; the
              * transfers reorder any other 8-bit UNORM byte order exactly.

@@ -115,6 +115,7 @@ struct ph_fs {
 struct ph_transfer {
    struct pipe_transfer base;
    void *staging;
+   void *wide;      /* a widened format's 32-bit texels, see ph_format_widened */
 };
 
 /* A sampler view plus, for a first level the hardware cannot use as its
@@ -162,6 +163,14 @@ ph_mip_layer_texel_offset(const struct ph_mip_layout *mip, unsigned level,
                                 mip->slices, cpp);
    return ph_mip_texel_offset_cpp(mip, level, x, y, linear, cpp) +
           (size_t)layer * mip->level[level].bytes;
+}
+
+/* A one-channel R8 image is stored as the native B8G8R8A8 texel (r, 0, 0, 1),
+ * which the sampler decodes to exactly what GL_RED defines. */
+static bool
+ph_format_widened(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_R8_UNORM;
 }
 
 static unsigned
@@ -8557,6 +8566,7 @@ ph_copy_texture_box(struct ph_context *ctx,
    ph_submit_vertices(ctx);
    if (!width || !height || width != dwidth || height != dheight ||
        src_box->depth != 1 || (cpp != 4 && cpp != 2 && cpp != 1) ||
+       ph_format_widened(src->format) || ph_format_widened(dst->format) ||
        util_format_get_blocksize(dst->format) != cpp ||
        !ph_level_extent(sr, src_level, &src_w, &src_h) ||
        !ph_level_extent(dr, dst_level, &dst_w, &dst_h) ||
@@ -9244,9 +9254,12 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
    struct ph_context *ctx = ph_context(p);
    struct parhelia_resource *r = ph_resource(res);
    struct ph_transfer *t = CALLOC_STRUCT(ph_transfer);
-   unsigned cpp = util_format_get_blocksize(res->format);
+   /* A widened format moves its stored 32-bit texels here and is narrowed
+    * into the caller's staging at the end. */
+   const bool widen = ph_format_widened(res->format);
+   unsigned cpp = widen ? 4 : util_format_get_blocksize(res->format);
    struct ph_texel_order order_storage;
-   const struct ph_texel_order *swap_rb =
+   const struct ph_texel_order *swap_rb = widen ? NULL :
       ph_format_texel_order(res->format, &order_storage);
 
    ph_zinit_resolve(ctx, r);
@@ -9404,6 +9417,22 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
        * Gallium transfer, but it cannot expose stale allocator contents. */
       memset(t->staging, 0, t->base.layer_stride * layers);
    }
+   if (widen) {
+      const size_t texels = (size_t)box->width * box->height * layers;
+      uint8_t *narrow = MALLOC(MAX2(texels, 1));
+
+      if (!narrow) {
+         FREE(t->staging);
+         FREE(t);
+         return NULL;
+      }
+      for (size_t n = 0; n < texels; n++)
+         narrow[n] = ((const uint8_t *)t->staging)[n * 4 + 2];
+      t->wide = t->staging;
+      t->staging = narrow;
+      t->base.stride = box->width;
+      t->base.layer_stride = (uintptr_t)box->width * box->height;
+   }
    *out = &t->base;
    return t->staging;
 }
@@ -9413,10 +9442,29 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
 {
    struct ph_transfer *t = (struct ph_transfer *)transfer;
    struct parhelia_resource *r = ph_resource(transfer->resource);
-   unsigned cpp = util_format_get_blocksize(transfer->resource->format);
+   const bool widen = t->wide != NULL;
+   unsigned cpp = widen ? 4 : util_format_get_blocksize(transfer->resource->format);
    struct ph_texel_order order_storage;
-   const struct ph_texel_order *swap_rb =
+   const struct ph_texel_order *swap_rb = widen ? NULL :
       ph_format_texel_order(transfer->resource->format, &order_storage);
+
+   if (widen) {
+      const size_t texels = (size_t)transfer->box.width *
+                            transfer->box.height * MAX2(transfer->box.depth, 1);
+      uint8_t *wide = t->wide;
+
+      /* B, G, R, A = 0, 0, r, 1: the sampler reads GL_RED's (r, 0, 0, 1). */
+      for (size_t n = 0; n < texels; n++) {
+         wide[n * 4 + 0] = wide[n * 4 + 1] = 0;
+         wide[n * 4 + 2] = ((const uint8_t *)t->staging)[n];
+         wide[n * 4 + 3] = 0xff;
+      }
+      FREE(t->staging);
+      t->staging = wide;
+      t->wide = NULL;
+      transfer->stride = transfer->box.width * 4;
+      transfer->layer_stride = (uintptr_t)transfer->stride * transfer->box.height;
+   }
    if (texture && !t->staging) {
       /* A host-only level was written in place. */
       if ((transfer->usage & PIPE_MAP_WRITE) && transfer->level) {
