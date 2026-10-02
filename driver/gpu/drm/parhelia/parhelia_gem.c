@@ -1394,7 +1394,18 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	if (!ret && to_parhelia_bo(&gbo->bo.base)->host_pitch !=
 		    host_pitch_pixels * cpp)
 		ret = -EINVAL;
-	if (!ret)
+	/* Dumb objects are KMS framebuffers: refresh them from the P690 display
+	 * band so it does not compete with bank-A colour and texture traffic. */
+	if (!ret && pdev->pdev->device == PARHELIA_P690) {
+		parhelia_bo_set_placement_class(gbo,
+			PARHELIA_PLACEMENT_NATIVE_SCANOUT);
+		ret = parhelia_vram_pin(gbo);
+		if (ret == -ENOSPC || ret == -ENOMEM || ret == -E2BIG) {
+			parhelia_bo_set_placement_class(gbo,
+				PARHELIA_PLACEMENT_LEGACY);
+			ret = parhelia_vram_pin(gbo);
+		}
+	} else if (!ret)
 		ret = parhelia_vram_pin(gbo);
 	if (ret) {
 		drm_gem_object_put(&gbo->bo.base);
