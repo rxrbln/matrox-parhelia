@@ -36,10 +36,13 @@
 } while (0)
 
 
-/* r0..r13 are free; the vendor epilogue owns r14/r15.  T0 latches the fetched
+/* r0..r13 less r10/r11 are free; the vendor epilogue owns r14/r15.  T0 latches the fetched
  * position, T1 the viewport offset and T2 is the temporary every draw depends
  * on, so none of the three may be allocated. */
 #define PH_VS_TEMPS 14u
+/* r10 and r11 are where the light accumulator commits (P3D_WARP_ACC); a
+ * value written there by an ordinary instruction does not read back. */
+#define PH_VS_RESERVED_TEMPS ((1u << 10) | (1u << 11))
 
 /* Highest constant slot an instruction can name: four index bits plus the one
  * three-bit extension field a bundle carries. */
@@ -90,7 +93,7 @@ static bool
 ph_vs_alloc(struct ph_vs_ctx *ctx, uint8_t *out)
 {
    for (unsigned i = 0; i < PH_VS_TEMPS; i++) {
-      if (!(ctx->live & (1u << i))) {
+      if (!((ctx->live | PH_VS_RESERVED_TEMPS) & (1u << i))) {
          ctx->live |= 1u << i;
          *out = i;
          return true;
