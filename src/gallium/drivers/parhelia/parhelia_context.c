@@ -214,6 +214,8 @@ static const char *const ph_stat_kind_names[PH_STAT_KINDS] = {
 struct ph_context {
    struct pipe_context base;
    struct draw_context *draw;
+   /* The native rasterise stage, and the logic-op colour grid in front. */
+   struct draw_stage *hw_stage, *quant_stage;
    struct pipe_framebuffer_state fb;
    struct pipe_rasterizer_state *rasterizer;
    struct pipe_depth_stencil_alpha_state *dsa;
@@ -6718,6 +6720,147 @@ fallback:
    return false;
 }
 
+/* ------------------------------------------------ logic-op colour grid
+ *
+ * The pixel pipe applies the raster op to a colour wider than the target:
+ * a source of k/255 XORs exactly into an 8-bit target for every k and every
+ * destination, while 0.5 or 0.25 come out one code apart between two
+ * identical draws, so XOR twice does not restore the image (MEASURED on the
+ * P690, all 256x256 source/destination pairs).  GL converts the fragment
+ * colour to the framebuffer's fixed point before the logic op, so vertex
+ * colours are put on the target's grid while a non-COPY logic op is active.
+ */
+struct ph_quant_stage {
+   struct draw_stage base;
+   struct ph_context *ctx;
+   int slot[2];
+   float scale[4];
+};
+
+static bool
+ph_logicop_quantize(const struct ph_context *ctx)
+{
+   return ctx->blend && ctx->blend->logicop_enable &&
+          ctx->blend->logicop_func != PIPE_LOGICOP_COPY &&
+          ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture;
+}
+
+/* The colour target's code count per GL channel; 0 leaves a channel alone. */
+static void
+ph_logicop_grid(const struct ph_context *ctx, float scale[4])
+{
+   const struct util_format_description *desc =
+      util_format_description(ctx->fb.cbufs[0].format);
+
+   for (unsigned c = 0; c < 4; c++) {
+      const unsigned s = desc->swizzle[c];
+
+      scale[c] = s <= PIPE_SWIZZLE_W && desc->channel[s].normalized &&
+                 desc->channel[s].size ?
+                 (float)((1u << desc->channel[s].size) - 1) : 0.0f;
+   }
+}
+
+static struct vertex_header *
+ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
+                unsigned idx)
+{
+   struct ph_quant_stage *q = (struct ph_quant_stage *)stage;
+   struct vertex_header *out = dup_vert(stage, v, idx);
+
+   for (unsigned i = 0; i < 2; i++) {
+      if (q->slot[i] < 0)
+         continue;
+      for (unsigned c = 0; c < 4; c++)
+         if (q->scale[c] > 0.0f)
+            out->data[q->slot[i]][c] =
+               roundf(CLAMP(out->data[q->slot[i]][c], 0.0f, 1.0f) *
+                      q->scale[c]) / q->scale[c];
+   }
+   return out;
+}
+
+static void
+ph_quant_tri(struct draw_stage *stage, struct prim_header *prim)
+{
+   struct prim_header tmp = *prim;
+
+   for (unsigned i = 0; i < 3; i++)
+      tmp.v[i] = ph_quant_vertex(stage, prim->v[i], i);
+   stage->next->tri(stage->next, &tmp);
+}
+
+static void
+ph_quant_line(struct draw_stage *stage, struct prim_header *prim)
+{
+   struct prim_header tmp = *prim;
+
+   for (unsigned i = 0; i < 2; i++)
+      tmp.v[i] = ph_quant_vertex(stage, prim->v[i], i);
+   stage->next->line(stage->next, &tmp);
+}
+
+static void
+ph_quant_point(struct draw_stage *stage, struct prim_header *prim)
+{
+   struct prim_header tmp = *prim;
+
+   tmp.v[0] = ph_quant_vertex(stage, prim->v[0], 0);
+   stage->next->point(stage->next, &tmp);
+}
+
+static void
+ph_quant_flush(struct draw_stage *stage, unsigned flags)
+{
+   stage->next->flush(stage->next, flags);
+}
+
+static void
+ph_quant_reset(struct draw_stage *stage)
+{
+   stage->next->reset_stipple_counter(stage->next);
+}
+
+static void
+ph_quant_destroy(struct draw_stage *stage)
+{
+   draw_free_temp_verts(stage);
+   FREE(stage);
+}
+
+static struct draw_stage *
+ph_quant_create_stage(struct ph_context *ctx)
+{
+   struct ph_quant_stage *q = CALLOC_STRUCT(ph_quant_stage);
+
+   if (!q)
+      return NULL;
+   q->ctx = ctx;
+   q->base.draw = ctx->draw;
+   q->base.next = ctx->hw_stage;
+   q->base.point = ph_quant_point;
+   q->base.line = ph_quant_line;
+   q->base.tri = ph_quant_tri;
+   q->base.flush = ph_quant_flush;
+   q->base.reset_stipple_counter = ph_quant_reset;
+   q->base.destroy = ph_quant_destroy;
+   if (!draw_alloc_temp_verts(&q->base, 3)) {
+      FREE(q);
+      return NULL;
+   }
+   return &q->base;
+}
+
+static void
+ph_quant_prepare(struct ph_context *ctx)
+{
+   struct ph_quant_stage *q = (struct ph_quant_stage *)ctx->quant_stage;
+
+   q->slot[0] = draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_COLOR, 0);
+   q->slot[1] = draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_COLOR, 1);
+   ph_logicop_grid(ctx, q->scale);
+}
+
 static void
 ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
             unsigned drawid_offset, const struct pipe_draw_indirect_info *indirect,
@@ -6772,14 +6915,23 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
          ph_submit_vertices(ctx);
       ctx->derived_triangles = derived;
    }
-   if (!derived && ph_draw_tcl(ctx, info, draws))
+   const bool quantize = ph_logicop_quantize(ctx) &&
+                         (ctx->quant_stage ||
+                          (ctx->quant_stage = ph_quant_create_stage(ctx)));
+   if (!derived && !quantize && ph_draw_tcl(ctx, info, draws))
       goto unbind;
    /* A software-transformed batch must not inherit an object-space one. */
    if (ctx->transform && ctx->triangles)
       ph_submit_vertices(ctx);
    ctx->transform = false;
+   if (quantize) {
+      ph_quant_prepare(ctx);
+      draw_set_rasterize_stage(ctx->draw, ctx->quant_stage);
+   }
    draw_vbo(ctx->draw, info, drawid_offset, NULL, draws, num_draws, 0);
    draw_flush(ctx->draw);
+   if (quantize)
+      draw_set_rasterize_stage(ctx->draw, ctx->hw_stage);
 unbind:
    for (unsigned i = 0; i < ctx->draw->pt.nr_vertex_buffers; i++)
       draw_set_mapped_vertex_buffer(ctx->draw, i, NULL, 0);
@@ -7200,6 +7352,22 @@ ph_compiled_combiner(struct ph_context *ctx, bool two_units)
          return NULL;
       ph_fs_update_constants(&fs->program, ctx->fs_const_snap,
                              ctx->fs_const_snap_size);
+   }
+   /* A program that only moves a constant (glColor's current colour) has
+    * that constant as its colour: put it on the logic op's target grid. */
+   if (ph_logicop_quantize(ctx) && !fs->program.sampler_mask &&
+       !fs->program.uses_color && !fs->program.uses_color1 &&
+       fs->program.comb.count == 1) {
+      struct p3d_comb_inst *inst = &fs->program.comb.inst[0];
+      float scale[4];
+
+      ph_logicop_grid(ctx, scale);
+      for (unsigned k = 0; k < 2; k++)
+         for (unsigned c = 0; k < 2 && inst->has_const[k] && c < 4; c++)
+            if (scale[c] > 0.0f)
+               inst->constant[k][c] =
+                  roundf(CLAMP(inst->constant[k][c], 0.0f, 1.0f) * scale[c]) /
+                  scale[c];
    }
    return &fs->program.comb;
 }
@@ -9121,6 +9289,8 @@ ph_destroy_context(struct pipe_context *p)
    free(ctx->vs_const);
    free(ctx->vs_const_pending);
    free(ctx->fs_const_snap);
+   if (ctx->quant_stage)
+      ctx->quant_stage->destroy(ctx->quant_stage);
    draw_destroy(ctx->draw);
    FREE(ctx);
 }
@@ -9304,6 +9474,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    if (!stage)
       goto fail;
    draw_set_rasterize_stage(ctx->draw, stage);
+   ctx->hw_stage = stage;
    /* Quad-rasterized (sprite) points become textured quads in the draw
     * module, which also generates their sprite coordinates. */
    draw_wide_point_sprites(ctx->draw, true);
