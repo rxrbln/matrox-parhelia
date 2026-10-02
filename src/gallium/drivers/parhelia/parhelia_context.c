@@ -156,6 +156,9 @@ struct ph_fs {
     * x of the sample of GL unit depth_unit, the colour the vertex colour. */
    bool depth_from_texture;
    unsigned depth_unit;
+   /* gl_FragDepth from uniforms only: the program's depth, evaluated per
+    * draw and given to every vertex, so the combiner runs the colour. */
+   nir_def *depth_uniform;
    /* The vertex output each GL unit's samples take their coordinate from,
     * as ph_fs_find_coord_sources() traced it: unit k need not use set k. */
    /* The unit is sampled as a rectangle: unnormalised texel coordinates. */
@@ -565,6 +568,7 @@ ph_fs_kill_route(struct ph_context *ctx, struct ph_fs_program **prog,
                  enum pipe_compare_func *func, uint8_t *ref);
 static bool ph_fs_untextured_program(struct ph_context *ctx);
 static bool ph_nir_def_uniform(nir_def *def, unsigned depth);
+static float ph_depth_window(double d, unsigned bits);
 
 static inline struct ph_context *
 ph_context(struct pipe_context *p)
@@ -7530,6 +7534,10 @@ struct ph_quant_stage {
    unsigned coord_count;
    int coord_slot[P3D_MAX_TEXTURE_UNITS];
    float coord[P3D_MAX_TEXTURE_UNITS][4];
+   /* A constant window depth for every vertex (depth_uniform). */
+   bool const_z;
+   int pos_slot;
+   float z;
    /* Rectangle coordinates scaled to the normalised ones the unit takes. */
    unsigned rect_count;
    int rect_slot[P3D_MAX_TEXTURE_UNITS];
@@ -7569,6 +7577,8 @@ ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
 
    for (unsigned i = 0; i < q->coord_count; i++)
       memcpy(out->data[q->coord_slot[i]], q->coord[i], sizeof(q->coord[i]));
+   if (q->const_z)
+      out->data[q->pos_slot][2] = q->z;
    for (unsigned i = 0; i < q->rect_count; i++) {
       out->data[q->rect_slot[i]][0] *= q->rect_scale[i][0];
       out->data[q->rect_slot[i]][1] *= q->rect_scale[i][1];
@@ -7899,6 +7909,30 @@ ph_fs_samples_rect(const struct ph_fs *fs)
       if (fs->coord_rect[k])
          return true;
    return false;
+}
+
+/* gl_FragDepth from uniforms: every vertex at that window depth, put on the
+ * Z grid the way a clear to the same value is (ph_depth_window). */
+static bool
+ph_fix_depth(struct ph_context *ctx, struct ph_quant_stage *q)
+{
+   nir_const_value v[NIR_MAX_VEC_COMPONENTS];
+   const struct util_format_description *zd;
+   unsigned bits;
+
+   q->const_z = false;
+   if (!ctx->fs || !ctx->fs->depth_uniform)
+      return true;
+   if (!ph_nir_eval_uniform(ctx, ctx->fs->depth_uniform, v, 0))
+      return false;
+   zd = ctx->fb.zsbuf.texture ? util_format_description(ctx->fb.zsbuf.format) :
+                                NULL;
+   bits = zd && util_format_has_depth(zd) ? zd->channel[zd->swizzle[0]].size : 0;
+   q->pos_slot = draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_POSITION, 0);
+   q->z = ctx->z_grid && bits && bits < 32 ? ph_depth_window(v[0].f32, bits) :
+          CLAMP(v[0].f32, 0.0f, 1.0f);
+   q->const_z = q->pos_slot >= 0;
+   return true;
 }
 
 static void
@@ -8295,7 +8329,8 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    const bool quantize = ph_logicop_quantize(ctx);
    const bool fix = (quantize || (ctx->fs && ctx->fs->ucoord_count) ||
-                     ph_fs_samples_rect(ctx->fs)) &&
+                     ph_fs_samples_rect(ctx->fs) ||
+                     (ctx->fs && ctx->fs->depth_uniform)) &&
                     (ctx->quant_stage ||
                      (ctx->quant_stage = ph_quant_create_stage(ctx)));
    if (derived || fix)
@@ -8309,6 +8344,10 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    if (fix) {
       ph_quant_prepare(ctx, quantize);
       ph_fix_rects(ctx, (struct ph_quant_stage *)ctx->quant_stage);
+      if (!ph_fix_depth(ctx, (struct ph_quant_stage *)ctx->quant_stage)) {
+         PH_REFUSE("a draw whose uniform fragment depth cannot be evaluated is dropped\n");
+         goto unbind;
+      }
       if (!ph_fix_coords(ctx, (struct ph_quant_stage *)ctx->quant_stage)) {
          draw_remove_extra_vertex_attribs(ctx->draw);
          PH_REFUSE("a draw whose uniform texture coordinate cannot be evaluated is dropped\n");
@@ -9123,6 +9162,71 @@ ph_fs_untextured_program(struct ph_context *ctx)
    return ctx->fs && ctx->fs->program.valid && !ctx->fs->program.sampler_mask;
 }
 
+/* The value a straight-line shader stores to FRAG_RESULT_DEPTH, or NULL. */
+static nir_intrinsic_instr *
+ph_nir_depth_store(nir_shader *nir, nir_def **value)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_intrinsic_instr *in;
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic == nir_intrinsic_store_deref) {
+               nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+
+               if (d && d->deref_type == nir_deref_type_var &&
+                   d->var->data.location == FRAG_RESULT_DEPTH) {
+                  *value = in->src[1].ssa;
+                  return in;
+               }
+            } else if (in->intrinsic == nir_intrinsic_store_output &&
+                       nir_intrinsic_io_semantics(in).location ==
+                       FRAG_RESULT_DEPTH) {
+               *value = in->src[0].ssa;
+               return in;
+            }
+         }
+      }
+   }
+   return NULL;
+}
+
+/* gl_FragDepth built from uniforms only: compile the colour without the
+ * depth store, and keep the depth for per-draw evaluation. */
+static void
+ph_fs_compile_uniform_depth(struct ph_fs *fs, nir_shader *orig,
+                            nir_shader *compile_src, unsigned budget)
+{
+   nir_def *value = NULL;
+   nir_intrinsic_instr *store = ph_nir_depth_store(orig, &value);
+   nir_shader *nir;
+   struct ph_fs_program prog;
+
+   if (!store || !value || !ph_nir_def_uniform(value, 0) ||
+       nir_shader_get_entrypoint(orig) == NULL)
+      return;
+   nir = nir_shader_clone(NULL, compile_src);
+   if (!nir)
+      return;
+   store = ph_nir_depth_store(nir, &(nir_def *){ NULL });
+   if (store) {
+      nir_instr_remove(&store->instr);
+      NIR_PASS(_, nir, nir_opt_dce);
+      if (ph_fs_compile(nir, budget, &prog) &&
+          !(prog.sampler_mask & ~fs->sampler_mask)) {
+         ph_fs_program_fini(&fs->program);
+         fs->program = prog;
+         fs->depth_uniform = value;
+      } else if (prog.valid) {
+         ph_fs_program_fini(&prog);
+      }
+   }
+   ralloc_free(nir);
+}
+
 static void *ph_create_fs(struct pipe_context *p,
                           const struct pipe_shader_state *s)
 {
@@ -9198,6 +9302,10 @@ static void *ph_create_fs(struct pipe_context *p,
                 BITFIELD64_BIT(FRAG_RESULT_DEPTH))
                fs->depth_from_texture =
                   ph_nir_depth_from_texture(s->ir.nir, &fs->depth_unit);
+            if (!fs->depth_from_texture && !fs->program.valid &&
+                (s->ir.nir->info.outputs_written &
+                 BITFIELD64_BIT(FRAG_RESULT_DEPTH)))
+               ph_fs_compile_uniform_depth(fs, s->ir.nir, compile_nir, budget);
             if (compile_nir != s->ir.nir)
                ralloc_free(compile_nir);
             if (ph_fs_program_must_drop(s->ir.nir, &fs->program))
@@ -9335,14 +9443,20 @@ ph_set_constant_buffer(struct pipe_context *p, mesa_shader_stage sh,
 /* The code an n-bit Z buffer receives for window depth @d: d as the
  * viewport transform of the default depth range produces it in single
  * precision, scaled by (2^n - 1) / 2^n and truncated by the Z unit. */
-static uint32_t
-ph_depth_code(double d, unsigned bits)
+static float
+ph_depth_window(double d, unsigned bits)
 {
    const float half = 0.5f * (float)((1u << bits) - 1) / (float)(1u << bits);
    const float ndc = (float)(2.0 * CLAMP(d, 0.0, 1.0) - 1.0);
-   const float z = ndc * half + half;
 
-   return MIN2((uint32_t)(z * (float)(1u << bits)), (1u << bits) - 1);
+   return ndc * half + half;
+}
+
+static uint32_t
+ph_depth_code(double d, unsigned bits)
+{
+   return MIN2((uint32_t)(ph_depth_window(d, bits) * (float)(1u << bits)),
+               (1u << bits) - 1);
 }
 
 static void
