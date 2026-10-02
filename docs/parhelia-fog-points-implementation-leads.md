@@ -1048,3 +1048,34 @@ with the field kind dispatched through `.rodata+0x2eb0` (36 kinds, the
 **most recently appended fragment**, so the user-plane patch is
 `imm32 := 1 << (n + 15)` on **instruction 0 of the table fragment**, which for
 the P690 is `mtx847[0]` (opcode `0x41`, imm32 0 in the symbol).
+
+### The user-plane fragment is a WARP polygon clipper (decoded, offline)
+
+`tools/parhelia-warpdis2.py --elf mtx_parhelia.o --sym <name>`:
+
+* `mtx847[0..1]` = `movi c8, <imm>; streg [0x000], c8` - the imm32 that the
+  `0x23` patch sets to `1 << (n + 15)` is the user-plane word in setup
+  scratch `[0x000]` (0 without planes).
+* `mtx769` (`0x136`, linked only with planes) reads it back
+  (`ldreg c2, [0x000]; shli c3, c2, -16`, so `c3 = 1 << (n - 1)`, the
+  highest enabled plane bit) and loops `c6 = 1, 2, 4, ...` up to `c3`
+  (`ctl03 c0, c6, c3`, `shli c6, c6, 1`): per plane it puts constant index
+  `0x16c` (`movi c2, 0x16c; putc T1.y, c2`) on the T1 port, takes
+  `dp4 r12, T[a0.z+1], c0` / `dp4 r13, T[a0.w+1], c0` for the two edge
+  vertices, compares both with `1.0f` (`movi c11, 0x3f800000`, `ctl2f`),
+  and on a sign change swaps/emits the edge (`ctl26`, scratch
+  `[0x000]/[0x004]` vertex slots) - a Sutherland-Hodgman pass on the setup
+  unit, i.e. **hardware user-plane clipping exists in the vendor's stage-6
+  program** and is driven by the plane count word alone.
+* `mtx2897` (`0x13b`) = `sync0d ..., 0x3800000; nop` (the stage-c prefix);
+  `mtx4036` (`0x13d`) = `getidx r12, b+0; getidx r13, a0+0`; `mtx1591`
+  (`0x13e`) reads scratch `[0x008..0x010]`, sets port T0/T1 and copies the
+  three vertices to `o[a0.x..a0.z]`.  `mtx569` does not decode as code (a
+  replay table, not a fragment).
+
+Open before a hardware test: where the plane equations come from (constant
+`0x16c` upward vs the `0x7a/0x79/0x6d` writes noted above), the plane value
+the compare against `1.0f` expects (pre-computed distance + 1 or a ratio),
+and the exact `0x111c`/`0x1130` arming.  The test needs the vendor link
+`0x13b, 0x13d, 0x13e, table, 0x136, 0x138/0x139` - not the resident
+`stage-c.bin` subset - and is lockup-risky.
