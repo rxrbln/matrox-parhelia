@@ -2116,6 +2116,16 @@ ph_use_mips(const struct parhelia_resource *texture,
                           ph_view_first_level(texture, view), levels) == levels;
 }
 
+/* Drop one draw or clear the hardware cannot do, reporting it once per call
+ * site.  Unlike a submit failure this leaves the context usable. */
+#define PH_REFUSE(...) do {                                 \
+      static bool said_;                                    \
+      if (!said_) {                                         \
+         said_ = true;                                      \
+         fprintf(stderr, "parhelia: " __VA_ARGS__);         \
+      }                                                     \
+   } while (0)
+
 /* Report an unsupportable state once per process, never per draw. */
 static void PRINTFLIKE(1, 2)
 ph_warn_once(const char *fmt, ...)
@@ -3652,7 +3662,7 @@ ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
    if (!count || !vertices_per_primitive || ctx->submit_error)
       goto out;
    if (!ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture) {
-      ctx->submit_error = -EINVAL;
+      PH_REFUSE("a draw without a colour buffer is dropped\n");
       goto out;
    }
 
@@ -3661,7 +3671,8 @@ ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
       depth = ph_resource(ctx->fb.zsbuf.texture);
    if (!color->handle || (depth && !depth->handle) || color->upload_texture ||
        (depth && depth->upload_texture)) {
-      ctx->submit_error = -EINVAL;
+      PH_REFUSE("a point or line draw into sampler-only storage is "
+                "dropped\n");
       goto out;
    }
    if (ctx->aggregate_batches && color->linear_dirty && ph_drain_batch(ctx))
@@ -3891,7 +3902,7 @@ ph_submit_vertices(struct ph_context *ctx)
       goto out;
    ctx->stat.triangles += ctx->triangles;
    if (!ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture) {
-      ctx->submit_error = -EINVAL;
+      PH_REFUSE("a draw without a colour buffer is dropped\n");
       goto out;
    }
    color = ph_resource(ctx->fb.cbufs[0].texture);
@@ -3901,7 +3912,7 @@ ph_submit_vertices(struct ph_context *ctx)
     * Never let a framebuffer write make those shadows stale and later
     * overwrite the rendered result on sampler bind. */
    if (color->upload_texture || (depth && depth->upload_texture)) {
-      ctx->submit_error = -EOPNOTSUPP;
+      PH_REFUSE("a draw into sampler-only storage is dropped\n");
       goto out;
    }
    /* GL may keep a depth attachment bound while disabling depth test for a
@@ -3966,7 +3977,7 @@ ph_submit_vertices(struct ph_context *ctx)
    texture1_mipped = texture1_tiled &&
       ph_use_mips(texture1, sampler1, ctx->sampler_views[1]);
    if (!color->handle || (depth && !depth->handle)) {
-      ctx->submit_error = -EINVAL;
+      PH_REFUSE("a draw into a surface without storage is dropped\n");
       goto out;
    }
    /* A native import this chip cannot sample has no linear handle; its
@@ -3987,7 +3998,8 @@ ph_submit_vertices(struct ph_context *ctx)
                  texture ? texture->linear_handle : 0, texture_tiled,
                  texture ? texture->native_shared : 0, (void *)texture1,
                  (void *)depth, ctx->transform);
-      ctx->submit_error = -EINVAL;
+      PH_REFUSE("a textured draw whose texture the unit cannot address is "
+                "dropped\n");
       goto out;
    }
    if (texture)
@@ -4243,7 +4255,6 @@ ph_submit_vertices(struct ph_context *ctx)
                       "code; the draw is dropped rather than rendered with a "
                       "different one\n", sampler->wrap_s, sampler->wrap_t,
                       sampler->wrap_r);
-         ctx->submit_error = -EOPNOTSUPP;
          goto out;
       }
       tex.max_level = texture_mipped ?
@@ -4289,7 +4300,6 @@ ph_submit_vertices(struct ph_context *ctx)
             ph_warn_once("texture wrap mode %u/%u/%u has no hardware address "
                          "code on the second unit; the draw is dropped\n",
                          sampler1->wrap_s, sampler1->wrap_t, sampler1->wrap_r);
-            ctx->submit_error = -EOPNOTSUPP;
             goto out;
          }
          tex1.max_level = texture1_mipped ?
@@ -7698,7 +7708,7 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
     * tiles the Z unit still owns have to reach memory first. */
    ph_zinit_resolve(ctx, r);
    if (r->upload_texture) {
-      ctx->submit_error = -EOPNOTSUPP;
+      PH_REFUSE("a clear of sampler-only storage is dropped\n");
       return;
    }
    if (x >= r->base.width0 || y >= r->base.height0)
@@ -7816,7 +7826,7 @@ ph_clear_zs(struct ph_context *ctx, const struct pipe_surface *surf,
       return;
    if (surf->format != PIPE_FORMAT_Z24_UNORM_S8_UINT &&
        surf->format != PIPE_FORMAT_Z16_UNORM) {
-      ctx->submit_error = -EOPNOTSUPP;
+      PH_REFUSE("a depth clear of format %u is dropped\n", surf->format);
       return;
    }
    /* The vendor packs D16 as min(d * 65536, 0xffff), replicated for the
