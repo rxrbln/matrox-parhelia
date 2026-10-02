@@ -8681,7 +8681,7 @@ static void *ph_create_fs(struct pipe_context *p,
 
             if (ph_fs_compile(compile_nir, budget, &fs->program) &&
                 (fs->program.sampler_mask & ~fs->sampler_mask))
-               fs->program.valid = false;
+               ph_fs_program_fini(&fs->program), fs->program.valid = false;
             if (compile_nir->info.fs.uses_discard)
                fs->kill = ph_fs_build_kill(compile_nir, budget);
             ph_fs_find_uniform_coords(fs, s->ir.nir);
@@ -8714,6 +8714,8 @@ static void *ph_create_fs(struct pipe_context *p,
                   msg = NULL;
                ((struct pipe_shader_state *)s)->error_message = msg;
                draw_delete_fragment_shader(ph_context(p)->draw, fs->draw);
+               ph_fs_program_fini(&fs->program);
+               free(fs->ucoord);
                FREE(fs);
                return NULL;
             }
@@ -8759,8 +8761,14 @@ static void ph_delete_fs(struct pipe_context *p, void *s)
    struct ph_fs *fs = s;
    if (fs) {
       draw_delete_fragment_shader(ph_context(p)->draw, fs->draw);
+      if (fs->kill) {
+         ph_fs_program_fini(&fs->kill->alpha_x);
+         ph_fs_program_fini(&fs->kill->alpha_sub);
+         ph_fs_program_fini(&fs->kill->colour);
+      }
       FREE(fs->kill);
       free(fs->ucoord);
+      ph_fs_program_fini(&fs->program);
    }
    FREE(fs);
 }

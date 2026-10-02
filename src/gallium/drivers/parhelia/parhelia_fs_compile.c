@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "compiler/nir/nir_constant_expressions.h"
 #include "parhelia_fs_compile.h"
 
 #define PH_FS_POLY_TERMS 8u
@@ -88,6 +89,12 @@ struct ph_fs_memo {
    struct ph_fs_src src;
 };
 
+struct ph_fs_pre_memo {
+   nir_def *def;
+   unsigned comp;
+   struct ph_fs_pre_src src;
+};
+
 struct ph_fs_ctx {
    struct ph_fs_node *node;
    unsigned nodes, node_cap;
@@ -97,6 +104,10 @@ struct ph_fs_ctx {
    unsigned atoms, atom_cap;
    struct ph_fs_memo *memo;
    unsigned memos, memo_cap;
+   struct ph_fs_pre_node *pre;
+   unsigned pres, pre_cap;
+   struct ph_fs_pre_memo *pre_memo;
+   unsigned pre_memos, pre_memo_cap;
    int tex_end[4][2];
    bool tex_end_cross[4][2];
    unsigned sampler_mask;
@@ -106,6 +117,7 @@ struct ph_fs_ctx {
 
 static bool ph_fs_lower(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
                         struct ph_fs_src *out);
+static bool ph_fs_uniform_only(nir_def *def, unsigned depth);
 
 static bool
 ph_fs_grow(void **array, unsigned count, unsigned *cap, size_t size)
@@ -526,7 +538,8 @@ ph_fs_expand(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
       return true;
    }
    if (instr->type != nir_instr_type_alu ||
-       (!root && !list_is_singular(&def->uses)))
+       (!root && !list_is_singular(&def->uses)) ||
+       ph_fs_uniform_only(def, 0))
       goto leaf;
    alu = nir_instr_as_alu(instr);
    memset(p, 0, sizeof(*p));
@@ -914,6 +927,212 @@ ph_fs_uniform(struct ph_fs_ctx *ctx, unsigned base, int lane, int sel,
    return ph_fs_part(ctx, &part, out);
 }
 
+/* ---- preshader ----------------------------------------------------------
+ * A sub-expression that reads only uniforms and literals has one value per
+ * draw.  It is evaluated on the CPU before the draw, with NIR's own constant
+ * evaluator, and reaches the combiner as one more runtime constant, so the
+ * ALU work the combiner lacks (floor, exp2, rsq, comparisons, ...) costs no
+ * combiner slot.  Every fragment is still shaded by the combiner. */
+
+/* The scalar constant-buffer offset of component 0 of a uniform load. */
+static bool
+ph_fs_uniform_offset(const nir_intrinsic_instr *load, unsigned *offset)
+{
+   switch (load->intrinsic) {
+   case nir_intrinsic_load_ubo_vec4:
+      if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+          !nir_src_is_const(load->src[1]))
+         return false;
+      *offset = (nir_intrinsic_base(load) + nir_src_as_uint(load->src[1])) * 4u +
+                nir_intrinsic_component(load);
+      return true;
+   case nir_intrinsic_load_ubo:
+      if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+          !nir_src_is_const(load->src[1]) || nir_src_as_uint(load->src[1]) % 4u)
+         return false;
+      *offset = nir_src_as_uint(load->src[1]) / 4u;
+      return true;
+   case nir_intrinsic_load_uniform:
+      if (!nir_src_is_const(load->src[0]) ||
+          (nir_intrinsic_base(load) + nir_src_as_uint(load->src[0])) % 4u)
+         return false;
+      *offset = (nir_intrinsic_base(load) + nir_src_as_uint(load->src[0])) / 4u;
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+ph_fs_uniform_only(nir_def *def, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+   unsigned offset;
+
+   if (depth > 64)
+      return false;
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+      return true;
+   case nir_instr_type_intrinsic:
+      return ph_fs_uniform_offset(nir_instr_as_intrinsic(instr), &offset);
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+         if (!ph_fs_uniform_only(alu->src[i].src.ssa, depth + 1))
+            return false;
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+static bool
+ph_fs_pre_node(struct ph_fs_ctx *ctx, nir_op op, unsigned bit_size,
+               unsigned nsrc, const struct ph_fs_pre_src *src,
+               struct ph_fs_pre_src *out)
+{
+   if (!PH_FS_GROW(ctx, pre, pres, pre_cap))
+      return ph_fs_fail(ctx, "out of memory");
+   ctx->pre[ctx->pres] = (struct ph_fs_pre_node){ .op = op,
+                                                 .bit_size = bit_size,
+                                                 .nsrc = nsrc };
+   memcpy(ctx->pre[ctx->pres].src, src, nsrc * sizeof(*src));
+   *out = (struct ph_fs_pre_src){ .kind = PH_FS_PRE_RESULT,
+                                  .index = ctx->pres++ };
+   return true;
+}
+
+/* Component @comp of uniform-only @def as a preshader source. */
+static bool
+ph_fs_pre_scalar(struct ph_fs_ctx *ctx, nir_def *def, unsigned comp,
+                 struct ph_fs_pre_src *out)
+{
+   nir_instr *instr = nir_def_instr(def);
+   struct ph_fs_pre_src src[3];
+   unsigned offset;
+
+   for (unsigned i = 0; i < ctx->pre_memos; i++)
+      if (ctx->pre_memo[i].def == def && ctx->pre_memo[i].comp == comp) {
+         *out = ctx->pre_memo[i].src;
+         return true;
+      }
+   memset(out, 0, sizeof(*out));
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+      out->kind = PH_FS_PRE_LITERAL;
+      out->literal = nir_instr_as_load_const(instr)->value[comp];
+      return true;
+   case nir_instr_type_intrinsic:
+      if (!ph_fs_uniform_offset(nir_instr_as_intrinsic(instr), &offset))
+         return ph_fs_fail(ctx, "a uniform the preshader cannot address");
+      out->kind = PH_FS_PRE_BUFFER;
+      out->index = offset + comp;
+      return true;
+   case nir_instr_type_alu:
+      break;
+   default:
+      return ph_fs_fail(ctx, "a preshader input that is no value");
+   }
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   const nir_op_info *info = &nir_op_infos[alu->op];
+   unsigned bit_size = 0;
+
+   switch (alu->op) {
+   case nir_op_vec2:
+   case nir_op_vec3:
+   case nir_op_vec4:
+      return ph_fs_pre_scalar(ctx, alu->src[comp].src.ssa,
+                              alu->src[comp].swizzle[0], out);
+   case nir_op_fdot2:
+   case nir_op_fdot3:
+   case nir_op_fdot4:
+   case nir_op_fdot2_replicated:
+   case nir_op_fdot3_replicated:
+   case nir_op_fdot4_replicated: {
+      const unsigned n = nir_ssa_alu_instr_src_components(alu, 0);
+      struct ph_fs_pre_src sum, product;
+
+      for (unsigned c = 0; c < n; c++) {
+         if (!ph_fs_pre_scalar(ctx, alu->src[0].src.ssa,
+                               alu->src[0].swizzle[c], &src[0]) ||
+             !ph_fs_pre_scalar(ctx, alu->src[1].src.ssa,
+                               alu->src[1].swizzle[c], &src[1]) ||
+             !ph_fs_pre_node(ctx, nir_op_fmul, 32, 2, src, &product))
+            return false;
+         if (!c) {
+            sum = product;
+            continue;
+         }
+         src[0] = sum;
+         src[1] = product;
+         if (!ph_fs_pre_node(ctx, nir_op_fadd, 32, 2, src, &sum))
+            return false;
+      }
+      *out = sum;
+      break;
+   }
+   default:
+      if (info->output_size || info->num_inputs > 3)
+         return ph_fs_fail(ctx, "a preshader operation that is not per component");
+      /* Unsized operations take the bit size of their unsized sources, as
+       * nir_opt_constant_folding does. */
+      if (!nir_alu_type_get_type_size(info->output_type))
+         bit_size = alu->def.bit_size;
+      for (unsigned i = 0; i < info->num_inputs; i++) {
+         if (info->input_sizes[i])
+            return ph_fs_fail(ctx, "a preshader operation that is not per component");
+         if (!bit_size && !nir_alu_type_get_type_size(info->input_types[i]))
+            bit_size = alu->src[i].src.ssa->bit_size;
+         if (!ph_fs_pre_scalar(ctx, alu->src[i].src.ssa,
+                               alu->src[i].swizzle[comp], &src[i]))
+            return false;
+      }
+      if (!ph_fs_pre_node(ctx, alu->op, bit_size ? bit_size : 32,
+                          info->num_inputs, src, out))
+         return false;
+      break;
+   }
+   if (!PH_FS_GROW(ctx, pre_memo, pre_memos, pre_memo_cap))
+      return ph_fs_fail(ctx, "out of memory");
+   ctx->pre_memo[ctx->pre_memos++] = (struct ph_fs_pre_memo){ def, comp, *out };
+   return true;
+}
+
+/* Uniform-only @def as a runtime constant filled by the preshader. */
+static bool
+ph_fs_preshade(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
+               struct ph_fs_src *out)
+{
+   struct ph_fs_part part;
+
+   if (def->bit_size != 32)
+      return ph_fs_fail(ctx, "a preshader value that is no 32-bit float");
+   memset(&part, 0, sizeof(part));
+   part.lane = lane;
+   for (unsigned c = 0; c < ph_fs_lane_channels(lane); c++) {
+      unsigned comp = sel < 0 ? c : (unsigned)sel;
+      struct ph_fs_pre_src src;
+
+      if (comp >= def->num_components)
+         comp = def->num_components - 1;
+      if (!ph_fs_pre_scalar(ctx, def, comp, &src))
+         return false;
+      /* A bare buffer scalar or literal still becomes a result, so every
+       * preshaded constant has one address space. */
+      if (src.kind != PH_FS_PRE_RESULT &&
+          !ph_fs_pre_node(ctx, nir_op_mov, 32, 1, &src, &src))
+         return false;
+      if (PH_FS_PRE_BASE + src.index > UINT16_MAX)
+         return ph_fs_fail(ctx, "a preshader past the addressable constants");
+      part.offset[c] = PH_FS_PRE_BASE + src.index;
+   }
+   return ph_fs_part(ctx, &part, out);
+}
+
 static bool
 ph_fs_varying(struct ph_fs_ctx *ctx, unsigned location, int sel,
               struct ph_fs_src *out)
@@ -1262,6 +1481,8 @@ ph_fs_lower_leaf(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
       return ph_fs_intrinsic(ctx, nir_instr_as_intrinsic(instr), lane, sel,
                              out);
    case nir_instr_type_alu:
+      if (ph_fs_uniform_only(def, 0))
+         return ph_fs_preshade(ctx, def, lane, sel, out);
       return ph_fs_operation(ctx, nir_instr_as_alu(instr), lane, sel, out);
    default:
       return ph_fs_fail(ctx, "an instruction that is no value");
@@ -2015,6 +2236,16 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
    out->uses_color = ctx.uses_color;
    out->uses_color1 = ctx.uses_color1;
    out->uses_fogc = ctx.uses_fogc;
+   if (ctx.pres) {
+      out->pre_value = calloc(ctx.pres, sizeof(*out->pre_value));
+      if (!out->pre_value) {
+         ph_fs_fail(&ctx, "out of memory");
+         goto done;
+      }
+      out->pre = ctx.pre;
+      out->pre_count = ctx.pres;
+      ctx.pre = NULL;
+   }
    out->valid = true;
    out->cls = ph_fs_classify(out);
    ok = true;
@@ -2038,7 +2269,51 @@ done:
    free(ctx.part);
    free(ctx.atom);
    free(ctx.memo);
+   free(ctx.pre);
+   free(ctx.pre_memo);
    return ok;
+}
+
+void
+ph_fs_program_fini(struct ph_fs_program *program)
+{
+   free(program->pre);
+   free(program->pre_value);
+   program->pre = NULL;
+   program->pre_value = NULL;
+   program->pre_count = 0;
+}
+
+/* Run the preshader over the constant buffer. */
+static void
+ph_fs_run_preshader(struct ph_fs_program *program, const float *values,
+                    unsigned size)
+{
+   for (unsigned i = 0; i < program->pre_count; i++) {
+      const struct ph_fs_pre_node *node = &program->pre[i];
+      nir_const_value src[3][NIR_MAX_VEC_COMPONENTS];
+      nir_const_value *srcs[3];
+      uint16_t poison = 0;
+
+      memset(src, 0, sizeof(src));
+      for (unsigned s = 0; s < node->nsrc; s++) {
+         const struct ph_fs_pre_src *in = &node->src[s];
+
+         if (in->kind == PH_FS_PRE_BUFFER)
+            src[s][0].f32 = values && (in->index + 1u) * sizeof(float) <= size ?
+                            values[in->index] : 0.0f;
+         else if (in->kind == PH_FS_PRE_RESULT)
+            src[s][0] = program->pre_value[in->index];
+         else
+            src[s][0] = in->literal;
+         srcs[s] = src[s];
+      }
+      if (node->op == nir_op_mov)
+         program->pre_value[i] = src[0][0];
+      else
+         nir_eval_const_opcode(node->op, &program->pre_value[i], &poison, 1,
+                               node->bit_size, srcs, 0);
+   }
 }
 
 void
@@ -2047,6 +2322,7 @@ ph_fs_update_constants(struct ph_fs_program *program, const void *constants,
 {
    const float *values = constants;
 
+   ph_fs_run_preshader(program, values, size);
    for (unsigned i = 0; i < program->const_ref_count; i++) {
       const struct ph_fs_const_ref *ref = &program->const_ref[i];
       float *target = program->comb.inst[ref->instruction].constant[ref->slot];
@@ -2054,8 +2330,13 @@ ph_fs_update_constants(struct ph_fs_program *program, const void *constants,
       for (unsigned c = 0; c < 4; c++) {
          if (!(ref->mask & (1u << c)))
             continue;
-         target[c] = values && (ref->offset[c] + 1u) * sizeof(float) <= size ?
-                     values[ref->offset[c]] : 0.0f;
+         if (ref->offset[c] >= PH_FS_PRE_BASE)
+            target[c] = ref->offset[c] - PH_FS_PRE_BASE < program->pre_count ?
+                        program->pre_value[ref->offset[c] - PH_FS_PRE_BASE].f32 :
+                        0.0f;
+         else
+            target[c] = values && (ref->offset[c] + 1u) * sizeof(float) <= size ?
+                        values[ref->offset[c]] : 0.0f;
       }
    }
 }

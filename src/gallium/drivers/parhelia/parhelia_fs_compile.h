@@ -23,6 +23,25 @@ struct ph_fs_const_ref {
    uint16_t offset[4];
 };
 
+/* One preshader scalar: @op over up to three sources, each a constant
+ * buffer scalar, an earlier result or a literal. */
+#define PH_FS_PRE_BASE 0x8000u
+
+enum ph_fs_pre_kind { PH_FS_PRE_BUFFER, PH_FS_PRE_RESULT, PH_FS_PRE_LITERAL };
+
+struct ph_fs_pre_src {
+   uint8_t kind;
+   uint32_t index;
+   nir_const_value literal;
+};
+
+struct ph_fs_pre_node {
+   nir_op op;
+   uint8_t bit_size;
+   uint8_t nsrc;
+   struct ph_fs_pre_src src[3];
+};
+
 /* The fixed-function algebra a program computes, decided by evaluating it,
  * for the draw routes that emit their own combiner words.  Units are logical:
  * t1 is the second bound texture. */
@@ -49,12 +68,20 @@ struct ph_fs_program {
    bool uses_fogc;         /* v1 is the fog coordinate */
    bool valid;
    enum ph_fs_class cls;
+   /* The preshader: uniform-only scalars the CPU evaluates before each draw;
+    * a constant reference at PH_FS_PRE_BASE + i reads result i. */
+   struct ph_fs_pre_node *pre;
+   nir_const_value *pre_value;
+   unsigned pre_count;
    const char *reject;     /* why it did not compile */
 };
 
 /* Compile @nir into at most @max_instructions combiner slots. */
 bool ph_fs_compile(nir_shader *nir, unsigned max_instructions,
                    struct ph_fs_program *out);
+
+/* Free what ph_fs_compile allocated for @program. */
+void ph_fs_program_fini(struct ph_fs_program *program);
 
 /* Copy the runtime constants into the program's constant registers.
  * @constants is the mapped fragment constant buffer, @size its bytes. */
