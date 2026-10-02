@@ -1947,3 +1947,11 @@ ph_fs_update_constants(struct ph_fs_program *program, const void *constants,
       }
    }
 }
+
+bool
+ph_fs_program_must_drop(const nir_shader *nir,
+                        const struct ph_fs_program *program)
+{
+   return !program->valid && nir->info.name &&
+          !strncmp(nir->info.name, "ARB", 3);
+}

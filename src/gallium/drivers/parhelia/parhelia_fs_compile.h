@@ -67,4 +67,11 @@ void ph_fs_eval(const struct p3d_comb_program *prog, const float tex[4][4],
 
 void ph_fs_dump(const struct ph_fs_program *program, FILE *f);
 
+/* True when draws with @nir must be dropped rather than rendered: an
+ * application's assembly fragment program (Mesa names those "ARB<n>") that
+ * @program could not express.  Fixed-function and internal shaders keep
+ * their environment-matcher fallback. */
+bool ph_fs_program_must_drop(const nir_shader *nir,
+                             const struct ph_fs_program *program);
+
 #endif

@@ -99,6 +99,8 @@ struct ph_fs {
    bool uses_color;
    uint32_t sampler_mask;
    uint32_t projective_mask;   /* samplers looked up with a projector */
+   /* Why draws with this program are dropped, or NULL. */
+   const char *drop_reason;
    /* The program's samplers packed onto units 0.., lowest first, when it
     * leaves a gap: unit u samples the GL unit unit_source[u]. */
    bool unit_remap;
@@ -7055,6 +7057,11 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    if (!num_draws || indirect || ctx->submit_error)
       return;
+   if (ctx->fs && ctx->fs->drop_reason) {
+      PH_REFUSE("draws with an ARB fragment program the combiner cannot "
+                "express are dropped (%s)\n", ctx->fs->drop_reason);
+      return;
+   }
    {
       struct ph_fs_program *kill_prog;
       enum pipe_compare_func kill_func;
@@ -7975,6 +7982,9 @@ static void *ph_create_fs(struct pipe_context *p,
                fs->kill = ph_fs_build_kill(compile_nir, budget);
             if (compile_nir != s->ir.nir)
                ralloc_free(compile_nir);
+            if (ph_fs_program_must_drop(s->ir.nir, &fs->program))
+               fs->drop_reason = fs->program.reject ? fs->program.reject :
+                                 "declared samplers";
             if (fs->program.valid)
                ph_fs_route_class(fs);
             else if (ph_env("PARHELIA_TRACE"))
