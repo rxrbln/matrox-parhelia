@@ -9004,7 +9004,9 @@ ph_copy_texture_box(struct ph_context *ctx,
    /* Imported drawable/renderbuffer resources have a linear companion.
     * Use the recovered type-2-to-type-1 hardware BITBLT to detile them once;
     * the format/orientation copy below can then read normal pitched rows. */
-   if (sr->linear_map)
+   /* A transfer shadow was just downloaded and is exact; the linear
+    * companion is only resolved for images without one. */
+   if (sr->linear_map && !sr->transfer_shadow)
       ph_resource_resolve_linear(sr);
 
    staging = MALLOC((size_t)width * height * cpp);
@@ -9022,7 +9024,8 @@ ph_copy_texture_box(struct ph_context *ctx,
       for (int x = 0; x < width; x++) {
          const int sx = src_box->x + (src_box->width < 0 ? -1 - x : x);
          uint8_t *out = staging + ((size_t)y * width + x) * cpp;
-         const bool linear = sr->linear_map && !sr->tiled_dirty;
+         const bool linear = sr->linear_map && !sr->tiled_dirty &&
+                             !sr->transfer_shadow;
 
          if (sx < 0 || sy < 0 || sx >= (int)src_w || sy >= (int)src_h ||
              (!linear && !sr->map)) {
