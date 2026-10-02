@@ -4798,6 +4798,18 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
        ctx->rasterizer->cull_face == PIPE_FACE_FRONT_AND_BACK)
       return;
 
+   /* Flat shading takes the last vertex's colour; a cyclic rotation makes the
+    * first-vertex convention's provoking vertex last and keeps the winding. */
+   struct prim_header rotated;
+   if (!ctx->derived_triangles && ctx->rasterizer &&
+       ctx->rasterizer->flatshade && ctx->rasterizer->flatshade_first) {
+      rotated = *prim;
+      rotated.v[0] = prim->v[1];
+      rotated.v[1] = prim->v[2];
+      rotated.v[2] = prim->v[0];
+      prim = &rotated;
+   }
+
    /* Preserve mixed-primitive ordering while allowing every run of compatible
     * line callbacks to share one state block. */
    if (ctx->points || ctx->lines) {
