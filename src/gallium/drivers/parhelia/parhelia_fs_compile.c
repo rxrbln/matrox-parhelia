@@ -1706,7 +1706,7 @@ ph_fs_classify(const struct ph_fs_program *prog)
    static const enum ph_fs_class classes[] = {
       PH_FS_CLASS_COLOUR, PH_FS_CLASS_REPLACE, PH_FS_CLASS_MODULATE,
       PH_FS_CLASS_DECAL, PH_FS_CLASS_ADD, PH_FS_CLASS_MODULATE2,
-      PH_FS_CLASS_ADD2, PH_FS_CLASS_REPLACE1,
+      PH_FS_CLASS_ADD2, PH_FS_CLASS_REPLACE1, PH_FS_CLASS_MODULATE2_TEX,
    };
    uint32_t seed = 0x2545f491;
 
@@ -1737,6 +1737,7 @@ ph_fs_classify(const struct ph_fs_program *prog)
                want[c] = c == 3 ? t0[3] * v[3] : t0[c] + v[c];
                break;
             case PH_FS_CLASS_MODULATE2: want[c] = t0[c] * v[c] * t1[c]; break;
+            case PH_FS_CLASS_MODULATE2_TEX: want[c] = t0[c] * t1[c]; break;
             case PH_FS_CLASS_ADD2:
                want[c] = c == 3 ? t0[3] * v[3] * t1[3] : t0[c] * v[c] + t1[c];
                break;

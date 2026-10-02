@@ -8141,6 +8141,12 @@ ph_fs_route_class(struct ph_fs *fs)
    case PH_FS_CLASS_DECAL:     fs->texenv = P3D_TEXENV_DECAL; break;
    case PH_FS_CLASS_ADD:       fs->texenv = P3D_TEXENV_ADD; break;
    case PH_FS_CLASS_MODULATE2: fs->serial_op = PH_SERIAL_MODULATE; break;
+   /* The serial MODULATE's first pass takes the texenv, REPLACE without a
+    * vertex colour, so it leaves t0 for the DST_COLOR pass to scale. */
+   case PH_FS_CLASS_MODULATE2_TEX:
+      fs->texenv = P3D_TEXENV_REPLACE;
+      fs->serial_op = PH_SERIAL_MODULATE;
+      break;
    case PH_FS_CLASS_ADD2:      fs->serial_op = PH_SERIAL_ADD; break;
    case PH_FS_CLASS_REPLACE1:  fs->serial_op = PH_SERIAL_REPLACE1; break;
    default: break;

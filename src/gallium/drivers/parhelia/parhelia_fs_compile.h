@@ -36,6 +36,7 @@ enum ph_fs_class {
    PH_FS_CLASS_MODULATE2,  /* t0 * v0 * t1 */
    PH_FS_CLASS_ADD2,       /* rgb t0 * v0 + t1, alpha t0 * v0 * t1 */
    PH_FS_CLASS_REPLACE1,   /* t1 */
+   PH_FS_CLASS_MODULATE2_TEX, /* t0 * t1, no vertex colour */
 };
 
 struct ph_fs_program {
