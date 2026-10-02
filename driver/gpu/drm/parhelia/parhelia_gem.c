@@ -78,12 +78,17 @@ MODULE_PARM_DESC(engine_transfer,
 static unsigned int engine_download_min = SZ_1K;
 module_param(engine_download_min, uint, 0644);
 MODULE_PARM_DESC(engine_download_min, "smallest engine download in bytes");
-/* Engine uploads are exact at any dword offset but slower than the WC CPU
- * path at every size (MEASURED: 330 vs 600 MB/s, 33 vs 21 us per 4 KiB): the
- * P690 hardwires Max_Read_Request_Size to 128 bytes, which bounds its reads. */
-static unsigned int engine_upload_min = U32_MAX;
+/* Queued engine uploads return sooner than the aperture copy from 64 KiB
+ * (80 vs 87 us) but not at 4 KiB (23 vs 11 us); end to end they tie (MEASURED). */
+static unsigned int engine_upload_min = SZ_64K;
 module_param(engine_upload_min, uint, 0644);
 MODULE_PARM_DESC(engine_upload_min, "smallest engine upload in bytes");
+/* Queued uploads overlap the caller's CPU work and earlier rendering
+ * instead of draining the engine; false waits for each blit (validated). */
+static bool engine_upload_async = true;
+module_param(engine_upload_async, bool, 0644);
+MODULE_PARM_DESC(engine_upload_async,
+	"P690: queue engine uploads under a fence without waiting (default true)");
 
 static bool root_transition_trace;
 module_param(root_transition_trace, bool, 0400);
@@ -1499,8 +1504,8 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 	struct parhelia_bo *bo;
 	u32 surface_address;
 	u64 copied;
-	void *buffer;
-	bool parked = false;
+	void *buffer = NULL;
+	bool parked = false, engine, async_up;
 	int ret;
 
 	if (!pdev->raw_aperture_owned)
@@ -1511,11 +1516,16 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 	    args->size > SIZE_MAX)
 		return -EINVAL;
 
+	engine = pdev->pdev->device == PARHELIA_P690 && engine_transfer &&
+		 !texture_upload_trace &&
+		 args->size >= (download ? engine_download_min : engine_upload_min);
+	/* Queued engine uploads copy straight from the caller into the ring. */
+	async_up = engine && !download && engine_upload_async;
 	if (download) {
 		buffer = kvmalloc(args->size, GFP_KERNEL);
 		if (!buffer)
 			return -ENOMEM;
-	} else {
+	} else if (!async_up) {
 		buffer = vmemdup_user(u64_to_user_ptr(args->data), args->size);
 		if (IS_ERR(buffer))
 			return PTR_ERR(buffer);
@@ -1541,9 +1551,23 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 	}
 
 	/* P690: the 2-D engine moves the data through class-3 staging. */
-	if (pdev->pdev->device == PARHELIA_P690 && engine_transfer &&
-	    !texture_upload_trace &&
-	    args->size >= (download ? engine_download_min : engine_upload_min)) {
+	if (async_up) {
+		ret = parhelia_engine_upload_async(pdev, file, &bo->gbo,
+				args->offset, u64_to_user_ptr(args->data),
+				args->size);
+		if (!ret || ret == -EINTR || ret == -ERESTARTSYS || ret == -EFAULT)
+			goto out_gem;
+		if (ret != -EOPNOTSUPP)
+			dev_warn_ratelimited(&pdev->pdev->dev,
+				"queued engine upload of %llu bytes failed (%d), using the aperture\n",
+				(unsigned long long)args->size, ret);
+		buffer = vmemdup_user(u64_to_user_ptr(args->data), args->size);
+		if (IS_ERR(buffer)) {
+			ret = PTR_ERR(buffer);
+			buffer = NULL;
+			goto out_gem;
+		}
+	} else if (engine) {
 		ret = parhelia_engine_transfer(pdev, file, &bo->gbo, args->offset,
 					       buffer, args->size, download);
 		if (!ret || ret == -EINTR || ret == -ERESTARTSYS)

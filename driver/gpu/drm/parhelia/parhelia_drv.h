@@ -563,6 +563,13 @@ struct parhelia_device {
 	void *staging_cpu;
 	dma_addr_t staging_bus;
 	size_t staging_size;
+	/* Ring of coherent class-3 spans queued engine uploads read from. */
+	struct mutex upload_lock;
+	struct list_head upload_busy;
+	void *upload_cpu;
+	dma_addr_t upload_bus;
+	size_t upload_size;
+	size_t upload_head;
 	/* Slots 1..19 and their BAR0 ranges are global hardware state. */
 	struct mutex aperture_lock;
 	struct drm_mm aperture_mm;
@@ -822,6 +829,10 @@ int parhelia_engine_transfer(struct parhelia_device *pdev,
 			     struct drm_file *file,
 			     struct drm_gem_vram_object *gbo, u64 offset,
 			     void *data, u64 size, bool download);
+int parhelia_engine_upload_async(struct parhelia_device *pdev,
+				 struct drm_file *file,
+				 struct drm_gem_vram_object *gbo, u64 offset,
+				 const void __user *data, u64 size);
 int parhelia_vram_write(struct parhelia_device *pdev,
 			struct drm_gem_vram_object *gbo, u64 offset,
 			const void *src, size_t len);

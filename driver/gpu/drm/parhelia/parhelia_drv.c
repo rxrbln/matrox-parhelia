@@ -471,6 +471,10 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	ret = drmm_mutex_init(drm, &pdev->staging_lock);
 	if (ret)
 		return ret;
+	ret = drmm_mutex_init(drm, &pdev->upload_lock);
+	if (ret)
+		return ret;
+	INIT_LIST_HEAD(&pdev->upload_busy);
 	ret = drmm_mutex_init(drm, &pdev->aperture_lock);
 	if (ret)
 		return ret;

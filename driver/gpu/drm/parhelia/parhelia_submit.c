@@ -5049,6 +5049,9 @@ int parhelia_bo_clear(struct parhelia_device *pdev, struct drm_file *file,
 	return parhelia_vram_clear_range(pdev, gbo, offset, size - offset);
 }
 
+static bool parhelia_fence_done_or_wedged(struct parhelia_device *pdev,
+					  u32 fence);
+
 static int parhelia_staging_get(struct parhelia_device *pdev)
 {
 	size_t size;
@@ -5090,11 +5093,104 @@ static u32 *parhelia_emit_linear_blit(u32 *cmd, u32 x, u32 y, u32 w, u32 h)
 	return cmd + 13;
 }
 
+/* Submit the blits moving @bytes at @skew past the 4 KiB-aligned VRAM
+ * @anchor of @gbo to or from the class-3 buffer at @bus: both ends are
+ * linear grids of 4 KiB rows, so a range is a partial head row, whole rows
+ * and a partial tail row.  @scratch_bus is a page the trailing flush blit
+ * may overwrite.  Async requests return after queueing with *@fence set. */
+static int parhelia_engine_blit_submit(struct parhelia_device *pdev,
+				       struct drm_file *file,
+				       struct drm_gem_vram_object *gbo,
+				       u64 anchor, u32 skew, u32 bytes,
+				       dma_addr_t bus, dma_addr_t scratch_bus,
+				       bool download, bool async, u32 *fence)
+{
+	struct drm_parhelia_submit args = { };
+	struct drm_parhelia_packet *packets;
+	struct drm_parhelia_reloc *relocs;
+	struct drm_gem_object *objects[8] = { };
+	u32 x, y, w, rows, n = 0, i;
+	u32 *commands, *cmd;
+	int ret;
+
+	packets = kvcalloc(4, sizeof(*packets), GFP_KERNEL);
+	commands = kvcalloc(4 * 13, sizeof(*commands), GFP_KERNEL);
+	relocs = kvcalloc(8, sizeof(*relocs), GFP_KERNEL);
+	if (!packets || !commands || !relocs) {
+		kvfree(packets);
+		kvfree(commands);
+		kvfree(relocs);
+		return -ENOMEM;
+	}
+	cmd = commands;
+	x = skew / 4;
+	y = 0;
+	for (i = 0; i < bytes / 4; i += w * rows) {
+		u32 left = bytes / 4 - i;
+
+		if (x) {
+			w = min(1024 - x, left);
+			rows = 1;
+		} else if (left >= 1024) {
+			w = 1024;
+			rows = left / 1024;
+		} else {
+			w = left;
+			rows = 1;
+		}
+		cmd = parhelia_emit_linear_blit(cmd, x, y, w, rows);
+		packets[n].offset = n * 13;
+		packets[n].length = 13;
+		/* SURF0 is the destination, SURF2 the source. */
+		relocs[2 * n] = (struct drm_parhelia_reloc){
+			.packet = n, .dword = download ? 2 : 4,
+			.delta = lower_32_bits(bus),
+			.type = PARHELIA_RELOC_KERNEL_BUS };
+		relocs[2 * n + 1] = (struct drm_parhelia_reloc){
+			.packet = n, .dword = download ? 4 : 2,
+			.delta = anchor, .type = PARHELIA_RELOC_VRAM };
+		objects[2 * n + 1] = &gbo->bo.base;
+		n++;
+		x = (x + w) % 1024;
+		y += x ? 0 : rows;
+	}
+	/* The engine's last ~2 KiB of class-3 writes were still in flight
+	 * at the fence (MEASURED): push them out with one row into the
+	 * scratch page, as the vendor's one-row-late readback (mtx3388)
+	 * implicitly does. */
+	cmd = parhelia_emit_linear_blit(cmd, 0, 0, 1024, 1);
+	packets[n].offset = n * 13;
+	packets[n].length = 13;
+	relocs[2 * n] = (struct drm_parhelia_reloc){
+		.packet = n, .dword = 2, .delta = lower_32_bits(scratch_bus),
+		.type = PARHELIA_RELOC_KERNEL_BUS };
+	relocs[2 * n + 1] = (struct drm_parhelia_reloc){
+		.packet = n, .dword = 4, .delta = anchor,
+		.type = PARHELIA_RELOC_VRAM };
+	objects[2 * n + 1] = &gbo->bo.base;
+	n++;
+	args.command_dwords = n * 13;
+	args.packet_count = n;
+	args.reloc_count = n * 2;
+	if (async)
+		args.flags = PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC;
+	ret = parhelia_submit_check(&args);
+	if (!ret)
+		ret = parhelia_submit_run(pdev, file, &args, packets,
+					  commands, relocs, objects);
+	else {
+		kvfree(packets);
+		kvfree(commands);
+		kvfree(relocs);
+	}
+	if (!ret && fence)
+		*fence = args.fence;
+	return ret;
+}
+
 /* Move [@offset, @offset + @size) of a VRAM object to or from @data with the
  * 2-D engine and a coherent class-3 staging buffer, instead of uncached CPU
- * accesses through the aperture (downloads ran at 18 MB/s).  Both ends are
- * linear grids of 4 KiB rows anchored at the page holding @offset; a range
- * is a partial head row, whole rows and a partial tail row. */
+ * accesses through the aperture (downloads ran at 18 MB/s). */
 int parhelia_engine_transfer(struct parhelia_device *pdev,
 			     struct drm_file *file,
 			     struct drm_gem_vram_object *gbo, u64 offset,
@@ -5109,90 +5205,18 @@ int parhelia_engine_transfer(struct parhelia_device *pdev,
 	mutex_lock(&pdev->staging_lock);
 	ret = parhelia_staging_get(pdev);
 	while (!ret && done < size) {
-		struct drm_parhelia_submit args = { };
-		struct drm_parhelia_packet *packets;
-		struct drm_parhelia_reloc *relocs;
-		struct drm_gem_object *objects[8] = { };
 		u64 pos = offset + done, anchor = ALIGN_DOWN(pos, SZ_4K);
-		u32 skew = pos - anchor, bytes, x, y, w, rows, n = 0, i;
-		u32 *commands, *cmd;
+		u32 skew = pos - anchor;
+		u32 bytes = min_t(u64, size - done,
+				  pdev->staging_size - SZ_4K - skew);
 
-		bytes = min_t(u64, size - done,
-			      pdev->staging_size - SZ_4K - skew);
-		packets = kvcalloc(4, sizeof(*packets), GFP_KERNEL);
-		commands = kvcalloc(4 * 13, sizeof(*commands), GFP_KERNEL);
-		relocs = kvcalloc(8, sizeof(*relocs), GFP_KERNEL);
-		if (!packets || !commands || !relocs) {
-			kvfree(packets);
-			kvfree(commands);
-			kvfree(relocs);
-			ret = -ENOMEM;
-			break;
-		}
 		if (!download)
 			memcpy((u8 *)pdev->staging_cpu + skew, (u8 *)data + done,
 			       bytes);
-		cmd = commands;
-		x = skew / 4;
-		y = 0;
-		for (i = 0; i < bytes / 4; i += w * rows) {
-			u32 left = bytes / 4 - i;
-
-			if (x) {
-				w = min(1024 - x, left);
-				rows = 1;
-			} else if (left >= 1024) {
-				w = 1024;
-				rows = left / 1024;
-			} else {
-				w = left;
-				rows = 1;
-			}
-			cmd = parhelia_emit_linear_blit(cmd, x, y, w, rows);
-			packets[n].offset = n * 13;
-			packets[n].length = 13;
-			/* SURF0 is the destination, SURF2 the source. */
-			relocs[2 * n] = (struct drm_parhelia_reloc){
-				.packet = n, .dword = download ? 2 : 4,
-				.delta = lower_32_bits(pdev->staging_bus),
-				.type = PARHELIA_RELOC_KERNEL_BUS };
-			relocs[2 * n + 1] = (struct drm_parhelia_reloc){
-				.packet = n, .dword = download ? 4 : 2,
-				.delta = anchor, .type = PARHELIA_RELOC_VRAM };
-			objects[2 * n + 1] = &gbo->bo.base;
-			n++;
-			x = (x + w) % 1024;
-			y += x ? 0 : rows;
-		}
-		/* The engine's last ~2 KiB of class-3 writes were still in flight
-		 * at the fence (MEASURED): push them out with one row into the
-		 * staging scratch page, as the vendor's one-row-late readback
-		 * (mtx3388) implicitly does. */
-		cmd = parhelia_emit_linear_blit(cmd, 0, 0, 1024, 1);
-		packets[n].offset = n * 13;
-		packets[n].length = 13;
-		relocs[2 * n] = (struct drm_parhelia_reloc){
-			.packet = n, .dword = 2,
-			.delta = lower_32_bits(pdev->staging_bus +
-					       pdev->staging_size - SZ_4K),
-			.type = PARHELIA_RELOC_KERNEL_BUS };
-		relocs[2 * n + 1] = (struct drm_parhelia_reloc){
-			.packet = n, .dword = 4, .delta = anchor,
-			.type = PARHELIA_RELOC_VRAM };
-		objects[2 * n + 1] = &gbo->bo.base;
-		n++;
-		args.command_dwords = n * 13;
-		args.packet_count = n;
-		args.reloc_count = n * 2;
-		ret = parhelia_submit_check(&args);
-		if (!ret)
-			ret = parhelia_submit_run(pdev, file, &args, packets,
-						  commands, relocs, objects);
-		else {
-			kvfree(packets);
-			kvfree(commands);
-			kvfree(relocs);
-		}
+		ret = parhelia_engine_blit_submit(pdev, file, gbo, anchor, skew,
+				bytes, pdev->staging_bus,
+				pdev->staging_bus + pdev->staging_size - SZ_4K,
+				download, false, NULL);
 		if (ret)
 			break;
 		if (download)
@@ -5201,6 +5225,143 @@ int parhelia_engine_transfer(struct parhelia_device *pdev,
 		done += bytes;
 	}
 	mutex_unlock(&pdev->staging_lock);
+	return ret;
+}
+
+struct parhelia_upload_span {
+	struct list_head link;
+	size_t start, end;
+	u32 fence;
+};
+
+static int parhelia_upload_ring_get(struct parhelia_device *pdev)
+{
+	size_t size;
+
+	lockdep_assert_held(&pdev->upload_lock);
+	if (pdev->upload_cpu)
+		return 0;
+	for (size = SZ_4M; size >= SZ_64K; size >>= 1) {
+		pdev->upload_cpu = dmam_alloc_coherent(&pdev->pdev->dev, size,
+				&pdev->upload_bus, GFP_KERNEL | __GFP_NOWARN);
+		if (pdev->upload_cpu) {
+			pdev->upload_size = size;
+			pdev->upload_head = 0;
+			return 0;
+		}
+	}
+	return -ENOMEM;
+}
+
+static void parhelia_upload_ring_drop(struct parhelia_device *pdev,
+				      struct parhelia_upload_span *span)
+{
+	list_del(&span->link);
+	kfree(span);
+}
+
+/* Reserve @len bytes (4 KiB multiple) of the upload ring, waiting for the
+ * oldest in-flight spans' fences; the last page is the flush scratch. */
+static int parhelia_upload_ring_alloc(struct parhelia_device *pdev,
+				      size_t len, size_t *start)
+{
+	const size_t limit = pdev->upload_size - SZ_4K;
+
+	if (len > limit)
+		return -E2BIG;
+	for (;;) {
+		struct parhelia_upload_span *oldest;
+		size_t head = pdev->upload_head, tail;
+		int ret;
+
+		while ((oldest = list_first_entry_or_null(&pdev->upload_busy,
+				struct parhelia_upload_span, link)) &&
+		       parhelia_fence_done_or_wedged(pdev, oldest->fence))
+			parhelia_upload_ring_drop(pdev, oldest);
+		if (READ_ONCE(pdev->wedged))
+			return -EIO;
+		if (!oldest) {
+			*start = head + len <= limit ? head : 0;
+			return 0;
+		}
+		tail = oldest->start;
+		if (head > tail) {
+			if (head + len <= limit) {
+				*start = head;
+				return 0;
+			}
+			if (len <= tail) {
+				*start = 0;
+				return 0;
+			}
+		} else if (head < tail && head + len <= tail) {
+			*start = head;
+			return 0;
+		}
+		ret = wait_event_interruptible(pdev->submit_waitq,
+			parhelia_fence_done_or_wedged(pdev, oldest->fence));
+		if (ret)
+			return ret;
+	}
+}
+
+/* Async P690 upload: copy the caller's data once into the coherent ring and
+ * queue the blits under a fence without waiting.  Later submits follow in
+ * ring order; CPU views and the aperture path order against the fence the
+ * submit attached to the object.  Spans recycle by fence. */
+int parhelia_engine_upload_async(struct parhelia_device *pdev,
+				 struct drm_file *file,
+				 struct drm_gem_vram_object *gbo, u64 offset,
+				 const void __user *data, u64 size)
+{
+	u64 done = 0;
+	int ret;
+
+	if (!IS_ALIGNED(offset, 4) || !IS_ALIGNED(size, 4) ||
+	    offset > gbo->bo.base.size || size > gbo->bo.base.size - offset)
+		return -EINVAL;
+	if (!pdev->async_primary_cpu || !coalesce_primary || trace_submit ||
+	    full_sync || post_draw_wb)
+		return -EOPNOTSUPP;
+	mutex_lock(&pdev->upload_lock);
+	ret = parhelia_upload_ring_get(pdev);
+	while (!ret && done < size) {
+		struct parhelia_upload_span *span;
+		u64 pos = offset + done, anchor = ALIGN_DOWN(pos, SZ_4K);
+		u32 skew = pos - anchor, bytes;
+		size_t start;
+
+		/* Quarter-ring chunks let the copy of one overlap the blit of
+		 * the previous. */
+		bytes = min_t(u64, size - done,
+			      (pdev->upload_size - SZ_4K) / 4 - skew);
+		span = kmalloc(sizeof(*span), GFP_KERNEL);
+		if (!span) {
+			ret = -ENOMEM;
+			break;
+		}
+		ret = parhelia_upload_ring_alloc(pdev,
+				ALIGN(skew + bytes, SZ_4K), &start);
+		if (!ret && copy_from_user((u8 *)pdev->upload_cpu + start + skew,
+					   (const u8 __user *)data + done, bytes))
+			ret = -EFAULT;
+		if (!ret)
+			ret = parhelia_engine_blit_submit(pdev, file, gbo, anchor,
+					skew, bytes, pdev->upload_bus + start,
+					pdev->upload_bus + pdev->upload_size -
+						SZ_4K,
+					false, true, &span->fence);
+		if (ret) {
+			kfree(span);
+			break;
+		}
+		span->start = start;
+		span->end = start + ALIGN(skew + bytes, SZ_4K);
+		list_add_tail(&span->link, &pdev->upload_busy);
+		pdev->upload_head = span->end;
+		done += bytes;
+	}
+	mutex_unlock(&pdev->upload_lock);
 	return ret;
 }
 
@@ -5289,6 +5450,7 @@ done:
 void parhelia_submit_fini(struct parhelia_device *pdev)
 {
 	struct parhelia_vertex_bo *entry, *tmp;
+	struct parhelia_upload_span *span;
 	u32 i;
 
 	cancel_delayed_work_sync(&pdev->retire_work);
@@ -5329,6 +5491,11 @@ void parhelia_submit_fini(struct parhelia_device *pdev)
 		drm_gem_object_put(&entry->dma.base);
 	}
 	parhelia_submit_unlock(pdev);
+	mutex_lock(&pdev->upload_lock);
+	while ((span = list_first_entry_or_null(&pdev->upload_busy,
+			struct parhelia_upload_span, link)))
+		parhelia_upload_ring_drop(pdev, span);
+	mutex_unlock(&pdev->upload_lock);
 }
 
 void parhelia_submit_postclose(struct parhelia_device *pdev,
