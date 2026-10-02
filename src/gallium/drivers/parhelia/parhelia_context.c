@@ -97,6 +97,10 @@ struct ph_fs {
    bool uses_color;
    uint32_t sampler_mask;
    uint32_t projective_mask;   /* samplers looked up with a projector */
+   /* The program's samplers packed onto units 0.., lowest first, when it
+    * leaves a gap: unit u samples the GL unit unit_source[u]. */
+   bool unit_remap;
+   uint8_t unit_source[P3D_MAX_TEXTURE_UNITS];
    enum ph_serial_op serial_op;
    enum p3d_texenv texenv;
    unsigned coord_semantic;
@@ -223,6 +227,8 @@ struct ph_context {
     * unit's base is replaced by its shadow chain's view at draw time. */
    struct pipe_sampler_view *sampler_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
    struct pipe_sampler_view *bound_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
+   struct pipe_sampler_state *bound_samplers[PIPE_MAX_SAMPLERS];
+   unsigned num_bound_views, num_bound_samplers;
    unsigned num_samplers;
    unsigned num_sampler_views;
    struct pipe_resource *constants[MESA_SHADER_STAGES];
@@ -4709,15 +4715,28 @@ ph_stage_alpha_micro(struct ph_context *ctx, struct prim_header *prim,
    }
 }
 
-/* Unit 0's coordinate has a q other than one at some corner. */
-static bool
-ph_primitive_projective(struct draw_context *draw,
-                        const struct prim_header *prim)
+/* The vertex output holding hardware unit @unit's coordinate set. */
+static int
+ph_unit_texcoord(const struct ph_context *ctx, unsigned unit)
 {
-   int texcoord = draw_find_shader_output(draw, TGSI_SEMANTIC_GENERIC, 0);
+   const unsigned index = ctx->fs && ctx->fs->unit_remap ?
+                          ctx->fs->unit_source[unit] : unit;
+   int texcoord = draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_GENERIC,
+                                          index);
 
    if (texcoord < 0)
-      texcoord = draw_find_shader_output(draw, TGSI_SEMANTIC_TEXCOORD, 0);
+      texcoord = draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_TEXCOORD,
+                                         index);
+   return texcoord;
+}
+
+/* Unit 0's coordinate has a q other than one at some corner. */
+static bool
+ph_primitive_projective(const struct ph_context *ctx,
+                        const struct prim_header *prim)
+{
+   int texcoord = ph_unit_texcoord(ctx, 0);
+
    if (texcoord < 0)
       return false;
    for (unsigned v = 0; v < 3; v++)
@@ -4920,7 +4939,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	 * divide, which reads q from a four-component coordinate set. */
 	proj = oow && !multitextured && !vertex_alpha &&
 	       (ctx->fs->projective_mask & BITFIELD_BIT(0)) &&
-	       ph_primitive_projective(stage->draw, prim);
+	       ph_primitive_projective(ctx, prim);
 	if (proj)
 	   dpv += 2;
 	/* A state setter normally drains a batch before reaching this point.  The
@@ -4949,17 +4968,9 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
        * output slot owned and initialized by a draw stage, not a copy of ST.
        * NIR-to-TGSI uses GENERIC by default, but honor screens which retain
        * TEXCOORD semantics too. */
-      texcoord = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_GENERIC, 0);
-      if (texcoord < 0)
-         texcoord = draw_find_shader_output(stage->draw,
-                                            TGSI_SEMANTIC_TEXCOORD, 0);
-      if (multitextured) {
-         texcoord1 = draw_find_shader_output(stage->draw,
-                                              TGSI_SEMANTIC_GENERIC, 1);
-         if (texcoord1 < 0)
-            texcoord1 = draw_find_shader_output(stage->draw,
-                                                 TGSI_SEMANTIC_TEXCOORD, 1);
-      }
+      texcoord = ph_unit_texcoord(ctx, 0);
+      if (multitextured)
+         texcoord1 = ph_unit_texcoord(ctx, 1);
    }
    /* A program that samples only unit 1 - GL1's unit-1 REPLACE - leaves
     * unit 0 without a coordinate set, and the draw was dropped.  Stage unit
@@ -5530,8 +5541,30 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
 static void
 ph_update_effective_views(struct ph_context *ctx)
 {
-   for (unsigned i = 0; i < ctx->num_sampler_views; i++) {
-      struct pipe_sampler_view *bound = ctx->bound_views[i], *use = bound;
+   const struct ph_fs *fs = ctx->fs;
+   const unsigned views = MAX2(ctx->num_bound_views, ctx->num_sampler_views);
+   const unsigned samplers = MAX2(ctx->num_bound_samplers, ctx->num_samplers);
+
+   for (unsigned i = 0; i < samplers; i++) {
+      unsigned src = fs && fs->unit_remap ?
+         (i < ARRAY_SIZE(fs->unit_source) ? fs->unit_source[i] : ~0u) : i;
+      struct pipe_sampler_state *use =
+         src < ctx->num_bound_samplers ? ctx->bound_samplers[src] : NULL;
+
+      if (ctx->samplers[i] != use) {
+         ph_submit_vertices(ctx);
+         ctx->samplers[i] = use;
+      }
+   }
+   ctx->num_samplers = samplers;
+   while (ctx->num_samplers && !ctx->samplers[ctx->num_samplers - 1])
+      ctx->num_samplers--;
+   for (unsigned i = 0; i < views; i++) {
+      unsigned src = fs && fs->unit_remap ?
+         (i < ARRAY_SIZE(fs->unit_source) ? fs->unit_source[i] : ~0u) : i;
+      struct pipe_sampler_view *bound =
+         src < ctx->num_bound_views ? ctx->bound_views[src] : NULL;
+      struct pipe_sampler_view *use = bound;
 
       if (bound && bound->u.tex.first_level &&
           !ph_view_first_level(ph_resource(bound->texture), bound)) {
@@ -5546,6 +5579,10 @@ ph_update_effective_views(struct ph_context *ctx)
          pipe_sampler_view_reference(&ctx->sampler_views[i], use);
       }
    }
+   ctx->num_sampler_views = views;
+   while (ctx->num_sampler_views &&
+          !ctx->sampler_views[ctx->num_sampler_views - 1])
+      ctx->num_sampler_views--;
 }
 
 /* ------------------------------------------------------- hardware transform
@@ -6221,6 +6258,9 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
    bool depth = ctx->fb.zsbuf.texture != NULL;
    bool colour;
 
+   /* The transform stream feeds unit u from GL coordinate set u. */
+   if (ctx->fs && ctx->fs->unit_remap)
+      return false;
    if (!ctx->tcl_available || ctx->tcl_forced_off || !ctx->vs ||
        (!ctx->vs->ff_transform && !ctx->vs->hw_program) || !ctx->velems ||
        ctx->derived_triangles ||
@@ -6763,16 +6803,17 @@ static void ph_bind_samplers(struct pipe_context *p, mesa_shader_stage sh,
    if (sh != MESA_SHADER_FRAGMENT || start + count > PIPE_MAX_SAMPLERS)
       return;
    for (unsigned i = 0; i < count; i++)
-      if (ctx->samplers[start + i] != states[i])
+      if (ctx->bound_samplers[start + i] != states[i])
          goto changed;
    return;
 changed:
    ph_submit_vertices(ctx);
    for (unsigned i = 0; i < count; i++)
-      ctx->samplers[start + i] = states[i];
-   ctx->num_samplers = MAX2(ctx->num_samplers, start + count);
-   while (ctx->num_samplers && !ctx->samplers[ctx->num_samplers - 1])
-      ctx->num_samplers--;
+      ctx->bound_samplers[start + i] = states[i];
+   ctx->num_bound_samplers = MAX2(ctx->num_bound_samplers, start + count);
+   while (ctx->num_bound_samplers &&
+          !ctx->bound_samplers[ctx->num_bound_samplers - 1])
+      ctx->num_bound_samplers--;
 }
 
 static struct pipe_sampler_view *
@@ -6845,10 +6886,10 @@ changed:
       pipe_sampler_view_reference(&ctx->bound_views[i], NULL);
       pipe_sampler_view_reference(&ctx->sampler_views[i], NULL);
    }
-   ctx->num_sampler_views = MAX2(ctx->num_sampler_views, start + count);
-   while (ctx->num_sampler_views &&
-          !ctx->sampler_views[ctx->num_sampler_views - 1])
-      ctx->num_sampler_views--;
+   ctx->num_bound_views = MAX2(ctx->num_bound_views, start + count);
+   while (ctx->num_bound_views &&
+          !ctx->bound_views[ctx->num_bound_views - 1])
+      ctx->num_bound_views--;
    if (ph_env("PARHELIA_TRACE_VIEWS"))
       fprintf(stderr,
               "parhelia: sampler views stage=%u start=%u count=%u trailing=%u active=%u view0=%p\n",
@@ -7010,6 +7051,46 @@ ph_nir_sampler_mask(nir_shader *nir)
    return mask;
 }
 
+/* A program that samples GL units with a gap below them (unit 1 alone, the
+ * fixed-function texture on a second unit) is compiled with its samplers
+ * packed onto units 0.., so the draw binds the units the program reads.
+ * Returns the shader to compile: @nir itself, or a clone the caller frees. */
+static nir_shader *
+ph_fs_pack_units(struct ph_fs *fs, nir_shader *nir)
+{
+   const uint32_t used = ph_nir_sampler_mask(nir);
+   uint8_t packed[32];
+   unsigned n = 0;
+   nir_shader *clone;
+
+   if (!used || !(used & (used + 1)) ||
+       util_bitcount(used) > ARRAY_SIZE(fs->unit_source))
+      return nir;
+   u_foreach_bit(k, used) {
+      packed[k] = n;
+      fs->unit_source[n++] = k;
+   }
+   clone = nir_shader_clone(NULL, nir);
+   if (!clone)
+      return nir;
+   nir_foreach_function_impl(impl, clone) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+
+               tex->sampler_index = packed[tex->sampler_index];
+               tex->texture_index = tex->sampler_index;
+            }
+         }
+      }
+   }
+   fs->unit_remap = true;
+   fs->sampler_mask = BITFIELD_MASK(n);
+   fs->projective_mask = ph_nir_projective_mask(clone);
+   return clone;
+}
+
 /* The fixed-function words the special draw routes emit, from the algebra
  * the compiled program computes. */
 static void
@@ -7133,9 +7214,13 @@ static void *ph_create_fs(struct pipe_context *p,
             unsigned units = util_bitcount(fs->sampler_mask);
             unsigned budget = P3D_COMB_QUANTUM - (units > 0) - (units > 1);
 
-            if (ph_fs_compile(s->ir.nir, budget, &fs->program) &&
+            nir_shader *compile_nir = ph_fs_pack_units(fs, s->ir.nir);
+
+            if (ph_fs_compile(compile_nir, budget, &fs->program) &&
                 (fs->program.sampler_mask & ~fs->sampler_mask))
                fs->program.valid = false;
+            if (compile_nir != s->ir.nir)
+               ralloc_free(compile_nir);
             if (fs->program.valid)
                ph_fs_route_class(fs);
             else if (ph_env("PARHELIA_TRACE"))
