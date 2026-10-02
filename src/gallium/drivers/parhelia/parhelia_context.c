@@ -4560,9 +4560,6 @@ ph_submit_vertices(struct ph_context *ctx)
 	}
    state.single_texture_pipe = ph_screen(ctx->base.screen)->single_texture_pipe;
    /* One texture ganged on pipes 0+2: +25% on trilinear minification. */
-   /* The LX guard-band clamp is not on by default: it is a proven vendor
-    * value whose effect on this driver's state stream is still being
-    * measured (PARHELIA_LX_GUARD_BAND=1). */
    /* 0x11e8, the global texture-cache partition latch.  The production path
     * writes zero while the fill probes use 0x00500000 and the vendor writes
     * 0x100000; measured in the ioquake3 timedemo, all three are within noise
@@ -4570,7 +4567,9 @@ ph_submit_vertices(struct ph_context *ctx)
     * here for the next attempt at decoding the register. */
    state.texture_cache_probe = ph_env("PARHELIA_TEX_CACHE") ?
       (uint32_t)strtoul(getenv("PARHELIA_TEX_CACHE"), NULL, 0) : 0;
-   state.lx_family = ph_env("PARHELIA_LX_GUARD_BAND") &&
+   /* The vendor's per-family 0x12f4 (31.0 on the LX class, KRN mtx2572);
+    * PARHELIA_NO_LX_GUARD_BAND=1 emits the original family's 32.0. */
+   state.lx_family = !ph_env("PARHELIA_NO_LX_GUARD_BAND") &&
       ph_lx_family(ph_screen(ctx->base.screen)->chip_id);
    /* The 0x11e8 latch is an LX-family register; writing it on the original
     * Parhelia stops its texture engine retiring. */
