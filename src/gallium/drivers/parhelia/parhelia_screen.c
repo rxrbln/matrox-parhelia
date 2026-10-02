@@ -398,13 +398,18 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
             supported = !(bind & (PIPE_BIND_RENDER_TARGET |
                                   PIPE_BIND_DEPTH_STENCIL));
             break;
-         default:
-            /* The texture unit consumes a 32-bit texel.  Gallium's format
-             * conversion path supplies the matching channel order for legacy
-             * non-sRGB OpenGL formats. */
-            supported = util_format_get_blocksize(format) == 4 &&
+         default: {
+            /* The sampler and colour surfaces store 8-bit B,G,R,A; the
+             * transfers reorder any other 8-bit UNORM byte order exactly.
+             * Other four-byte formats (signed, 10- or 16-bit channels) would
+             * be read as 8:8:8:8 and are left to the state tracker's
+             * conversion into a supported format. */
+            uint8_t order[4];
+
+            supported = ph_rgba8_order(format, order) &&
                         !(bind & PIPE_BIND_DEPTH_STENCIL);
             break;
+         }
          }
       }
    }

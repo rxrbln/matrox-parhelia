@@ -9,6 +9,7 @@
 #include <stdlib.h>
 
 #include "pipe/p_screen.h"
+#include "util/format/u_format.h"
 #include "parhelia_mipmap.h"
 
 /* Presence of a debug environment variable, looked up once per call site:
@@ -168,6 +169,40 @@ struct ph_sampler_format {
 };
 
 bool ph_sampler_format(enum pipe_format format, struct ph_sampler_format *out);
+
+/* A four-byte 8-bit UNORM RGB(A/X) format, which the 32-bit sampler and
+ * colour surfaces store as B,G,R,A bytes.  @order[i] is the format's byte
+ * that holds stored byte i, or 0xff for an X channel stored as one. */
+static inline bool
+ph_rgba8_order(enum pipe_format format, uint8_t order[4])
+{
+   const struct util_format_description *desc = util_format_description(format);
+   static const unsigned component[4] = { 2, 1, 0, 3 };   /* B, G, R, A */
+
+   if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
+       desc->block.bits != 32 || desc->nr_channels != 4 ||
+       desc->colorspace != UTIL_FORMAT_COLORSPACE_RGB || desc->is_array == 0)
+      return false;
+   for (unsigned c = 0; c < 4; c++) {
+      const struct util_format_channel_description *ch = &desc->channel[c];
+
+      if (ch->size != 8 || ch->shift != 8 * c ||
+          !(ch->type == UTIL_FORMAT_TYPE_VOID ||
+            (ch->type == UTIL_FORMAT_TYPE_UNSIGNED && ch->normalized)))
+         return false;
+   }
+   for (unsigned i = 0; i < 4; i++) {
+      const unsigned s = desc->swizzle[component[i]];
+
+      if (s <= PIPE_SWIZZLE_W && desc->channel[s].type != UTIL_FORMAT_TYPE_VOID)
+         order[i] = s;
+      else if (i == 3 && s == PIPE_SWIZZLE_1)
+         order[i] = 0xff;
+      else
+         return false;
+   }
+   return true;
+}
 
 /* Native render-target or depth storage of a Gallium format: its surface
  * descriptor code and bytes per pixel.  False when the hardware has no such

@@ -7793,19 +7793,32 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
    }
 }
 
+/* The format whose byte layout a colour surface's storage really has. */
+static enum pipe_format
+ph_storage_format(enum pipe_format format)
+{
+   uint8_t order[4];
+
+   if (!ph_rgba8_order(format, order))
+      return format;
+   return order[3] == 0xff ? PIPE_FORMAT_B8G8R8X8_UNORM :
+                             PIPE_FORMAT_B8G8R8A8_UNORM;
+}
+
 static void
 ph_clear_colour(struct ph_context *ctx, const struct pipe_surface *surf,
                 const union pipe_color_union *color, unsigned colormask,
                 unsigned x, unsigned y, unsigned width, unsigned height)
 {
    struct parhelia_resource *r = ph_resource(surf->texture);
-   const uint32_t mask = ph_colour_write_mask(surf->format, colormask);
+   const enum pipe_format format = ph_storage_format(surf->format);
+   const uint32_t mask = ph_colour_write_mask(format, colormask);
    union util_color packed;
    uint32_t value;
 
    if (!mask)
       return;
-   util_pack_color(color->f, surf->format, &packed);
+   util_pack_color(color->f, format, &packed);
    /* The 2-D fill writes whole dwords, so a 16 bpp value has to appear in
     * both halves; the rectangle itself is honoured at pixel granularity. */
    value = r->cpp == 2 ? (packed.ui[0] & 0xffffu) * 0x10001u : packed.ui[0];
@@ -8370,37 +8383,35 @@ ph_blit(struct pipe_context *p, const struct pipe_blit_info *info)
               info->dst.box.width, info->dst.box.height);
 }
 
-/* P3D's 0x32/0x33 32-bit sampler formats are little-endian BGR(A/X).  Mesa
- * gives OpenGL uploads as R8G8B8(A/X), so keep the GPU backing images in the
- * hardware byte order and convert at the transfer boundary. */
-static bool
-ph_format_needs_rb_swap(enum pipe_format format)
+/* P3D's 0x32/0x33 32-bit sampler and colour formats are little-endian
+ * BGR(A/X).  Keep the GPU backing images in that byte order and convert any
+ * other 8-bit RGBA byte order at the transfer boundary.  Returns the
+ * conversion, or NULL when the format's bytes are stored as they are. */
+struct ph_texel_order {
+   uint8_t byte[4];
+};
+
+static const struct ph_texel_order *
+ph_format_texel_order(enum pipe_format format, struct ph_texel_order *order)
 {
-   switch (format) {
-   case PIPE_FORMAT_R8G8B8A8_UNORM:
-   case PIPE_FORMAT_R8G8B8X8_UNORM:
-      return true;
-   default:
-      return false;
-   }
+   static const uint8_t identity[4] = { 0, 1, 2, 3 };
+
+   if (!ph_rgba8_order(format, order->byte) ||
+       !memcmp(order->byte, identity, sizeof(identity)))
+      return NULL;
+   return order;
 }
 
 static void
-ph_copy_texel_to_gpu(uint8_t *dst, const uint8_t *src, bool swap_rb,
-                     unsigned cpp)
+ph_copy_texel_to_gpu(uint8_t *dst, const uint8_t *src,
+                     const struct ph_texel_order *order, unsigned cpp)
 {
-   if (cpp != 4) {
+   if (cpp != 4 || !order) {
       memcpy(dst, src, cpp);
       return;
    }
-   if (swap_rb) {
-      dst[0] = src[2];
-      dst[1] = src[1];
-      dst[2] = src[0];
-      dst[3] = src[3];
-   } else {
-      memcpy(dst, src, 4);
-   }
+   for (unsigned i = 0; i < 4; i++)
+      dst[i] = order->byte[i] == 0xff ? 0xff : src[order->byte[i]];
 }
 
 /* Texture layout code 2 addresses 32x16 blocks using a power-of-two row
@@ -8509,11 +8520,17 @@ ph_restore_rgba_tiled(struct parhelia_resource *texture)
 }
 
 static void
-ph_copy_texel_from_gpu(uint8_t *dst, const uint8_t *src, bool swap_rb,
-                       unsigned cpp)
+ph_copy_texel_from_gpu(uint8_t *dst, const uint8_t *src,
+                       const struct ph_texel_order *order, unsigned cpp)
 {
-   /* The red/blue conversion is its own inverse. */
-   ph_copy_texel_to_gpu(dst, src, swap_rb, cpp);
+   if (cpp != 4 || !order) {
+      memcpy(dst, src, cpp);
+      return;
+   }
+   memset(dst, 0xff, 4);
+   for (unsigned i = 0; i < 4; i++)
+      if (order->byte[i] != 0xff)
+         dst[order->byte[i]] = src[i];
 }
 
 static bool
@@ -8560,7 +8577,9 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
    struct parhelia_resource *r = ph_resource(res);
    struct ph_transfer *t = CALLOC_STRUCT(ph_transfer);
    unsigned cpp = util_format_get_blocksize(res->format);
-   bool swap_rb = ph_format_needs_rb_swap(res->format);
+   struct ph_texel_order order_storage;
+   const struct ph_texel_order *swap_rb =
+      ph_format_texel_order(res->format, &order_storage);
 
    ph_zinit_resolve(ctx, r);
    unsigned image_width, image_height;
@@ -8714,7 +8733,9 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
    struct ph_transfer *t = (struct ph_transfer *)transfer;
    struct parhelia_resource *r = ph_resource(transfer->resource);
    unsigned cpp = util_format_get_blocksize(transfer->resource->format);
-   bool swap_rb = ph_format_needs_rb_swap(transfer->resource->format);
+   struct ph_texel_order order_storage;
+   const struct ph_texel_order *swap_rb =
+      ph_format_texel_order(transfer->resource->format, &order_storage);
    if (texture && r->mip.block_bytes && t->staging && r->map) {
       if (transfer->usage & PIPE_MAP_WRITE) {
          ph_copy_blocks(r, t->staging, transfer->stride, &transfer->box, true);
