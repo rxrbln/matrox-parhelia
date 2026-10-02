@@ -239,6 +239,8 @@ static void parhelia_aperture_program(struct parhelia_device *pdev, u8 slot,
 {
 	u32 reg = PARHELIA_HOST_APERTURE_SLOT(slot);
 
+	/* Drain write-combined stores through the old translation first. */
+	wmb();
 	/* Dwords 1..3 are private until VALID is published in dword 0. */
 	parhelia_write(pdev, reg, 0);
 	parhelia_write(pdev, reg + 4, mapping->surface);
@@ -428,6 +430,7 @@ static void parhelia_aperture_release_locked(struct parhelia_device *pdev,
 		return;
 	old_tail = pdev->aperture_mapping_count;
 	if (pdev->aperture_live) {
+		wmb();
 		parhelia_write(pdev, PARHELIA_HOST_APERTURE_SLOT(mapping->slot), 0);
 		list_for_each_entry(pos, &pdev->aperture_mappings, link) {
 			if (pos->slot > mapping->slot)

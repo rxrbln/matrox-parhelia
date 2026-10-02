@@ -430,7 +430,10 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	 * pci_map_rom() may temporarily enable the legacy shadow aperture and the
 	 * PCI resource checker otherwise reports overlapping active mappings. */
 	parhelia_bios_init(pdev);
-	pdev->vram = pcim_iomap(pci, 0, 0);
+	/* Write-combined: an uncached kernel mapping reserves BAR0 as UC-
+	 * and PAT then downgrades every WC CPU view of it as well. */
+	pdev->vram = devm_ioremap_wc(&pci->dev, pci_resource_start(pci, 0),
+				     pdev->vram_size);
 	pdev->mmio = pcim_iomap(pci, mmio_bar, 0);
 	if (!pdev->vram || !pdev->mmio)
 		return dev_err_probe(&pci->dev, -ENOMEM, "cannot map BARs\n");
