@@ -3713,6 +3713,11 @@ ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
       state.depth_slot = 1;
    }
    ph_apply_fragment_state(ctx, &state, depth != NULL);
+   /* The fragment program applies to lines and points as to triangles: a
+    * constant glColor reaches it as a uniform, not as the vertex colour. */
+   state.comb = ctx->fs && ctx->fs->program.valid &&
+                !ctx->fs->program.sampler_mask ?
+                ph_compiled_combiner(ctx, false) : NULL;
 
    ret = ph_batch_primitives(ctx, batch, &state, color->handle,
                              depth ? depth->handle : 0, 0, 0, count);
