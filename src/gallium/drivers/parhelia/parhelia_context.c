@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_builder.h"
 #include "draw/draw_context.h"
 #include "draw/draw_fs.h"
 #include "draw/draw_pipe.h"
@@ -110,6 +111,8 @@ struct ph_fs {
     * expression the combiner can evaluate; everything else keeps the
     * instruction-shape matcher above and the draw module. */
    struct ph_fs_program program;
+   /* A discard folded into the alpha test, see ph_fs_build_kill(). */
+   struct ph_fs_kill *kill;
 };
 
 struct ph_transfer {
@@ -454,6 +457,19 @@ struct ph_stage {
    struct draw_stage base;
    struct ph_context *ctx;
 };
+
+enum ph_kill_route {
+   PH_KILL_NONE,          /* no discard */
+   PH_KILL_ALPHA_X,
+   PH_KILL_ALPHA_SUB,
+   PH_KILL_ALL,           /* the GL alpha test rejects every fragment */
+   PH_KILL_UNSUPPORTED,
+};
+
+static enum ph_kill_route
+ph_fs_kill_route(struct ph_context *ctx, struct ph_fs_program **prog,
+                 enum pipe_compare_func *func, uint8_t *ref);
+static bool ph_fs_untextured_program(struct ph_context *ctx);
 
 static inline struct ph_context *
 ph_context(struct pipe_context *p)
@@ -1523,6 +1539,20 @@ ph_apply_fragment_state(struct ph_context *ctx, struct p3d_state *state,
       state->mask_b = !!(blend->colormask & PIPE_MASK_B);
       state->mask_a = !!(blend->colormask & PIPE_MASK_A);
       state->mask_explicit = true;
+   }
+   {
+      struct ph_fs_program *kill_prog;
+      enum pipe_compare_func kill_func;
+      uint8_t kill_ref;
+      const enum ph_kill_route route =
+         ph_fs_kill_route(ctx, &kill_prog, &kill_func, &kill_ref);
+
+      /* The discard became an alpha test; GL's own was folded in. */
+      if (route == PH_KILL_ALPHA_X || route == PH_KILL_ALPHA_SUB) {
+         state->alpha_test = true;
+         state->alpha_func = ph_compare(kill_func);
+         state->alpha_ref = kill_ref;
+      }
    }
    if (ctx->rasterizer && ctx->rasterizer->scissor) {
       state->scissor = true;
@@ -3784,8 +3814,7 @@ ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
    ph_apply_fragment_state(ctx, &state, depth != NULL);
    /* The fragment program applies to lines and points as to triangles: a
     * constant glColor reaches it as a uniform, not as the vertex colour. */
-   state.comb = ctx->fs && ctx->fs->program.valid &&
-                !ctx->fs->program.sampler_mask ?
+   state.comb = ph_fs_untextured_program(ctx) ?
                 ph_compiled_combiner(ctx, false) : NULL;
 
    ret = ph_batch_primitives(ctx, batch, &state, color->handle,
@@ -4237,8 +4266,7 @@ ph_submit_vertices(struct ph_context *ctx)
    /* An untextured draw can still need a compiled fragment program - fixed
     * function fog is a mix between the fragment colour and a constant - as
     * long as that program samples nothing. */
-   state.comb = ctx->fs && ctx->fs->program.valid &&
-                !ctx->fs->program.sampler_mask ?
+   state.comb = ph_fs_untextured_program(ctx) ?
                 ph_compiled_combiner(ctx, false) : NULL;
    state.dither = !ctx->blend || ctx->blend->dither;
    state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
@@ -7027,6 +7055,22 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    if (!num_draws || indirect || ctx->submit_error)
       return;
+   {
+      struct ph_fs_program *kill_prog;
+      enum pipe_compare_func kill_func;
+      uint8_t kill_ref;
+
+      ph_fs_snapshot_constants(ctx);
+      switch (ph_fs_kill_route(ctx, &kill_prog, &kill_func, &kill_ref)) {
+      case PH_KILL_ALL:
+         return;
+      case PH_KILL_UNSUPPORTED:
+         PH_REFUSE("a draw whose discard has no alpha-test form is dropped\n");
+         return;
+      default:
+         break;
+      }
+   }
    ph_fs_snapshot_constants(ctx);
    ph_update_effective_views(ctx);
    for (unsigned i = 0; i < ctx->draw->pt.nr_vertex_buffers; i++) {
@@ -7461,7 +7505,19 @@ static const struct p3d_comb_program *
 ph_compiled_combiner(struct ph_context *ctx, bool two_units)
 {
    struct ph_fs *fs = ctx->fs;
+   struct ph_fs_program *kill_prog = NULL;
+   enum pipe_compare_func kill_func;
+   uint8_t kill_ref;
 
+   if (fs && (ph_fs_kill_route(ctx, &kill_prog, &kill_func, &kill_ref) ==
+              PH_KILL_ALPHA_X ||
+              ph_fs_kill_route(ctx, &kill_prog, &kill_func, &kill_ref) ==
+              PH_KILL_ALPHA_SUB)) {
+      /* The discard's alpha form; its constants are already current. */
+      if (!two_units && (kill_prog->sampler_mask & BITFIELD_BIT(1)))
+         return NULL;
+      return kill_prog->valid ? &kill_prog->comb : NULL;
+   }
    if (!fs || !fs->program.valid || ph_env("PARHELIA_FS_TEXENV"))
       return NULL;
    /* The draw binds a second texture unit only for the shapes the
@@ -7523,6 +7579,342 @@ ph_compiled_combiner(struct ph_context *ctx, bool two_units)
    return &fs->program.comb;
 }
 
+/* ------------------------------------------------ discard as alpha test
+ *
+ * The combiner has no kill, but its alpha half can carry any channel of a
+ * sample (replicate .r drives the alpha test on the P690, docs/parhelia-
+ * p690-combiner-isa-re.md section 3.1), and the alpha test runs per fragment.
+ * A shader whose only discard is "discard if x <cmp> c", with x a scalar the
+ * combiner computes and c a constant on the 8-bit alpha grid, is rewritten
+ * into one of two combiner programs:
+ *
+ *  - alpha := x, with the alpha test keeping exactly the fragments the
+ *    discard keeps.  Exact whenever the written alpha cannot be observed
+ *    (no alpha channel or alpha masked, no source-alpha blending, no GL
+ *    alpha test) - or when the colour alpha is a draw constant 0 and the
+ *    discard keeps only x == 0, since the kept fragments then write 0.
+ *  - alpha := sat(a - x) for "discard if x != 0" with a draw-constant
+ *    colour alpha a > 0 on the 8-bit grid, tested GEQUAL a: a kept fragment
+ *    writes exactly a, a discarded one (x >= 1/255) falls below it.  This is
+ *    glBitmap's shader (nir_lower_bitmap) with its constant raster colour.
+ */
+struct ph_fs_kill {
+   enum pipe_compare_func keep;   /* x <keep> ref keeps the fragment */
+   uint8_t ref;
+   bool ne_zero;                  /* the discard is "x != 0" */
+   bool const_alpha;              /* the colour alpha is a draw constant */
+   bool have_x, have_sub, have_colour;
+   struct ph_fs_program alpha_x, alpha_sub, colour;
+};
+
+/* @def only depends on constants and uniforms. */
+static bool
+ph_nir_def_uniform(nir_def *def, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   if (depth > 16)
+      return false;
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+      return true;
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+
+      return in->intrinsic == nir_intrinsic_load_ubo ||
+             in->intrinsic == nir_intrinsic_load_ubo_vec4 ||
+             in->intrinsic == nir_intrinsic_load_uniform;
+   }
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+         if (!ph_nir_def_uniform(alu->src[i].src.ssa, depth + 1))
+            return false;
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+/* The single terminate_if and the colour store of a straight-line shader. */
+static bool
+ph_nir_find_kill(nir_shader *nir, nir_intrinsic_instr **kill,
+                 nir_intrinsic_instr **store, unsigned *value_src)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+
+   *kill = *store = NULL;
+   if (!impl || exec_list_length(&impl->body) != 1)
+      return false;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         nir_intrinsic_instr *in;
+         int location = -1;
+
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         in = nir_instr_as_intrinsic(instr);
+         switch (in->intrinsic) {
+         case nir_intrinsic_terminate_if:
+         case nir_intrinsic_demote_if:
+            if (*kill)
+               return false;
+            *kill = in;
+            break;
+         case nir_intrinsic_terminate:
+         case nir_intrinsic_demote:
+            return false;
+         case nir_intrinsic_store_deref: {
+            nir_deref_instr *deref = nir_src_as_deref(in->src[0]);
+
+            if (deref && deref->deref_type == nir_deref_type_var &&
+                (deref->var->data.mode & nir_var_shader_out))
+               location = deref->var->data.location;
+            *value_src = 1;
+            break;
+         }
+         case nir_intrinsic_store_output:
+            location = nir_intrinsic_io_semantics(in).location;
+            *value_src = 0;
+            break;
+         default:
+            break;
+         }
+         if (location < 0)
+            continue;
+         if ((location != FRAG_RESULT_COLOR && location != FRAG_RESULT_DATA0) ||
+             *store || nir_intrinsic_write_mask(in) != 0xf ||
+             (in->intrinsic == nir_intrinsic_store_output &&
+              nir_intrinsic_component(in)) ||
+             in->src[*value_src].ssa->num_components != 4)
+            return false;
+         *store = in;
+      }
+   }
+   return *kill && *store;
+}
+
+enum ph_kill_variant { PH_KILL_V_X, PH_KILL_V_SUB, PH_KILL_V_COLOUR };
+
+/* Compile @nir with its discard rewritten as @variant. */
+static bool
+ph_fs_compile_kill_variant(const nir_shader *src, enum ph_kill_variant variant,
+                           unsigned budget, struct ph_fs_program *out)
+{
+   nir_shader *nir = nir_shader_clone(NULL, src);
+   nir_intrinsic_instr *kill, *store;
+   unsigned value_src = 0;
+   bool ok = false;
+
+   if (!nir || !ph_nir_find_kill(nir, &kill, &store, &value_src))
+      goto done;
+   if (variant != PH_KILL_V_COLOUR) {
+      nir_alu_instr *cmp = nir_def_as_alu_or_null(kill->src[0].ssa);
+      const unsigned xi = cmp && nir_src_is_const(cmp->src[0].src) ? 1 : 0;
+      nir_builder b = nir_builder_at(nir_before_instr(&store->instr));
+      nir_def *v = store->src[value_src].ssa, *x, *alpha;
+      nir_intrinsic_instr *alpha_store;
+
+      if (!cmp)
+         goto done;
+      x = nir_mov_alu(&b, cmp->src[xi], 1);
+      alpha = variant == PH_KILL_V_X ? x :
+              nir_fsat(&b, nir_fsub(&b, nir_channel(&b, v, 3), x));
+      /* RGB keeps its one source; the alpha gets a store of its own. */
+      alpha_store = nir_instr_as_intrinsic(nir_instr_clone(nir, &store->instr));
+      nir_builder_instr_insert(&b, &alpha_store->instr);
+      nir_src_rewrite(&alpha_store->src[value_src], nir_replicate(&b, alpha, 4));
+      nir_intrinsic_set_write_mask(alpha_store, 0x8);
+      nir_intrinsic_set_write_mask(store, 0x7);
+   }
+   nir_instr_remove(&kill->instr);
+   NIR_PASS(_, nir, nir_opt_dce);
+   ok = ph_fs_compile(nir, budget, out);
+done:
+   ralloc_free(nir);
+   return ok;
+}
+
+static struct ph_fs_kill *
+ph_fs_build_kill(nir_shader *src, unsigned budget)
+{
+   nir_intrinsic_instr *kill, *store;
+   unsigned value_src = 0;
+   struct ph_fs_kill *k;
+   nir_alu_instr *cmp;
+   float c;
+   unsigned xi;
+
+   if (!ph_nir_find_kill(src, &kill, &store, &value_src))
+      return NULL;
+   cmp = nir_def_as_alu_or_null(kill->src[0].ssa);
+   if (!cmp || nir_op_infos[cmp->op].num_inputs != 2 ||
+       cmp->src[0].src.ssa->bit_size != 32 ||
+       nir_src_is_const(cmp->src[0].src) == nir_src_is_const(cmp->src[1].src))
+      return NULL;
+   xi = nir_src_is_const(cmp->src[0].src) ? 1 : 0;
+   c = nir_src_comp_as_float(cmp->src[xi ^ 1].src, cmp->src[xi ^ 1].swizzle[0]);
+   if (c < 0.0f || c > 1.0f || c * 255.0f != floorf(c * 255.0f))
+      return NULL;
+   k = CALLOC_STRUCT(ph_fs_kill);
+   if (!k)
+      return NULL;
+   k->ref = (uint8_t)(c * 255.0f);
+   /* Keep is the negated discard, with x on the left. */
+   switch (cmp->op) {
+   case nir_op_fneu: k->keep = PIPE_FUNC_EQUAL; break;
+   case nir_op_feq: k->keep = PIPE_FUNC_NOTEQUAL; break;
+   case nir_op_flt: k->keep = xi ? PIPE_FUNC_LEQUAL : PIPE_FUNC_GEQUAL; break;
+   case nir_op_fge: k->keep = xi ? PIPE_FUNC_GREATER : PIPE_FUNC_LESS; break;
+   default:
+      FREE(k);
+      return NULL;
+   }
+   k->ne_zero = cmp->op == nir_op_fneu && !k->ref;
+   k->const_alpha =
+      ph_nir_def_uniform(store->src[value_src].ssa, 0);
+   if (!k->const_alpha) {
+      /* A vec built from per-channel sources: only its alpha matters. */
+      nir_alu_instr *vec = nir_def_as_alu_or_null(store->src[value_src].ssa);
+
+      k->const_alpha = vec && vec->op == nir_op_vec4 &&
+                       ph_nir_def_uniform(vec->src[3].src.ssa, 0);
+   }
+   k->have_x = ph_fs_compile_kill_variant(src, PH_KILL_V_X, budget, &k->alpha_x);
+   if (k->ne_zero && k->const_alpha) {
+      k->have_sub = ph_fs_compile_kill_variant(src, PH_KILL_V_SUB, budget,
+                                               &k->alpha_sub);
+      k->have_colour = ph_fs_compile_kill_variant(src, PH_KILL_V_COLOUR,
+                                                  budget, &k->colour);
+   }
+   if (ph_env("PARHELIA_TRACE"))
+      fprintf(stderr, "parhelia: discard as alpha test: keep func %u ref %u const alpha %u, alpha:=x %u, alpha:=a-x %u\n",
+              k->keep, k->ref, k->const_alpha, k->have_x, k->have_sub);
+   return k;
+}
+
+/* The program's constants from the current fragment constant buffer. */
+static bool
+ph_fs_program_constants(struct ph_context *ctx, struct ph_fs_program *prog)
+{
+   if (!prog->const_ref_count)
+      return true;
+   if (!ctx->fs_const_snap_size)
+      return false;
+   ph_fs_update_constants(prog, ctx->fs_const_snap, ctx->fs_const_snap_size);
+   return true;
+}
+
+static bool
+ph_alpha_observable(const struct ph_context *ctx)
+{
+   const struct pipe_rt_blend_state *rt = ctx->blend ? &ctx->blend->rt[0] : NULL;
+   const struct util_format_description *desc = ctx->fb.nr_cbufs ?
+      util_format_description(ctx->fb.cbufs[0].format) : NULL;
+   const enum pipe_blendfactor f[4] = {
+      rt ? rt->rgb_src_factor : PIPE_BLENDFACTOR_ONE,
+      rt ? rt->rgb_dst_factor : PIPE_BLENDFACTOR_ZERO,
+      rt ? rt->alpha_src_factor : PIPE_BLENDFACTOR_ONE,
+      rt ? rt->alpha_dst_factor : PIPE_BLENDFACTOR_ZERO,
+   };
+
+   if (rt && rt->blend_enable)
+      for (unsigned i = 0; i < 4; i++)
+         if (f[i] == PIPE_BLENDFACTOR_SRC_ALPHA ||
+             f[i] == PIPE_BLENDFACTOR_INV_SRC_ALPHA ||
+             f[i] == PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE)
+            return true;
+   return desc && util_format_has_alpha(ctx->fb.cbufs[0].format) &&
+          (!rt || (rt->colormask & PIPE_MASK_A));
+}
+
+static bool
+ph_alpha_func_passes(enum pipe_compare_func func, uint8_t a, uint8_t ref)
+{
+   switch (func) {
+   case PIPE_FUNC_NEVER: return false;
+   case PIPE_FUNC_LESS: return a < ref;
+   case PIPE_FUNC_EQUAL: return a == ref;
+   case PIPE_FUNC_LEQUAL: return a <= ref;
+   case PIPE_FUNC_GREATER: return a > ref;
+   case PIPE_FUNC_NOTEQUAL: return a != ref;
+   case PIPE_FUNC_GEQUAL: return a >= ref;
+   default: return true;
+   }
+}
+
+/* How the bound fragment shader's discard reaches the hardware for this
+ * draw: the program to run and the alpha test that replaces the discard. */
+static enum ph_kill_route
+ph_fs_kill_route(struct ph_context *ctx, struct ph_fs_program **prog,
+                 enum pipe_compare_func *func, uint8_t *ref)
+{
+   struct ph_fs_kill *k = ctx->fs ? ctx->fs->kill : NULL;
+   const bool gl_test = ctx->dsa && ctx->dsa->alpha_enabled;
+   float a[4];
+   uint8_t a8;
+
+   if (!ctx->fs || !ctx->fs->draw ||
+       ctx->fs->draw->base.type != PIPE_SHADER_IR_NIR ||
+       !ctx->fs->draw->base.ir.nir->info.fs.uses_discard)
+      return PH_KILL_NONE;
+   if (!k)
+      return PH_KILL_UNSUPPORTED;
+   if (k->have_x && !gl_test && !ph_alpha_observable(ctx)) {
+      *prog = &k->alpha_x;
+      *func = k->keep;
+      *ref = k->ref;
+      return ph_fs_program_constants(ctx, *prog) ? PH_KILL_ALPHA_X :
+                                                   PH_KILL_UNSUPPORTED;
+   }
+   if (!k->ne_zero || !k->const_alpha || !k->have_colour ||
+       !ph_fs_program_constants(ctx, &k->colour))
+      return PH_KILL_UNSUPPORTED;
+   {
+      static const float zero[4][4];
+
+      ph_fs_eval(&k->colour.comb, zero, (const float (*)[4])zero, 1.0f, a);
+   }
+   /* The evaluation models the Q1.10 constant registers, so 1.0 reads as
+    * 1023/1024: the code the target stores is the rounded one. */
+   a8 = (uint8_t)CLAMP(lrintf(a[3] * 255.0f), 0, 255);
+   if (gl_test &&
+       !ph_alpha_func_passes(ctx->dsa->alpha_func, a8,
+                             CLAMP((int)lrintf(ctx->dsa->alpha_ref_value * 255.0f),
+                                   0, 255)))
+      return PH_KILL_ALL;
+   if (!a8 && k->have_x) {
+      *prog = &k->alpha_x;
+      *func = PIPE_FUNC_EQUAL;
+      *ref = 0;
+      return ph_fs_program_constants(ctx, *prog) ? PH_KILL_ALPHA_X :
+                                                   PH_KILL_UNSUPPORTED;
+   }
+   if (!k->have_sub || !ph_fs_program_constants(ctx, &k->alpha_sub))
+      return PH_KILL_UNSUPPORTED;
+   *prog = &k->alpha_sub;
+   *func = PIPE_FUNC_GEQUAL;
+   *ref = a8;
+   return PH_KILL_ALPHA_SUB;
+}
+
+/* The bound fragment program samples nothing, counting a discard's form. */
+static bool
+ph_fs_untextured_program(struct ph_context *ctx)
+{
+   struct ph_fs_program *kill_prog = NULL;
+   enum pipe_compare_func kill_func;
+   uint8_t kill_ref;
+   const enum ph_kill_route route = ctx->fs ?
+      ph_fs_kill_route(ctx, &kill_prog, &kill_func, &kill_ref) : PH_KILL_NONE;
+
+   if (route == PH_KILL_ALPHA_X || route == PH_KILL_ALPHA_SUB)
+      return kill_prog->valid && !kill_prog->sampler_mask;
+   return ctx->fs && ctx->fs->program.valid && !ctx->fs->program.sampler_mask;
+}
+
 static void *ph_create_fs(struct pipe_context *p,
                           const struct pipe_shader_state *s)
 {
@@ -7579,6 +7971,8 @@ static void *ph_create_fs(struct pipe_context *p,
             if (ph_fs_compile(compile_nir, budget, &fs->program) &&
                 (fs->program.sampler_mask & ~fs->sampler_mask))
                fs->program.valid = false;
+            if (compile_nir->info.fs.uses_discard)
+               fs->kill = ph_fs_build_kill(compile_nir, budget);
             if (compile_nir != s->ir.nir)
                ralloc_free(compile_nir);
             if (fs->program.valid)
@@ -7627,8 +8021,10 @@ static void ph_bind_fs(struct pipe_context *p, void *s)
 static void ph_delete_fs(struct pipe_context *p, void *s)
 {
    struct ph_fs *fs = s;
-   if (fs)
+   if (fs) {
       draw_delete_fragment_shader(ph_context(p)->draw, fs->draw);
+      FREE(fs->kill);
+   }
    FREE(fs);
 }
 
