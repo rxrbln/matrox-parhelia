@@ -785,6 +785,14 @@ ph_vs_value(struct ph_vs_ctx *ctx, nir_def *def, struct ph_vs_value *out)
       case nir_instr_type_load_const:
          ok = ph_vs_leaf_const(ctx, nir_instr_as_load_const(instr), out);
          break;
+      case nir_instr_type_undef: {
+         /* An undefined value may be anything; zero is as good as any. */
+         static const float zero[4] = { 0 };
+
+         *out = ph_vs_swizzled_literal(zero);
+         ok = true;
+         break;
+      }
       case nir_instr_type_intrinsic:
          ok = ph_vs_leaf_intrinsic(ctx, nir_instr_as_intrinsic(instr), out);
          break;
@@ -894,6 +902,7 @@ ph_vs_collect(nir_shader *nir, struct ph_vs_output *position,
 
          switch (instr->type) {
          case nir_instr_type_load_const:
+         case nir_instr_type_undef:
          case nir_instr_type_alu:
          case nir_instr_type_jump:
             continue;
@@ -969,13 +978,12 @@ ph_vs_collect(nir_shader *nir, struct ph_vs_output *position,
          }
       }
    }
-   /* Every slot has to end up completely written: a component left out would
-    * read whatever the previous vertex put there. */
+   /* The position has to be completely written.  A varying component the
+    * shader leaves out (the linker drops one the fragment shader does not
+    * read) is undefined and gets zero at emission, so it never reads what
+    * the previous vertex left there. */
    if (position->present && position->covered != 0xf)
       { PH_VS_REJECT("collect"); return false; }
-   for (unsigned i = 0; i < varyings; i++)
-      if (varying[i].present && varying[i].covered != 0xf)
-         { PH_VS_REJECT("collect"); return false; }
    return position->present && position->value;
 }
 
@@ -1220,7 +1228,10 @@ ph_vs_compile(nir_shader *nir, const struct ph_vs_inputs *inputs,
    ph_vs_flush_free(&ctx);
 
    for (unsigned i = 0; i < ARRAY_SIZE(varying) && varying[i].present; i++) {
-      if (varying[i].parts > 1) {
+      if (varying[i].parts > 1 || varying[i].covered != 0xf) {
+         static const float zeros[4] = { 0 };
+         struct ph_vs_value zero = ph_vs_swizzled_literal(zeros);
+
          /* Several partial stores: each one writes its own components. */
          for (unsigned p = 0; p < varying[i].parts; p++) {
             if (!ph_vs_value(&ctx, varying[i].part[p].value, &value) ||
@@ -1229,6 +1240,10 @@ ph_vs_compile(nir_shader *nir, const struct ph_vs_inputs *inputs,
                do { PH_VS_REJECT("compile"); goto done; } while (0);
             ph_vs_flush_free(&ctx);
          }
+         if (varying[i].covered != 0xf &&
+             !ph_vs_write_output_masked(&ctx, varying[i].slot, &zero,
+                                        0xf & ~varying[i].covered))
+            do { PH_VS_REJECT("compile"); goto done; } while (0);
          ctx.program->output_mask |= 1u << varying[i].slot;
          continue;
       }
