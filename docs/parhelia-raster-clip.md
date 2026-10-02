@@ -1074,3 +1074,51 @@ hardware cannot express the state.
    meanings not.
 10. **`GLVSClipPlaneDesc`'s parameter kind `0x87c2`** (`0x1696b0`) — the
     binding slot user clip planes occupy in a WARP vertex program.
+
+## Depth range, z-clip registers and guard band - MEASURED on the P690 (2026-10-03)
+
+`parhelia-drm-test --zclip-guard-probe` (Mesa p690-raster `69bc188`,
+`a804a96`): a window-space quad whose z runs linearly from -0.5 (top) to
+1.5 (bottom), 32-bit colour, native Z24, pass-through WARP program; counts of
+written pixels per band (`z<0` 4096, `0..1` 10240, `z>1` 4096 pixels).
+
+* **Depth test off**: every fragment is written, whatever z and whatever
+  `0x12c0/0x12c4` hold.  Out-of-range z is never discarded per fragment.
+* **z is clamped to [0, 1] before the depth test and write** (saturate,
+  not wrap): func `ALWAYS` writes all bands; `GEQUAL` against a cleared
+  `0xffffff` passes exactly the `z>1` band (clamped to 1.0) and nothing else;
+  `LESS` against a cleared `0x400000` (0.25) passes all of `z<0` (clamped to
+  0; a wrap would fail half of it) plus exactly the 16 rows below 0.25
+  (2048 pixels, the exact count).
+* **`0x12c0` / `0x12c4` are a per-fragment z-clip window on the unclamped
+  z, signed 4.28 fixed point (1.0 = `0x10000000`), applied only while the
+  depth test is enabled** (any function, including `ALWAYS`):
+  `[0, 0x10000000]` with `ALWAYS` writes exactly the `0..1` band and
+  discards `z<0` and `z>1`; `[0x08000000, 0x10000000]` writes exactly the
+  rows with z >= 0.5 (5120 pixels, exact); `zmax 0x01000000` (z <= 1/16)
+  discards the whole visible part of the band, `zmax 0x20000000` (2.0) keeps
+  `z = 1.5`.  The vendor's `0x80000000 / 0x7fffffff` is "no z clip", which
+  together with the clamp is exactly `GL_DEPTH_CLAMP` behaviour.  Our earlier
+  guess `[0, 0x00ffffff]` (Z24 units) discards everything.
+* The vendor GL (`opengl6/libGL.so.1.3.0`) exports no depth-clamp
+  extension, and `mtx_parhelia.o` has no clamp/z-clip registry switch; the
+  vendor always emits the full window (D3D device fields `0x20b0/0x20b4`).
+
+So GL near/far clipping for vertices with w > 0 can be done per fragment by
+the hardware: program `[0, 0x10000000]` while the depth test is on (or turn
+the test on with `ALWAYS` and no depth write when a depth buffer is bound).
+Without a depth buffer there is no z discard; those draws need geometric
+clipping.  Not yet measured: the exact inclusive/exclusive edge and the
+behaviour on the original family (DERIVED/UNTESTED there).
+
+**Guard band `0x12f4`**: with the vendor's LX value 31.0 (`0x41f80000`) and
+with 64.0, a quad whose left and right edges lie 0, 32, ... 8160 pixels off
+a 256-pixel target is rasterised fully and its red ramp (0 at the left edge,
+1 at the right edge) is exact to within 0.5 LSB at x = 8, 128 and 248 for
+every offset - window-space vertices up to 8160 pixels outside interpolate
+correctly.  With `0x12f4 = 1024.0` quads of 0..256 pixels off screen are
+not drawn at their edges and the z quad loses pixels: the register is not a
+pixel bound and must keep the vendor value.  The colour error seen earlier
+with the draw module's guard band (fog-linear-floor) therefore is not an
+x/y raster limit of window-space vertices; its cause (perspective vertices
+handed through unclipped, the w/z path) is still unmeasured.
