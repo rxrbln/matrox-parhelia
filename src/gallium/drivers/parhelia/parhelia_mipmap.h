@@ -330,34 +330,34 @@ ph_mip_log2(unsigned value)
 
 /* Byte offset of texel (x,y) of slice @z in the measured P690 volume order
  * (parhelia-drm-test --texture-volume-probe; see
- * docs/parhelia-p690-volume-cube-targets.md).  The address is XOR-linear in
- * the coordinate bits and is built from:
+ * docs/parhelia-p690-volume-cube-targets.md).  It is built from:
  *
  *   bits 0..6  a 512-byte granule of 32x4 texels, the same seven low bits
  *              the plain 2-D order uses;
  *   bit 7      the slice index's low bit, exclusive-ORed with the 32-wide
  *              half selector x5 ^ trow the 64x16 texture tile already uses;
  *   bits 8,9   y2 and y3, the four granules of a 32x16 sub-tile;
- *   bits 10..  the rest of the slice index;
- *   above it   the 32x16 sub-tile index with its bit 0 replaced by that same
- *              half selector.
+ *   bits 10..  (s * @slices + z) >> 1, where s is the 32x16 sub-tile index
+ *              with its bit 0 replaced by that same half selector.
  *
  * So the slices of one granule are consecutive: a volume is neither a stack
- * of whole 2-D images nor the vendor's generic whole-block interleave.  @pitch
- * must be at least 64; a 32-texel volume pitch is not measured. */
+ * of whole 2-D images nor the vendor's generic whole-block interleave.  For a
+ * power-of-two depth the last field is the XOR-linear (s << log2(D)-1) |
+ * z >> 1; a depth of 3 or 5 multiplies, measured at 16x64x3, 64x32x3 and
+ * 32x48x5 tile corner by tile corner.  @pitch is the descriptor width
+ * rounded up to 32 (measured at 32 and 64). */
 static inline size_t
 ph_volume_texel_offset(unsigned x, unsigned y, unsigned z, unsigned pitch,
                        unsigned slices, unsigned cpp)
 {
-   const unsigned zbits = ph_mip_log2(slices);
    const unsigned half = ((x >> 5) ^ (y >> 4)) & 1u;
    const unsigned tile = (y >> 4) * (pitch >> 5) + (x >> 5);
    const unsigned granule = (x & 7u) | ((y & 1u) << 3) |
                             (((x >> 3) & 3u) << 4) | (((y >> 1) & 1u) << 6);
+   const size_t slot = (size_t)((tile & ~1u) | half) * slices + z;
 
-   return (size_t)(granule | (((z & 1u) ^ half) << 7) |
-                   (((y >> 2) & 3u) << 8) | ((z >> 1) << 10) |
-                   (((tile & ~1u) | half) << (zbits ? 9 + zbits : 10))) * cpp;
+   return (granule | (((z & 1u) ^ half) << 7) | (((y >> 2) & 3u) << 8) |
+           ((slot >> 1) << 10)) * cpp;
 }
 
 static inline unsigned

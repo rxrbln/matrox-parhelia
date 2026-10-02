@@ -784,10 +784,8 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    if (templ->width0 > max_width || templ->height0 > max_height ||
        (util_format_is_compressed(templ->format) && !block_bytes) ||
        (slices > 1 && (!p690_native_texture32 || block_bytes ||
-                       slices > 64 ||
-                       (cube_target ? templ->width0 != templ->height0 :
-                        (templ->width0 < 64 ||
-                         !!(templ->depth0 & (templ->depth0 - 1)))))) ||
+                       slices > 256 ||
+                       (cube_target && templ->width0 != templ->height0))) ||
        (templ->target != PIPE_TEXTURE_3D && templ->depth0 != 1) ||
        templ->array_size != (cube_target ? 6u : 1u)) {
       fprintf(stderr,
