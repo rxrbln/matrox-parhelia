@@ -5706,9 +5706,10 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
 {
    struct parhelia_resource *r = ph_resource(v->base.texture);
    const unsigned first = v->base.u.tex.first_level;
-   const unsigned last = MIN2(v->base.u.tex.last_level, r->base.last_level);
+   const unsigned last = MIN2(MIN2(v->base.u.tex.last_level, r->base.last_level),
+                              ph_resource_mip_levels(r) - 1);
 
-   if (util_format_get_blocksize(r->base.format) != 4)
+   if (util_format_get_blocksize(r->base.format) != 4 || first > last)
       return NULL;
    if (!v->shadow_view) {
       struct pipe_resource templ = r->base, *shadow;
@@ -5752,6 +5753,17 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
    return v->shadow_view;
 }
 
+static bool
+ph_sampled_through_copy(const struct parhelia_resource *r)
+{
+   return r->transfer_shadow && !r->native_shared &&
+          !ph_resource_uses_sampler_layout(r) &&
+          !(r->base.bind & PIPE_BIND_DEPTH_STENCIL) &&
+          (r->base.target == PIPE_TEXTURE_2D ||
+           r->base.target == PIPE_TEXTURE_RECT ||
+           r->base.target == PIPE_TEXTURE_1D);
+}
+
 /* Select the effective view for every bound sampler view before a draw. */
 static void
 ph_update_effective_views(struct ph_context *ctx)
@@ -5781,8 +5793,13 @@ ph_update_effective_views(struct ph_context *ctx)
          src < ctx->num_bound_views ? ctx->bound_views[src] : NULL;
       struct pipe_sampler_view *use = bound;
 
-      if (bound && bound->u.tex.first_level &&
-          !ph_view_first_level(ph_resource(bound->texture), bound)) {
+      /* A render target keeps the surface order, the sampler's with y bits
+       * 0 and 1 exchanged: it is sampled through a sampler-order copy that
+       * follows its content generation. */
+      if (bound && ((bound->u.tex.first_level &&
+                     !ph_view_first_level(ph_resource(bound->texture),
+                                          bound)) ||
+                    ph_sampled_through_copy(ph_resource(bound->texture)))) {
          struct pipe_sampler_view *shadow =
             ph_shadow_view(ctx, (struct ph_sampler_view *)bound);
 
