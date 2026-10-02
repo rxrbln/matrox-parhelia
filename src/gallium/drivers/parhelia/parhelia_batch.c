@@ -660,7 +660,15 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 	        !!input->oow +
 	        2 * (!!input->tex + !!input->tex1 +
 	             !!input->second_texcoord_probe) + !!input->vertex_alpha +
-	        3u * !!input->vertex_colour1) ||
+	        3u * !!input->vertex_colour1 +
+	        2u * (input->texcoord_q && !input->texcoord3)) ||
+	       /* The projective set is measured for one 2-D unit only. */
+	       (input->texcoord_q &&
+	        (!input->tex || input->tex1 || input->texcoord3 ||
+	         input->vertex_alpha || input->vertex_colour1 ||
+	         input->second_texcoord_probe || input->pos_desc ||
+	         input->sampled_alpha_companion ||
+	         input->tex->coord_mode != P3D_TEX_COORD_2D_PROJ)) ||
 	       /* 1/w follows z; the second colour and the three-coordinate
 	        * and probe layouts do not carry it. */
 	       (input->oow && (input->vertex_colour1 || input->texcoord3 ||

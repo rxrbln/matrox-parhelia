@@ -342,6 +342,25 @@ p3d_descriptors_add_w(struct p3d_rw *desc, size_t n)
 	}
 }
 
+/* A projective coordinate set 0: widen its component mask to s,t,r,q and
+ * move every later attribute the two added dwords on. */
+static void
+p3d_descriptors_add_q(struct p3d_rw *desc, size_t n)
+{
+	int found = 0;
+
+	for (size_t i = 0; i < n; i++) {
+		if (!desc[i].val)
+			continue;
+		if (found) {
+			desc[i].val += 2u << 4;
+		} else if (((desc[i].val >> 16) & 0xf) == 7) {
+			desc[i].val |= 0x03c00000u;
+			found = 1;
+		}
+	}
+}
+
 /* The attribute descriptors, by vertex layout.  Bit fields: [2:0] stream,
  * [11:4] dword offset, [19:16] attribute KIND, [25:22] component mask,
  * [31] last.  Every capture terminates the burst with a zero descriptor. */
@@ -898,6 +917,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			     st->vertex_colour1);
 	if (st->oow)
 		p3d_descriptors_add_w(desc, nd);
+	if (st->texcoord_q)
+		p3d_descriptors_add_q(desc, nd);
 
 	/* Interpolant 5 is the fog factor and 0x1114's nibble 5 already sources
 	 * it from o2, so the fog unit needs only its presence bit here. */
@@ -1313,6 +1334,8 @@ p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 			     !!st->vertex_colour1);
 	if (st->oow)
 		p3d_descriptors_add_w(desc, nd);
+	if (st->texcoord_q)
+		p3d_descriptors_add_q(desc, nd);
 	p3d_reglist(cs, desc, nd);
 
 	for (i = 0; i < nprim; i++)

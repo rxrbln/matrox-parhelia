@@ -96,6 +96,7 @@ struct ph_fs {
    bool uses_texture;
    bool uses_color;
    uint32_t sampler_mask;
+   uint32_t projective_mask;   /* samplers looked up with a projector */
    enum ph_serial_op serial_op;
    enum p3d_texenv texenv;
    unsigned coord_semantic;
@@ -256,6 +257,7 @@ struct ph_context {
     * the size the staged points carry. */
    bool colour1;		/* the staged stream carries a second colour */
    bool oow;		/* the staged stream carries 1/w after z */
+   bool proj;		/* set 0 carries s,t,r,q for the projective mode */
    uint32_t warp_sized_point;
    uint32_t warp_sized_point_slot;
    /* Pass-through plus "mov o2, v6": the second colour reaches the combiner
@@ -4152,6 +4154,10 @@ ph_submit_vertices(struct ph_context *ctx)
 	                               (zpos ? 6 : 5);
 	if (state.oow)
 		state.dw_per_vertex++;
+	state.texcoord_q = ctx->proj && state.oow && texture && !texture1 &&
+	                   texture->mip.slices <= 1;
+	if (state.texcoord_q)
+		state.dw_per_vertex += 2;
 	/* The staged stream carries a second colour: declare the kind-6
 	 * attribute and bind the program that forwards it to output 2, so the
 	 * combiner sees it as v1. */
@@ -4216,6 +4222,8 @@ ph_submit_vertices(struct ph_context *ctx)
          tex.coord_mode = P3D_TEX_COORD_3D;
          state.texcoord3 = 1;
       }
+      if (state.texcoord_q)
+         tex.coord_mode = P3D_TEX_COORD_2D_PROJ;
       tex.min_filter = ph_sampler_image_filter(
          sampler && sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR,
          sampler ? sampler->max_anisotropy : 0);
@@ -4510,6 +4518,7 @@ out:
 	 * later draw that stages five dwords while this still says eight
 	 * declares an attribute the stream does not carry. */
 	ctx->colour1 = false;
+	ctx->proj = false;
 	ctx->vertex_alpha = false;
 	ctx->alpha_micro = false;
 	ctx->alpha_micro_cutout = false;
@@ -4700,6 +4709,23 @@ ph_stage_alpha_micro(struct ph_context *ctx, struct prim_header *prim,
    }
 }
 
+/* Unit 0's coordinate has a q other than one at some corner. */
+static bool
+ph_primitive_projective(struct draw_context *draw,
+                        const struct prim_header *prim)
+{
+   int texcoord = draw_find_shader_output(draw, TGSI_SEMANTIC_GENERIC, 0);
+
+   if (texcoord < 0)
+      texcoord = draw_find_shader_output(draw, TGSI_SEMANTIC_TEXCOORD, 0);
+   if (texcoord < 0)
+      return false;
+   for (unsigned v = 0; v < 3; v++)
+      if (prim->v[v]->data[texcoord][3] != 1.0f)
+         return true;
+   return false;
+}
+
 static void
 ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 {
@@ -4728,6 +4754,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	bool native_sampled_alpha;
 	unsigned dpv;
 	bool oow = false;
+	bool proj = false;
 	bool colour1;
    float *dst;
    const int fogc = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_FOG, 0);
@@ -4889,11 +4916,18 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	      !alpha_micro_cutout && !three_coord && !ph_env("PARHELIA_NO_OOW");
 	if (oow)
 	   dpv = (multitextured ? 10 : 8) + 1 + !!vertex_alpha;
+	/* A projector other than one switches unit 0 to the per-fragment
+	 * divide, which reads q from a four-component coordinate set. */
+	proj = oow && !multitextured && !vertex_alpha &&
+	       (ctx->fs->projective_mask & BITFIELD_BIT(0)) &&
+	       ph_primitive_projective(stage->draw, prim);
+	if (proj)
+	   dpv += 2;
 	/* A state setter normally drains a batch before reaching this point.  The
 	 * extra guard keeps a future draw-stage change from mixing 7- and 8-dword
 	 * streams if the exact blend predicate changes within a primitive list. */
 	if (ctx->triangles && (ctx->colour1 != colour1 ||
-	                       ctx->oow != oow ||
+	                       ctx->oow != oow || ctx->proj != proj ||
 	                       ctx->vertex_alpha != vertex_alpha ||
 	                       ctx->alpha_micro != alpha_micro ||
 	                       ctx->alpha_micro_cutout != alpha_micro_cutout ||
@@ -4947,6 +4981,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
       return;
 	ctx->colour1 = colour1;
 	ctx->oow = oow;
+	ctx->proj = proj;
 	ctx->vertex_alpha = vertex_alpha;
 	ctx->alpha_micro = alpha_micro;
 	ctx->alpha_micro_cutout = alpha_micro_cutout;
@@ -5056,6 +5091,10 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
          const float *tc = prim->v[v]->data[texcoord];
          *dst++ = tc[0];
          *dst++ = tc[1];
+         if (proj) {
+            *dst++ = tc[2];
+            *dst++ = tc[3];
+         }
          if (multitextured) {
             const float *tc1 = prim->v[v]->data[texcoord1];
             *dst++ = tc1[0];
@@ -6932,6 +6971,27 @@ ph_nir_uses_texture(nir_shader *nir)
 }
 
 static uint32_t
+ph_nir_projective_mask(nir_shader *nir)
+{
+   uint32_t mask = 0;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+
+               if (tex->sampler_index < 32 &&
+                   nir_tex_instr_src_index(tex, nir_tex_src_projector) >= 0)
+                  mask |= BITFIELD_BIT(tex->sampler_index);
+            }
+         }
+      }
+   }
+   return mask;
+}
+
+static uint32_t
 ph_nir_sampler_mask(nir_shader *nir)
 {
    uint32_t mask = 0;
@@ -7040,6 +7100,7 @@ static void *ph_create_fs(struct pipe_context *p,
          if (s->type == PIPE_SHADER_IR_NIR) {
             fs->sampler_mask |= s->ir.nir->info.textures_used[0];
             fs->sampler_mask |= ph_nir_sampler_mask(s->ir.nir);
+            fs->projective_mask = ph_nir_projective_mask(s->ir.nir);
          }
          fs->uses_texture = fs->sampler_mask != 0 ||
             (s->type == PIPE_SHADER_IR_NIR && ph_nir_uses_texture(s->ir.nir));

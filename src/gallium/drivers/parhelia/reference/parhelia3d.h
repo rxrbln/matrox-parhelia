@@ -539,6 +539,10 @@ struct p3d_comb_program {
 enum p3d_tex_type { P3D_TEX_TYPE_2D = 0, P3D_TEX_TYPE_CUBE = 1,
 		    P3D_TEX_TYPE_VOLUME = 2 };
 #define P3D_TEX_COORD_2D	4u
+/* Bit 16 divides the coordinate by its fourth component per fragment: a
+ * 4-component set (mask 0xf) with mode 5 samples s/q,t/q, measured by
+ * parhelia-drm-test --texture-projective-probe on the P690. */
+#define P3D_TEX_COORD_2D_PROJ	5u
 #define P3D_TEX_COORD_3D	6u
 
 struct p3d_texture {
@@ -858,6 +862,9 @@ struct p3d_state {
 	 * shape drops the colour attribute; the combiner takes its primary
 	 * colour from the WARP replace program's constant instead. */
 	int		   texcoord3;
+	/* Coordinate set 0 carries four components, s,t,r,q, for the projective
+	 * coordinate mode; later attributes move two dwords on. */
+	int		   texcoord_q;
 	/* The position carries 1/w as a fourth component (descriptor mask
 	 * xyzw), and every later attribute sits one dword further on. */
 	int		   oow;
