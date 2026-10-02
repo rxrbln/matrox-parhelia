@@ -1413,12 +1413,14 @@ ph_stencil_op(unsigned op)
    }
 }
 
+/* Two 10-bit blend constants, the first in [31:16].  Measured on the P690:
+ * 0x12ec is A<<16 | R and 0x12f0 is G<<16 | B, not the documented RGBA. */
 static uint32_t
-ph_pack_2x10(float lo, float hi)
+ph_pack_2x10(float first, float second)
 {
-   unsigned a = (unsigned)(CLAMP(lo, 0.0f, 1.0f) * 1023.0f);
-   unsigned b = (unsigned)(CLAMP(hi, 0.0f, 1.0f) * 1023.0f);
-   return a | (b << 16);
+   unsigned a = (unsigned)(CLAMP(first, 0.0f, 1.0f) * 1023.0f);
+   unsigned b = (unsigned)(CLAMP(second, 0.0f, 1.0f) * 1023.0f);
+   return (a << 16) | b;
 }
 
 static void
@@ -1465,10 +1467,10 @@ ph_apply_fragment_state(struct ph_context *ctx, struct p3d_state *state,
       state->blend_eq = ph_blend_equation(blend->rgb_func);
       state->blend_eq_alpha = ph_blend_equation(blend->alpha_func);
       state->blend_eq_alpha_separate = state->blend_eq_alpha != state->blend_eq;
-      state->blend_const_rg = ph_pack_2x10(ctx->blend_color.color[0],
-                                           ctx->blend_color.color[1]);
-      state->blend_const_ba = ph_pack_2x10(ctx->blend_color.color[2],
-                                           ctx->blend_color.color[3]);
+      state->blend_const_rg = ph_pack_2x10(ctx->blend_color.color[3],
+                                           ctx->blend_color.color[0]);
+      state->blend_const_ba = ph_pack_2x10(ctx->blend_color.color[1],
+                                           ctx->blend_color.color[2]);
       state->mask_r = !!(blend->colormask & PIPE_MASK_R);
       state->mask_g = !!(blend->colormask & PIPE_MASK_G);
       state->mask_b = !!(blend->colormask & PIPE_MASK_B);
