@@ -7229,6 +7229,11 @@ ph_create_sampler_view(struct pipe_context *p, struct pipe_resource *texture,
    view = CALLOC_STRUCT(ph_sampler_view);
    if (!view)
       return NULL;
+   if (ph_env("PARHELIA_TRACE_VIEWS"))
+      fprintf(stderr, "parhelia: view target=%u format=%s on %s swizzle=%u%u%u%u\n",
+              templ->target, util_format_short_name(templ->format),
+              util_format_short_name(texture->format), templ->swizzle_r,
+              templ->swizzle_g, templ->swizzle_b, templ->swizzle_a);
    view->base = *templ;
    view->base.reference.count = 1;
    view->base.texture = NULL;
