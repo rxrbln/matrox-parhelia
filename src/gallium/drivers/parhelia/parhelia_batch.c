@@ -702,7 +702,11 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 	        * source-alpha ADD form.  The depth+RGBA alpha-test combination is
 	        * deliberately test-only: it proves the descriptor and texture-alpha
 	        * route without exposing a Mesa production path. */
-	       (input->vertex_alpha && (!input->tex || input->tex1 ||
+	       /* Untextured RGBA is the measured x,y,z,r,g,b,a stream only. */
+	       (input->vertex_alpha && !input->tex &&
+	        (!p3d_position_has_z(input) || input->depth_vertex_alpha ||
+	         input->pos_desc || input->col_desc)) ||
+	       (input->vertex_alpha && input->tex && (input->tex1 ||
 	                               (input->has_depth !=
 	                                !!input->depth_vertex_alpha) ||
 	                               (input->depth_vertex_alpha &&

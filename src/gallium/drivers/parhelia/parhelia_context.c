@@ -267,11 +267,14 @@ struct ph_context {
    bool colour1;		/* the staged stream carries a second colour */
    bool oow;		/* the staged stream carries 1/w after z */
    bool proj;		/* set 0 carries s,t,r,q for the projective mode */
+   bool colour_alpha;	/* the staged colour carries alpha: RGBA, not RGB */
    uint32_t warp_sized_point;
    uint32_t warp_sized_point_slot;
    /* Pass-through plus "mov o2, v6": the second colour reaches the combiner
     * as v1, which is where a lowered GL fog expression reads its coordinate. */
    uint32_t warp_colour1;
+   /* Pass-through without the T2 write, for the RGBA colour stream. */
+   uint32_t warp_rgba;
    float point_radius;
    bool tcl_available;
    bool tcl_forced_off;
@@ -1527,6 +1530,24 @@ ph_target_no_dest_alpha(enum pipe_format format)
 {
    return format == PIPE_FORMAT_B8G8R8X8_UNORM ||
           format == PIPE_FORMAT_B5G6R5_UNORM;
+}
+
+/* The vertex colour's alpha reaches a visible result: an alpha test, a blend,
+ * or a target that stores alpha.  Otherwise the RGB stream and the default
+ * attribute's alpha of 1.0 (0x112c) are equivalent and one dword shorter. */
+static bool
+ph_colour_alpha_observable(const struct ph_context *ctx)
+{
+   const struct pipe_rt_blend_state *blend =
+      ctx->blend ? &ctx->blend->rt[0] : NULL;
+
+   if (ctx->dsa && ctx->dsa->alpha_enabled)
+      return true;
+   if (blend && blend->blend_enable)
+      return true;
+   return ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture &&
+          util_format_has_alpha(ctx->fb.cbufs[0].format) &&
+          (!blend || (blend->colormask & PIPE_MASK_A));
 }
 
 /* The alpha approximation routes, all off by default.
@@ -3760,6 +3781,35 @@ out:
    }
 }
 
+/* The pass-through for an RGBA colour: warp_textured without its o3 move
+ * (parhelia-p690-warp-isa-re.md 5.2).  The kernel pass-through's
+ * "mul T2, v5, r1.0000" makes T2 follow the colour, and with a real alpha
+ * every triangle whose vertices all have a colour channel above alpha (or
+ * alpha 0) is rejected (measured, --colour-alpha-probe COLOUR_ALPHA_FLAT).
+ * T2 keeps the value ph_prime_warp() left, as for the textured programs. */
+static bool
+ph_rgba_program(struct ph_context *ctx)
+{
+   static const uint32_t code[] = {
+      0x00083e00, 0x00440000, 0xb89a2249,
+      0x08087ebf, 0x00440215, 0xb89a2249,
+      0x00000200, 0x00040000, 0x14c00000,
+      0x00080200, 0x00440000, 0x301a21a2,
+   };
+   struct drm_parhelia_warp_program program = {
+      .code = (uintptr_t)code, .count = 4,
+   };
+
+   if (ctx->warp_rgba)
+      return true;
+   if (!ctx->warp_program_instructions ||
+       ioctl(ph_screen(ctx->base.screen)->fd, DRM_IOCTL_PARHELIA_WARP_PROGRAM,
+             &program))
+      return false;
+   ctx->warp_rgba = (uint32_t)program.entry;
+   return true;
+}
+
 /* The pass-through with one move that forwards the second colour attribute to
  * output 2, so the combiner sees it as v1.  Uploaded once per context, on the
  * first draw whose fragment program reads it. */
@@ -4210,6 +4260,13 @@ ph_submit_vertices(struct ph_context *ctx)
 		state.vertex_alpha = 1;
 		state.depth_vertex_alpha = depth != NULL;
 		state.dw_per_vertex++;
+	}
+	/* The measured untextured RGBA stream: x,y,z,r,g,b,a. */
+	if (ctx->colour_alpha && !texture) {
+		state.vertex_alpha = 1;
+		state.pos_z = !zpos;
+		state.dw_per_vertex = 7;
+		state.warp_entry = ctx->warp_rgba;
 	}
    state.single_texture_pipe = ph_screen(ctx->base.screen)->single_texture_pipe;
    /* One texture ganged on pipes 0+2: +25% on trilinear minification. */
@@ -4801,6 +4858,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	bool oow = false;
 	bool proj = false;
 	bool colour1;
+	bool colour_alpha;
    float *dst;
    const int fogc = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_FOG, 0);
 
@@ -4963,6 +5021,21 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	           ctx->warp_colour1);
 	if (colour1)
 	   dpv += 3;
+	/* An untextured colour with a visible alpha takes the measured
+	 * x,y,z,r,g,b,a stream; z rides along without a depth surface. */
+	colour_alpha = !textured && !vertex_alpha && !colour1 &&
+	               ph_colour_alpha_observable(ctx);
+	if (colour_alpha && !ctx->warp_rgba) {
+	   /* Uploading drains the engine: publish the staged batch first. */
+	   if (ctx->triangles || ctx->points || ctx->lines) {
+	      ph_submit_vertices(ctx);
+	      if (ctx->submit_error)
+	         return;
+	   }
+	   colour_alpha = ph_rgba_program(ctx);
+	}
+	if (colour_alpha)
+	   dpv = 7;
 	if (cpu_alpha_cutout || rgb_alpha_two_pass)
 	   dpv = 10; /* Internal XYZOOW,RGBA,ST; packed to 7/8 GPU dwords later. */
 	/* The textured stream carries z and 1/w, so the setup unit interpolates
@@ -4985,6 +5058,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	 * streams if the exact blend predicate changes within a primitive list. */
 	if (ctx->triangles && (ctx->colour1 != colour1 ||
 	                       ctx->oow != oow || ctx->proj != proj ||
+	                       ctx->colour_alpha != colour_alpha ||
 	                       ctx->vertex_alpha != vertex_alpha ||
 	                       ctx->alpha_micro != alpha_micro ||
 	                       ctx->alpha_micro_cutout != alpha_micro_cutout ||
@@ -5031,6 +5105,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	ctx->colour1 = colour1;
 	ctx->oow = oow;
 	ctx->proj = proj;
+	ctx->colour_alpha = colour_alpha;
 	ctx->vertex_alpha = vertex_alpha;
 	ctx->alpha_micro = alpha_micro;
 	ctx->alpha_micro_cutout = alpha_micro_cutout;
@@ -5118,14 +5193,14 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 		}
       *dst++ = p[0];
       *dst++ = p[1];
-      if (depth || oow)
+      if (depth || oow || colour_alpha)
          *dst++ = CLAMP(p[2], 0.0f, 1.0f);
       if (oow)
          *dst++ = p[3];
 		*dst++ = c[0];
 		*dst++ = c[1];
 		*dst++ = c[2];
-		if (vertex_alpha)
+		if (vertex_alpha || colour_alpha)
 			*dst++ = c[3];
       if (colour1) {
          /* The fog coordinate, broadcast: the combiner reads v1 as a colour
@@ -5347,7 +5422,9 @@ ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
                                        rast->point_quad_rasterization)) &&
                             ph_sized_point_program(ctx);
 
+   /* As for lines, a visible alpha takes the triangle expansion. */
    if (has_texture || (wide && !native_wide) ||
+       ph_colour_alpha_observable(ctx) ||
        (rast && (rast->point_smooth || rast->point_quad_rasterization))) {
       ph_expand_point(stage, prim, size, rast && rast->point_smooth);
       return;
@@ -5449,8 +5526,10 @@ ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
               rast ? rast->line_width : 1.0f, has_texture,
               rast ? rast->line_smooth : 0, rast ? rast->cull_face : 0,
               ctx->derived_triangles);
-   if (has_texture || (rast && (rast->line_smooth ||
-                                roundf(rast->line_width) > 1.0f))) {
+   /* A visible alpha needs the RGBA stream, which the native line
+    * primitive does not take (it stopped the P690); triangles do. */
+   if (has_texture || ph_colour_alpha_observable(ctx) ||
+       (rast && (rast->line_smooth || roundf(rast->line_width) > 1.0f))) {
       ph_expand_line(stage, prim, rast ? rast->line_width : 1.0f,
                      rast && rast->line_smooth);
       return;
@@ -6321,6 +6400,11 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
               rs->fill_back != PIPE_POLYGON_MODE_FILL ||
               /* no packet encoding culls both faces; the draw module does */
               rs->cull_face == PIPE_FACE_FRONT_AND_BACK))
+      return false;
+   /* An untextured colour with a visible alpha needs the RGBA stream, which
+    * is measured only in window space (x,y,z,r,g,b,a); the draw module
+    * stages it. */
+   if (!textured && ph_colour_alpha_observable(ctx))
       return false;
    /* The alpha routes below re-shape or replace the vertex stream. */
    if (ph_use_vertex_alpha(ctx, textured, multitextured, depth, colour) ||

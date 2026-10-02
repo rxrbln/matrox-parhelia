@@ -798,6 +798,9 @@ struct p3d_state {
 	 * isolated alpha-blend diagnostic.  Keep it opt-in until that diagnostic
 	 * has demonstrated the required WARP/attribute routing on hardware. */
 	int		   vertex_alpha;
+	/* A three-component position without a depth surface: the vendor's
+	 * x,y,z,r,g,b,a stream, the only measured untextured RGBA layout. */
+	int		   pos_z;
 	/* A depth-bound RGBA stream has a different descriptor and source stride.
 	 * The batch validator accepts it only for the verified one-texture,
 	 * MODULATE, source-alpha, depth-test shape. */
@@ -990,7 +993,7 @@ size_t	 p3d_warp_transform(uint32_t *out, size_t cap);
  * bound. */
 static inline int p3d_position_has_z(const struct p3d_state *st)
 {
-	return st->has_depth || st->transform || st->oow;
+	return st->has_depth || st->transform || st->oow || st->pos_z;
 }
 size_t	 p3d_warp_lighting(uint32_t *out, size_t cap);
 /* GL_REPLACE: writes a constant white colour so MUL(TEX, PREV) passes TEX */
