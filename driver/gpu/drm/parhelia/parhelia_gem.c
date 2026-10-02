@@ -1258,22 +1258,28 @@ int parhelia_bo_init_host_view(struct drm_gem_vram_object *gbo, u32 cpp,
 	return 0;
 }
 
-/* Zero a newly placed, pinned object through a kernel aperture window. */
-int parhelia_vram_clear(struct parhelia_device *pdev,
-			struct drm_gem_vram_object *gbo)
+/* Zero [@offset, @offset + @len) of a pinned object through a kernel
+ * aperture window. */
+int parhelia_vram_clear_range(struct parhelia_device *pdev,
+			      struct drm_gem_vram_object *gbo, u64 offset,
+			      u64 len)
 {
 	struct parhelia_aperture_mapping mapping = { };
-	u64 size = gbo->bo.base.size, done;
+	u64 done;
 	bool parked = false;
 	int ret;
 
+	if (offset > gbo->bo.base.size || len > gbo->bo.base.size - offset)
+		return -EINVAL;
+	if (!len)
+		return 0;
 	mutex_lock(&pdev->aperture_lock);
 	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, &parked);
-	for (done = 0; !ret && done < size; done += SZ_8K) {
-		u32 bytes = min_t(u64, size - done, SZ_8K);
+	for (done = 0; !ret && done < len; done += SZ_8K) {
+		u32 bytes = min_t(u64, len - done, SZ_8K);
 		u32 surface_address;
 
-		ret = parhelia_vram_gpu_addr(pdev, gbo, done, bytes,
+		ret = parhelia_vram_gpu_addr(pdev, gbo, offset + done, bytes,
 					     &surface_address);
 		if (ret)
 			break;
@@ -1296,6 +1302,12 @@ int parhelia_vram_clear(struct parhelia_device *pdev,
 	if (parked)
 		parhelia_submit_unlock(pdev);
 	return ret;
+}
+
+int parhelia_vram_clear(struct parhelia_device *pdev,
+			struct drm_gem_vram_object *gbo)
+{
+	return parhelia_vram_clear_range(pdev, gbo, 0, gbo->bo.base.size);
 }
 
 /* Copy @len bytes into a VRAM object through the driver's own aperture window.
@@ -1399,20 +1411,20 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	if (!ret && pdev->pdev->device == PARHELIA_P690) {
 		parhelia_bo_set_placement_class(gbo,
 			PARHELIA_PLACEMENT_NATIVE_SCANOUT);
-		ret = parhelia_vram_pin(gbo);
+		ret = parhelia_vram_pin_new(pdev, gbo);
 		if (ret == -ENOSPC || ret == -ENOMEM || ret == -E2BIG) {
 			parhelia_bo_set_placement_class(gbo,
 				PARHELIA_PLACEMENT_LEGACY);
-			ret = parhelia_vram_pin(gbo);
+			ret = parhelia_vram_pin_new(pdev, gbo);
 		}
 	} else if (!ret)
-		ret = parhelia_vram_pin(gbo);
+		ret = parhelia_vram_pin_new(pdev, gbo);
 	if (ret) {
 		drm_gem_object_put(&gbo->bo.base);
 		return ret;
 	}
 	/* TTM does not clear new P690 objects. */
-	ret = parhelia_vram_clear(pdev, gbo);
+	ret = parhelia_bo_clear(pdev, file, gbo);
 	parhelia_vram_unpin(gbo);
 	if (!ret)
 		ret = drm_gem_handle_create(file, &gbo->bo.base, &handle);

@@ -1636,6 +1636,25 @@ out:
 	return ret;
 }
 
+/* Place and pin a new object.  Freed objects stay pinned until the queued
+ * work using them retires: when a band is full, wait for those fences, which
+ * releases the pins, and retry while the queue held anything to reclaim. */
+int parhelia_vram_pin_new(struct parhelia_device *pdev,
+			  struct drm_gem_vram_object *bo)
+{
+	int ret = parhelia_vram_pin(bo);
+
+	while ((ret == -ENOMEM || ret == -ENOSPC) &&
+	       pdev->submit_owner != current && READ_ONCE(pdev->queued_slots)) {
+		ret = parhelia_submit_idle_lock(pdev);
+		if (ret)
+			return ret;
+		parhelia_submit_unlock(pdev);
+		ret = parhelia_vram_pin(bo);
+	}
+	return ret;
+}
+
 void parhelia_vram_unpin(struct drm_gem_vram_object *bo)
 {
 	if (!ttm_bo_reserve(&bo->bo, false, false, NULL)) {
@@ -3229,17 +3248,16 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 			return ret;
 		}
 	}
-	/* A new object is zeroed through the driver's own aperture window on
-	 * every family, because TTM's CPU clear over BAR0 lands wherever that
-	 * translated window currently points.  The pin is held for the clear only:
-	 * parhelia_ttm_move() copies through the aperture too, so TTM may
-	 * evict these objects afterwards instead of failing an allocation. */
-	ret = parhelia_vram_pin(bo);
+	/* TTM's CPU clear over BAR0 lands wherever that translated window
+	 * currently points, so the driver zeroes new objects itself.  The pin is
+	 * held for the clear only: parhelia_ttm_move() copies through the
+	 * aperture too, so TTM may evict these objects afterwards. */
+	ret = parhelia_vram_pin_new(pdev, bo);
 	if (ret) {
 		drm_gem_object_put(&bo->bo.base);
 		return ret;
 	}
-	ret = parhelia_vram_clear(pdev, bo);
+	ret = parhelia_bo_clear(pdev, file, bo);
 	parhelia_vram_unpin(bo);
 	if (ret) {
 		drm_gem_object_put(&bo->bo.base);
@@ -3619,6 +3637,7 @@ static void parhelia_move_colour_below_depth(struct parhelia_device *pdev,
 
 static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 				      struct drm_file *file,
+				      struct drm_gem_object **kernel_objects,
 				      const u32 *commands, u32 command_dwords,
 				      const struct drm_parhelia_packet *packets,
 				      u32 packet_count,
@@ -3634,7 +3653,12 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 	for (i = 0; i < count; i++) {
 		if (relocs[i].type != PARHELIA_RELOC_VRAM)
 			continue;
-		objects[i] = drm_gem_object_lookup(file, relocs[i].handle);
+		if (kernel_objects) {
+			objects[i] = kernel_objects[i];
+			drm_gem_object_get(objects[i]);
+		} else {
+			objects[i] = drm_gem_object_lookup(file, relocs[i].handle);
+		}
 		if (!objects[i]) {
 			ret = -ENOENT;
 			goto unwind;
@@ -3699,14 +3723,51 @@ unwind:
 	return ret;
 }
 
-int parhelia_submit_ioctl(struct drm_device *drm, void *data,
-			  struct drm_file *file)
+static int parhelia_submit_check(const struct drm_parhelia_submit *args)
 {
-	struct parhelia_device *pdev = to_parhelia(drm);
+	bool async = args->flags & PARHELIA_SUBMIT_ASYNC;
+	bool boundary_aware = args->flags & PARHELIA_SUBMIT_CALL_BOUNDARIES;
+	bool generic_packet_packing = async && boundary_aware &&
+		pack_adjacent_packets && coalesce_primary && !trace_submit &&
+		!full_sync && !post_draw_wb && !state_shadow_cache;
+
+	if (args->flags & ~(PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC |
+			    PARHELIA_SUBMIT_CALL_BOUNDARIES) ||
+	    !args->packet_count || args->packet_count > PARHELIA_MAX_USER_PACKETS ||
+	    !args->command_dwords || args->command_dwords > PARHELIA_MAX_COMMAND_DWORDS ||
+	    args->reloc_count > PARHELIA_MAX_RELOCS ||
+	    args->vertex_dwords > PARHELIA_VERTEX_DWORDS)
+		return -EINVAL;
+	if (async && (!(args->flags & PARHELIA_SUBMIT_FENCE) || !coalesce_primary ||
+		      trace_submit || full_sync || post_draw_wb))
+		return -EINVAL;
+	if (boundary_aware && !generic_packet_packing)
+		return -EOPNOTSUPP;
+	if (!async && args->packet_count > PARHELIA_LEGACY_USER_PACKETS)
+		return -E2BIG;
+	if (args->vertex_dwords && !args->vertices)
+		return -EINVAL;
+	/* Keep comparisons independent; tracing is for small diagnostic batches. */
+	if ((full_sync && (trace_submit || replay_fences)) ||
+	    (post_draw_wb && trace_submit))
+		return -EINVAL;
+	if (trace_submit && args->packet_count > 64)
+		return -E2BIG;
+	return 0;
+}
+
+/* Runs a checked request whose arrays are kernel copies; it frees them.
+ * @kernel_objects, when set, supplies the VRAM reloc targets in place of
+ * @file's handles. */
+static int parhelia_submit_run(struct parhelia_device *pdev,
+			       struct drm_file *file,
+			       struct drm_parhelia_submit *args,
+			       struct drm_parhelia_packet *packets,
+			       u32 *commands,
+			       struct drm_parhelia_reloc *relocs,
+			       struct drm_gem_object **kernel_objects)
+{
 	struct parhelia_submit_stats *stats = &pdev->submit_stats;
-	struct drm_parhelia_submit *args = data;
-	struct drm_parhelia_packet *packets;
-	struct drm_parhelia_reloc *relocs;
 	struct drm_gem_object **objects = NULL;
 	struct drm_gem_vram_object **pinned = NULL;
 	struct parhelia_call_plan *plan;
@@ -3719,7 +3780,7 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	struct parhelia_shadow_txn *shadow_txn = NULL;
 	struct parhelia_root_probe_trace *root_probe = NULL;
 	struct parhelia_file_waiter file_waiter = { .file = file };
-	u32 *commands, *primary;
+	u32 *primary;
 	void *vertex_cpu = pdev->vertex_cpu;
 	dma_addr_t vertex_bus = pdev->vertex_bus;
 	dma_addr_t writeback_bus = pdev->writeback_bus;
@@ -3753,39 +3814,6 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 	defer_packet_packing = coalesce_primary && !trace_submit && !full_sync &&
 		!post_draw_wb && (pack_draw_packets || generic_packet_packing);
 
-	if (args->flags & ~(PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC |
-			    PARHELIA_SUBMIT_CALL_BOUNDARIES) ||
-	    !args->packet_count || args->packet_count > PARHELIA_MAX_USER_PACKETS ||
-	    !args->command_dwords || args->command_dwords > PARHELIA_MAX_COMMAND_DWORDS ||
-	    args->reloc_count > PARHELIA_MAX_RELOCS ||
-	    args->vertex_dwords > PARHELIA_VERTEX_DWORDS)
-		return -EINVAL;
-	if (async && (!(args->flags & PARHELIA_SUBMIT_FENCE) || !coalesce_primary ||
-		      trace_submit || full_sync || post_draw_wb))
-		return -EINVAL;
-	if (boundary_aware && !generic_packet_packing)
-		return -EOPNOTSUPP;
-	if (!async && args->packet_count > PARHELIA_LEGACY_USER_PACKETS)
-		return -E2BIG;
-	if (args->vertex_dwords && !args->vertices)
-		return -EINVAL;
-	/* Keep comparisons independent; tracing is for small diagnostic batches. */
-	if ((full_sync && (trace_submit || replay_fences)) ||
-	    (post_draw_wb && trace_submit))
-		return -EINVAL;
-	if (trace_submit && args->packet_count > 64)
-		return -E2BIG;
-
-	packets = memdup_user(u64_to_user_ptr(args->packets),
-			      array_size(args->packet_count, sizeof(*packets)));
-	if (IS_ERR(packets))
-		return PTR_ERR(packets);
-	commands = memdup_user(u64_to_user_ptr(args->commands),
-			       array_size(args->command_dwords, sizeof(*commands)));
-	if (IS_ERR(commands)) {
-		ret = PTR_ERR(commands);
-		goto out_packets;
-	}
 	plan = kvzalloc_obj(*plan, GFP_KERNEL);
 	if (!plan) {
 		ret = -ENOMEM;
@@ -3798,14 +3826,6 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 			goto out_commands;
 		}
 	}
-	relocs = memdup_user(u64_to_user_ptr(args->relocs),
-			     array_size(args->reloc_count, sizeof(*relocs)));
-	if (args->reloc_count && IS_ERR(relocs)) {
-		ret = PTR_ERR(relocs);
-		goto out_commands;
-	}
-	if (!args->reloc_count)
-		relocs = NULL;
 	draw_relocated = kcalloc(args->packet_count, sizeof(*draw_relocated), GFP_KERNEL);
 	call_boundaries = kcalloc(args->packet_count, sizeof(*call_boundaries),
 				  GFP_KERNEL);
@@ -3816,7 +3836,7 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 		ret = -ENOMEM;
 		goto out_relocs;
 	}
-	ret = parhelia_pin_reloc_targets(pdev, file, commands,
+	ret = parhelia_pin_reloc_targets(pdev, file, kernel_objects, commands,
 					 args->command_dwords, packets,
 					 args->packet_count, relocs,
 					 args->reloc_count, objects, pinned);
@@ -4863,13 +4883,159 @@ out_relocs:
 	kfree(call_boundaries);
 	kfree(draw_relocated);
 	kvfree(relocs);
+	relocs = NULL;
 out_commands:
+	kvfree(relocs);
 	kfree(shadow_txn);
 	kvfree(plan);
 	kvfree(commands);
-out_packets:
 	kvfree(packets);
 	return ret;
+}
+
+int parhelia_submit_ioctl(struct drm_device *drm, void *data,
+			  struct drm_file *file)
+{
+	struct drm_parhelia_submit *args = data;
+	struct drm_parhelia_packet *packets;
+	struct drm_parhelia_reloc *relocs = NULL;
+	u32 *commands;
+	int ret;
+
+	ret = parhelia_submit_check(args);
+	if (ret)
+		return ret;
+	packets = memdup_user(u64_to_user_ptr(args->packets),
+			      array_size(args->packet_count, sizeof(*packets)));
+	if (IS_ERR(packets))
+		return PTR_ERR(packets);
+	commands = memdup_user(u64_to_user_ptr(args->commands),
+			       array_size(args->command_dwords, sizeof(*commands)));
+	if (IS_ERR(commands)) {
+		kvfree(packets);
+		return PTR_ERR(commands);
+	}
+	if (args->reloc_count) {
+		relocs = memdup_user(u64_to_user_ptr(args->relocs),
+				     array_size(args->reloc_count, sizeof(*relocs)));
+		if (IS_ERR(relocs)) {
+			kvfree(commands);
+			kvfree(packets);
+			return PTR_ERR(relocs);
+		}
+	}
+	return parhelia_submit_run(to_parhelia(drm), file, args, packets,
+				   commands, relocs, NULL);
+}
+
+/* The largest power-of-two width up to @max_width pixels whose whole tile
+ * rows fit in @bytes; 0 when not even a 64-pixel tile row does. */
+static u32 parhelia_clear_width(u64 bytes, u32 tile_rows, u32 max_width)
+{
+	u32 width;
+
+	for (width = max_width; width >= 64; width >>= 1)
+		if ((u64)width * 4 * tile_rows <= bytes)
+			return width;
+	return 0;
+}
+
+/* Zero a new, pinned object with the 2-D solid fill of p3d_emit_clear()
+ * rather than uncached CPU stores through the aperture (4 MiB took 30 ms).
+ * The fill is queued like a client submit of @file, so the object's
+ * reservation carries its fence for CPU views; a tail below one tile row
+ * and a device that cannot take the fill use the CPU clear. */
+int parhelia_bo_clear(struct parhelia_device *pdev, struct drm_file *file,
+		      struct drm_gem_vram_object *gbo)
+{
+	/* Fill extents stay within the 2048x2048 targets clients clear. */
+	const u32 max_extent = 2048;
+	u32 tile_rows = pdev->chip->tile_layout == PARHELIA_TILE_64X16_4K ? 16 : 32;
+	u64 size = gbo->bo.base.size, offset = 0, chunk;
+	struct drm_parhelia_submit args = { };
+	struct drm_parhelia_packet *packets;
+	struct drm_parhelia_reloc *relocs;
+	struct drm_gem_object **objects;
+	u32 *commands, gpu, fills = 0, i, width, rows;
+	int ret;
+
+	if (!file || !pdev->raw_aperture_owned ||
+	    parhelia_vram_gpu_addr(pdev, gbo, 0, size, &gpu))
+		return parhelia_vram_clear(pdev, gbo);
+	for (chunk = size; parhelia_clear_width(chunk, tile_rows, max_extent);
+	     fills++) {
+		width = parhelia_clear_width(chunk, tile_rows, max_extent);
+		rows = min_t(u64, chunk / (width * 4), max_extent);
+		chunk -= (u64)ALIGN_DOWN(rows, tile_rows) * width * 4;
+	}
+	if (!fills || fills > PARHELIA_LEGACY_USER_PACKETS)
+		return parhelia_vram_clear(pdev, gbo);
+
+	packets = kvcalloc(fills, sizeof(*packets), GFP_KERNEL);
+	commands = kvcalloc(fills, 15 * sizeof(*commands), GFP_KERNEL);
+	relocs = kvcalloc(fills * 2, sizeof(*relocs), GFP_KERNEL);
+	objects = kcalloc(fills * 2, sizeof(*objects), GFP_KERNEL);
+	if (!packets || !commands || !relocs || !objects) {
+		kvfree(packets);
+		kvfree(commands);
+		kvfree(relocs);
+		kfree(objects);
+		return -ENOMEM;
+	}
+	for (i = 0; i < fills; i++) {
+		u32 *cmd = commands + i * 15;
+		u32 cfg;
+
+		width = parhelia_clear_width(size - offset, tile_rows, max_extent);
+		rows = ALIGN_DOWN(min_t(u64, (size - offset) / (width * 4),
+					max_extent), tile_rows);
+		cfg = width | (2u << 16) | (0x32u << 24);
+		cmd[0] = 13;
+		cmd[1] = 0x8b8a8988;	/* SURF0 base/cfg, SURF1 base/cfg */
+		cmd[3] = cfg;
+		cmd[5] = cfg;
+		cmd[6] = 0xc5c0c9b0;	/* 0x12c0, PLNWT, DWGCTL, FCOL */
+		cmd[7] = 0xffffffff;
+		cmd[8] = 0xffffffff;
+		cmd[9] = 0xc0;		/* opaque solid fill */
+		cmd[11] = 0x21e3c2c1;	/* SRC, DSTXY, LEN fires */
+		cmd[14] = (rows << 16) | width;
+		packets[i].offset = i * 15;
+		packets[i].length = 15;
+		relocs[2 * i] = (struct drm_parhelia_reloc){
+			.packet = i, .dword = 2, .delta = offset,
+			.type = PARHELIA_RELOC_VRAM };
+		relocs[2 * i + 1] = relocs[2 * i];
+		relocs[2 * i + 1].dword = 4;
+		objects[2 * i] = &gbo->bo.base;
+		objects[2 * i + 1] = &gbo->bo.base;
+		offset += (u64)rows * width * 4;
+	}
+	args.command_dwords = fills * 15;
+	args.packet_count = fills;
+	args.reloc_count = fills * 2;
+	if (pdev->async_primary_cpu && coalesce_primary && !trace_submit &&
+	    !full_sync && !post_draw_wb)
+		args.flags = PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC;
+	ret = parhelia_submit_check(&args);
+	if (!ret)
+		ret = parhelia_submit_run(pdev, file, &args, packets, commands,
+					  relocs, objects);
+	else {
+		kvfree(packets);
+		kvfree(commands);
+		kvfree(relocs);
+	}
+	kfree(objects);
+	if (ret == -EINTR || ret == -ERESTARTSYS)
+		return ret;
+	if (ret) {
+		dev_warn_ratelimited(&pdev->pdev->dev,
+			"engine clear of %llu bytes failed (%d), clearing by CPU\n",
+			(unsigned long long)size, ret);
+		return parhelia_vram_clear(pdev, gbo);
+	}
+	return parhelia_vram_clear_range(pdev, gbo, offset, size - offset);
 }
 
 static bool parhelia_fence_is_issued_locked(struct parhelia_device *pdev,

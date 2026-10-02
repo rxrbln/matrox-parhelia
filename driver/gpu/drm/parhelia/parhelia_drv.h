@@ -798,12 +798,19 @@ bool parhelia_warp_entry_allowed(struct parhelia_device *pdev,
 void parhelia_submit_fini(struct parhelia_device *pdev);
 int parhelia_submit_init(struct parhelia_device *pdev);
 int parhelia_vram_pin(struct drm_gem_vram_object *bo);
+int parhelia_vram_pin_new(struct parhelia_device *pdev,
+			  struct drm_gem_vram_object *bo);
 void parhelia_vram_unpin(struct drm_gem_vram_object *bo);
 int parhelia_vram_bar_addr(struct parhelia_device *pdev,
 			   struct drm_gem_vram_object *bo, u64 offset,
 			   u64 length, u32 *bar_addr);
 int parhelia_vram_clear(struct parhelia_device *pdev,
 			struct drm_gem_vram_object *gbo);
+int parhelia_vram_clear_range(struct parhelia_device *pdev,
+			      struct drm_gem_vram_object *gbo, u64 offset,
+			      u64 len);
+int parhelia_bo_clear(struct parhelia_device *pdev, struct drm_file *file,
+		      struct drm_gem_vram_object *gbo);
 int parhelia_vram_write(struct parhelia_device *pdev,
 			struct drm_gem_vram_object *gbo, u64 offset,
 			const void *src, size_t len);
