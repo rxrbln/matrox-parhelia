@@ -1762,7 +1762,10 @@ static void parhelia_slot_release_locked(struct parhelia_device *pdev,
 		slot->root_probe = NULL;
 	}
 	if (slot->out_fence) {
-		if (error)
+		/* A timed-out slot's fence was already failed when it was
+		 * quarantined; teardown releases it once more. */
+		if (error && !test_bit(DMA_FENCE_FLAG_SIGNALED_BIT,
+				       &slot->out_fence->base.flags))
 			dma_fence_set_error(&slot->out_fence->base, -EIO);
 		dma_fence_signal(&slot->out_fence->base);
 		dma_fence_put(&slot->out_fence->base);
