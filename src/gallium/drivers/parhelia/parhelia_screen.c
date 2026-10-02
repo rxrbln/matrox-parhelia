@@ -760,6 +760,10 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    const bool cube_target = templ->target == PIPE_TEXTURE_CUBE;
    const unsigned slices = templ->target == PIPE_TEXTURE_3D ? templ->depth0 :
                            cube_target ? 6u : 1u;
+   /* Every volume takes the volume order, a single slice too: a depth-1
+    * volume still filters and wraps along r (--texture-volume-probe W H 1
+    * matches the volume order). */
+   const bool layered = templ->target == PIPE_TEXTURE_3D || cube_target;
    unsigned mip_levels;
    int fail_line = 0;
    if (!r)
@@ -790,7 +794,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
     * classes have. */
    if (templ->width0 > max_width || templ->height0 > max_height ||
        (util_format_is_compressed(templ->format) && !block_bytes) ||
-       (slices > 1 && (!p690_native_texture32 || block_bytes ||
+       (layered && (!p690_native_texture32 || block_bytes ||
                        slices > 256 ||
                        (cube_target && templ->width0 != templ->height0))) ||
        (templ->target != PIPE_TEXTURE_3D && templ->depth0 != 1) ||
@@ -817,7 +821,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
       p3d_texture_uses_native_64x32(screen->chip_id, screen->tile_layout,
                                     cpp);
    mip_levels = (p690_native_texture32 || native_64x32_texture) &&
-                slices == 1 &&
+                !layered &&
                 !(templ->width0 & (templ->width0 - 1)) &&
                 !(templ->height0 & (templ->height0 - 1)) ?
                    templ->last_level + 1 : 1;
@@ -864,7 +868,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    }
    /* The original's sampler reads single-level 32-bit storage in 64x32 tiles
     * at a 32-aligned pitch; cover every tile its row bands reach. */
-   if (native_64x32_texture && slices == 1) {
+   if (native_64x32_texture && !layered) {
       /* Tail positions of the levels after the first one no larger than
        * 32x32, inside that level's 64x32 tile. */
       static const unsigned tail_x[] = { 32, 48, 56, 48, 56 };
@@ -919,7 +923,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    }
    /* One level image per cube face, or one per volume slice; the chain above
     * already describes a single image. */
-   if (slices > 1) {
+   if (layered) {
       r->mip.slices = slices;
       r->mip.cube = cube_target;
       /* The vendor's own level size, which is what the address unit derives
@@ -969,7 +973,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
        * single-level native image also needs them whenever its layout
        * reserves more rows than it has, which a one-row 1-D image always
        * does: the P690 order quantises the base level to 32 rows. */
-      .height = mip_levels > 1 || cpp != 4 || block_bytes || slices > 1 ||
+      .height = mip_levels > 1 || cpp != 4 || block_bytes || layered ||
                 r->mip.size > (size_t)row_pitch * 4 * templ->height0 ?
          (r->mip.size + (size_t)row_pitch * 4 - 1) /
          ((size_t)row_pitch * 4) :
@@ -1103,7 +1107,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
     * storage the sampler decodes, and nothing detiles blocks.  Neither has a
     * 16 bpp render or depth surface: it is never shared or sampled, and its
     * CPU image is the byte-exact native shadow. */
-   if (!share_native && !block_bytes && r->cpp == 4 && slices == 1 &&
+   if (!share_native && !block_bytes && r->cpp == 4 && !layered &&
        (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
                        PIPE_BIND_SHARED | PIPE_BIND_SAMPLER_VIEW))) {
       /* CREATE_DUMB is a modeset-only ioctl and is unavailable through a

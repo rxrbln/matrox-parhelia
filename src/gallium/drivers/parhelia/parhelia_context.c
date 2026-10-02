@@ -162,7 +162,7 @@ ph_mip_layer_texel_offset(const struct ph_mip_layout *mip, unsigned level,
                           unsigned layer, unsigned x, unsigned y, bool linear,
                           unsigned cpp)
 {
-   if (mip->slices > 1 && !mip->cube && !linear)
+   if (mip->slices && !mip->cube && !linear)
       return mip->level[level].offset +
          ph_volume_texel_offset(x, y, layer, mip->level[level].pitch,
                                 mip->slices, cpp);
@@ -2404,7 +2404,7 @@ ph_three_coord_texture(const struct ph_context *ctx)
        !ctx->sampler_views[0]->texture)
       return false;
    r = ph_resource(ctx->sampler_views[0]->texture);
-   return r->mip.slices > 1;
+   return r->mip.slices != 0;
 }
 
 /* GL_MODULATE by white is the texture itself, so a white primitive is exact
@@ -4079,7 +4079,7 @@ ph_submit_vertices(struct ph_context *ctx)
    /* A three-coordinate unit-0 texture owns the whole coordinate stream, so
     * there is no room for a second coordinate set and none for the
     * transform program's object-space position. */
-   if (texture && texture->mip.slices > 1) {
+   if (texture && texture->mip.slices) {
       texture1 = NULL;
       sampler1 = NULL;
       ctx->transform = false;
@@ -4312,7 +4312,7 @@ ph_submit_vertices(struct ph_context *ctx)
 	if (state.oow)
 		state.dw_per_vertex++;
 	state.texcoord_q = ctx->proj && state.oow && texture && !texture1 &&
-	                   texture->mip.slices <= 1;
+	                   !texture->mip.slices;
 	if (state.texcoord_q)
 		state.dw_per_vertex += 2;
 	/* The staged stream carries a second colour: declare the kind-6
@@ -4378,7 +4378,7 @@ ph_submit_vertices(struct ph_context *ctx)
        * coordinates and 0x11e4[27:16] carries the slice count, which for a
        * cube map is the face edge length rather than six (vendor mtx3887,
        * .text+0x279bd). */
-      if (texture->mip.slices > 1) {
+      if (texture->mip.slices) {
          tex.type = texture->mip.cube ? P3D_TEX_TYPE_CUBE :
                                         P3D_TEX_TYPE_VOLUME;
          tex.depth = texture->mip.cube ? texture->base.width0 :
