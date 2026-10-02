@@ -678,6 +678,18 @@ ph_resource_download_shadow_rows(struct parhelia_resource *r, unsigned y0,
                                       "render-shadow download", offset, size);
 }
 
+int
+ph_resource_shadow_range(struct parhelia_resource *r, bool upload,
+                         uint64_t offset, uint64_t size)
+{
+   return ph_resource_shadow_transfer(r, upload ?
+                                         DRM_IOCTL_PARHELIA_UPLOAD_RENDER :
+                                         DRM_IOCTL_PARHELIA_DOWNLOAD_RENDER,
+                                      upload ? "render-shadow upload" :
+                                               "render-shadow download",
+                                      offset, size);
+}
+
 /* Each failure exit records where it left, for PARHELIA_TRACE. */
 #define PH_CREATE_FAIL() do { fail_line = __LINE__; goto fail; } while (0)
 

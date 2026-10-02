@@ -27,6 +27,7 @@
 #include "util/u_debug.h"
 #include "util/u_debug_cb.h"
 #include "util/u_draw.h"
+#include "util/u_dynarray.h"
 #include "util/u_framebuffer.h"
 #include "util/u_helpers.h"
 #include "util/u_inlines.h"
@@ -8077,12 +8078,79 @@ ph_level_extent(const struct parhelia_resource *r, unsigned level,
    return true;
 }
 
+struct ph_byte_range {
+   uint64_t start, end;
+};
+
 static int
-ph_shadow_download_level(struct parhelia_resource *r, unsigned level,
-                         int y0, int y1)
+ph_byte_range_cmp(const void *a, const void *b)
 {
-   return level ? ph_resource_download_shadow(r) :
-                  ph_resource_download_shadow_rows(r, y0, y1);
+   const struct ph_byte_range *ra = a, *rb = b;
+
+   return ra->start < rb->start ? -1 : ra->start > rb->start;
+}
+
+/* Boxes above this many texels move whole tile rows instead of sorted runs. */
+#define PH_SHADOW_BOX_TEXELS (64 * 1024)
+/* A transfer call costs about as much as 64 downloaded bytes (MEASURED). */
+#define PH_SHADOW_GAP 64
+/* The host aperture addresses VRAM in 32-byte units (MEASURED). */
+#define PH_SHADOW_ALIGN 32
+
+/* Move only the 32-byte units holding the texels of a box between the CPU
+ * shadow and VRAM (aperture reads cost ~0.4 us per dword, MEASURED on the
+ * P690).  Uploads cover whole runs: download the same box before writing. */
+static int
+ph_shadow_transfer_box(struct parhelia_resource *r, unsigned level,
+                       int x0, int y0, int w, int h, bool upload)
+{
+   const unsigned cpp = util_format_get_blocksize(r->base.format);
+   struct util_dynarray runs;
+   struct ph_byte_range *run;
+   unsigned count, n = 0;
+   int ret = 0;
+
+   if (w <= 0 || h <= 0)
+      return 0;
+   if ((uint64_t)w * h > PH_SHADOW_BOX_TEXELS) {
+      if (level)
+         return upload ? ph_resource_upload_shadow(r) :
+                         ph_resource_download_shadow(r);
+      return upload ? ph_resource_upload_shadow_rows(r, y0, y0 + h) :
+                      ph_resource_download_shadow_rows(r, y0, y0 + h);
+   }
+   util_dynarray_init(&runs, NULL);
+   for (int y = y0; y < y0 + h; y++)
+      for (int x = x0; x < x0 + w; x++) {
+         const size_t off = ph_texel_offset(r, level, x, y, cpp, false);
+         const uint64_t start = off & ~(uint64_t)(PH_SHADOW_ALIGN - 1);
+         const uint64_t end = align64(off + cpp, PH_SHADOW_ALIGN);
+         struct ph_byte_range *last = runs.size ?
+            util_dynarray_top_ptr(&runs, struct ph_byte_range) : NULL;
+         struct ph_byte_range *next;
+
+         if (last && start >= last->start && start <= last->end)
+            last->end = MAX2(last->end, end);
+         else if (!(next = util_dynarray_grow(&runs, struct ph_byte_range, 1))) {
+            util_dynarray_fini(&runs);
+            return -ENOMEM;
+         } else
+            *next = (struct ph_byte_range) { start, end };
+      }
+   run = util_dynarray_begin(&runs);
+   count = util_dynarray_num_elements(&runs, struct ph_byte_range);
+   qsort(run, count, sizeof(*run), ph_byte_range_cmp);
+   for (unsigned i = 1; i < count; i++) {
+      if (run[i].start <= run[n].end + PH_SHADOW_GAP)
+         run[n].end = MAX2(run[n].end, run[i].end);
+      else
+         run[++n] = run[i];
+   }
+   for (unsigned i = 0; count && i <= n && !ret; i++)
+      ret = ph_resource_shadow_range(r, upload, run[i].start,
+                                     MIN2(run[i].end, r->size) - run[i].start);
+   util_dynarray_fini(&runs);
+   return ret;
 }
 
 static bool
@@ -8100,6 +8168,7 @@ ph_copy_texture_box(struct ph_context *ctx,
    const int dwidth = abs(dst_width);
    const int dheight = abs(dst_height);
    const unsigned cpp = util_format_get_blocksize(src->format);
+   const int dst_x0 = dst_width < 0 ? dstx - width : dstx;
    const int dst_y0 = dst_height < 0 ? dsty - height : dsty;
    unsigned src_w, src_h, dst_w, dst_h;
    uint8_t *staging;
@@ -8120,14 +8189,14 @@ ph_copy_texture_box(struct ph_context *ctx,
    if (ph_wait_async(ctx) || ctx->submit_error)
       return false;
    if (sr->transfer_shadow &&
-       ph_shadow_download_level(sr, src_level,
+       ph_shadow_transfer_box(sr, src_level,
+          src_box->width < 0 ? src_box->x - width : src_box->x,
           src_box->height < 0 ? src_box->y - height : src_box->y,
-          src_box->height < 0 ? src_box->y : src_box->y + height))
+          width, height, false))
       return false;
-   /* The destination upload publishes whole tile rows; the pixels beside
-    * the copied box must be current in its shadow first. */
    if (dr->transfer_shadow && (dr->mip_defined & BITFIELD_BIT(dst_level)) &&
-       ph_shadow_download_level(dr, dst_level, dst_y0, dst_y0 + height))
+       ph_shadow_transfer_box(dr, dst_level, dst_x0, dst_y0, dwidth, dheight,
+                              false))
       return false;
 
    /* Imported drawable/renderbuffer resources have a linear companion.
@@ -8188,8 +8257,8 @@ ph_copy_texture_box(struct ph_context *ctx,
    dr->tiled_dirty = dr->map && !dr->linear_map;
    dr->linear_dirty = dr->linear_map && !dr->map;
    if (dr->transfer_shadow) {
-      int ret = dst_level ? ph_resource_upload_shadow(dr) :
-         ph_resource_upload_shadow_rows(dr, dst_y0, dst_y0 + height);
+      int ret = ph_shadow_transfer_box(dr, dst_level, dst_x0, dst_y0,
+                                       dwidth, dheight, true);
 
       if (ret) {
          ctx->submit_error = ret;
@@ -8707,11 +8776,10 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
          return NULL;
       }
    }
-   if ((usage & (PIPE_MAP_READ | PIPE_MAP_WRITE)) && r->transfer_shadow &&
-       (r->mip_defined & BITFIELD_BIT(level)) &&
-       (level ? ph_resource_download_shadow(r) :
-                ph_resource_download_shadow_rows(r, box->y,
-                                                 box->y + box->height))) {
+   if ((usage & (PIPE_MAP_READ | PIPE_MAP_WRITE)) &&
+       r->transfer_shadow && (r->mip_defined & BITFIELD_BIT(level)) &&
+       ph_shadow_transfer_box(r, level, box->x, box->y, box->width,
+                              box->height, false)) {
       FREE(t->staging);
       FREE(t);
       return NULL;
@@ -8868,10 +8936,10 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
       r->content_generation++;
       r->mip_defined |= BITFIELD_BIT(transfer->level);
       if (r->transfer_shadow) {
-         int ret = transfer->level ? ph_resource_upload_shadow(r) :
-                   ph_resource_upload_shadow_rows(r, transfer->box.y,
-                                                  transfer->box.y +
-                                                     transfer->box.height);
+         int ret = ph_shadow_transfer_box(r, transfer->level,
+                                          transfer->box.x, transfer->box.y,
+                                          transfer->box.width,
+                                          transfer->box.height, true);
 
          if (ret)
             ph_context(p)->submit_error = ret;

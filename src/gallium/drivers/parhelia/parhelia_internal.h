@@ -228,6 +228,9 @@ int ph_resource_upload_shadow_rows(struct parhelia_resource *r, unsigned y0,
                                    unsigned y1);
 int ph_resource_download_shadow_rows(struct parhelia_resource *r, unsigned y0,
                                      unsigned y1);
+/* Move one dword-aligned byte range between the CPU shadow and VRAM. */
+int ph_resource_shadow_range(struct parhelia_resource *r, bool upload,
+                             uint64_t offset, uint64_t size);
 struct pipe_context *ph_context_create(struct pipe_screen *screen, void *priv,
                                        unsigned flags);
 
