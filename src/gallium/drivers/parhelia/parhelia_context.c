@@ -8305,8 +8305,6 @@ ph_resource_copy_region(struct pipe_context *p,
 
    ph_zinit_resolve(ctx, ph_resource(src));
    ph_zinit_resolve(ctx, ph_resource(dst));
-   if (dstz || src_box->z)
-      return;
    if (dst->target == PIPE_BUFFER && src->target == PIPE_BUFFER) {
       struct parhelia_resource *dr = ph_resource(dst);
       struct parhelia_resource *sr = ph_resource(src);
@@ -8321,9 +8319,17 @@ ph_resource_copy_region(struct pipe_context *p,
    }
    if (dst->target == PIPE_BUFFER || src->target == PIPE_BUFFER)
       return;
-   bool ok = ph_copy_texture_box(ctx, dst, dst_level, dstx, dsty, src,
+   bool ok = !dstz && !src_box->z &&
+             ph_copy_texture_box(ctx, dst, dst_level, dstx, dsty, src,
                                  src_level, src_box, src_box->width,
                                  src_box->height);
+   /* Volume slices and anything the direct copy refuses go through the
+    * transfer paths, which know every layout. */
+   if (!ok) {
+      util_resource_copy_region(p, dst, dst_level, dstx, dsty, dstz, src,
+                                src_level, src_box);
+      ok = !ctx->submit_error;
+   }
    if (ph_env("PARHELIA_TRACE_COPY"))
       fprintf(stderr, "parhelia: copy %ux%u l%u -> %ux%u l%u at %d,%d box %d,%d %dx%d: %s (err %d)\n",
               src->width0, src->height0, src_level, dst->width0,
@@ -8346,16 +8352,20 @@ ph_normalize_box(const struct pipe_box *in, struct pipe_box *out)
    }
 }
 
-/* General 2-D blit through the CPU transfer paths: scaling with nearest or
- * bilinear filtering, format conversion, flips, write masks and scissor. */
+/* General blit through the CPU transfer paths: scaling with nearest or
+ * bilinear filtering, colour and depth/stencil format conversion, flips,
+ * write masks, scissor and whole volume slices. */
 static bool
 ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
 {
    const enum pipe_format sf = info->src.format, df = info->dst.format;
    const bool zs = util_format_is_depth_or_stencil(sf) ||
                    util_format_is_depth_or_stencil(df);
-   const unsigned mask = info->mask & (zs ? PIPE_MASK_ZS : PIPE_MASK_RGBA);
-   const bool keep = (!zs && mask != PIPE_MASK_RGBA) || info->scissor_enable;
+   const struct util_format_description *sd = util_format_description(sf);
+   const struct util_format_description *dd = util_format_description(df);
+   const bool sz = util_format_has_depth(sd), ss = util_format_has_stencil(sd);
+   const bool dz = util_format_has_depth(dd), ds = util_format_has_stencil(dd);
+   unsigned mask = info->mask & (zs ? PIPE_MASK_ZS : PIPE_MASK_RGBA);
    const bool flip_x = (info->src.box.width < 0) != (info->dst.box.width < 0);
    const bool flip_y = (info->src.box.height < 0) != (info->dst.box.height < 0);
    struct pipe_transfer *st = NULL, *dt = NULL;
@@ -8363,110 +8373,155 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
    const uint8_t *src;
    uint8_t *dst;
    float *pixels = NULL, *row = NULL;
+   uint32_t *zsrc = NULL, *zrow = NULL;
+   uint8_t *ssrc = NULL, *srow = NULL;
    bool ok = false;
+
+   if (zs) {
+      if (!util_format_is_depth_or_stencil(sf) ||
+          !util_format_is_depth_or_stencil(df))
+         return false;
+      /* A channel neither side holds is not part of the copy. */
+      if (!sz || !dz)
+         mask &= ~PIPE_MASK_Z;
+      if (!ss || !ds)
+         mask &= ~PIPE_MASK_S;
+   }
+   const bool keep = zs ? (dz && !(mask & PIPE_MASK_Z)) ||
+                          (ds && !(mask & PIPE_MASK_S)) ||
+                          info->scissor_enable :
+                          mask != PIPE_MASK_RGBA || info->scissor_enable;
 
    ph_normalize_box(&info->src.box, &sb);
    ph_normalize_box(&info->dst.box, &db);
    if (!mask || !sb.width || !sb.height || !db.width || !db.height ||
-       sb.depth != 1 || db.depth != 1 ||
-       (zs && (sf != df ||
-               (util_format_get_blocksize(sf) != 4 &&
-                util_format_get_blocksize(sf) != 2))))
+       sb.depth != db.depth || sb.depth < 1)
       return !mask;
    src = p->texture_map(p, info->src.resource, info->src.level,
                         PIPE_MAP_READ, &sb, &st);
    dst = p->texture_map(p, info->dst.resource, info->dst.level,
                         PIPE_MAP_WRITE | (keep ? PIPE_MAP_READ : 0), &db,
                         &dt);
-   pixels = MALLOC((size_t)sb.width * sb.height * 4 * sizeof(float));
-   row = MALLOC((size_t)db.width * 4 * sizeof(float));
-   if (!src || !dst || !pixels || !row) {
+   if (zs) {
+      zsrc = MALLOC((size_t)sb.width * sb.height * sizeof(*zsrc));
+      ssrc = MALLOC((size_t)sb.width * sb.height);
+      zrow = MALLOC((size_t)db.width * sizeof(*zrow));
+      srow = MALLOC(db.width);
+   } else {
+      pixels = MALLOC((size_t)sb.width * sb.height * 4 * sizeof(float));
+      row = MALLOC((size_t)db.width * 4 * sizeof(float));
+   }
+   if (!src || !dst || (zs ? !zsrc || !ssrc || !zrow || !srow :
+                             !pixels || !row)) {
       if (ph_env("PARHELIA_TRACE") || ph_env("PARHELIA_DEBUG"))
          fprintf(stderr,
                  "parhelia: blit CPU fallback could not map src=%p dst=%p\n",
                  (void *)src, (void *)dst);
       goto out;
    }
-   if (!zs)
-      for (int y = 0; y < sb.height; y++)
-         util_format_unpack_rgba(sf, pixels + (size_t)y * sb.width * 4,
-                                 src + (size_t)y * st->stride, sb.width);
-   for (int y = 0; y < db.height; y++) {
-      const float fy = ((flip_y ? db.height - 1 - y : y) + 0.5f) *
-                       sb.height / db.height - 0.5f;
-      uint8_t *out = dst + (size_t)y * dt->stride;
-      const int wy = db.y + y;
+   for (int l = 0; l < sb.depth; l++) {
+      const uint8_t *slice = src + (size_t)l * st->layer_stride;
+      uint8_t *dslice = dst + (size_t)l * dt->layer_stride;
 
-      if (zs) {
-         /* A D16 word carries no stencil, so the Z/S split does not apply. */
-         const unsigned zcpp = util_format_get_blocksize(sf);
+      for (int y = 0; y < sb.height; y++) {
+         const uint8_t *in = slice + (size_t)y * st->stride;
 
+         if (!zs) {
+            util_format_unpack_rgba(sf, pixels + (size_t)y * sb.width * 4,
+                                    in, sb.width);
+            continue;
+         }
+         if (sz)
+            util_format_unpack_z_32unorm(sf, zsrc + (size_t)y * sb.width,
+                                         in, sb.width);
+         if (ss)
+            util_format_unpack_s_8uint(sf, ssrc + (size_t)y * sb.width,
+                                       in, sb.width);
+      }
+      for (int y = 0; y < db.height; y++) {
+         const float fy = ((flip_y ? db.height - 1 - y : y) + 0.5f) *
+                          sb.height / db.height - 0.5f;
+         uint8_t *out = dslice + (size_t)y * dt->stride;
+         const int wy = db.y + y;
+
+         if (zs) {
+            if (keep && dz)
+               util_format_unpack_z_32unorm(df, zrow, out, db.width);
+            if (keep && ds)
+               util_format_unpack_s_8uint(df, srow, out, db.width);
+            for (int x = 0; x < db.width; x++) {
+               const float fx = ((flip_x ? db.width - 1 - x : x) + 0.5f) *
+                                sb.width / db.width - 0.5f;
+               const int sx = CLAMP((int)lroundf(fx), 0, sb.width - 1);
+               const int sy = CLAMP((int)lroundf(fy), 0, sb.height - 1);
+               const size_t i = (size_t)sy * sb.width + sx;
+
+               if (info->scissor_enable &&
+                   (db.x + x < info->scissor.minx ||
+                    db.x + x >= info->scissor.maxx ||
+                    wy < info->scissor.miny || wy >= info->scissor.maxy))
+                  continue;
+               if (mask & PIPE_MASK_Z)
+                  zrow[x] = zsrc[i];
+               if (mask & PIPE_MASK_S)
+                  srow[x] = ssrc[i];
+            }
+            if (dz)
+               util_format_pack_z_32unorm(df, out, zrow, db.width);
+            if (ds)
+               util_format_pack_s_8uint(df, out, srow, db.width);
+            continue;
+         }
+         if (keep)
+            util_format_unpack_rgba(df, row, out, db.width);
          for (int x = 0; x < db.width; x++) {
             const float fx = ((flip_x ? db.width - 1 - x : x) + 0.5f) *
                              sb.width / db.width - 0.5f;
-            const int sx = CLAMP((int)lroundf(fx), 0, sb.width - 1);
-            const int sy = CLAMP((int)lroundf(fy), 0, sb.height - 1);
-            uint32_t in = 0, old = 0;
+            const int wx = db.x + x;
+            float texel[4];
 
-            memcpy(&in, src + (size_t)sy * st->stride + sx * zcpp, zcpp);
-            memcpy(&old, out + x * zcpp, zcpp);
-            if (zcpp == 4 && mask != PIPE_MASK_ZS)
-               in = (mask & PIPE_MASK_Z) ? (in & 0x00ffffffu) | (old & 0xff000000u) :
-                                           (in & 0xff000000u) | (old & 0x00ffffffu);
-            else if (zcpp == 2 && !(mask & PIPE_MASK_Z))
-               in = old;
-            if (!info->scissor_enable ||
-                (db.x + x >= info->scissor.minx && db.x + x < info->scissor.maxx &&
-                 wy >= info->scissor.miny && wy < info->scissor.maxy))
-               memcpy(out + x * zcpp, &in, zcpp);
-         }
-         continue;
-      }
-      if (keep)
-         util_format_unpack_rgba(df, row, out, db.width);
-      for (int x = 0; x < db.width; x++) {
-         const float fx = ((flip_x ? db.width - 1 - x : x) + 0.5f) *
-                          sb.width / db.width - 0.5f;
-         const int wx = db.x + x;
-         float texel[4];
+            if (info->scissor_enable &&
+                (wx < info->scissor.minx || wx >= info->scissor.maxx ||
+                 wy < info->scissor.miny || wy >= info->scissor.maxy))
+               continue;
+            if (info->filter == PIPE_TEX_FILTER_LINEAR &&
+                (sb.width != db.width || sb.height != db.height)) {
+               const float cx = CLAMP(fx, 0.0f, sb.width - 1.0f);
+               const float cy = CLAMP(fy, 0.0f, sb.height - 1.0f);
+               const int x0 = (int)cx, y0 = (int)cy;
+               const int x1 = MIN2(x0 + 1, sb.width - 1);
+               const int y1 = MIN2(y0 + 1, sb.height - 1);
+               const float ax = cx - x0, ay = cy - y0;
 
-         if (info->scissor_enable &&
-             (wx < info->scissor.minx || wx >= info->scissor.maxx ||
-              wy < info->scissor.miny || wy >= info->scissor.maxy))
-            continue;
-         if (info->filter == PIPE_TEX_FILTER_LINEAR &&
-             (sb.width != db.width || sb.height != db.height)) {
-            const float cx = CLAMP(fx, 0.0f, sb.width - 1.0f);
-            const float cy = CLAMP(fy, 0.0f, sb.height - 1.0f);
-            const int x0 = (int)cx, y0 = (int)cy;
-            const int x1 = MIN2(x0 + 1, sb.width - 1);
-            const int y1 = MIN2(y0 + 1, sb.height - 1);
-            const float ax = cx - x0, ay = cy - y0;
+               for (unsigned c = 0; c < 4; c++) {
+                  const float *p00 = pixels + ((size_t)y0 * sb.width + x0) * 4;
+                  const float *p10 = pixels + ((size_t)y0 * sb.width + x1) * 4;
+                  const float *p01 = pixels + ((size_t)y1 * sb.width + x0) * 4;
+                  const float *p11 = pixels + ((size_t)y1 * sb.width + x1) * 4;
 
-            for (unsigned c = 0; c < 4; c++) {
-               const float *p00 = pixels + ((size_t)y0 * sb.width + x0) * 4;
-               const float *p10 = pixels + ((size_t)y0 * sb.width + x1) * 4;
-               const float *p01 = pixels + ((size_t)y1 * sb.width + x0) * 4;
-               const float *p11 = pixels + ((size_t)y1 * sb.width + x1) * 4;
+                  texel[c] = (p00[c] * (1 - ax) + p10[c] * ax) * (1 - ay) +
+                             (p01[c] * (1 - ax) + p11[c] * ax) * ay;
+               }
+            } else {
+               const int sx = CLAMP((int)floorf(fx + 0.5f), 0, sb.width - 1);
+               const int sy = CLAMP((int)floorf(fy + 0.5f), 0, sb.height - 1);
 
-               texel[c] = (p00[c] * (1 - ax) + p10[c] * ax) * (1 - ay) +
-                          (p01[c] * (1 - ax) + p11[c] * ax) * ay;
+               memcpy(texel, pixels + ((size_t)sy * sb.width + sx) * 4,
+                      sizeof(texel));
             }
-         } else {
-            const int sx = CLAMP((int)floorf(fx + 0.5f), 0, sb.width - 1);
-            const int sy = CLAMP((int)floorf(fy + 0.5f), 0, sb.height - 1);
-
-            memcpy(texel, pixels + ((size_t)sy * sb.width + sx) * 4,
-                   sizeof(texel));
+            for (unsigned c = 0; c < 4; c++)
+               if (mask & (PIPE_MASK_R << c))
+                  row[x * 4 + c] = texel[c];
          }
-         for (unsigned c = 0; c < 4; c++)
-            if (mask & (PIPE_MASK_R << c))
-               row[x * 4 + c] = texel[c];
+         util_format_pack_rgba(df, out, row, db.width);
       }
-      util_format_pack_rgba(df, out, row, db.width);
    }
    ok = true;
 out:
+   FREE(srow);
+   FREE(zrow);
+   FREE(ssrc);
+   FREE(zsrc);
    FREE(row);
    FREE(pixels);
    if (dt)
