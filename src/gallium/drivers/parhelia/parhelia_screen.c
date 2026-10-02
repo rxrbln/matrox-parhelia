@@ -266,6 +266,9 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
                     unsigned storage_samples, unsigned bind)
 {
    bool supported = false;
+   /* Volume slices and cube faces exist only in the 32-bit native order. */
+   const bool layered = target == PIPE_TEXTURE_3D ||
+                        target == PIPE_TEXTURE_CUBE;
 
    /* P690 has no sampler sRGB decode or render-target sRGB encode path.
     * Accepting these formats makes state_tracker advertise the sRGB texture
@@ -307,7 +310,7 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
                            !(bind & (PIPE_BIND_SAMPLER_VIEW |
                                      PIPE_BIND_DEPTH_STENCIL));
             else
-               supported = ph_screen(s)->narrow_formats &&
+               supported = ph_screen(s)->narrow_formats && !layered &&
                            (bind & PIPE_BIND_SAMPLER_VIEW) &&
                            !(bind & (PIPE_BIND_DEPTH_STENCIL |
                                      PIPE_BIND_SCANOUT |
@@ -359,7 +362,7 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
              * descriptor at these texel sizes, so they stay sampler-only.
              * Their alpha is no worse off than the 32-bit formats': this
              * texture unit emits none for any of them. */
-            supported = ph_screen(s)->narrow_formats &&
+            supported = ph_screen(s)->narrow_formats && !layered &&
                         (bind & PIPE_BIND_SAMPLER_VIEW) &&
                         !(bind & (PIPE_BIND_RENDER_TARGET |
                                   PIPE_BIND_DEPTH_STENCIL |
