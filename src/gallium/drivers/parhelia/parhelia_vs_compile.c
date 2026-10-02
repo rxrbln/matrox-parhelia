@@ -25,6 +25,7 @@
 #include "util/macros.h"
 #include "util/u_math.h"
 
+#include "compiler/nir/nir_constant_expressions.h"
 #include "parhelia_vs_compile.h"
 
 /* Why a shader was refused, when PARHELIA_TRACE_TCL is set.  A rejection is
@@ -1332,4 +1333,344 @@ done:
    if (!ok)
       memset(out, 0, sizeof(*out));
    return ok;
+}
+
+/* ---- position slice ---------------------------------------------------- */
+
+struct ph_slice_memo {
+   nir_def *def;
+   unsigned comp;
+   struct ph_slice_src src;
+};
+
+struct ph_slice_build {
+   struct ph_slice *slice;
+   unsigned node_cap;
+   struct ph_slice_memo *memo;
+   unsigned memos, memo_cap;
+};
+
+static bool
+ph_slice_grow(void **array, unsigned count, unsigned *cap, size_t size)
+{
+   if (count < *cap)
+      return true;
+   unsigned want = MAX2(16u, *cap * 2u);
+   void *grown = realloc(*array, want * size);
+
+   if (!grown)
+      return false;
+   *array = grown;
+   *cap = want;
+   return true;
+}
+
+static unsigned
+ph_slice_src_degree(const struct ph_slice *slice, const struct ph_slice_src *src)
+{
+   if (src->kind == PH_SLICE_INPUT)
+      return 1;
+   if (src->kind == PH_SLICE_RESULT)
+      return slice->node[src->index].degree;
+   return 0;
+}
+
+/* The degree of a node's result in the vertex inputs, saturating at 2. */
+static unsigned
+ph_slice_degree(const struct ph_slice *slice, const struct ph_slice_node *node)
+{
+   unsigned d[3][4] = { { 0 } }, any = 0;
+
+   for (unsigned i = 0; i < node->nsrc; i++)
+      for (unsigned c = 0; c < node->ncomp[i]; c++) {
+         d[i][c] = ph_slice_src_degree(slice, &node->src[i][c]);
+         any |= d[i][c];
+      }
+   if (!any)
+      return 0;
+   switch (node->op) {
+   case nir_op_fneg:
+   case nir_op_mov:
+      return d[0][0];
+   case nir_op_fadd:
+   case nir_op_fsub:
+      return MIN2(MAX2(d[0][0], d[1][0]), 2u);
+   case nir_op_fmul:
+      return MIN2(d[0][0] + d[1][0], 2u);
+   case nir_op_ffma:
+      return MIN2(MAX2(d[0][0] + d[1][0], d[2][0]), 2u);
+   case nir_op_fdot2:
+   case nir_op_fdot3:
+   case nir_op_fdot4: {
+      unsigned deg = 0;
+
+      for (unsigned c = 0; c < node->ncomp[0]; c++)
+         deg = MAX2(deg, d[0][c] + d[1][c]);
+      return MIN2(deg, 2u);
+   }
+   default:
+      return 2;
+   }
+}
+
+static bool
+ph_slice_node(struct ph_slice_build *b, nir_op op, unsigned bit_size,
+              unsigned nsrc, const unsigned *ncomp,
+              const struct ph_slice_src (*src)[4], struct ph_slice_src *out)
+{
+   struct ph_slice *slice = b->slice;
+   struct ph_slice_node *node;
+
+   if (!ph_slice_grow((void **)&slice->node, slice->nodes, &b->node_cap,
+                      sizeof(*slice->node)))
+      return false;
+   node = &slice->node[slice->nodes];
+   memset(node, 0, sizeof(*node));
+   node->op = op;
+   node->bit_size = bit_size;
+   node->nsrc = nsrc;
+   for (unsigned i = 0; i < nsrc; i++) {
+      node->ncomp[i] = ncomp[i];
+      memcpy(node->src[i], src[i], ncomp[i] * sizeof(src[i][0]));
+   }
+   node->degree = ph_slice_degree(slice, node);
+   *out = (struct ph_slice_src){ .kind = PH_SLICE_RESULT,
+                                 .index = slice->nodes++ };
+   return true;
+}
+
+/* The scalar constant-buffer offset of component 0 of a uniform load. */
+static bool
+ph_slice_uniform(const nir_intrinsic_instr *load, unsigned *offset)
+{
+   switch (load->intrinsic) {
+   case nir_intrinsic_load_ubo_vec4:
+      if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+          !nir_src_is_const(load->src[1]))
+         return false;
+      *offset = (nir_intrinsic_base(load) + nir_src_as_uint(load->src[1])) * 4u +
+                nir_intrinsic_component(load);
+      return true;
+   case nir_intrinsic_load_ubo:
+      if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+          !nir_src_is_const(load->src[1]) || nir_src_as_uint(load->src[1]) % 4u)
+         return false;
+      *offset = nir_src_as_uint(load->src[1]) / 4u;
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+ph_slice_scalar(struct ph_slice_build *b, nir_def *def, unsigned comp,
+                unsigned depth, struct ph_slice_src *out)
+{
+   nir_instr *instr = nir_def_instr(def);
+   struct ph_slice_src src[3][4];
+   unsigned ncomp[3], bit_size = 0;
+
+   if (depth > 256)
+      return false;
+   for (unsigned i = 0; i < b->memos; i++)
+      if (b->memo[i].def == def && b->memo[i].comp == comp) {
+         *out = b->memo[i].src;
+         return true;
+      }
+   memset(out, 0, sizeof(*out));
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+      out->kind = PH_SLICE_LITERAL;
+      out->literal = nir_instr_as_load_const(instr)->value[comp];
+      return true;
+   case nir_instr_type_undef:
+      out->kind = PH_SLICE_LITERAL;
+      return true;
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+      unsigned offset;
+
+      if (in->intrinsic == nir_intrinsic_load_deref) {
+         nir_deref_instr *deref = nir_src_as_deref(in->src[0]);
+
+         if (!deref || deref->deref_type != nir_deref_type_var ||
+             deref->var->data.mode != nir_var_shader_in ||
+             deref->var->data.driver_location >= 32)
+            return false;
+         out->kind = PH_SLICE_INPUT;
+         out->index = deref->var->data.driver_location * 4u + comp;
+         b->slice->input_mask |= 1u << deref->var->data.driver_location;
+         return true;
+      }
+      if (!ph_slice_uniform(in, &offset))
+         return false;
+      out->kind = PH_SLICE_BUFFER;
+      out->index = offset + comp;
+      return true;
+   }
+   case nir_instr_type_alu:
+      break;
+   default:
+      return false;
+   }
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   const nir_op_info *info = &nir_op_infos[alu->op];
+
+   switch (alu->op) {
+   case nir_op_vec2:
+   case nir_op_vec3:
+   case nir_op_vec4:
+      return ph_slice_scalar(b, alu->src[comp].src.ssa,
+                             alu->src[comp].swizzle[0], depth + 1, out);
+   case nir_op_mov:
+   case nir_op_fcanonicalize:
+      return ph_slice_scalar(b, alu->src[0].src.ssa, alu->src[0].swizzle[comp],
+                             depth + 1, out);
+   default:
+      break;
+   }
+   if (info->num_inputs > 3 || info->output_size > 1)
+      return false;
+   if (!nir_alu_type_get_type_size(info->output_type))
+      bit_size = alu->def.bit_size;
+   for (unsigned i = 0; i < info->num_inputs; i++) {
+      /* A reduction (fdot, all, any) keeps its sources' width. */
+      ncomp[i] = info->output_size == 1 ?
+                 (info->input_sizes[i] ? info->input_sizes[i] :
+                  nir_ssa_alu_instr_src_components(alu, i)) : 1;
+      if (!info->output_size && info->input_sizes[i])
+         return false;
+      if (ncomp[i] > 4)
+         return false;
+      if (!bit_size && !nir_alu_type_get_type_size(info->input_types[i]))
+         bit_size = alu->src[i].src.ssa->bit_size;
+      for (unsigned c = 0; c < ncomp[i]; c++)
+         if (!ph_slice_scalar(b, alu->src[i].src.ssa,
+                              alu->src[i].swizzle[info->output_size ? c : comp],
+                              depth + 1, &src[i][c]))
+            return false;
+   }
+   if (!ph_slice_node(b, alu->op, bit_size ? bit_size : 32, info->num_inputs,
+                      ncomp, (const struct ph_slice_src (*)[4])src, out))
+      return false;
+   if (!ph_slice_grow((void **)&b->memo, b->memos, &b->memo_cap,
+                      sizeof(*b->memo)))
+      return false;
+   b->memo[b->memos++] = (struct ph_slice_memo){ def, comp, *out };
+   return true;
+}
+
+struct ph_slice *
+ph_slice_create(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   struct ph_slice_build b = {0};
+   nir_def *position = NULL;
+   bool ok = true;
+
+   if (!impl || exec_list_length(&impl->body) != 1)
+      return NULL;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         nir_intrinsic_instr *store;
+         nir_deref_instr *deref;
+
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         store = nir_instr_as_intrinsic(instr);
+         if (store->intrinsic != nir_intrinsic_store_deref)
+            continue;
+         deref = nir_src_as_deref(store->src[0]);
+         if (!deref || deref->deref_type != nir_deref_type_var ||
+             deref->var->data.location != VARYING_SLOT_POS)
+            continue;
+         /* One complete store: partial position writes are not modelled. */
+         if (position || nir_intrinsic_write_mask(store) != 0xf)
+            return NULL;
+         position = store->src[1].ssa;
+      }
+   }
+   if (!position)
+      return NULL;
+   b.slice = calloc(1, sizeof(*b.slice));
+   if (!b.slice)
+      return NULL;
+   for (unsigned c = 0; c < 4 && ok; c++)
+      ok = ph_slice_scalar(&b, position, c, 0, &b.slice->pos[c]);
+   free(b.memo);
+   if (ok) {
+      b.slice->affine = true;
+      for (unsigned c = 0; c < 4; c++)
+         if (ph_slice_src_degree(b.slice, &b.slice->pos[c]) > 1)
+            b.slice->affine = false;
+   }
+   if (ok && b.slice->nodes) {
+      b.slice->value = calloc(b.slice->nodes, sizeof(*b.slice->value));
+      ok = b.slice->value != NULL;
+   }
+   if (!ok) {
+      ph_slice_destroy(b.slice);
+      return NULL;
+   }
+   return b.slice;
+}
+
+void
+ph_slice_destroy(struct ph_slice *slice)
+{
+   if (!slice)
+      return;
+   free(slice->node);
+   free(slice->value);
+   free(slice);
+}
+
+static nir_const_value
+ph_slice_read(const struct ph_slice *slice, const struct ph_slice_src *src,
+              const float (*input)[4], const float *constants, unsigned size)
+{
+   nir_const_value v = {0};
+
+   switch (src->kind) {
+   case PH_SLICE_INPUT:
+      v.f32 = input[src->index / 4u][src->index % 4u];
+      break;
+   case PH_SLICE_BUFFER:
+      v.f32 = constants && (src->index + 1u) * sizeof(float) <= size ?
+              constants[src->index] : 0.0f;
+      break;
+   case PH_SLICE_RESULT:
+      v = slice->value[src->index];
+      break;
+   default:
+      v = src->literal;
+      break;
+   }
+   return v;
+}
+
+void
+ph_slice_eval(struct ph_slice *slice, const float (*input)[4],
+              const float *constants, unsigned size, float out[4])
+{
+   for (unsigned i = 0; i < slice->nodes; i++) {
+      const struct ph_slice_node *node = &slice->node[i];
+      nir_const_value src[3][NIR_MAX_VEC_COMPONENTS];
+      nir_const_value *srcs[3];
+      uint16_t poison = 0;
+
+      memset(src, 0, sizeof(src));
+      for (unsigned s = 0; s < node->nsrc; s++) {
+         for (unsigned c = 0; c < node->ncomp[s]; c++)
+            src[s][c] = ph_slice_read(slice, &node->src[s][c], input,
+                                      constants, size);
+         srcs[s] = src[s];
+      }
+      nir_eval_const_opcode(node->op, &slice->value[i], &poison, 1,
+                            node->bit_size, srcs, 0);
+   }
+   for (unsigned c = 0; c < 4; c++)
+      out[c] = ph_slice_read(slice, &slice->pos[c], input, constants,
+                             size).f32;
 }

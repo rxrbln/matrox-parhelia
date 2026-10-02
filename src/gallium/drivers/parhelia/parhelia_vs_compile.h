@@ -69,4 +69,46 @@ bool ph_vs_compile(nir_shader *nir, const struct ph_vs_inputs *inputs,
                    unsigned constant_first, unsigned max_instructions,
                    bool allow_t2, struct ph_vs_program *out);
 
+/* The position slice of a vertex shader: the scalar operations that compute
+ * gl_Position, for the CPU's clip-volume bound (as the vendor ICD computes
+ * outcodes on the CPU before handing triangles to the transform engine).
+ * Each source is a vertex input component, a constant-buffer scalar, an
+ * earlier result or a literal. */
+enum ph_slice_kind {
+   PH_SLICE_INPUT, PH_SLICE_BUFFER, PH_SLICE_RESULT, PH_SLICE_LITERAL,
+};
+
+struct ph_slice_src {
+   uint8_t kind;
+   uint32_t index;              /* input: location * 4 + component */
+   nir_const_value literal;
+};
+
+struct ph_slice_node {
+   nir_op op;
+   uint8_t bit_size;
+   uint8_t nsrc;
+   uint8_t ncomp[3];
+   struct ph_slice_src src[3][4];
+   uint8_t degree;              /* polynomial degree in the inputs, 2 = more */
+};
+
+struct ph_slice {
+   struct ph_slice_node *node;
+   unsigned nodes;
+   struct ph_slice_src pos[4];
+   uint32_t input_mask;         /* driver_locations the slice reads */
+   bool affine;                 /* the position is affine in the inputs */
+   nir_const_value *value;      /* per-evaluation scratch, one per node */
+};
+
+/* Build the position slice of @nir, or NULL when it reads anything other
+ * than inputs, constants and per-component arithmetic. */
+struct ph_slice *ph_slice_create(nir_shader *nir);
+void ph_slice_destroy(struct ph_slice *slice);
+/* Evaluate the slice for one vertex: @input[location][component] are the
+ * vertex's inputs, @constants the mapped constant buffer of @size bytes. */
+void ph_slice_eval(struct ph_slice *slice, const float (*input)[4],
+                   const float *constants, unsigned size, float out[4]);
+
 #endif

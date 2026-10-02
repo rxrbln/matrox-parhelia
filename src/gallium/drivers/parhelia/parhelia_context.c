@@ -78,6 +78,9 @@ struct ph_vs {
     * other output is compiled rather than pattern matched.  The program runs
     * from a kernel instruction-store slot this context uploaded. */
    bool hw_program;
+   /* A program whose position is no matrix product keeps its position
+    * slice here, so the CPU can still bound the clip volume per vertex. */
+   struct ph_slice *pos_slice;
    struct ph_vs_program prog;
    struct ph_vs_inputs prog_inputs;
    unsigned prog_slot;          /* kernel WARP program slot, 0 = none yet */
@@ -419,6 +422,7 @@ struct ph_context {
    unsigned tcl_clip_why[4];	/* w <= 0, guard band, near, far */
    enum ph_tcl_reason tcl_last_reason;
    unsigned tcl_program_draws;
+   unsigned tcl_slice_draws;    /* bounded through a CPU position slice */
    uint32_t fence;
    bool async_pending;
    int submit_error;
@@ -793,8 +797,9 @@ ph_stats_frame(struct ph_context *ctx)
                               ctx->tcl_reason[PH_TCL_NO_PRIMITIVE] ||
                               ctx->tcl_reason[PH_TCL_NO_FIXUP]))
       fprintf(stderr,
-              "parhelia stats/frame: %.1f hardware-transform draws (%.1f compiled vertex programs), %.1f not expressible, %.1f handed back to the software clipper\n",
+              "parhelia stats/frame: %.1f hardware-transform draws (%.1f compiled vertex programs, %.1f bounded by a position slice), %.1f not expressible, %.1f handed back to the software clipper\n",
               ctx->tcl_draws / n, ctx->tcl_program_draws / n,
+              ctx->tcl_slice_draws / n,
               ctx->tcl_fallbacks / n, ctx->tcl_clip_fallbacks / n);
    if (ctx->stat.start_ns && (ctx->tcl_draws || ctx->tcl_clip_fallbacks))
       fprintf(stderr, "  hardware transform: %.0f vertices; software clipper "
@@ -812,7 +817,7 @@ ph_stats_frame(struct ph_context *ctx)
    memset(ctx->tcl_clip_why, 0, sizeof(ctx->tcl_clip_why));
    ctx->tcl_verts = ctx->tcl_clip_verts = 0;
    ctx->tcl_draws = ctx->tcl_fallbacks = ctx->tcl_clip_fallbacks = 0;
-   ctx->tcl_program_draws = 0;
+   ctx->tcl_program_draws = ctx->tcl_slice_draws = 0;
    for (unsigned k = 0; ctx->stats_sync && k < PH_STAT_KINDS; k++)
       if (ctx->stat.kind_count[k])
          fprintf(stderr,
@@ -7106,14 +7111,58 @@ ph_tcl_vertices_fit(struct ph_context *ctx, const float *vertices,
    float gy = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[1])) /
               MAX2(fabsf(ctx->viewport.scale[1]), 1e-6f);
 
+   struct ph_slice *slice = ctx->warp_program_entry && ctx->vs ?
+                            ctx->vs->pos_slice : NULL;
+   const float *constants = NULL;
+   unsigned constant_size = 0;
+
    if (gx <= 1.0f || gy <= 1.0f)
       return false;
+   if (slice) {
+      const uint8_t *base = ctx->user_constants[MESA_SHADER_VERTEX];
+
+      if (!base && ctx->constants[MESA_SHADER_VERTEX])
+         base = ph_resource(ctx->constants[MESA_SHADER_VERTEX])->malloc_data;
+      if (base) {
+         constants = (const float *)(base +
+                                     ctx->constant_offset[MESA_SHADER_VERTEX]);
+         constant_size = ctx->constant_size[MESA_SHADER_VERTEX];
+      }
+   }
    for (unsigned v = 0; v < count; v++) {
       const float *p = vertices + v * dpv;
-      float x = m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3];
-      float y = m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7];
-      float z = m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11];
-      float w = m[12] * p[0] + m[13] * p[1] + m[14] * p[2] + m[15];
+      float x, y, z, w;
+
+      if (slice) {
+         float input[32][4];
+         float clip[4];
+
+         /* The stream carries each input at its fetch slot's dword, with
+          * the slot's component count; the rest takes GL's 0,0,0,1. */
+         u_foreach_bit(i, slice->input_mask) {
+            const int slot = ctx->vs->prog_inputs.slot[i];
+            const struct ph_tcl_slot *desc =
+               slot >= 0 ? ph_tcl_slot_of((unsigned)slot) : NULL;
+            const unsigned n = desc ?
+               util_format_get_nr_components(desc->format) : 0;
+
+            input[i][0] = input[i][1] = input[i][2] = 0.0f;
+            input[i][3] = 1.0f;
+            for (unsigned c = 0; c < n; c++)
+               input[i][c] = p[desc->offset + c];
+         }
+         ph_slice_eval(slice, (const float (*)[4])input, constants,
+                       constant_size, clip);
+         x = clip[0];
+         y = clip[1];
+         z = clip[2];
+         w = clip[3];
+      } else {
+         x = m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3];
+         y = m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7];
+         z = m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11];
+         w = m[12] * p[0] + m[13] * p[1] + m[14] * p[2] + m[15];
+      }
 
       if (!(w > 1e-6f) || !(fabsf(x) <= gx * w) || !(fabsf(y) <= gy * w) ||
           !(z >= -w) || !(z <= w)) {
@@ -7438,7 +7487,12 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
 
    ctx->tcl_last_reason = PH_TCL_NO_DRAW_SHAPE;
    if (info->primitive_restart || info->instance_count != 1 ||
-       !ph_tcl_layout(ctx, &lay) || !ph_tcl_matrix(ctx, mvp))
+       !ph_tcl_layout(ctx, &lay))
+      goto fallback;
+   /* A position slice needs no matrix: the program brings its constants. */
+   if (lay.program && ctx->vs->pos_slice)
+      memset(mvp, 0, sizeof(mvp));
+   else if (!ph_tcl_matrix(ctx, mvp))
       goto fallback;
    /* An unsampleable native import can only be presented by copy, which
     * matches the window-space quad of the software path. */
@@ -7559,6 +7613,8 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    if (lay.program)
       ctx->tcl_program_draws++;
 
+   if (lay.program && ctx->vs->pos_slice)
+      ctx->tcl_slice_draws++;
    limit = ph_triangle_batch_limit(ctx);
    while (done < ntri) {
       unsigned room = ph_logical_vertex_limit(ctx) / (3 * lay.dpv);
@@ -8721,8 +8777,22 @@ static void *ph_create_vs(struct pipe_context *p,
        * compiled into a WARP program of this shader's own.  The transforming
        * stream may sample a texture, so the program must never write T2 -
        * ph_prime_warp() primes it at context creation instead. */
-      const bool analyzed = !vs->ff_transform && ctx->tcl_programs &&
+      bool analyzed = !vs->ff_transform && ctx->tcl_programs &&
          ph_vs_analyze(s->ir.nir, vs, true);
+
+      /* Any other position: evaluate just its slice on the CPU for the
+       * clip-volume bound, as the vendor ICD computes outcodes itself. */
+      if (!analyzed && !vs->ff_transform && ctx->tcl_programs &&
+          s->type == PIPE_SHADER_IR_NIR &&
+          (vs->pos_slice = ph_slice_create(s->ir.nir))) {
+         vs->pos_input = -1;
+         nir_foreach_shader_in_variable(var, s->ir.nir)
+            if (var->data.location == VERT_ATTRIB_POS)
+               vs->pos_input = var->data.driver_location;
+         if (vs->pos_input < 0 && vs->pos_slice->input_mask)
+            vs->pos_input = ffs(vs->pos_slice->input_mask) - 1;
+         analyzed = vs->pos_input >= 0;
+      }
       const bool inputs_ok = analyzed && ph_vs_assign_inputs(s->ir.nir, vs);
 
       if (ph_env("PARHELIA_TRACE_TCL"))
@@ -8768,6 +8838,8 @@ static void ph_delete_vs(struct pipe_context *p, void *s)
 {
    struct ph_context *ctx = ph_context(p);
    struct ph_vs *vs = s;
+
+   ph_slice_destroy(vs->pos_slice);
 
    if (vs->prog_slot) {
       struct drm_parhelia_warp_program release = {
