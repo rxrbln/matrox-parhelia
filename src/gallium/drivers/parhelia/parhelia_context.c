@@ -4382,7 +4382,11 @@ ph_submit_vertices(struct ph_context *ctx)
 		state.vertex_alpha = 1;
 		state.pos_z = !zpos;
 		state.dw_per_vertex = 7;
-		state.warp_entry = ctx->warp_rgba;
+		/* The T2-free pass-through on the LX class only: the 0528 measured
+		 * this stream through the kernel pass-through. */
+		if (!state.transform &&
+		    ph_lx_family(ph_screen(ctx->base.screen)->chip_id))
+			state.warp_entry = ctx->warp_rgba;
 	}
    state.single_texture_pipe = ph_screen(ctx->base.screen)->single_texture_pipe;
    /* One texture ganged on pipes 0+2: +25% on trilinear minification. */
@@ -5164,7 +5168,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	 * x,y,z,r,g,b,a stream; z rides along without a depth surface. */
 	colour_alpha = !textured && !vertex_alpha && !colour1 &&
 	               ph_colour_alpha_observable(ctx);
-	if (colour_alpha && !ctx->warp_rgba) {
+	if (colour_alpha && !ctx->warp_rgba &&
+	    ph_lx_family(ph_screen(ctx->base.screen)->chip_id)) {
 	   /* Uploading drains the engine: publish the staged batch first. */
 	   if (ctx->triangles || ctx->points || ctx->lines) {
 	      ph_submit_vertices(ctx);
