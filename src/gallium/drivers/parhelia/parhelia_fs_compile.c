@@ -112,6 +112,10 @@ struct ph_fs_ctx {
    bool tex_end_cross[4][2];
    unsigned sampler_mask;
    bool uses_color, uses_color1, uses_fogc, uses_col1;
+   /* The fog factor read as v1.x: its root and its per-vertex expression. */
+   nir_def *fog_root;
+   struct ph_fs_fog_op *fog;
+   unsigned fog_ops, fog_cap;
    const char *reject;
 };
 
@@ -1143,7 +1147,8 @@ ph_fs_varying(struct ph_fs_ctx *ctx, unsigned location, int sel,
               location == VARYING_SLOT_FOGC) {
       /* The vertex side carries the secondary colour or the fog
        * coordinate in colour 1, never both. */
-      if (location == VARYING_SLOT_FOGC ? ctx->uses_col1 : ctx->uses_fogc)
+      if ((location == VARYING_SLOT_FOGC ? ctx->uses_col1 : ctx->uses_fogc) ||
+          ctx->fog_root)
          return ph_fs_fail(ctx, "fog and the secondary colour both need v1");
       ctx->uses_fogc |= location == VARYING_SLOT_FOGC;
       ctx->uses_col1 |= location == VARYING_SLOT_COL1;
@@ -1227,6 +1232,155 @@ ph_fs_texture(struct ph_fs_ctx *ctx, const nir_tex_instr *tex, int sel,
    ctx->sampler_mask |= 1u << tex->sampler_index;
    *out = (struct ph_fs_src){ .kind = PH_SRC_TEX, .channel = sel,
                               .index = tex->sampler_index };
+   return true;
+}
+
+/* ---- the fog factor ------------------------------------------------- */
+
+static int
+ph_fs_fog_push(struct ph_fs_ctx *ctx, struct ph_fs_fog_op op)
+{
+   if (ctx->fog_ops == ctx->fog_cap) {
+      unsigned cap = ctx->fog_cap ? 2 * ctx->fog_cap : 8;
+      struct ph_fs_fog_op *grown = realloc(ctx->fog, cap * sizeof(*grown));
+
+      if (!grown)
+         return -1;
+      ctx->fog = grown;
+      ctx->fog_cap = cap;
+   }
+   ctx->fog[ctx->fog_ops] = op;
+   return ctx->fog_ops++;
+}
+
+/* Channel @comp of @def as a scalar expression over the fog coordinate,
+ * uniforms and literals; -1 when it reads anything else.  *@coord is set
+ * once the fog coordinate is reached. */
+static int
+ph_fs_fog_expr(struct ph_fs_ctx *ctx, nir_def *def, unsigned comp, bool *coord)
+{
+   nir_instr *instr = nir_def_instr(def);
+   struct ph_fs_fog_op op = {0};
+
+   switch (instr->type) {
+   case nir_instr_type_load_const: {
+      const nir_load_const_instr *load = nir_instr_as_load_const(instr);
+
+      if (load->def.bit_size != 32 || comp >= load->def.num_components)
+         return -1;
+      op.kind = PH_FOG_LITERAL;
+      op.value = nir_const_value_as_float(load->value[comp], 32);
+      return ph_fs_fog_push(ctx, op);
+   }
+   case nir_instr_type_intrinsic: {
+      const nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+      unsigned location;
+
+      switch (load->intrinsic) {
+      case nir_intrinsic_load_input:
+      case nir_intrinsic_load_interpolated_input:
+         location = nir_intrinsic_io_semantics(load).location;
+         break;
+      case nir_intrinsic_load_deref: {
+         nir_deref_instr *deref = nir_src_as_deref(load->src[0]);
+
+         if (!deref || deref->deref_type != nir_deref_type_var ||
+             !(deref->var->data.mode & nir_var_shader_in))
+            return -1;
+         location = deref->var->data.location;
+         break;
+      }
+      case nir_intrinsic_load_ubo_vec4:
+         if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+             !nir_src_is_const(load->src[1]))
+            return -1;
+         op.kind = PH_FOG_UNIFORM;
+         op.offset = (nir_intrinsic_base(load) +
+                      nir_src_as_uint(load->src[1])) * 4u +
+                     nir_intrinsic_component(load) + comp;
+         return ph_fs_fog_push(ctx, op);
+      default:
+         return -1;
+      }
+      if (location != VARYING_SLOT_FOGC || comp)
+         return -1;
+      *coord = true;
+      op.kind = PH_FOG_COORD;
+      return ph_fs_fog_push(ctx, op);
+   }
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      unsigned n = nir_op_infos[alu->op].num_inputs;
+      int src[3] = { -1, -1, -1 };
+
+      switch (alu->op) {
+      case nir_op_mov:
+         return ph_fs_fog_expr(ctx, alu->src[0].src.ssa,
+                               alu->src[0].swizzle[comp], coord);
+      case nir_op_vec2:
+      case nir_op_vec3:
+      case nir_op_vec4:
+         return comp < n ? ph_fs_fog_expr(ctx, alu->src[comp].src.ssa,
+                                          alu->src[comp].swizzle[0], coord) :
+                           -1;
+      case nir_op_fneg: op.kind = PH_FOG_NEG; break;
+      case nir_op_fabs: op.kind = PH_FOG_ABS; break;
+      case nir_op_fsat: op.kind = PH_FOG_SAT; break;
+      case nir_op_fexp2: op.kind = PH_FOG_EXP2; break;
+      case nir_op_fadd: op.kind = PH_FOG_ADD; break;
+      case nir_op_fmul: op.kind = PH_FOG_MUL; break;
+      case nir_op_fmin: op.kind = PH_FOG_MIN; break;
+      case nir_op_fmax: op.kind = PH_FOG_MAX; break;
+      case nir_op_ffma:
+      case nir_op_ffma_weak:
+      case nir_op_fmad:
+         op.kind = PH_FOG_FMA;
+         break;
+      default:
+         return -1;
+      }
+      for (unsigned i = 0; i < n; i++) {
+         const unsigned c = nir_op_infos[alu->op].input_sizes[i] ? 0 :
+                            alu->src[i].swizzle[comp];
+
+         src[i] = ph_fs_fog_expr(ctx, alu->src[i].src.ssa, c, coord);
+         if (src[i] < 0)
+            return -1;
+      }
+      op.a = src[0];
+      op.b = src[1] < 0 ? 0 : src[1];
+      op.c = src[2] < 0 ? 0 : src[2];
+      return ph_fs_fog_push(ctx, op);
+   }
+   default:
+      return -1;
+   }
+}
+
+/* A scalar of the fog coordinate - GL's fog factor as the state tracker
+ * lowers it - becomes v1.x, which the vertex side fills with the
+ * factor evaluated at each vertex. */
+static bool
+ph_fs_fog_factor(struct ph_fs_ctx *ctx, nir_alu_instr *sat, int sel,
+                 struct ph_fs_src *out)
+{
+   const unsigned comp = sel < 0 ? 0 : (unsigned)sel;
+   const unsigned mark = ctx->fog_ops;
+   bool coord = false;
+
+   if (ctx->fog_root && ctx->fog_root != &sat->def)
+      return false;
+   if (!ctx->fog_root) {
+      if (sat->def.num_components != 1 || ctx->uses_fogc || ctx->uses_col1 ||
+          ph_fs_fog_expr(ctx, &sat->def, comp, &coord) < 0 || !coord) {
+         ctx->fog_ops = mark;
+         return false;
+      }
+      ctx->fog_root = &sat->def;
+   }
+   *out = (struct ph_fs_src){ .kind = PH_SRC_COLOUR, .channel = 0,
+                              .index = 1 };
+   ctx->uses_color = ctx->uses_color1 = true;
    return true;
 }
 
@@ -1315,6 +1469,11 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
 {
    struct ph_fs_src a, b, c, d;
 
+   /* The fog factor's outermost step: the saturate, or the exponential
+    * when range analysis has removed a saturate it cannot need. */
+   if ((alu->op == nir_op_fsat || alu->op == nir_op_fexp2) &&
+       ph_fs_fog_factor(ctx, alu, sel, out))
+      return true;
    switch (alu->op) {
    case nir_op_mov:
       return ph_fs_operand(ctx, alu, 0, lane, sel, out);
@@ -2252,7 +2411,12 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
    out->sampler_mask = ctx.sampler_mask;
    out->uses_color = ctx.uses_color;
    out->uses_color1 = ctx.uses_color1;
-   out->uses_fogc = ctx.uses_fogc;
+   out->uses_fogc = ctx.uses_fogc || ctx.fog_root;
+   if (ctx.fog_root) {
+      out->fog = ctx.fog;
+      out->fog_ops = ctx.fog_ops;
+      ctx.fog = NULL;
+   }
    if (ctx.pres) {
       out->pre_value = calloc(ctx.pres, sizeof(*out->pre_value));
       if (!out->pre_value) {
@@ -2288,12 +2452,50 @@ done:
    free(ctx.memo);
    free(ctx.pre);
    free(ctx.pre_memo);
+   free(ctx.fog);
    return ok;
+}
+
+float
+ph_fs_fog_eval(const struct ph_fs_program *program, float fogc,
+               const void *constants, unsigned size)
+{
+   if (!program->fog_ops)
+      return 1.0f;
+
+   float v[program->fog_ops];
+
+   for (unsigned i = 0; i < program->fog_ops; i++) {
+      const struct ph_fs_fog_op *op = &program->fog[i];
+
+      switch (op->kind) {
+      case PH_FOG_COORD: v[i] = fogc; break;
+      case PH_FOG_UNIFORM:
+         v[i] = (op->offset + 1u) * 4u <= size ?
+                ((const float *)constants)[op->offset] : 0.0f;
+         break;
+      case PH_FOG_LITERAL: v[i] = op->value; break;
+      case PH_FOG_NEG: v[i] = -v[op->a]; break;
+      case PH_FOG_ABS: v[i] = fabsf(v[op->a]); break;
+      case PH_FOG_ADD: v[i] = v[op->a] + v[op->b]; break;
+      case PH_FOG_MUL: v[i] = v[op->a] * v[op->b]; break;
+      case PH_FOG_FMA: v[i] = v[op->a] * v[op->b] + v[op->c]; break;
+      case PH_FOG_EXP2: v[i] = exp2f(v[op->a]); break;
+      case PH_FOG_MIN: v[i] = fminf(v[op->a], v[op->b]); break;
+      case PH_FOG_MAX: v[i] = fmaxf(v[op->a], v[op->b]); break;
+      case PH_FOG_SAT: v[i] = CLAMP(v[op->a], 0.0f, 1.0f); break;
+      default: v[i] = 0.0f; break;
+      }
+   }
+   return v[program->fog_ops - 1];
 }
 
 void
 ph_fs_program_fini(struct ph_fs_program *program)
 {
+   free(program->fog);
+   program->fog = NULL;
+   program->fog_ops = 0;
    free(program->pre);
    free(program->pre_value);
    program->pre = NULL;

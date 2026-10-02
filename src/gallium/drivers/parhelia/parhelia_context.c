@@ -1660,6 +1660,13 @@ ph_colour_alpha_observable(const struct ph_context *ctx)
           (!blend || (blend->colormask & PIPE_MASK_A));
 }
 
+/* The fragment program reads v1, which only the triangle stream carries. */
+static bool
+ph_fs_reads_v1(const struct ph_context *ctx)
+{
+   return ctx->fs && ctx->fs->program.valid && ctx->fs->program.uses_color1;
+}
+
 /* The alpha approximation routes, all off by default.
  *
  * Each of them replaces a texel's own alpha with something cheaper, and they
@@ -5339,7 +5346,10 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
       if (colour1 && ctx->fs->program.uses_fogc) {
          /* The fog coordinate, broadcast: the combiner reads v1 as a colour
           * and the lowered expression selects one channel of it. */
-         const float f = prim->v[v]->data[fogc][0];
+         const float f = ctx->fs->program.fog ?
+            ph_fs_fog_eval(&ctx->fs->program, prim->v[v]->data[fogc][0],
+                           ctx->fs_const_snap, ctx->fs_const_snap_size) :
+            prim->v[v]->data[fogc][0];
 
          *dst++ = f;
          *dst++ = f;
@@ -5564,7 +5574,7 @@ ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
 
    /* As for lines, a visible alpha takes the triangle expansion. */
    if (has_texture || (wide && !native_wide) ||
-       ph_colour_alpha_observable(ctx) ||
+       ph_colour_alpha_observable(ctx) || ph_fs_reads_v1(ctx) ||
        (rast && (rast->point_smooth || rast->point_quad_rasterization))) {
       ph_expand_point(stage, prim, size, rast && rast->point_smooth);
       return;
@@ -5668,7 +5678,7 @@ ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
               ctx->derived_triangles);
    /* A visible alpha needs the RGBA stream, which the native line
     * primitive does not take (it stopped the P690); triangles do. */
-   if (has_texture || ph_colour_alpha_observable(ctx) ||
+   if (has_texture || ph_colour_alpha_observable(ctx) || ph_fs_reads_v1(ctx) ||
        (rast && (rast->line_smooth || roundf(rast->line_width) > 1.0f))) {
       ph_expand_line(stage, prim, rast ? rast->line_width : 1.0f,
                      rast && rast->line_smooth);

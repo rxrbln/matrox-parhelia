@@ -58,6 +58,20 @@ enum ph_fs_class {
    PH_FS_CLASS_MODULATE2_TEX, /* t0 * t1, no vertex colour */
 };
 
+/* One step of a fog-factor expression: operands are earlier steps. */
+enum ph_fs_fog_kind {
+   PH_FOG_COORD, PH_FOG_UNIFORM, PH_FOG_LITERAL, PH_FOG_NEG, PH_FOG_ABS,
+   PH_FOG_ADD, PH_FOG_MUL, PH_FOG_FMA, PH_FOG_EXP2, PH_FOG_MIN, PH_FOG_MAX,
+   PH_FOG_SAT,
+};
+
+struct ph_fs_fog_op {
+   uint8_t kind;
+   uint16_t a, b, c;
+   uint32_t offset;        /* PH_FOG_UNIFORM: scalar index into the buffer */
+   float value;            /* PH_FOG_LITERAL */
+};
+
 struct ph_fs_program {
    struct p3d_comb_program comb;
    unsigned sampler_mask;
@@ -66,6 +80,11 @@ struct ph_fs_program {
    bool uses_color;
    bool uses_color1;       /* v1: the secondary colour or the fog coordinate */
    bool uses_fogc;         /* v1 is the fog coordinate */
+   /* v1.x is GL's fog factor, evaluated per vertex by this expression over
+    * the fog coordinate (GL allows the factor at each vertex); NULL when
+    * the program reads the raw coordinate or no fog at all. */
+   struct ph_fs_fog_op *fog;
+   unsigned fog_ops;
    bool valid;
    enum ph_fs_class cls;
    /* The preshader: uniform-only scalars the CPU evaluates before each draw;
@@ -92,6 +111,11 @@ void ph_fs_update_constants(struct ph_fs_program *program,
  * Every intermediate is clamped to [-@range, @range]. */
 void ph_fs_eval(const struct p3d_comb_program *prog, const float tex[4][4],
                 const float colour[2][4], float range, float out[4]);
+
+/* The fog factor for fog coordinate @fogc, from @program's expression. */
+float ph_fs_fog_eval(const struct ph_fs_program *program, float fogc,
+                     const void *constants, unsigned size);
+
 
 void ph_fs_dump(const struct ph_fs_program *program, FILE *f);
 
