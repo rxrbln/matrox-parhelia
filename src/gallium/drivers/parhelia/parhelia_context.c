@@ -8702,9 +8702,10 @@ static void *ph_create_fs(struct pipe_context *p,
                        (void *)fs, fs->program.reject ? fs->program.reject :
                                                         "declared samplers");
             /* A linked program the combiner cannot express fails the link with
-             * the reason instead of rendering through the texenv fallback. */
-            if (!fs->program.valid && s->report_compile_error &&
-                !s->ir.nir->info.internal) {
+             * the reason, unless its discard runs as the alpha test or it is
+             * the depth-from-texture shape. */
+            if (!fs->program.valid && !fs->kill && !fs->depth_from_texture &&
+                s->report_compile_error && !s->ir.nir->info.internal) {
                char *msg = NULL;
 
                if (asprintf(&msg, "parhelia: fragment shader exceeds the "
