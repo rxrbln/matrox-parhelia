@@ -44,7 +44,8 @@ struct ph_fs_program {
    unsigned const_ref_count;
    struct ph_fs_const_ref const_ref[2 * P3D_COMB_MAX_INSTRUCTIONS];
    bool uses_color;
-   bool uses_color1;       /* v1 carries the fog coordinate */
+   bool uses_color1;       /* v1: the secondary colour or the fog coordinate */
+   bool uses_fogc;         /* v1 is the fog coordinate */
    bool valid;
    enum ph_fs_class cls;
    const char *reject;     /* why it did not compile */

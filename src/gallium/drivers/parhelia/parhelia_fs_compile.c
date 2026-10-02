@@ -100,7 +100,7 @@ struct ph_fs_ctx {
    int tex_end[4][2];
    bool tex_end_cross[4][2];
    unsigned sampler_mask;
-   bool uses_color, uses_color1;
+   bool uses_color, uses_color1, uses_fogc, uses_col1;
    const char *reject;
 };
 
@@ -915,7 +915,12 @@ ph_fs_varying(struct ph_fs_ctx *ctx, unsigned location, int sel,
       out->index = 0;
    } else if (location == VARYING_SLOT_COL1 ||
               location == VARYING_SLOT_FOGC) {
-      /* The vertex side carries the fog coordinate in colour 1. */
+      /* The vertex side carries the secondary colour or the fog
+       * coordinate in colour 1, never both. */
+      if (location == VARYING_SLOT_FOGC ? ctx->uses_col1 : ctx->uses_fogc)
+         return ph_fs_fail(ctx, "fog and the secondary colour both need v1");
+      ctx->uses_fogc |= location == VARYING_SLOT_FOGC;
+      ctx->uses_col1 |= location == VARYING_SLOT_COL1;
       out->index = 1;
       ctx->uses_color1 = true;
    } else {
@@ -1897,6 +1902,7 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
    out->sampler_mask = ctx.sampler_mask;
    out->uses_color = ctx.uses_color;
    out->uses_color1 = ctx.uses_color1;
+   out->uses_fogc = ctx.uses_fogc;
    out->valid = true;
    out->cls = ph_fs_classify(out);
    ok = true;

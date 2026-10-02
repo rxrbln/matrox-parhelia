@@ -4895,6 +4895,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	bool colour_alpha;
    float *dst;
    const int fogc = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_FOG, 0);
+   const int col1 = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 1);
 
    /* The hardware exposes only one-face cull selectors.  FRONT_AND_BACK has
     * no packet encoding and must reject the polygon before staging it. */
@@ -5045,7 +5046,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	          !ph_env("PARHELIA_NO_FOG_COLOUR1") &&
 	          !textured && !vertex_alpha && ctx->fs &&
 	          ctx->fs->program.valid && ctx->fs->program.uses_color1 &&
-	          fogc >= 0;
+	          (ctx->fs->program.uses_fogc ? fogc : col1) >= 0;
 	if (colour1 && !ctx->warp_colour1) {
 	   /* Uploading a program drains the engine, so never do it with
 	    * vertices already staged: the batch under construction would be
@@ -5248,7 +5249,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 		*dst++ = c[2];
 		if (vertex_alpha || colour_alpha)
 			*dst++ = c[3];
-      if (colour1) {
+      if (colour1 && ctx->fs->program.uses_fogc) {
          /* The fog coordinate, broadcast: the combiner reads v1 as a colour
           * and the lowered expression selects one channel of it. */
          const float f = prim->v[v]->data[fogc][0];
@@ -5256,6 +5257,12 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
          *dst++ = f;
          *dst++ = f;
          *dst++ = f;
+      } else if (colour1) {
+         const float *s = prim->v[v]->data[col1];
+
+         *dst++ = s[0];
+         *dst++ = s[1];
+         *dst++ = s[2];
       }
       if (textured) {
          const float *tc = prim->v[v]->data[texcoord];
@@ -6446,6 +6453,10 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
               rs->fill_back != PIPE_POLYGON_MODE_FILL ||
               /* no packet encoding culls both faces; the draw module does */
               rs->cull_face == PIPE_FACE_FRONT_AND_BACK))
+      return false;
+   /* v1 - the secondary colour or the fog coordinate - is carried only by
+    * the window-space stream. */
+   if (ctx->fs && ctx->fs->program.valid && ctx->fs->program.uses_color1)
       return false;
    /* An untextured colour with a visible alpha needs the RGBA stream, which
     * is measured only in window space (x,y,z,r,g,b,a); the draw module
