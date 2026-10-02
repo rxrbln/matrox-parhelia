@@ -1491,7 +1491,10 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 		goto out_aperture_unlock;
 
 	for (copied = 0; copied < args->size;) {
-		u32 bytes = min_t(u64, args->size - copied, SZ_8K);
+		/* The descriptor addresses VRAM in 32-byte units: publish the unit
+		 * holding the offset and copy from inside the window. */
+		u32 skew = (args->offset + copied) & (PARHELIA_APERTURE_ADDR_UNIT - 1);
+		u32 bytes = min_t(u64, args->size - copied, SZ_8K - skew);
 		u32 root_before[3], root_after[3];
 		bool watch_root;
 
@@ -1500,7 +1503,8 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 			goto out_mapping;
 		}
 		ret = parhelia_vram_gpu_addr(pdev, &bo->gbo,
-				args->offset + copied, bytes, &surface_address);
+				args->offset + copied - skew, bytes + skew,
+				&surface_address);
 		if (ret)
 			goto out_mapping;
 
@@ -1529,10 +1533,10 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 			parhelia_read_root_samples(pdev, root_before);
 		if (download) {
 			memcpy_fromio((u8 *)buffer + copied,
-				      (u8 __iomem *)pdev->vram + mapping.node.start,
-				      bytes);
+				      (u8 __iomem *)pdev->vram + mapping.node.start +
+				      skew, bytes);
 		} else {
-			memcpy_toio((u8 __iomem *)pdev->vram + mapping.node.start,
+			memcpy_toio((u8 __iomem *)pdev->vram + mapping.node.start + skew,
 				    (u8 *)buffer + copied, bytes);
 			wmb();
 			parhelia_read(pdev,

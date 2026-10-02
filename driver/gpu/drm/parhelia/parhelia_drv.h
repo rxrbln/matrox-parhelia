@@ -184,6 +184,8 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 #define PARHELIA_HOST_APERTURE_ALIGN	SZ_256K
 #define PARHELIA_HOST_APERTURE_LIMIT	SZ_16M
 #define PARHELIA_HOST_APERTURE_FIRST	(2 * PARHELIA_HOST_APERTURE_ALIGN)
+/* A descriptor's VRAM address drops its low five bits (MEASURED, P690). */
+#define PARHELIA_APERTURE_ADDR_UNIT	32
 #define PARHELIA_DC_LUT_INDEX		0x038
 #define PARHELIA_DC_LUT_R		0x03c
 #define PARHELIA_DC_LUT_G		0x040
