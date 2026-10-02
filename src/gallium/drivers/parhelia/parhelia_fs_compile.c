@@ -1396,6 +1396,23 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
                 ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &b, &c, out) :
                 ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &c, &b, out);
       }
+      if (b2b->op == nir_op_feq || b2b->op == nir_op_fneu) {
+         /* x == y holds where both x - y >= 0 and y - x >= 0. */
+         struct ph_fs_src t, n;
+         const bool eq = b2b->op == nir_op_feq;
+
+         if (!ph_fs_operand(ctx, b2b, 0, lane, req, &a) ||
+             !ph_fs_operand(ctx, b2b, 1, lane, req, &d) ||
+             !ph_fs_apply(ctx, lane, &d, P3D_COMB_MOD_NEG) ||
+             !ph_fs_node(ctx, lane, P3D_COMB_ADD, &a, &d, NULL, &a) ||
+             !ph_fs_operand(ctx, alu, eq ? 1 : 2, lane, sel, &b) ||
+             !ph_fs_operand(ctx, alu, eq ? 2 : 1, lane, sel, &c) ||
+             !ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &b, &c, &t))
+            return false;
+         n = a;
+         return ph_fs_apply(ctx, lane, &n, P3D_COMB_MOD_NEG) &&
+                ph_fs_node(ctx, lane, P3D_COMB_CMP, &n, &t, &c, out);
+      }
       if (b2b->op != nir_op_b2b1)
          return ph_fs_fail(ctx, "a select on a condition that is no boolean value");
       return ph_fs_operand(ctx, b2b, 0, lane, req, &a) &&
