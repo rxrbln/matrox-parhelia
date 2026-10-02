@@ -9487,6 +9487,20 @@ ph_zinit_fits(const struct parhelia_resource *r)
    return bytes && bytes <= (uint64_t)PH_ZINIT_TILES * PH_ZINIT_TILE_BYTES;
 }
 
+/* Rows of whole tile rows inside the coverage, counted in address order from
+ * the origin (the vendor's own split, mtxpserd.dll 0xa0d95, with the measured
+ * 640 tiles).  The P690 4 KiB tile is 16 rows high. */
+static unsigned
+ph_zinit_covered_rows(const struct parhelia_resource *r)
+{
+   const uint64_t row_bytes = (uint64_t)r->stride * r->cpp * 16;
+
+   if (r->tile_layout != PARHELIA_TILE_64X16_4K || !row_bytes)
+      return 0;
+   return (unsigned)((uint64_t)PH_ZINIT_TILES * PH_ZINIT_TILE_BYTES /
+                     row_bytes) * 16;
+}
+
 /* The vertex depth that stores exactly @value.  Both quotients are exact in
  * binary32 for every representable depth, so the interpolated constant lands
  * in its own bucket whether the hardware rounds or truncates. */
@@ -9558,17 +9572,22 @@ ph_zinit_resolve(struct ph_context *ctx, struct parhelia_resource *r)
    pipe_resource_reference(&r->zinit_colour, NULL);
 }
 
-/* Native format 0x36 keeps Z24 in [23:0] and stencil in [31:24]; 0x2a is a
- * bare 16-bit depth with no stencil. */
+/* Native format 0x36 keeps Z24 in [23:0] and stencil in [31:24] (unused for
+ * X8Z24); 0x2a is a bare 16-bit depth with no stencil. */
 static uint32_t
 ph_zs_write_mask(enum pipe_format format, unsigned buffers,
                  uint8_t stencil_mask)
 {
-   if (format == PIPE_FORMAT_Z16_UNORM)
+   if (format == PIPE_FORMAT_Z16_UNORM || format == PIPE_FORMAT_Z24X8_UNORM)
       return (buffers & PIPE_CLEAR_DEPTH) ? 0xffffffffu : 0;
    return ((buffers & PIPE_CLEAR_DEPTH) ? 0x00ffffffu : 0) |
           ((buffers & PIPE_CLEAR_STENCIL) ? (uint32_t)stencil_mask << 24 : 0);
 }
+
+static void ph_fill_surface(struct ph_context *ctx,
+                            struct parhelia_resource *r, unsigned format,
+                            uint32_t value, uint32_t write_mask, unsigned x,
+                            unsigned y, unsigned width, unsigned height);
 
 /* Arm the hardware clear instead of filling.  It carries neither an extent
  * nor a write mask, so only a whole-surface clear of every bit qualifies, and
@@ -9580,12 +9599,16 @@ ph_zinit_clear(struct ph_context *ctx, struct parhelia_resource *r,
 {
    struct parhelia_batch *batch = &ctx->build_batch;
    struct parhelia_resource *colour;
+   unsigned tail;
    int ret;
 
    if (!ph_zinit_enabled() || !r || !r->handle || ctx->submit_error)
       return false;
    if (x || y || width != r->base.width0 || height != r->base.height0 ||
-       write_mask != 0xffffffffu || r->upload_texture || !ph_zinit_fits(r))
+       write_mask != 0xffffffffu || r->upload_texture)
+      return false;
+   tail = ph_zinit_fits(r) ? r->base.height0 : ph_zinit_covered_rows(r);
+   if (!tail)
       return false;
    if (!ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture)
       return false;
@@ -9611,6 +9634,11 @@ ph_zinit_clear(struct ph_context *ctx, struct parhelia_resource *r,
    r->zinit_value = value;
    pipe_resource_reference(&r->zinit_colour, &colour->base);
    ctx->zinit_res = r;
+   /* Rows past the coverage are plain memory: fill them with the same value.
+    * Tracked tiles of a partial tile row get it twice, which is harmless. */
+   if (tail < r->base.height0)
+      ph_fill_surface(ctx, r, r->surf_fmt, value, write_mask, 0, tail,
+                      width, r->base.height0 - tail);
    r->tiled_dirty = true;
    r->linear_dirty = false;
    r->mip_defined |= BITFIELD_BIT(0);
@@ -9642,7 +9670,8 @@ ph_zinit_rect_clear(struct ph_context *ctx, struct parhelia_resource *r,
       return false;
    /* Stencil planes have no depth-pipe equivalent here, and a masked clear
     * has no equivalent at all. */
-   if (r->surf_fmt != 0x2a || write_mask != 0xffffffffu)
+   if ((r->surf_fmt != 0x2a && r->base.format != PIPE_FORMAT_Z24X8_UNORM) ||
+       write_mask != 0xffffffffu)
       return false;
    colour = ph_resource(r->zinit_colour);
    state = (struct p3d_state){
@@ -9688,20 +9717,17 @@ ph_zinit_rect_clear(struct ph_context *ctx, struct parhelia_resource *r,
    return true;
 }
 
+/* The 2-D fill itself, for a surface with no Z unit state to resolve. */
 static void
-ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
-                 unsigned format, uint32_t value, uint32_t write_mask,
-                 unsigned x, unsigned y, unsigned width, unsigned height)
+ph_fill_surface(struct ph_context *ctx, struct parhelia_resource *r,
+                unsigned format, uint32_t value, uint32_t write_mask,
+                unsigned x, unsigned y, unsigned width, unsigned height)
 {
    struct parhelia_batch *batch = &ctx->build_batch;
    unsigned alloc_height;
    bool full;
    int ret;
-   if (!r || !r->handle || ctx->submit_error || !write_mask)
-      return;
-   /* A fill only writes the bits of its mask inside its rectangle, so the
-    * tiles the Z unit still owns have to reach memory first. */
-   ph_zinit_resolve(ctx, r);
+
    if (r->upload_texture) {
       PH_REFUSE("a clear of sampler-only storage is dropped\n");
       return;
@@ -9786,6 +9812,19 @@ ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
       r->mip_defined |= BITFIELD_BIT(0);
       r->content_generation++;
    }
+}
+
+static void
+ph_clear_surface(struct ph_context *ctx, struct parhelia_resource *r,
+                 unsigned format, uint32_t value, uint32_t write_mask,
+                 unsigned x, unsigned y, unsigned width, unsigned height)
+{
+   if (!r || !r->handle || ctx->submit_error || !write_mask)
+      return;
+   /* A fill only writes the bits of its mask inside its rectangle, so the
+    * tiles the Z unit still owns have to reach memory first. */
+   ph_zinit_resolve(ctx, r);
+   ph_fill_surface(ctx, r, format, value, write_mask, x, y, width, height);
 }
 
 /* The format whose byte layout a colour surface's storage really has. */
