@@ -55,6 +55,7 @@ static int parhelia_ttm_move(struct ttm_buffer_object *bo, bool evict,
 		ret = parhelia_submit_idle_lock(pdev);
 		if (ret)
 			return ret;
+		parhelia_host_views_drop(pdev, bo);
 		ret = parhelia_vram_copy_resources(pdev, bo, old_mem, new_mem);
 		parhelia_submit_unlock(pdev);
 		if (ret) {
@@ -91,6 +92,8 @@ static int parhelia_ttm_move(struct ttm_buffer_object *bo, bool evict,
 		ret = parhelia_submit_idle_lock(pdev);
 		if (ret)
 			return ret;
+		if (old_vram)
+			parhelia_host_views_drop(pdev, bo);
 		ret = parhelia_vram_move_pages(pdev, bo,
 					       new_vram ? new_mem : old_mem,
 					       new_vram);

@@ -1071,7 +1071,7 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	if ((cpp != 4 && cpp != 2) || fb->pitches[0] % cpp)
 		return -EINVAL;
 	pitch_pixels = fb->pitches[0] / cpp;
-	if (pitch_pixels != (bo->host_aperture ? bo->host_pitch : bo->gpu_pitch) / cpp ||
+	if (pitch_pixels != parhelia_bo_cpu_pitch(bo) / cpp ||
 	    bo->gpu_pitch / cpp != ALIGN(fb->width, 64 * 4 / cpp) ||
 	    bo->gpu_pitch / cpp > 0x3fff)
 		return -EINVAL;
@@ -1216,7 +1216,7 @@ parhelia_fb_create(struct drm_device *drm, struct drm_file *file,
 	}
 	bo = to_parhelia_bo(gem);
 	if (!parhelia_bo_is_native(bo) ||
-	    (bo->host_aperture ? bo->host_pitch : bo->gpu_pitch) !=
+	    parhelia_bo_cpu_pitch(bo) !=
 		mode_cmd->pitches[0] ||
 	    bo->width < mode_cmd->width || bo->height < mode_cmd->height) {
 		fb = ERR_PTR(-EINVAL);

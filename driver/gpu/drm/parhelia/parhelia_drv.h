@@ -173,7 +173,8 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 /* Host-aperture surface descriptors.  BAR0 accesses falling inside a valid
  * descriptor are translated between a CPU-linear view and the surface layout
  * named by CTRL.  Slot 0 remains the engine bootstrap; dumb BOs own slots
- * 1..19 for their whole mapped/pinned lifetime.
+ * for their whole lifetime, native class targets borrow evictable views of
+ * slots 1..19 on CPU fault.
  */
 #define PARHELIA_HOST_APERTURE_SLOT(n)	((n) * 0x10)
 #define PARHELIA_LOCAL_BANK_B_BASE	0x08000000u
@@ -505,6 +506,9 @@ enum parhelia_placement_class {
 struct parhelia_bo {
 	struct drm_gem_vram_object gbo;
 	struct parhelia_aperture_mapping aperture;
+	/* Demand-bound host-aperture views of a native class target, see
+	 * parhelia_host_view_fault(). */
+	struct list_head host_views;
 	u32 width;
 	u32 height;
 	u32 gpu_pitch;
@@ -515,7 +519,9 @@ struct parhelia_bo {
 	u8 layout;
 	u8 aperture_slot;
 	u8 placement_class;
+	u8 cpp;
 	bool host_aperture;
+	bool host_view;
 };
 
 static inline struct parhelia_bo *to_parhelia_bo(struct drm_gem_object *gem)
@@ -552,6 +558,8 @@ struct parhelia_device {
 	struct drm_mm aperture_mm;
 	struct list_head aperture_mappings;
 	u8 aperture_mapping_count;
+	/* Evictable host views, least recently used first. */
+	struct list_head host_view_lru;
 	bool aperture_live;
 	/* Default-off root corruption tracer.  The saved sample survives across
 	 * ioctl and mmap boundaries, so a userspace store between two kernel
@@ -747,6 +755,13 @@ void parhelia_bo_set_layout(struct drm_gem_vram_object *gbo, u8 layout,
 void parhelia_bo_set_placement_class(struct drm_gem_vram_object *gbo, u8 class);
 void parhelia_bo_make_unmappable(struct drm_gem_vram_object *gbo);
 void parhelia_bo_force_unmappable(struct drm_gem_vram_object *gbo);
+int parhelia_bo_init_host_view(struct drm_gem_vram_object *gbo, u32 cpp,
+			       u32 alloc_height);
+void parhelia_host_views_drop(struct parhelia_device *pdev,
+			      struct ttm_buffer_object *tbo);
+void parhelia_host_views_revoke_cpu(struct parhelia_device *pdev,
+				    struct drm_gem_object *gem);
+u32 parhelia_bo_cpu_pitch(const struct parhelia_bo *bo);
 bool parhelia_texture_upload_enabled(void);
 bool parhelia_bo_is_native(const struct parhelia_bo *bo);
 bool parhelia_gem_is_owned(const struct drm_gem_object *gem);

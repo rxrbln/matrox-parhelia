@@ -1743,6 +1743,7 @@ static int parhelia_slot_attach_fence(struct parhelia_submit_slot *slot,
 		dma_resv_unlock(obj->resv);
 		if (ret)
 			break;
+		parhelia_host_views_revoke_cpu(to_parhelia(obj->dev), obj);
 	}
 	return ret;
 }
@@ -3214,12 +3215,17 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	else if (args->flags & PARHELIA_CREATE_RENDER_NATIVE_SCANOUT)
 		parhelia_bo_set_placement_class(bo,
 			PARHELIA_PLACEMENT_NATIVE_SCANOUT);
-	if (layout == PARHELIA_BO_LAYOUT_TEXTURE)
+	if (layout == PARHELIA_BO_LAYOUT_TEXTURE) {
 		parhelia_bo_make_unmappable(bo);
-	else if (args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
-				PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
-				PARHELIA_CREATE_RENDER_NATIVE_SCANOUT))
-		parhelia_bo_force_unmappable(bo);
+	} else if (args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
+				  PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
+				  PARHELIA_CREATE_RENDER_NATIVE_SCANOUT)) {
+		ret = parhelia_bo_init_host_view(bo, cpp, allocation_height);
+		if (ret) {
+			drm_gem_object_put(&bo->bo.base);
+			return ret;
+		}
+	}
 	/* A new object is zeroed through the driver's own aperture window on
 	 * every family, because TTM's CPU clear over BAR0 lands wherever that
 	 * translated window currently points.  The pin is held for the clear only:

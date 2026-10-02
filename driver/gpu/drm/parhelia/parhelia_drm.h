@@ -72,6 +72,8 @@
  * third 32 MiB band (bank B) so display refresh does not compete with the
  * colour and texture traffic of bank A. */
 #define PARHELIA_CREATE_RENDER_NATIVE_SCANOUT	(1u << 5)
+/* The three native classes report mmap_offset 0, yet their GEM mmap offset
+ * (MAP_DUMB) is a CPU-linear view with GET_BO_INFO's host_pitch. */
 
 /* Bring-up tiled render allocation, deliberately separate from linear dumb
  * scanout. Both 32-bit colour and S8Z24 use this storage. The kernel reserves
@@ -110,6 +112,7 @@ struct drm_parhelia_create_vertex {
 #define PARHELIA_BO_LAYOUT_NATIVE_64X32	1
 #define PARHELIA_BO_LAYOUT_NATIVE_64X16	2
 #define PARHELIA_BO_LAYOUT_TEXTURE		3
+/* The object's mmap is a CPU-linear host-aperture view of its native bytes. */
 #define PARHELIA_BO_INFO_HOST_APERTURE	(1u << 0)
 
 struct drm_parhelia_get_bo_info {
@@ -119,7 +122,9 @@ struct drm_parhelia_get_bo_info {
 	__u32 width;
 	__u32 height;
 	__u32 pitch; /* out: native GPU byte pitch, not dumb host pitch */
-	__u32 pad;
+	/* out: byte pitch of the CPU-linear mmap (MAP_DUMB offset) and of
+	 * framebuffers; zero when the object has no host-aperture view */
+	__u32 host_pitch;
 	__u64 size;
 };
 
