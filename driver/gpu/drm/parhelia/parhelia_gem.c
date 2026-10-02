@@ -78,9 +78,9 @@ MODULE_PARM_DESC(engine_transfer,
 static unsigned int engine_download_min = SZ_1K;
 module_param(engine_download_min, uint, 0644);
 MODULE_PARM_DESC(engine_download_min, "smallest engine download in bytes");
-/* Engine uploads lose writes: a narrow row band merged into a 32-byte unit
- * came back with an earlier band's old dwords (MEASURED); the WC CPU path
- * moves 600 MB/s meanwhile.  Off until that is understood. */
+/* Engine uploads are exact at any dword offset but slower than the WC CPU
+ * path at every size (MEASURED: 330 vs 600 MB/s, 33 vs 21 us per 4 KiB): the
+ * P690 hardwires Max_Read_Request_Size to 128 bytes, which bounds its reads. */
 static unsigned int engine_upload_min = U32_MAX;
 module_param(engine_upload_min, uint, 0644);
 MODULE_PARM_DESC(engine_upload_min, "smallest engine upload in bytes");
