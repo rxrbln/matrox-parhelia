@@ -422,6 +422,7 @@ struct ph_context {
    unsigned tcl_clip_why[4];	/* w <= 0, guard band, near, far */
    enum ph_tcl_reason tcl_last_reason;
    unsigned tcl_program_draws;
+   unsigned tcl_box_draws;      /* cleared by the position box, no per-vertex test */
    unsigned tcl_slice_draws;    /* bounded through a CPU position slice */
    uint32_t fence;
    bool async_pending;
@@ -797,9 +798,9 @@ ph_stats_frame(struct ph_context *ctx)
                               ctx->tcl_reason[PH_TCL_NO_PRIMITIVE] ||
                               ctx->tcl_reason[PH_TCL_NO_FIXUP]))
       fprintf(stderr,
-              "parhelia stats/frame: %.1f hardware-transform draws (%.1f compiled vertex programs, %.1f bounded by a position slice), %.1f not expressible, %.1f handed back to the software clipper\n",
+              "parhelia stats/frame: %.1f hardware-transform draws (%.1f compiled vertex programs, %.1f cleared by the position box, %.1f bounded by a position slice), %.1f not expressible, %.1f handed back to the software clipper\n",
               ctx->tcl_draws / n, ctx->tcl_program_draws / n,
-              ctx->tcl_slice_draws / n,
+              ctx->tcl_box_draws / n, ctx->tcl_slice_draws / n,
               ctx->tcl_fallbacks / n, ctx->tcl_clip_fallbacks / n);
    if (ctx->stat.start_ns && (ctx->tcl_draws || ctx->tcl_clip_fallbacks))
       fprintf(stderr, "  hardware transform: %.0f vertices; software clipper "
@@ -817,7 +818,7 @@ ph_stats_frame(struct ph_context *ctx)
    memset(ctx->tcl_clip_why, 0, sizeof(ctx->tcl_clip_why));
    ctx->tcl_verts = ctx->tcl_clip_verts = 0;
    ctx->tcl_draws = ctx->tcl_fallbacks = ctx->tcl_clip_fallbacks = 0;
-   ctx->tcl_program_draws = ctx->tcl_slice_draws = 0;
+   ctx->tcl_program_draws = ctx->tcl_box_draws = ctx->tcl_slice_draws = 0;
    for (unsigned k = 0; ctx->stats_sync && k < PH_STAT_KINDS; k++)
       if (ctx->stat.kind_count[k])
          fprintf(stderr,
@@ -7175,6 +7176,168 @@ ph_tcl_vertices_fit(struct ph_context *ctx, const float *vertices,
    return true;
 }
 
+/* The object-space box of the positions a draw references: from the
+ * buffer's cache while its contents are unchanged, else one min/max pass
+ * over the referenced vertex range. */
+static bool
+ph_tcl_position_box(struct ph_context *ctx, const uint32_t *elts, unsigned n,
+                    float lo_out[3], float hi_out[3])
+{
+   const struct pipe_vertex_element *e;
+   const struct pipe_vertex_buffer *vb;
+   struct parhelia_resource *res = NULL;
+   const uint8_t *map;
+   unsigned comps, offset, stride, lo = UINT_MAX, hi = 0;
+
+   if (!ctx->vs || ctx->vs->pos_input < 0 ||
+       (unsigned)ctx->vs->pos_input >= ctx->velems->count || !n)
+      return false;
+   e = &ctx->velems->elem[ctx->vs->pos_input];
+   if (e->src_format == PIPE_FORMAT_R32G32B32_FLOAT)
+      comps = 3;
+   else if (e->src_format == PIPE_FORMAT_R32G32_FLOAT)
+      comps = 2;
+   else
+      return false;
+   vb = &ctx->draw->pt.vertex_buffer[e->vertex_buffer_index];
+   if (vb->is_user_buffer) {
+      map = vb->buffer.user;
+   } else {
+      if (!vb->buffer.resource)
+         return false;
+      res = ph_resource(vb->buffer.resource);
+      map = res->malloc_data;
+   }
+   if (!map)
+      return false;
+   offset = vb->buffer_offset + e->src_offset;
+   stride = e->src_stride;
+   for (unsigned i = 0; i < n; i++) {
+      lo = MIN2(lo, elts[i]);
+      hi = MAX2(hi, elts[i]);
+   }
+   if (res && (uint64_t)hi * stride + offset + comps * 4u > res->base.width0)
+      return false;
+   if (res && !res->data_volatile) {
+      for (unsigned i = 0; i < res->bounds_count; i++) {
+         const struct ph_vertex_bounds *b = &res->bounds[i];
+
+         if (b->gen == res->data_gen && b->offset == offset &&
+             b->stride == stride && b->format == e->src_format &&
+             b->lo == lo && b->hi == hi) {
+            memcpy(lo_out, b->min, 3 * sizeof(float));
+            memcpy(hi_out, b->max, 3 * sizeof(float));
+            return true;
+         }
+      }
+   }
+   lo_out[0] = lo_out[1] = lo_out[2] = INFINITY;
+   hi_out[0] = hi_out[1] = hi_out[2] = -INFINITY;
+   if (comps == 2)
+      lo_out[2] = hi_out[2] = 0.0f;
+   for (unsigned v = lo; v <= hi; v++) {
+      float p[3];
+
+      memcpy(p, map + offset + (size_t)v * stride, comps * sizeof(float));
+      for (unsigned c = 0; c < comps; c++) {
+         /* NaN fails both compares and keeps the box unusable. */
+         if (!(p[c] >= lo_out[c]))
+            lo_out[c] = isnan(p[c]) ? NAN : p[c];
+         if (!(p[c] <= hi_out[c]))
+            hi_out[c] = isnan(p[c]) ? NAN : p[c];
+      }
+   }
+   if (res && !res->data_volatile) {
+      struct ph_vertex_bounds *b = NULL;
+
+      /* Entries of an older content generation are reused first. */
+      for (unsigned i = 0; i < res->bounds_count && !b; i++)
+         if (res->bounds[i].gen != res->data_gen)
+            b = &res->bounds[i];
+      if (!b) {
+         if (res->bounds_count == res->bounds_cap) {
+            unsigned cap = MAX2(4u, res->bounds_cap * 2u);
+            struct ph_vertex_bounds *grown =
+               realloc(res->bounds, cap * sizeof(*grown));
+
+            if (grown) {
+               res->bounds = grown;
+               res->bounds_cap = cap;
+            }
+         }
+         if (res->bounds_count < res->bounds_cap)
+            b = &res->bounds[res->bounds_count++];
+      }
+      if (b) {
+         *b = (struct ph_vertex_bounds){ .gen = res->data_gen,
+                                         .offset = offset, .stride = stride,
+                                         .format = e->src_format,
+                                         .lo = lo, .hi = hi };
+         memcpy(b->min, lo_out, 3 * sizeof(float));
+         memcpy(b->max, hi_out, 3 * sizeof(float));
+      }
+   }
+   return true;
+}
+
+/* Whether every vertex inside the box lies within the clip volume and guard
+ * band: the bounds are linear in the position, so the eight corners decide
+ * it, and the draw then needs no per-vertex test at all. */
+static bool
+ph_tcl_box_fits(const struct ph_context *ctx, const float *m,
+                struct ph_slice *slice, const float lo[3], const float hi[3])
+{
+   const float *constants = NULL;
+   unsigned constant_size = 0;
+
+   float gx = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[0])) /
+              MAX2(fabsf(ctx->viewport.scale[0]), 1e-6f);
+   float gy = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[1])) /
+              MAX2(fabsf(ctx->viewport.scale[1]), 1e-6f);
+
+   if (gx <= 1.0f || gy <= 1.0f)
+      return false;
+   if (slice) {
+      const uint8_t *base = ctx->user_constants[MESA_SHADER_VERTEX];
+
+      if (!base && ctx->constants[MESA_SHADER_VERTEX])
+         base = ph_resource(ctx->constants[MESA_SHADER_VERTEX])->malloc_data;
+      if (base) {
+         constants = (const float *)(base +
+                                     ctx->constant_offset[MESA_SHADER_VERTEX]);
+         constant_size = ctx->constant_size[MESA_SHADER_VERTEX];
+      }
+   }
+   for (unsigned k = 0; k < 8; k++) {
+      const float p[3] = { k & 1 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1],
+                           k & 4 ? hi[2] : lo[2] };
+      float x, y, z, w;
+
+      if (slice) {
+         float input[32][4] = { { 0 } }, clip[4];
+
+         memcpy(input[ctx->vs->pos_input], p, sizeof(p));
+         input[ctx->vs->pos_input][3] = 1.0f;
+         ph_slice_eval(slice, (const float (*)[4])input, constants,
+                       constant_size, clip);
+         x = clip[0];
+         y = clip[1];
+         z = clip[2];
+         w = clip[3];
+      } else {
+         x = m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3];
+         y = m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7];
+         z = m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11];
+         w = m[12] * p[0] + m[13] * p[1] + m[14] * p[2] + m[15];
+      }
+
+      if (!(w > 1e-6f) || !(fabsf(x) <= gx * w) || !(fabsf(y) <= gy * w) ||
+          !(z >= -w) || !(z <= w))
+         return false;
+   }
+   return true;
+}
+
 struct ph_tcl_layout {
    bool textured, multitextured;
    bool colour_alpha;           /* the colour slot is RGBA */
@@ -7484,6 +7647,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    unsigned vs_const_vec4s = 0;
    uint32_t entry = 0;
    float mvp[16];
+   bool box_fits;
 
    ctx->tcl_last_reason = PH_TCL_NO_DRAW_SHAPE;
    if (info->primitive_restart || info->instance_count != 1 ||
@@ -7613,8 +7777,28 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    if (lay.program)
       ctx->tcl_program_draws++;
 
-   if (lay.program && ctx->vs->pos_slice)
-      ctx->tcl_slice_draws++;
+   /* A box of all referenced positions inside the clip volume clears the
+    * whole draw at once; otherwise each chunk is tested per vertex. */
+   {
+      float lo[3], hi[3];
+
+      struct ph_slice *slice = lay.program ? ctx->vs->pos_slice : NULL;
+
+      /* An affine position slice that reads only the position input is
+       * bounded by its corners just like a matrix product. */
+      /* PARHELIA_TCL_BOX=1: the vendor tests every vertex; the box is a
+       * deviation that stays opt-in until it is measured to pay. */
+      box_fits = ph_env("PARHELIA_TCL_BOX") &&
+                 (!slice || (slice->affine && ctx->vs->pos_input >= 0 &&
+                             ctx->vs->pos_input < 32 &&
+                             slice->input_mask == 1u << ctx->vs->pos_input)) &&
+                 ph_tcl_position_box(ctx, elts, ntri * 3, lo, hi) &&
+                 ph_tcl_box_fits(ctx, mvp, slice, lo, hi);
+      if (box_fits)
+         ctx->tcl_box_draws++;
+      else if (lay.program && ctx->vs->pos_slice)
+         ctx->tcl_slice_draws++;
+   }
    limit = ph_triangle_batch_limit(ctx);
    while (done < ntri) {
       unsigned room = ph_logical_vertex_limit(ctx) / (3 * lay.dpv);
@@ -7648,7 +7832,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
                c[3] = have ? constant[3] : 1.0f;
          }
       }
-      if (!ph_tcl_vertices_fit(ctx, dst, chunk * 3, lay.dpv)) {
+      if (!box_fits && !ph_tcl_vertices_fit(ctx, dst, chunk * 3, lay.dpv)) {
          /* Publish what already fitted, then let the software clipper own
           * the rest of this draw. */
          if (ctx->triangles)
@@ -10909,6 +11093,7 @@ ph_resource_copy_region(struct pipe_context *p,
           (uint64_t)src_box->x + src_box->width > src->width0 ||
           (uint64_t)dstx + src_box->width > dst->width0)
          return;
+      dr->data_gen++;
       memmove((uint8_t *)dr->malloc_data + dstx,
               (uint8_t *)sr->malloc_data + src_box->x, src_box->width);
       return;
@@ -11557,6 +11742,10 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
    t->base.level = level;
    t->base.box = *box;
    if (!texture) {
+      if (usage & PIPE_MAP_WRITE)
+         r->data_gen++;
+      if (usage & PIPE_MAP_PERSISTENT)
+         r->data_volatile = true;
       *out = &t->base;
       return (uint8_t *)r->malloc_data + box->x;
    }
@@ -11861,7 +12050,11 @@ static void *ph_texture_map(struct pipe_context *p, struct pipe_resource *r,
                             struct pipe_transfer **t)
 { return ph_map(p, r, l, u, b, t, true); }
 static void ph_buffer_unmap(struct pipe_context *p, struct pipe_transfer *t)
-{ ph_unmap(p, t, false); }
+{
+   if (t->usage & PIPE_MAP_WRITE)
+      ph_resource(t->resource)->data_gen++;
+   ph_unmap(p, t, false);
+}
 static void ph_texture_unmap(struct pipe_context *p, struct pipe_transfer *t)
 { ph_unmap(p, t, true); }
 

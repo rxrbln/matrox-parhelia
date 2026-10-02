@@ -1393,6 +1393,7 @@ ph_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *pres)
 {
    struct parhelia_resource *r = ph_resource(pres);
 
+   free(r->bounds);
    /* Nothing can consume an outstanding hardware depth clear once the surface
     * is gone; only the resolve target's reference has to be released. */
    r->zinit_pending = false;

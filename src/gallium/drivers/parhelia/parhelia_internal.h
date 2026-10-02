@@ -70,6 +70,11 @@ struct parhelia_screen {
  * or dma-buf boundary gets a distinct linear image; rendering never treats
  * that image as a native 3D surface.
  */
+struct ph_vertex_bounds {
+   uint32_t gen, offset, stride, format, lo, hi;
+   float min[4], max[4];
+};
+
 struct parhelia_resource {
    struct pipe_resource base;
    uint32_t handle;
@@ -115,6 +120,14 @@ struct parhelia_resource {
    /* Increment after any CPU-visible image write.  Predicate caches use this
     * instead of dirty flags because uploads may update both representations. */
    uint64_t content_generation;
+   /* Vertex buffers: @data_gen counts CPU writes; a persistent map makes
+    * the contents unknowable, so nothing is cached for it any more.  The
+    * position bounds the hardware transform computed per attribute layout
+    * and vertex range stay valid while @data_gen is unchanged. */
+   uint32_t data_gen;
+   bool data_volatile;
+   struct ph_vertex_bounds *bounds;
+   unsigned bounds_count, bounds_cap;
    /* P690 does not expose sampled alpha from its four-byte texture decoder.
     * These texture-layout BOs are generated lazily from level zero: one
     * carries A replicated into RGB for the native unit-1 alpha route, the
