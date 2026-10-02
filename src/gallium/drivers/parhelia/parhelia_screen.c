@@ -52,6 +52,8 @@ ph_query_bo(struct parhelia_screen *screen, uint32_t handle,
  * draw's software fragment path; vertex NIR is executed by draw as well.  Use
  * the established no-integer lowering contract for that combination. */
 static const nir_shader_compiler_options ph_fs_nir_options = {
+   /* The combiner reads COL0/COL1 as fixed RGBA interpolators. */
+   .io_options = nir_io_dont_compact_color_varyings,
    .fdot_replicates = true,
    .float_mul_add32 =
       nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
