@@ -5857,9 +5857,11 @@ ph_stage_coverage_quad(struct draw_stage *stage, struct prim_header *prim,
    ctx->ov_valid = false;
 }
 
-/* A smooth line as coverage in alpha: a full-alpha core of width w - 1 and a
- * one-pixel ramp to zero on either side, so each column across the line sums
- * to the line's width - GL's area coverage, filtered by a tent. */
+/* A smooth line as coverage in alpha.  Across it, a full-alpha core of
+ * width w - 1 and a one-pixel ramp to zero on either side, so each column
+ * sums to the width (GL's area coverage under a tent); along it, the same
+ * one-pixel ramp centred on each end, which is a pixel's box overlap with
+ * the end - what a stippled smooth line's dashes need. */
 static bool
 ph_coverage_line(struct draw_stage *stage, struct prim_header *prim,
                  float width)
@@ -5872,43 +5874,62 @@ ph_coverage_line(struct draw_stage *stage, struct prim_header *prim,
    const float len = sqrtf(dx * dx + dy * dy);
    const float h = 0.5f * CLAMP(width, 1.0f, 2048.0f);
    const float inner = h - 0.5f, outer = h + 0.5f;
-   float c[2][4], nx, ny;
+   float c[2][4], along[4], across[4], a_al[4], a_ac[4];
+   unsigned na, nc;
 
    if (len <= 0.0f || !ph_line_coverage_colours(ctx, prim, col, c))
       return false;
-   nx = -dy / len;
-   ny = dx / len;
-   for (int side = -1; side <= 1; side += 2) {
-      const float xy[4][2] = {
-         { p0[0] + side * nx * inner, p0[1] + side * ny * inner },
-         { p1[0] + side * nx * inner, p1[1] + side * ny * inner },
-         { p1[0] + side * nx * outer, p1[1] + side * ny * outer },
-         { p0[0] + side * nx * outer, p0[1] + side * ny * outer },
-      };
-      const float rgba[4][4] = {
-         { c[0][0], c[0][1], c[0][2], c[0][3] },
-         { c[1][0], c[1][1], c[1][2], c[1][3] },
-         { c[1][0], c[1][1], c[1][2], 0.0f },
-         { c[0][0], c[0][1], c[0][2], 0.0f },
-      };
+   /* Stations along the line (from p0) and across it, with their coverage:
+    * along, a pixel's overlap with [0, len], a trapezoid. */
+   {
+      const float lo = MIN2(0.5f, len - 0.5f), hi = MAX2(0.5f, len - 0.5f);
+      const float st[4] = { -0.5f, lo, hi, len + 0.5f };
+      const float m = MIN2(len, 1.0f);
+      const float al[4] = { 0.0f, m, m, 0.0f };
 
-      ph_stage_coverage_quad(stage, prim, xy, rgba);
+      memcpy(along, st, sizeof(st));
+      memcpy(a_al, al, sizeof(al));
+      na = hi > lo ? 4 : 3;
+      if (na == 3) {
+         along[2] = along[3];
+         a_al[2] = 0.0f;
+      }
    }
    if (inner > 0.0f) {
-      const float xy[4][2] = {
-         { p0[0] - nx * inner, p0[1] - ny * inner },
-         { p1[0] - nx * inner, p1[1] - ny * inner },
-         { p1[0] + nx * inner, p1[1] + ny * inner },
-         { p0[0] + nx * inner, p0[1] + ny * inner },
-      };
-      const float rgba[4][4] = {
-         { c[0][0], c[0][1], c[0][2], c[0][3] },
-         { c[1][0], c[1][1], c[1][2], c[1][3] },
-         { c[1][0], c[1][1], c[1][2], c[1][3] },
-         { c[0][0], c[0][1], c[0][2], c[0][3] },
-      };
+      const float st[4] = { -outer, -inner, inner, outer };
+      const float ac[4] = { 0.0f, 1.0f, 1.0f, 0.0f };
 
-      ph_stage_coverage_quad(stage, prim, xy, rgba);
+      memcpy(across, st, sizeof(st));
+      memcpy(a_ac, ac, sizeof(ac));
+      nc = 4;
+   } else {
+      const float st[3] = { -outer, 0.0f, outer };
+      const float ac[3] = { 0.0f, 1.0f, 0.0f };
+
+      memcpy(across, st, sizeof(st));
+      memcpy(a_ac, ac, sizeof(ac));
+      nc = 3;
+   }
+   const float ux = dx / len, uy = dy / len, nx = -uy, ny = ux;
+
+   for (unsigned i = 0; i + 1 < na; i++) {
+      for (unsigned j = 0; j + 1 < nc; j++) {
+         static const unsigned di[4] = { 0, 1, 1, 0 }, dj[4] = { 0, 0, 1, 1 };
+         float xy[4][2], rgba[4][4];
+
+         for (unsigned k = 0; k < 4; k++) {
+            const float sa = along[i + di[k]], sc = across[j + dj[k]];
+            const float t = CLAMP(sa / len, 0.0f, 1.0f);
+
+            xy[k][0] = p0[0] + ux * sa + nx * sc;
+            xy[k][1] = p0[1] + uy * sa + ny * sc;
+            for (unsigned ch = 0; ch < 4; ch++)
+               rgba[k][ch] = c[0][ch] + t * (c[1][ch] - c[0][ch]);
+            rgba[k][3] *= a_al[i + di[k]] * a_ac[j + dj[k]];
+         }
+         ph_stage_coverage_quad(stage, prim, (const float (*)[2])xy,
+                                (const float (*)[4])rgba);
+      }
    }
    return true;
 }
