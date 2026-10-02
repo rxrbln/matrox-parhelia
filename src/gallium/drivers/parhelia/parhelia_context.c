@@ -7731,6 +7731,12 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    if (!num_draws || indirect || ctx->submit_error)
       return;
+   /* An empty scissor rectangle passes nothing, but the engine reads a zero
+    * maximum as no limit (0x132c is exclusive): skip the draw. */
+   if (ctx->rasterizer && ctx->rasterizer->scissor &&
+       (ctx->scissor.maxx <= ctx->scissor.minx ||
+        ctx->scissor.maxy <= ctx->scissor.miny))
+      return;
    if (ctx->fs && ctx->fs->drop_reason) {
       PH_REFUSE("draws with an ARB fragment program the combiner cannot "
                 "express are dropped (%s)\n", ctx->fs->drop_reason);
@@ -10827,8 +10833,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    (void)flags;
    if (!ctx)
       return NULL;
-   ctx->scissor.maxx = UINT16_MAX;
-   ctx->scissor.maxy = UINT16_MAX;
+   /* All zero, like the state tracker's own initial copy: it only calls
+    * set_scissor_states for a rectangle that differs from that copy. */
    ctx->base.screen = screen;
    ctx->base.priv = priv;
    if (native_alpha_mode) {
