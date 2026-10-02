@@ -400,6 +400,9 @@ struct ph_context {
    unsigned tcl_elts_cap;
    unsigned tcl_draws, tcl_fallbacks, tcl_clip_fallbacks;
    unsigned tcl_reason[PH_TCL_REASONS];
+   uint64_t tcl_reason_verts[PH_TCL_REASONS];
+   uint64_t tcl_verts, tcl_clip_verts;
+   unsigned tcl_clip_why[4];	/* w <= 0, guard band, near, far */
    enum ph_tcl_reason tcl_last_reason;
    unsigned tcl_program_draws;
    uint32_t fence;
@@ -710,11 +713,21 @@ ph_stats_frame(struct ph_context *ctx)
               "parhelia stats/frame: %.1f hardware-transform draws (%.1f compiled vertex programs), %.1f not expressible, %.1f handed back to the software clipper\n",
               ctx->tcl_draws / n, ctx->tcl_program_draws / n,
               ctx->tcl_fallbacks / n, ctx->tcl_clip_fallbacks / n);
+   if (ctx->stat.start_ns && (ctx->tcl_draws || ctx->tcl_clip_fallbacks))
+      fprintf(stderr, "  hardware transform: %.0f vertices; software clipper "
+              "tails: %.0f vertices (w<=0 %.1f, guard band %.1f, near %.1f, "
+              "far %.1f)\n", ctx->tcl_verts / n, ctx->tcl_clip_verts / n,
+              ctx->tcl_clip_why[0] / n, ctx->tcl_clip_why[1] / n,
+              ctx->tcl_clip_why[2] / n, ctx->tcl_clip_why[3] / n);
    for (unsigned r = 0; ctx->stat.start_ns && r < PH_TCL_REASONS; r++)
       if (ctx->tcl_reason[r])
-         fprintf(stderr, "  off the hardware transform: %-24s %.1f draws\n",
-                 ph_tcl_reason_names[r], ctx->tcl_reason[r] / n);
+         fprintf(stderr, "  off the hardware transform: %-24s %.1f draws %.0f vertices\n",
+                 ph_tcl_reason_names[r], ctx->tcl_reason[r] / n,
+                 ctx->tcl_reason_verts[r] / n);
    memset(ctx->tcl_reason, 0, sizeof(ctx->tcl_reason));
+   memset(ctx->tcl_reason_verts, 0, sizeof(ctx->tcl_reason_verts));
+   memset(ctx->tcl_clip_why, 0, sizeof(ctx->tcl_clip_why));
+   ctx->tcl_verts = ctx->tcl_clip_verts = 0;
    ctx->tcl_draws = ctx->tcl_fallbacks = ctx->tcl_clip_fallbacks = 0;
    ctx->tcl_program_draws = 0;
    for (unsigned k = 0; ctx->stats_sync && k < PH_STAT_KINDS; k++)
@@ -6908,7 +6921,7 @@ ph_fs_constant_colour(struct ph_context *ctx, float out[4])
 }
 
 static bool
-ph_tcl_vertices_fit(const struct ph_context *ctx, const float *vertices,
+ph_tcl_vertices_fit(struct ph_context *ctx, const float *vertices,
                     unsigned count, unsigned dpv)
 {
    const float *m = ctx->mvp;
@@ -6927,8 +6940,12 @@ ph_tcl_vertices_fit(const struct ph_context *ctx, const float *vertices,
       float w = m[12] * p[0] + m[13] * p[1] + m[14] * p[2] + m[15];
 
       if (!(w > 1e-6f) || !(fabsf(x) <= gx * w) || !(fabsf(y) <= gy * w) ||
-          !(z >= -w) || !(z <= w))
+          !(z >= -w) || !(z <= w)) {
+         ctx->tcl_clip_why[!(w > 1e-6f) ? 0 :
+                           !(fabsf(x) <= gx * w && fabsf(y) <= gy * w) ? 1 :
+                           !(z >= -w) ? 2 : 3]++;
          return false;
+      }
    }
    return true;
 }
@@ -7216,6 +7233,7 @@ ph_tcl_software_tail(struct ph_context *ctx, const uint32_t *elts,
    draw.start = first * 3;
    draw.count = (ntri - first) * 3;
    ctx->tcl_clip_fallbacks++;
+   ctx->tcl_clip_verts += draw.count;
    draw_set_indexes(ctx->draw, elts, 4, ~0u);
    draw_vbo(ctx->draw, &info, 0, NULL, &draw, 1, 0);
    draw_flush(ctx->draw);
@@ -7349,6 +7367,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    ctx->warp_program_entry = entry;
    ctx->transform = true;
    ctx->tcl_draws++;
+   ctx->tcl_verts += draw->count;
    if (lay.program)
       ctx->tcl_program_draws++;
 
@@ -7400,6 +7419,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
 fallback:
    ctx->tcl_fallbacks++;
    ctx->tcl_reason[ctx->tcl_last_reason]++;
+   ctx->tcl_reason_verts[ctx->tcl_last_reason] += draw->count;
    return false;
 }
 
