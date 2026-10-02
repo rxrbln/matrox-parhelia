@@ -664,10 +664,19 @@ ph_vs_alu(struct ph_vs_ctx *ctx, const nir_alu_instr *alu,
       count = 2;
       break;
    }
-   /* fmin is deliberately absent: hardware refutes 0x61 as a componentwise
-    * minimum (scene 2 of parhelia-gl-vs-test differed on every pixel of the
-    * quad while every other scene was bit-identical, and scene 3 proves 0x62
-    * is a real maximum).  clamp() and min() therefore keep the draw module. */
+   /* Hardware refutes 0x61 as a componentwise minimum (scene 2 of
+    * parhelia-gl-vs-test differed on every pixel while scene 3 proves 0x62
+    * is a real maximum), so min(a, b) is -max(-a, -b). */
+   case nir_op_fmin:
+      if (!ph_vs_operand(ctx, alu, 0, &src[0]) ||
+          !ph_vs_operand(ctx, alu, 1, &src[1]))
+         return false;
+      src[0].neg = !src[0].neg;
+      src[1].neg = !src[1].neg;
+      if (!ph_vs_issue(ctx, P3D_WARP_MAX, src, 2, 0, 0, 0, out))
+         return false;
+      out->neg = !out->neg;
+      return true;
    case nir_op_fmax: op = P3D_WARP_MAX; count = 2; break;
    case nir_op_ffma: op = P3D_WARP_MAD; count = 3; break;
    case nir_op_fdot2:
