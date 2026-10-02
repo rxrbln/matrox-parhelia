@@ -9946,7 +9946,12 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
        * image.  Rebuild the complete ordinary native shadow first. */
       if (r->rgb5a1_packed)
          ph_restore_rgba_tiled(r);
-      if (r->linear_map) {
+      /* A shadowed image reaches VRAM through the shadow upload; its linear
+       * companion is then refreshed by the GPU resolve blit instead of a
+       * second CPU copy over the bus. */
+      const bool gpu_linear = r->transfer_shadow && r->linear_handle &&
+                              r->linear_map && !transfer->level;
+      if (r->linear_map && !gpu_linear) {
          for (int y = 0; y < transfer->box.height; y++)
             ph_linear_row(r, transfer->level, transfer->box.x,
                           transfer->box.y + y, transfer->box.width,
@@ -10027,7 +10032,7 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
          if (ret)
             ph_context(p)->submit_error = ret;
          else {
-            r->tiled_dirty = false;
+            r->tiled_dirty = gpu_linear;
             r->linear_dirty = false;
          }
       }
