@@ -8815,8 +8815,13 @@ ph_copy_texel_to_gpu(uint8_t *dst, const uint8_t *src,
       memcpy(dst, src, cpp);
       return;
    }
+   /* Either side may be an uncached aperture mapping: one access per texel. */
+   uint8_t in[4], out[4];
+
+   memcpy(in, src, 4);
    for (unsigned i = 0; i < 4; i++)
-      dst[i] = order->byte[i] == 0xff ? 0xff : src[order->byte[i]];
+      out[i] = order->byte[i] == 0xff ? 0xff : in[order->byte[i]];
+   memcpy(dst, out, 4);
 }
 
 /* Texture layout code 2 addresses 32x16 blocks using a power-of-two row
@@ -8932,10 +8937,106 @@ ph_copy_texel_from_gpu(uint8_t *dst, const uint8_t *src,
       memcpy(dst, src, cpp);
       return;
    }
-   memset(dst, 0xff, 4);
+   uint8_t in[4], out[4];
+
+   memcpy(in, src, 4);
+   memset(out, 0xff, 4);
    for (unsigned i = 0; i < 4; i++)
       if (order->byte[i] != 0xff)
-         dst[order->byte[i]] = src[i];
+         out[order->byte[i]] = in[i];
+   memcpy(dst, out, 4);
+}
+
+static size_t
+ph_linear_texel_offset(const struct parhelia_resource *r, unsigned level,
+                       unsigned x, unsigned y, unsigned cpp)
+{
+   return r->linear_mip.levels ?
+      ph_mip_texel_offset_cpp(&r->linear_mip, level, x, y, true, cpp) :
+      (size_t)y * r->linear_stride + (size_t)x * cpp;
+}
+
+/* Texels gathered in cached memory before one wide copy to or from an
+ * aperture mapping, where every access is a bus transaction. */
+#define PH_SPAN_TEXELS 64
+
+struct ph_span {
+   uint8_t *base;
+   size_t start;
+   unsigned bytes;
+   uint8_t buf[PH_SPAN_TEXELS * 4];
+};
+
+static void
+ph_span_flush(struct ph_span *s)
+{
+   if (s->bytes)
+      memcpy(s->base + s->start, s->buf, s->bytes);
+   s->bytes = 0;
+}
+
+/* Queue one texel for @off, extending the span when it continues it. */
+static void
+ph_span_put(struct ph_span *s, size_t off, const uint8_t *src,
+            const struct ph_texel_order *order, unsigned cpp)
+{
+   if (s->bytes && (off != s->start + s->bytes ||
+                    s->bytes + cpp > sizeof(s->buf)))
+      ph_span_flush(s);
+   if (!s->bytes)
+      s->start = off;
+   ph_copy_texel_to_gpu(s->buf + s->bytes, src, order, cpp);
+   s->bytes += cpp;
+}
+
+/* Move one row of a box between staging and the linear companion. */
+static void
+ph_linear_row(struct parhelia_resource *r, unsigned level, unsigned x0,
+              unsigned y, unsigned w, uint8_t *host, bool to_gpu,
+              const struct ph_texel_order *order, unsigned cpp)
+{
+   const size_t start = ph_linear_texel_offset(r, level, x0, y, cpp);
+   uint8_t *lin = (uint8_t *)r->linear_map;
+   struct ph_span span = { .base = lin };
+
+   if (!w)
+      return;
+   if (ph_linear_texel_offset(r, level, x0 + w - 1, y, cpp) ==
+       start + (size_t)(w - 1) * cpp) {
+      if (cpp != 4 || !order) {
+         if (to_gpu)
+            memcpy(lin + start, host, (size_t)w * cpp);
+         else
+            memcpy(host, lin + start, (size_t)w * cpp);
+         return;
+      }
+      for (unsigned x = 0; x < w; x += PH_SPAN_TEXELS) {
+         const unsigned n = MIN2(w - x, PH_SPAN_TEXELS);
+
+         if (to_gpu) {
+            for (unsigned i = 0; i < n; i++)
+               ph_copy_texel_to_gpu(span.buf + i * 4, host + (x + i) * 4,
+                                    order, 4);
+            memcpy(lin + start + (size_t)x * 4, span.buf, n * 4);
+         } else {
+            memcpy(span.buf, lin + start + (size_t)x * 4, n * 4);
+            for (unsigned i = 0; i < n; i++)
+               ph_copy_texel_from_gpu(host + (x + i) * 4, span.buf + i * 4,
+                                      order, 4);
+         }
+      }
+      return;
+   }
+   for (unsigned x = 0; x < w; x++) {
+      const size_t off = ph_linear_texel_offset(r, level, x0 + x, y, cpp);
+
+      if (to_gpu)
+         ph_span_put(&span, off, host + (size_t)x * cpp, order, cpp);
+      else
+         ph_copy_texel_from_gpu(host + (size_t)x * cpp, lin + off, order,
+                                cpp);
+   }
+   ph_span_flush(&span);
 }
 
 static bool
@@ -9126,16 +9227,9 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
       if (r->linear_map && !r->transfer_shadow) {
          ph_resource_resolve_linear(r);
          for (int y = 0; y < box->height; y++)
-            for (int x = 0; x < box->width; x++)
-               ph_copy_texel_from_gpu((uint8_t *)t->staging +
-                                          y * t->base.stride + x * cpp,
-                                      (uint8_t *)r->linear_map +
-                                      (r->linear_mip.levels ?
-                                       ph_mip_texel_offset_cpp(&r->linear_mip, level,
-                                                           box->x + x, box->y + y,
-                                                           true, cpp) :
-                                       (size_t)(box->y + y) * r->linear_stride +
-                                       (box->x + x) * cpp), swap_rb, cpp);
+            ph_linear_row(r, level, box->x, box->y + y, box->width,
+                          (uint8_t *)t->staging + y * t->base.stride, false,
+                          swap_rb, cpp);
       } else {
          for (unsigned z = 0; z < layers; z++)
          for (int y = 0; y < box->height; y++)
@@ -9211,19 +9305,14 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
          ph_restore_rgba_tiled(r);
       if (r->linear_map) {
          for (int y = 0; y < transfer->box.height; y++)
-            for (int x = 0; x < transfer->box.width; x++)
-            ph_copy_texel_to_gpu((uint8_t *)r->linear_map +
-                                  (r->linear_mip.levels ?
-                                   ph_mip_texel_offset_cpp(&r->linear_mip,
-                                                       transfer->level,
-                                                       transfer->box.x + x,
-                                                       transfer->box.y + y, true, cpp) :
-                                   (size_t)(transfer->box.y + y) *
-                                   r->linear_stride + (transfer->box.x + x) * cpp),
-                                    (uint8_t *)t->staging +
-                                       y * transfer->stride + x * cpp, swap_rb, cpp);
+            ph_linear_row(r, transfer->level, transfer->box.x,
+                          transfer->box.y + y, transfer->box.width,
+                          (uint8_t *)t->staging + y * transfer->stride, true,
+                          swap_rb, cpp);
       }
       if (r->map) {
+         struct ph_span span = { .base = (uint8_t *)r->map };
+
          for (unsigned z = 0; z < MAX2(transfer->box.depth, 1); z++)
          for (int y = 0; y < transfer->box.height; y++)
             for (int x = 0; x < transfer->box.width; x++) {
@@ -9261,11 +9350,18 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
                }
                continue;
             }
-            ph_copy_texel_to_gpu((uint8_t *)r->map + off,
-                                    (uint8_t *)t->staging +
-                                       z * transfer->layer_stride +
-                                       y * transfer->stride + x * cpp, swap_rb, cpp);
+            const uint8_t *src = (uint8_t *)t->staging +
+                                 z * transfer->layer_stride +
+                                 y * transfer->stride + x * cpp;
+
+            /* A transfer shadow is cached memory: no span to gather. */
+            if (r->transfer_shadow)
+               ph_copy_texel_to_gpu((uint8_t *)r->map + off, src, swap_rb,
+                                    cpp);
+            else
+               ph_span_put(&span, off, src, swap_rb, cpp);
             }
+         ph_span_flush(&span);
       }
       /* Both representations were updated when a presentation/sampler
        * backing exists; otherwise the tiled render image is authoritative.
