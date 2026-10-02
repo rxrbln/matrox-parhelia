@@ -4335,9 +4335,9 @@ ph_submit_vertices(struct ph_context *ctx)
 	                               (zpos ? 6 : 5);
 	if (state.oow)
 		state.dw_per_vertex++;
-	state.texcoord_q = ctx->proj && state.oow && texture && !texture1 &&
-	                   !texture->mip.slices;
-	if (state.texcoord_q)
+	state.texcoord_q = ctx->proj && texture && !texture1 &&
+	                   (texture->mip.slices ? !texture->mip.cube : state.oow);
+	if (state.texcoord_q && !texture->mip.slices)
 		state.dw_per_vertex += 2;
 	/* The staged stream carries a second colour: declare the kind-6
 	 * attribute and bind the program that forwards it to output 2, so the
@@ -4411,7 +4411,8 @@ ph_submit_vertices(struct ph_context *ctx)
          state.texcoord3 = 1;
       }
       if (state.texcoord_q)
-         tex.coord_mode = P3D_TEX_COORD_2D_PROJ;
+         tex.coord_mode = state.texcoord3 ? P3D_TEX_COORD_3D_PROJ :
+                                            P3D_TEX_COORD_2D_PROJ;
       tex.min_filter = ph_sampler_image_filter(
          sampler && sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR,
          sampler ? sampler->max_anisotropy : 0);
@@ -5160,10 +5161,12 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	   dpv = (multitextured ? 10 : 8) + 1 + !!vertex_alpha;
 	/* A projector other than one switches unit 0 to the per-fragment
 	 * divide, which reads q from a four-component coordinate set. */
-	proj = oow && !multitextured && !vertex_alpha &&
+	proj = (three_coord ? !ph_resource(ctx->sampler_views[0]->texture)->mip.cube :
+	                      oow && !multitextured && !vertex_alpha) &&
 	       (ctx->fs->projective_mask & BITFIELD_BIT(0)) &&
 	       ph_primitive_projective(ctx, prim);
-	if (proj)
+	/* A volume's q takes the stream's spare dword. */
+	if (proj && !three_coord)
 	   dpv += 2;
 	/* A state setter normally drains a batch before reaching this point.  The
 	 * extra guard keeps a future draw-stage change from mixing 7- and 8-dword
@@ -5297,9 +5300,9 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 			*dst++ = tc[0];
 			*dst++ = tc[1];
 			*dst++ = tc[2];
-			/* The stream keeps its two-coordinate width; the last two
-			 * dwords are no longer named by any descriptor. */
-			*dst++ = 0.0f;
+			/* The stream keeps its two-coordinate width; the spare
+			 * dwords carry q for a projective volume, else nothing. */
+			*dst++ = proj ? tc[3] : 0.0f;
 			*dst++ = 0.0f;
 			continue;
 		}

@@ -543,6 +543,9 @@ enum p3d_tex_type { P3D_TEX_TYPE_2D = 0, P3D_TEX_TYPE_CUBE = 1,
  * 4-component set (mask 0xf) with mode 5 samples s/q,t/q, measured by
  * parhelia-drm-test --texture-projective-probe on the P690. */
 #define P3D_TEX_COORD_2D_PROJ	5u
+/* The same divide for a volume's s,t,r: mode 7 with a volume descriptor,
+ * measured with --texture-projective-probe PROBE_TYPE=2 PROBE_COORD=7. */
+#define P3D_TEX_COORD_3D_PROJ	7u
 #define P3D_TEX_COORD_3D	6u
 
 struct p3d_texture {
