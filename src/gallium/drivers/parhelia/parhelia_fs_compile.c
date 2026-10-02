@@ -2457,15 +2457,15 @@ done:
 }
 
 float
-ph_fs_fog_eval(const struct ph_fs_program *program, float fogc,
-               const void *constants, unsigned size)
+ph_fs_fog_eval_step(const struct ph_fs_program *program, unsigned step,
+                    float fogc, const void *constants, unsigned size)
 {
-   if (!program->fog_ops)
+   if (step >= program->fog_ops)
       return 1.0f;
 
-   float v[program->fog_ops];
+   float v[step + 1];
 
-   for (unsigned i = 0; i < program->fog_ops; i++) {
+   for (unsigned i = 0; i <= step; i++) {
       const struct ph_fs_fog_op *op = &program->fog[i];
 
       switch (op->kind) {
@@ -2487,7 +2487,16 @@ ph_fs_fog_eval(const struct ph_fs_program *program, float fogc,
       default: v[i] = 0.0f; break;
       }
    }
-   return v[program->fog_ops - 1];
+   return v[step];
+}
+
+float
+ph_fs_fog_eval(const struct ph_fs_program *program, float fogc,
+               const void *constants, unsigned size)
+{
+   return program->fog_ops ?
+      ph_fs_fog_eval_step(program, program->fog_ops - 1, fogc, constants, size) :
+      1.0f;
 }
 
 void

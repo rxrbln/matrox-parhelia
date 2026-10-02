@@ -352,6 +352,7 @@ struct ph_context {
     * triangles carry their final colour and bypass the fragment program. */
    bool line_coverage;
    bool ov_valid;		/* ph_stage_tri takes ov_colour, not the vertex's */
+   bool fog_splitting;	/* staging the pieces of a triangle cut at fogc 0 */
    float ov_colour[3][4];
    uint32_t warp_sized_point;
    uint32_t warp_sized_point_slot;
@@ -5005,6 +5006,140 @@ ph_primitive_projective(const struct ph_context *ctx,
    return false;
 }
 
+/* The fog factor reads |fog coordinate|: the state tracker keeps the
+ * absolute value per fragment for an eye-plane distance (mesa issue #15407). */
+static bool
+ph_fog_abs_coord(const struct ph_fs_program *program)
+{
+   for (unsigned i = 0; i < program->fog_ops; i++)
+      if (program->fog[i].kind == PH_FOG_ABS &&
+          program->fog[program->fog[i].a].kind == PH_FOG_COORD)
+         return true;
+   return false;
+}
+
+/* The fog coordinates at which the per-vertex factor stops being linear:
+ * zero under an absolute value, and where a saturated linear factor (GL_LINEAR
+ * fog) reaches 0 and 1.  Between them the factor is linear in the coordinate,
+ * so interpolating per-vertex values is exact.  Returns the count. */
+static unsigned
+ph_fog_cuts(const struct ph_context *ctx, float cut[6])
+{
+   const struct ph_fs_program *prog = &ctx->fs->program;
+   const struct ph_fs_fog_op *root = &prog->fog[prog->fog_ops - 1];
+   const bool abs_coord = ph_fog_abs_coord(prog);
+   unsigned n = 0;
+
+   if (abs_coord)
+      cut[n++] = 0.0f;
+   if (root->kind == PH_FOG_SAT) {
+      const void *k = ctx->fs_const_snap;
+      const unsigned size = ctx->fs_const_snap_size;
+      const float v0 = ph_fs_fog_eval_step(prog, root->a, 1.0f, k, size);
+      const float v1 = ph_fs_fog_eval_step(prog, root->a, 2.0f, k, size);
+      const float v2 = ph_fs_fog_eval_step(prog, root->a, 3.0f, k, size);
+      const float slope = v1 - v0;
+
+      /* Only a factor linear in the coordinate (beyond zero) has two edges. */
+      if (slope != 0.0f && fabsf(v2 - v1 - slope) <= 1e-4f * fabsf(slope)) {
+         const float base = v0 - slope;
+
+         for (unsigned e = 0; e < 2; e++) {
+            const float c = ((float)e - base) / slope;
+
+            cut[n++] = c;
+            if (abs_coord && c != 0.0f)
+               cut[n++] = -c;
+         }
+      }
+   }
+   return n;
+}
+
+static void ph_stage_tri(struct draw_stage *stage, struct prim_header *prim);
+
+/* Stage a triangle cut at every fog coordinate in @cut it straddles, so the
+ * colour-1 carrier interpolates a factor that is linear on each piece. */
+static void
+ph_stage_fog_pieces(struct draw_stage *stage, struct prim_header *prim,
+                    int fogc, const float *cut, unsigned cuts)
+{
+   struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   const unsigned attrs = draw_num_shader_outputs(stage->draw);
+   const size_t size = sizeof(struct vertex_header) + attrs * 4 * sizeof(float);
+   struct vertex_header *poly[2][4], *cv[2];
+   unsigned n[2] = {0, 0}, made = 0;
+   float d[3];
+   uint8_t *mem;
+
+   while (cuts) {
+      for (unsigned v = 0; v < 3; v++)
+         d[v] = prim->v[v]->data[fogc][0] - cut[0];
+      if (MIN3(d[0], d[1], d[2]) < 0.0f && MAX3(d[0], d[1], d[2]) > 0.0f)
+         break;
+      cut++;
+      cuts--;
+   }
+   if (!cuts || !(mem = malloc(2 * size))) {
+      ph_stage_tri(stage, prim);
+      return;
+   }
+   cv[0] = (struct vertex_header *)mem;
+   cv[1] = (struct vertex_header *)(mem + size);
+   for (unsigned i = 0; i < 3; i++) {
+      const unsigned j = (i + 1) % 3;
+
+      if (d[i] >= 0.0f)
+         poly[0][n[0]++] = prim->v[i];
+      if (d[i] <= 0.0f)
+         poly[1][n[1]++] = prim->v[i];
+      if ((d[i] < 0.0f && d[j] > 0.0f) || (d[i] > 0.0f && d[j] < 0.0f)) {
+         const float t = d[i] / (d[i] - d[j]);
+         struct vertex_header *c = cv[made++];
+
+         memcpy(c, prim->v[i], sizeof(*c));
+         for (unsigned k = 0; k < 4; k++)
+            c->clip_pos[k] = prim->v[i]->clip_pos[k] +
+               t * (prim->v[j]->clip_pos[k] - prim->v[i]->clip_pos[k]);
+         for (unsigned a = 0; a < attrs; a++)
+            for (unsigned k = 0; k < 4; k++)
+               c->data[a][k] = prim->v[i]->data[a][k] +
+                  t * (prim->v[j]->data[a][k] - prim->v[i]->data[a][k]);
+         c->data[fogc][0] = cut[0];
+         poly[0][n[0]++] = c;
+         poly[1][n[1]++] = c;
+      }
+   }
+   for (unsigned side = 0; side < 2 && !ctx->submit_error; side++)
+      for (unsigned k = 1; k + 1 < n[side]; k++) {
+         struct prim_header tri = *prim;
+
+         tri.v[0] = poly[side][0];
+         tri.v[1] = poly[side][k];
+         tri.v[2] = poly[side][k + 1];
+         ph_stage_fog_pieces(stage, &tri, fogc, cut + 1, cuts - 1);
+      }
+   free(mem);
+}
+
+/* Cut the triangle where its per-vertex fog factor would interpolate wrong;
+ * false when nothing needs cutting. */
+static bool
+ph_split_fog_triangle(struct draw_stage *stage, struct prim_header *prim,
+                      int fogc)
+{
+   struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   float cut[6];
+   const unsigned cuts = ph_fog_cuts(ctx, cut);
+
+   if (!cuts)
+      return false;
+   ctx->fog_splitting = true;
+   ph_stage_fog_pieces(stage, prim, fogc, cut, cuts);
+   ctx->fog_splitting = false;
+   return true;
+}
+
 static void
 ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 {
@@ -5065,6 +5200,10 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
       if (ctx->submit_error)
          return;
    }
+   if (!ctx->fog_splitting && fogc >= 0 && ctx->fs &&
+       ctx->fs->program.valid && ctx->fs->program.fog &&
+       ph_split_fog_triangle(stage, prim, fogc))
+      return;
    if (pos >= 0) {
       const bool back = !ctx->derived_triangles && ctx->rasterizer &&
                         ph_two_sided_stencil(ctx) &&

@@ -112,6 +112,10 @@ void ph_fs_update_constants(struct ph_fs_program *program,
 void ph_fs_eval(const struct p3d_comb_program *prog, const float tex[4][4],
                 const float colour[2][4], float range, float out[4]);
 
+/* Step @step of @program's fog expression for fog coordinate @fogc. */
+float ph_fs_fog_eval_step(const struct ph_fs_program *program, unsigned step,
+                          float fogc, const void *constants, unsigned size);
+
 /* The fog factor for fog coordinate @fogc, from @program's expression. */
 float ph_fs_fog_eval(const struct ph_fs_program *program, float fogc,
                      const void *constants, unsigned size);
