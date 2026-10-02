@@ -295,6 +295,8 @@ enum p3d_warp_op {
 	P3D_WARP_DP3 = 0x78,
 	P3D_WARP_SMUL = 0x89,	/* dst.c = s1.c * (1 / s0.w): perspective divide */
 	P3D_WARP_RSQ = 0x8a,	/* dst.c = s1.c * rsq(s0.w) */
+	P3D_WARP_EXP = 0x91,	/* dst.c = exp2(s0.w), every component */
+	P3D_WARP_LOG = 0x92,	/* dst.c = log2(s0.w), every component */
 	/* The fixed-function light accumulator.  Neither ACC opcode encodes a
 	 * destination: they commit into r10 (diffuse) and r11 (specular). */
 	P3D_WARP_ACC_START = 0x82,

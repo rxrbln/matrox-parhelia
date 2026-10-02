@@ -556,6 +556,20 @@ ph_vs_alu(struct ph_vs_ctx *ctx, const nir_alu_instr *alu,
       src[1] = src[0];
       src[1].neg = !src[1].neg;
       return ph_vs_issue(ctx, P3D_WARP_MAX, src, 2, 0, 0, 0, out);
+   case nir_op_fsqrt: {
+      /* rcp(rsq(x)) rather than x * rsq(x), so that sqrt(0) is 0. */
+      struct ph_vs_value inv;
+
+      if (!ph_vs_operand(ctx, alu, 0, &src[0]) ||
+          !ph_vs_reciprocal(ctx, P3D_WARP_RSQ, &src[0], &inv))
+         return false;
+      /* Every component of the reciprocal root holds the same scalar. */
+      ph_vs_swizzle(&inv, (const unsigned[4]){ 3, 3, 3, 3 });
+      if (!ph_vs_reciprocal(ctx, P3D_WARP_SMUL, &inv, out))
+         return false;
+      ph_vs_defer_free(ctx, &inv);
+      return true;
+   }
    case nir_op_frcp:
    case nir_op_frsq:
       if (!ph_vs_operand(ctx, alu, 0, &src[0]))
@@ -563,6 +577,17 @@ ph_vs_alu(struct ph_vs_ctx *ctx, const nir_alu_instr *alu,
       return ph_vs_reciprocal(ctx, alu->op == nir_op_frcp ? P3D_WARP_SMUL :
                                                             P3D_WARP_RSQ,
                               &src[0], out);
+   case nir_op_fexp2:
+   case nir_op_flog2:
+      /* 0x91/0x92 read the scalar from .w and, MEASURED on the P690, write
+       * the result to every component: exp2/log2 over [-1.7, 1.3] and
+       * [0.25, 3.3] matched the draw module to 8 bits in each channel. */
+      if (!ph_vs_operand(ctx, alu, 0, &src[0]) ||
+          !ph_vs_swz_uniform(src[0].swizzle))
+         return false;
+      return ph_vs_issue(ctx, alu->op == nir_op_fexp2 ? P3D_WARP_EXP :
+                                                        P3D_WARP_LOG,
+                         src, 1, 0, 0, 0, out);
    case nir_op_ffloor:
    case nir_op_ffract:
       if (!ph_vs_operand(ctx, alu, 0, &src[0]))

@@ -75,6 +75,7 @@ static const nir_shader_compiler_options ph_fs_nir_options = {
 
 static const nir_shader_compiler_options ph_vs_nir_options = {
    .lower_bitops = true,
+   .lower_fpow = true,
    .lower_scmp = true,
    .lower_flrp32 = true,
    .lower_flrp64 = true,
