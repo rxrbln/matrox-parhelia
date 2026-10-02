@@ -1591,6 +1591,7 @@ static bool
 ph_alpha_route_depth(enum pipe_format format)
 {
    return format == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
+          format == PIPE_FORMAT_Z24X8_UNORM ||
           format == PIPE_FORMAT_Z16_UNORM;
 }
 
@@ -2812,7 +2813,8 @@ ph_use_cpu_alpha_cutout(struct ph_context *ctx, bool textured,
        blend->blend_enable || blend->colormask != PIPE_MASK_RGBA ||
        (ctx->rasterizer && (ctx->rasterizer->flatshade ||
                             ctx->rasterizer->poly_stipple_enable)) ||
-       ctx->fb.zsbuf.format != PIPE_FORMAT_Z24_UNORM_S8_UINT)
+       (ctx->fb.zsbuf.format != PIPE_FORMAT_Z24_UNORM_S8_UINT &&
+        ctx->fb.zsbuf.format != PIPE_FORMAT_Z24X8_UNORM))
       return false;
 
    /* Stage selection needs the same logical tiled image that submission will
@@ -8712,6 +8714,7 @@ ph_clear_zs(struct ph_context *ctx, const struct pipe_surface *surf,
    if (!mask)
       return;
    if (surf->format != PIPE_FORMAT_Z24_UNORM_S8_UINT &&
+       surf->format != PIPE_FORMAT_Z24X8_UNORM &&
        surf->format != PIPE_FORMAT_Z16_UNORM) {
       PH_REFUSE("a depth clear of format %u is dropped\n", surf->format);
       return;

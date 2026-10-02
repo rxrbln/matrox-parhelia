@@ -220,6 +220,7 @@ ph_target_format(enum pipe_format format, uint32_t *code, unsigned *cpp)
       c = 0x2a; b = 2;
       break;
    case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+   case PIPE_FORMAT_Z24X8_UNORM:
       c = 0x36;
       break;
    case PIPE_FORMAT_B8G8R8A8_UNORM:
@@ -393,6 +394,9 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
                                   PIPE_BIND_SHARED));
             break;
          case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+         /* The same 0x36 surface; its stencil byte is simply unused, which
+          * gives GL a depth-only format with no stencil bits. */
+         case PIPE_FORMAT_Z24X8_UNORM:
             supported = !(bind & PIPE_BIND_RENDER_TARGET);
             break;
          case PIPE_FORMAT_S8_UINT_Z24_UNORM:
