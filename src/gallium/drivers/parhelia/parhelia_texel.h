@@ -31,9 +31,11 @@ ph_mip_texel_offset_cpp(const struct ph_mip_layout *mip, unsigned level,
    bool native;
 
    /* A linear image is row-major in its own coordinates: the native level's
-    * coordinate permutation belongs to the tiled orders alone. */
+    * coordinate permutation belongs to the tiled orders alone.  Levels in the
+    * shared tail block still sit at their own slot inside it. */
    if (linear)
-      return image->offset + ((size_t)y * image->pitch + x) * cpp;
+      return image->offset + ((size_t)(y + image->tail_y) * image->pitch +
+                              x + image->tail_x) * cpp;
    native = ph_mip_physical_coords(mip, level, cpp, &x, &y, &physical_pitch);
    if (native)
       return p3d_texture_tile_offset_64x16_at(image->offset, x, y,
