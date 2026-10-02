@@ -1035,3 +1035,16 @@ imm32 patch; still open before any hardware attempt: the exact target of the
 kind-`0x23` patch (`mtx3558`'s record format: instruction index and fragment),
 `mtx569`'s replay, the remaining key fields (`r9`, `c30`, `b`, `r15`), and the
 `0x111c`/`0x1130` field values from the earlier section.
+
+`mtx3558` (the linker's copy-and-patch pass, `.text+0xa0f20`) walks the
+fragment list at `engine+0xa0` (12-byte records: registry index, patch
+count, relocation count), copies each body (`LocMemCpy` from the registry's
+`+0x10` table at `engine+0x9c108`), applies the per-fragment relocation
+records at `engine+0xe8` (kinds 0/1/2, stride-7 register relocation), then
+the patch records at `engine+0xc0`: `{instruction index, field kind, value}`
+with the field kind dispatched through `.rodata+0x2eb0` (36 kinds, the
+`MTXPARD 0x79e00` table of `parhelia-warp-control-ops.md`).
+`mtx2634(engine, kind, value, index)` appends exactly such a record to the
+**most recently appended fragment**, so the user-plane patch is
+`imm32 := 1 << (n + 15)` on **instruction 0 of the table fragment**, which for
+the P690 is `mtx847[0]` (opcode `0x41`, imm32 0 in the symbol).
