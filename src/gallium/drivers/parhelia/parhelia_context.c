@@ -5560,10 +5560,16 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
          const unsigned h = u_minify(r->base.height0, l);
          const struct pipe_box box = {.width = w, .height = h, .depth = 1};
 
-         if ((r->mip_defined & BITFIELD_BIT(l)) &&
-             !ph_copy_texture_box(ctx, v->shadow_view->texture, l - first,
-                                  0, 0, &r->base, l, &box, w, h))
-            return NULL;
+         if (!(r->mip_defined & BITFIELD_BIT(l)))
+            continue;
+         if (!ph_copy_texture_box(ctx, v->shadow_view->texture, l - first,
+                                  0, 0, &r->base, l, &box, w, h)) {
+            /* Host-only levels go through the transfer paths. */
+            util_resource_copy_region(&ctx->base, v->shadow_view->texture,
+                                      l - first, 0, 0, 0, &r->base, l, &box);
+            if (ctx->submit_error)
+               return NULL;
+         }
       }
       v->shadow_generation = r->content_generation;
    }
@@ -8752,6 +8758,27 @@ ph_copy_blocks(struct parhelia_resource *r, void *staging, unsigned stride,
       }
 }
 
+/* Host image of a level outside the hardware storage, or NULL. */
+static uint8_t *
+ph_sw_level(struct parhelia_resource *r, unsigned level)
+{
+   const struct pipe_resource *b = &r->base;
+
+   if (!r->sw_level) {
+      r->sw_level = CALLOC(b->last_level + 1, sizeof(*r->sw_level));
+      if (!r->sw_level)
+         return NULL;
+   }
+   if (!r->sw_level[level])
+      r->sw_level[level] =
+         CALLOC(util_format_get_2d_size(b->format,
+                   util_format_get_stride(b->format, u_minify(b->width0, level)),
+                   u_minify(b->height0, level)),
+                b->target == PIPE_TEXTURE_3D ? u_minify(b->depth0, level) :
+                MAX2(b->array_size, 1));
+   return r->sw_level[level];
+}
+
 static void *
 ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
        unsigned usage, const struct pipe_box *box,
@@ -8817,6 +8844,25 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
          ph_copy_blocks(r, t->staging, t->base.stride, box, false);
       *out = &t->base;
       return t->staging;
+   }
+   /* A level the hardware storage lacks lives in host memory only. */
+   if (level && level >= ph_resource_mip_levels(r) &&
+       level <= res->last_level && !r->mip.block_bytes) {
+      uint8_t *image = ph_sw_level(r, level);
+
+      if (!image) {
+         FREE(t);
+         return NULL;
+      }
+      t->base.stride = util_format_get_stride(res->format, image_width);
+      t->base.layer_stride = util_format_get_2d_size(res->format,
+                                                     t->base.stride,
+                                                     image_height);
+      *out = &t->base;
+      return image + (size_t)box->z * t->base.layer_stride +
+             (size_t)util_format_get_nblocksy(res->format, box->y) *
+                t->base.stride +
+             util_format_get_stride(res->format, box->x);
    }
    /* Volume slices and cube faces are addressed by the box's z range. */
    const unsigned layers = MAX2(box->depth, 1);
@@ -8921,6 +8967,15 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
    struct ph_texel_order order_storage;
    const struct ph_texel_order *swap_rb =
       ph_format_texel_order(transfer->resource->format, &order_storage);
+   if (texture && !t->staging) {
+      /* A host-only level was written in place. */
+      if ((transfer->usage & PIPE_MAP_WRITE) && transfer->level) {
+         r->mip_defined |= BITFIELD_BIT(transfer->level);
+         r->content_generation++;
+      }
+      FREE(t);
+      return;
+   }
    if (texture && r->mip.block_bytes && t->staging && r->map) {
       if (transfer->usage & PIPE_MAP_WRITE) {
          ph_copy_blocks(r, t->staging, transfer->stride, &transfer->box, true);

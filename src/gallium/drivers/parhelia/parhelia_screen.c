@@ -1401,6 +1401,11 @@ ph_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *pres)
       ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &close);
    }
    align_free(r->malloc_data);
+   if (r->sw_level) {
+      for (unsigned l = 0; l <= r->base.last_level; l++)
+         FREE(r->sw_level[l]);
+      FREE(r->sw_level);
+   }
    FREE(r);
 }
 

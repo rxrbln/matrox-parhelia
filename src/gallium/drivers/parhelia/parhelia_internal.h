@@ -144,6 +144,10 @@ struct parhelia_resource {
    bool zinit_pending;
    uint32_t zinit_value;
    struct pipe_resource *zinit_colour;
+   /* Levels the hardware storage does not hold (the render classes keep
+    * level 0 only, some sampler classes a single level): one host image per
+    * level, allocated on first map, last_level + 1 entries. */
+   void **sw_level;
 };
 
 static inline struct parhelia_screen *
