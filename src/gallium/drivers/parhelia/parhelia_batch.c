@@ -420,6 +420,57 @@ parhelia_batch_zclear(struct parhelia_batch *batch, uint32_t depth_handle,
                        P3D_TRIANGLES, 0, 0, false);
 }
 
+/* The Z-init load with an explicit DWGCTL word: 0x208 uncompressed, 0x008
+ * with Z compression engaged (mtxpserd.dll 0x9eff0). */
+int
+parhelia_batch_zclear_word(struct parhelia_batch *batch, uint32_t depth_handle,
+                           unsigned pitch, unsigned format, uint32_t value,
+                           uint32_t word)
+{
+   struct p3d_reloc calls[PH_BATCH_PACKETS];
+   uint32_t ring[PH_BATCH_PACKETS * 5];
+   struct p3d_cs cs;
+   struct p3d_surface surface = {.pitch = pitch, .fmt = format};
+
+   if (!batch || !depth_handle || !pitch || (pitch & 63) || pitch > 0x3fff ||
+       !p3d_surface_format_bytes(format))
+      return -EINVAL;
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
+               PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
+   p3d_emit_depth_control(&cs, &surface, 1, word, true, value,
+                          P3D_DWGCTL_SOLID);
+   return batch_finish(batch, &cs, calls, 0, depth_handle, 0, 0, NULL, 0, 0, 0,
+                       P3D_TRIANGLES, 0, 0, false);
+}
+
+int
+parhelia_batch_zcontrol(struct parhelia_batch *batch, uint32_t depth_handle,
+                        unsigned pitch, unsigned format, const uint32_t *words,
+                        unsigned count)
+{
+   struct p3d_reloc calls[PH_BATCH_PACKETS];
+   uint32_t ring[PH_BATCH_PACKETS * 5];
+   struct p3d_cs cs;
+   struct p3d_surface surface = {.pitch = pitch, .fmt = format};
+
+   if (!batch || !depth_handle || !pitch || (pitch & 63) || pitch > 0x3fff ||
+       !p3d_surface_format_bytes(format) || !count || count > 8)
+      return -EINVAL;
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
+               PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
+   for (unsigned i = 0; i < count; i++)
+      p3d_emit_depth_control(&cs, &surface, 1, words[i], false, 0,
+                             P3D_DWGCTL_SOLID);
+   return batch_finish(batch, &cs, calls, 0, depth_handle, 0, 0, NULL, 0, 0, 0,
+                       P3D_TRIANGLES, 0, 0, false);
+}
+
 /* Drop the tracked tile state after it has been written out. */
 int
 parhelia_batch_zdiscard(struct parhelia_batch *batch, uint32_t depth_handle,
