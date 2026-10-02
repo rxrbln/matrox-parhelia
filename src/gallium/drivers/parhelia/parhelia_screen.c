@@ -1768,6 +1768,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    draw_init_shader_caps((struct pipe_shader_caps *)&s->base.shader_caps[MESA_SHADER_VERTEX]);
    ((struct pipe_shader_caps *)&s->base.shader_caps[MESA_SHADER_VERTEX])->supported_irs =
       1 << PIPE_SHADER_IR_NIR;
+   /* The WARP engine has no texture path and the context never hands vertex
+    * sampler views to draw, so vertex texture fetch is not available. */
+   ((struct pipe_shader_caps *)&s->base.shader_caps[MESA_SHADER_VERTEX])->max_texture_samplers = 0;
+   ((struct pipe_shader_caps *)&s->base.shader_caps[MESA_SHADER_VERTEX])->max_sampler_views = 0;
    struct pipe_shader_caps *fs =
       (struct pipe_shader_caps *)&s->base.shader_caps[MESA_SHADER_FRAGMENT];
    fs->max_instructions = fs->max_alu_instructions = 64;
