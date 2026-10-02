@@ -7117,6 +7117,7 @@ ph_tcl_vertices_fit(struct ph_context *ctx, const float *vertices,
 
 struct ph_tcl_layout {
    bool textured, multitextured;
+   bool colour_alpha;           /* the colour slot is RGBA */
    bool program;                /* a compiled vertex program, not the kernel's */
    unsigned dpv;
    unsigned colour_offset, tex_offset[2];
@@ -7125,6 +7126,8 @@ struct ph_tcl_layout {
 /* Everything the hardware transform cannot express keeps the draw module: the
  * alpha work-arounds own the vertex layout, the software clipper owns user
  * clip planes, and polygon offset has no place in the WARP program. */
+DEBUG_GET_ONCE_BOOL_OPTION(tcl_rgba, "PARHELIA_TCL_RGBA", false)
+
 static bool
 ph_tcl_no(struct ph_context *ctx, enum ph_tcl_reason reason)
 {
@@ -7177,8 +7180,10 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
       return ph_tcl_no(ctx, PH_TCL_NO_COLOUR1);
    /* An untextured colour with a visible alpha needs the RGBA stream: its
     * transforming form drew right in --colour-alpha-probe but stopped the
-    * engine on a 100000-vertex GL_POLYGON, so the draw module stages it. */
-   if (!textured && ph_colour_alpha_observable(ctx))
+    * engine on a 100000-vertex GL_POLYGON, so the draw module stages it
+    * unless PARHELIA_TCL_RGBA=1 asks for the transform route. */
+   const bool rgba = !textured && ph_colour_alpha_observable(ctx);
+   if (rgba && !debug_get_option_tcl_rgba())
       return ph_tcl_no(ctx, PH_TCL_NO_RGBA_COLOUR);
    /* The alpha routes below re-shape or replace the vertex stream. */
    if (ph_use_vertex_alpha(ctx, textured, multitextured, depth, colour) ||
@@ -7225,10 +7230,11 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
 
    lay->textured = textured;
    lay->multitextured = multitextured;
+   lay->colour_alpha = rgba;
    lay->colour_offset = 3;
    lay->tex_offset[0] = 6;
    lay->tex_offset[1] = 8;
-   lay->dpv = 6 + (textured ? 2 : 0) + (multitextured ? 2 : 0);
+   lay->dpv = 6 + rgba + (textured ? 2 : 0) + (multitextured ? 2 : 0);
    return true;
 }
 
@@ -7452,7 +7458,11 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
             continue;
          desc = ph_tcl_slot_of((unsigned)slot);
          if (!desc ||
-             !ph_tcl_add_element(ctx, &key, (int)i, desc->format,
+             !ph_tcl_add_element(ctx, &key, (int)i,
+                                 lay.colour_alpha &&
+                                    desc->slot == P3D_WARP_V_COLOUR ?
+                                    PIPE_FORMAT_R32G32B32A32_FLOAT :
+                                    desc->format,
                                  desc->offset * sizeof(float),
                                  desc->max_components))
             goto fallback;
@@ -7463,7 +7473,9 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
          goto fallback;
       if (ctx->vs->colour_input >= 0 &&
           !ph_tcl_add_element(ctx, &key, ctx->vs->colour_input,
-                              PIPE_FORMAT_R32G32B32_FLOAT,
+                              lay.colour_alpha ?
+                                 PIPE_FORMAT_R32G32B32A32_FLOAT :
+                                 PIPE_FORMAT_R32G32B32_FLOAT,
                               lay.colour_offset * sizeof(float), 4))
          goto fallback;
       for (unsigned u = 0; u < 2; u++) {
@@ -7509,7 +7521,8 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
     * either ends it too. */
    if (ctx->points || ctx->lines ||
        (ctx->triangles &&
-        (!ctx->transform || memcmp(ctx->mvp, mvp, sizeof mvp) ||
+        (!ctx->transform || ctx->colour_alpha != lay.colour_alpha ||
+         memcmp(ctx->mvp, mvp, sizeof mvp) ||
          ctx->warp_program_entry != entry ||
          ctx->vs_const_vec4s != vs_const_vec4s ||
          (vs_const_vec4s &&
@@ -7529,6 +7542,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    ctx->vp_slot = lay.program ? ctx->vs->prog.vp_scale_slot : 0;
    ctx->warp_program_entry = entry;
    ctx->transform = true;
+   ctx->colour_alpha = lay.colour_alpha;
    ctx->tcl_draws++;
    ctx->tcl_verts += draw->count;
    if (lay.program)
@@ -7563,6 +7577,8 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
             c[0] = have ? constant[0] : 1.0f;
             c[1] = have ? constant[1] : 1.0f;
             c[2] = have ? constant[2] : 1.0f;
+            if (lay.colour_alpha)
+               c[3] = have ? constant[3] : 1.0f;
          }
       }
       if (!ph_tcl_vertices_fit(ctx, dst, chunk * 3, lay.dpv)) {
