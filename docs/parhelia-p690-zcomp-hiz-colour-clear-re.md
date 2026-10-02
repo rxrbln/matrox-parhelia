@@ -594,6 +594,28 @@ Only cheap fragments pay for Z traffic (1:1 bilinear 262 -> 230, 16:1
 trilinear 655 -> 230).  A capture of the Windows driver with
 `3D.EnableZCompSundog=1` would show whether more state is needed.
 
+**P6 continued, Z compression in a GL driver (PARHELIA_ZCOMP, not
+landed).**  Armed on full depth clears of 0x36 layout-2 surfaces, in the
+vendor's two orders: `0x20a`, `0x108`, then the clear loaded as compressed
+Z-init `0x008`; or `0x20a`, `0x108`, then the 2-D fill.  The release ran the
+EQUAL resolve, then the decompress pass (`0xa0a`, a depth-NEVER rectangle,
+`0x20a`, `0x00a`), before every consumer outside the Z unit.  No lockup, and
+ioquake3 ran at the same 23.0/22.9 fps.  But the depth test is **wrong**
+while compression is armed.  piglit depthstencil-default_fb-clear,
+fbo-depth-gl_depth_component24/32-clear and
+fbo-depthstencil-gl_depth24_stencil8-clear fail in both orders and pass
+without it.  The fragments that should pass the cleared depth draw nothing:
+the colour probes read black.  The vendor's `0x207` + `0x12bc` sync between
+mode changes was replaced by batch fences, because `0x12bc` is kernel-owned;
+whether that is the missing piece is OPEN.  The code is shelved as
+`zre-zcomp-option-wip.diff` and needs that kernel support plus a Windows
+capture with `3D.EnableZCompSundog=1` before it can count as validated.
+
+**Strip-split 2-D fill (P2), landed, default on:** vendor 32-pixel column
+strips refired by DSTXY+LEN.  1280x1024 at 32 bpp: 482 -> 676 Mpixel/s; at
+16 bpp: 771 -> 1311 Mpixel/s.  An odd-edged rectangle over a known
+background is pixel-exact (0 of 1310720 mismatches).
+
 **Z-init beyond the coverage:** the vendor's split, Z-init for the whole
 tile rows inside the 640 measured tiles plus a 2-D fill of the rest, is
 exact.  On a Z24X8 buffer it takes ioquake3 from 22.9/23.0 to 24.7/24.7 fps
