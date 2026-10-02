@@ -338,6 +338,64 @@ P690 route gangs pipes 0+2 for one texture, see
 compression and fast clear exist but ship disabled on the P690 in the vendor
 driver (`parhelia-p690-zcompression-clear-banks-re.md`).
 
+## CPU transfers of render targets (piglit timeouts, 2026-10-02)
+
+Thirteen core piglit tests timed out at 7 s.  At 120 s most of them were
+slow but correct, and every slow one was CPU-bound in the kernel's aperture
+copy (`memcpy_fromio` 78-95% of all samples).
+
+`xferbench` (UPLOAD/DOWNLOAD_RENDER on a 256x256 native colour target,
+P690 on a PCIe 1.0 x8 link, VIA Nano host), MEASURED:
+
+| size | download | upload |
+|---:|---:|---:|
+| 4 B | 8.1 us | 7.1 us |
+| 256 B | 36.6 us | 9.4 us |
+| 4 KiB | 454 us | 46 us |
+| 64 KiB | 6.8 ms (9.6 MB/s) | 0.66 ms (99 MB/s) |
+
+* An uncached BAR0 read is one PCIe round trip, ~0.4 us per dword.  A
+  read-only probe of the slot-0 window: 4-byte loads 9.8 MB/s, 8-byte loads
+  19.1 MB/s, 16-byte and `movntdqa` loads no better, a write-combined
+  mapping (`resource0_wc`) identical.
+* The host-aperture descriptor addresses VRAM in **32-byte units**: single
+  dword transfers at offsets 1..7 of a unit read dword 0 and wrote dword 0.
+  The kernel published the unaligned offset itself.
+
+Mesa moved whole tile rows (12-16 KiB) for every one-pixel `glReadPixels`
+or `glCopyPixels` on a class target.  It now collects the 32-byte units of
+the box, merges runs closer than one call's cost (64 bytes) and moves only
+those:
+
+| test | before | after |
+|---|---:|---:|
+| copypixels-sync | 108 s | 1.9 s |
+| copypixels-draw-sync | 75 s | 4.0 s |
+| draw-copypixels-sync | 37 s | 2.8 s |
+| draw-sync | 37 s | 3.1 s |
+
+Tests that read whole windows per subtest are bound by the read rate
+itself.  The kernel now publishes sub-32-byte offsets correctly and reads
+the aperture with `readq`: downloads 9.6 -> 18.5 MB/s (64 KiB calls,
+MEASURED), clipflat 24 -> 17 s, texsubimage 48 -> 38 s.
+
+`streaming-texture-leak` is bound by bus writes and cannot finish in a
+reasonable time on this link.  It creates, fills, draws and deletes 5000
+1024x1024 RGBA textures (20 GB of texels).  Each texture costs about
+16 MB of uncached bus writes at ~100 MB/s (DERIVED from the profile):
+the kernel clears both new 4 MiB objects (tiled and linear companion)
+through the aperture (`memset`, ~20% of samples), the 4 MiB render-shadow upload (`memcpy_toio`, ~21%),
+and the linear companion written through its mapping.  Byte-wise stores
+into the mappings were replaced by texel-wide accesses and gathered row
+copies: 92 -> 146 textures per 30 s (MEASURED), i.e. ~1000 s for the
+whole test instead of ~1600 s.  Further gains need fewer bytes on the bus:
+clearing new objects with the 2-D engine, not writing both representations
+of a sampler image from the CPU, or a write-combined mapping.
+
+The register-list compaction allocated a ~100 KiB scratch batch per draw
+and scanned the relocations per packet (25% of longprim); it now compacts
+in place: longprim 11.0 -> 8.4 s.
+
 ## Known issues found while measuring
 
 * `trace_vram_reloc=1` hangs the first submit after module load.
