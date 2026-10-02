@@ -289,14 +289,17 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
                  ((target == PIPE_TEXTURE_3D ? ph_screen(s)->volume_targets :
                    target == PIPE_TEXTURE_CUBE && ph_screen(s)->cube_targets) &&
                   (bind & PIPE_BIND_SAMPLER_VIEW) &&
-                  !(bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL |
+                  !(bind & (PIPE_BIND_DEPTH_STENCIL |
                             PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
                             PIPE_BIND_SHARED)))) {
          /* A 1-D image is a one-row 2-D surface: the address unit's own mip
           * chain for a height-1 base was measured level by level with
           * --mip-address-probe W 1 and needs no descriptor of its own.  A
-          * volume or cube map is sampler-only: those descriptors exist for
-          * the texture unit alone. */
+          * volume or cube map is stored for the texture unit alone; the
+          * state tracker asks for the render bind on the GL_RGBA/RGB packed
+          * types it treats as required renderable formats and has no
+          * fallback without it, so the bind is accepted and a draw into a
+          * slice or face is refused at draw time. */
          switch (format) {
          case PIPE_FORMAT_B5G6R5_UNORM:
             /* Sampler code 0x28, and the same code as a render target: a

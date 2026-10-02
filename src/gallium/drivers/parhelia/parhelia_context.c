@@ -8772,7 +8772,9 @@ ph_promote_target(struct ph_context *ctx, struct pipe_resource *res)
       .width = res->width0, .height = res->height0, .depth = 1,
    };
 
-   if (!r->upload_texture)
+   /* Volume slices and cube faces stay in their sampler order; draws into
+    * them are refused. */
+   if (!r->upload_texture || r->mip.slices)
       return true;
    if ((ctx->aggregate_batches && ph_drain_batch(ctx)) || ph_wait_async(ctx))
       return false;
