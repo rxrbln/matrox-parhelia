@@ -30,7 +30,6 @@ module_param(host_format_rgb565, uint, 0644);
 MODULE_PARM_DESC(host_format_rgb565,
 		 "host-aperture format code for 16 bpp surfaces");
 
-static const struct drm_gem_object_funcs parhelia_host_object_funcs;
 static const struct drm_gem_object_funcs parhelia_view_object_funcs;
 static const struct drm_gem_object_funcs parhelia_raw_object_funcs;
 static const struct drm_gem_object_funcs parhelia_unmappable_object_funcs;
@@ -227,7 +226,7 @@ static bool parhelia_host_view_evict_one_locked(struct parhelia_device *pdev);
 
 static int parhelia_aperture_try_alloc_locked(struct parhelia_device *pdev,
 					      struct parhelia_aperture_mapping *mapping,
-					      u32 map_size)
+					      u32 map_size, bool type0)
 {
 	u64 span;
 
@@ -247,8 +246,9 @@ static int parhelia_aperture_try_alloc_locked(struct parhelia_device *pdev,
 	INIT_LIST_HEAD(&mapping->link);
 	mapping->map_size = map_size;
 	return drm_mm_insert_node_generic(&pdev->aperture_mm, &mapping->node,
-					  span, PARHELIA_HOST_APERTURE_ALIGN,
-					  0, DRM_MM_INSERT_LOW);
+					  span, PARHELIA_HOST_APERTURE_ALIGN, 0,
+					  type0 ? DRM_MM_INSERT_HIGH :
+						  DRM_MM_INSERT_LOW);
 }
 
 static bool parhelia_engine_parked(struct parhelia_device *pdev)
@@ -261,28 +261,49 @@ static bool parhelia_engine_parked(struct parhelia_device *pdev)
  * parked may do it. */
 static int parhelia_aperture_alloc_locked(struct parhelia_device *pdev,
 					  struct parhelia_aperture_mapping *mapping,
-					  u32 map_size)
+					  u32 map_size, bool type0)
 {
 	int ret;
 
 	do {
-		ret = parhelia_aperture_try_alloc_locked(pdev, mapping, map_size);
+		ret = parhelia_aperture_try_alloc_locked(pdev, mapping, map_size,
+							 type0);
 	} while (ret == -ENOSPC && parhelia_engine_parked(pdev) &&
 		 parhelia_host_view_evict_one_locked(pdev));
 	return ret;
 }
 
-/* For callers that do not park the engine themselves: park it and retry
- * when only revoking host views can make room.  *parked tells the caller
- * to parhelia_submit_unlock() once its window is released. */
-static int parhelia_aperture_alloc_parking(struct parhelia_device *pdev,
-					   struct parhelia_aperture_mapping *mapping,
-					   u32 map_size, bool *parked)
-{
-	int ret = parhelia_aperture_alloc_locked(pdev, mapping, map_size);
+static bool parhelia_raw_views_evict_locked(struct parhelia_device *pdev,
+					    bool dry_run);
 
-	if (ret != -ENOSPC || pdev->submit_owner == current ||
-	    list_empty(&pdev->host_view_lru))
+/* Allocate a window for a caller that may not hold the engine parked.  Two
+ * type-0 descriptors never coexist (a second one left the first undecoded,
+ * reading 0xffffffff), so a type-0 window first revokes the raw views, and
+ * either revocation parks the engine when the caller has not.  *parked tells
+ * the caller to parhelia_submit_unlock() once its window is released. */
+static int parhelia_aperture_alloc_window(struct parhelia_device *pdev,
+					  struct parhelia_aperture_mapping *mapping,
+					  u32 map_size, bool type0, bool *parked)
+{
+	int ret;
+
+	lockdep_assert_held(&pdev->aperture_lock);
+	if (type0 && !parhelia_engine_parked(pdev) &&
+	    parhelia_raw_views_evict_locked(pdev, true)) {
+		if (pdev->submit_owner == current)
+			return -EBUSY;
+		mutex_unlock(&pdev->aperture_lock);
+		ret = parhelia_submit_idle_lock(pdev);
+		mutex_lock(&pdev->aperture_lock);
+		if (ret)
+			return ret;
+		*parked = true;
+	}
+	if (type0)
+		parhelia_raw_views_evict_locked(pdev, false);
+	ret = parhelia_aperture_alloc_locked(pdev, mapping, map_size, type0);
+	if (ret != -ENOSPC || parhelia_engine_parked(pdev) ||
+	    pdev->submit_owner == current || list_empty(&pdev->host_view_lru))
 		return ret;
 	mutex_unlock(&pdev->aperture_lock);
 	ret = parhelia_submit_idle_lock(pdev);
@@ -290,7 +311,7 @@ static int parhelia_aperture_alloc_parking(struct parhelia_device *pdev,
 	if (ret)
 		return ret;
 	*parked = true;
-	return parhelia_aperture_alloc_locked(pdev, mapping, map_size);
+	return parhelia_aperture_alloc_locked(pdev, mapping, map_size, type0);
 }
 
 static void parhelia_aperture_free_unpublished_locked(
@@ -349,7 +370,7 @@ int parhelia_host_aperture_acquire(struct parhelia_device *pdev,
 	int ret;
 
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_locked(pdev, mapping, map_size);
+	ret = parhelia_aperture_alloc_locked(pdev, mapping, map_size, false);
 	if (!ret)
 		parhelia_aperture_publish_locked(pdev, mapping, surface, ctrl,
 						 dims, owner);
@@ -479,15 +500,13 @@ bool parhelia_gem_is_owned(const struct drm_gem_object *gem)
 {
 	return gem->funcs == &parhelia_raw_object_funcs ||
 	       gem->funcs == &parhelia_unmappable_object_funcs ||
-	       gem->funcs == &parhelia_host_object_funcs ||
 	       gem->funcs == &parhelia_view_object_funcs;
 }
 
 /* Byte pitch of the object's CPU mapping and of its framebuffers. */
 u32 parhelia_bo_cpu_pitch(const struct parhelia_bo *bo)
 {
-	return bo->host_aperture || bo->host_view ? bo->host_pitch :
-						     bo->gpu_pitch;
+	return bo->host_view ? bo->host_pitch : bo->gpu_pitch;
 }
 
 /* Validate and return the CPU/display-controller view of a TTM placement. */
@@ -600,13 +619,15 @@ int parhelia_vram_copy_resources(struct parhelia_device *pdev,
 	struct parhelia_aperture_mapping mapping = { };
 	u64 size = bo->base.size, done;
 	void *bounce;
+	bool parked = false;
 	int ret;
 
 	bounce = kmalloc(SZ_8K, GFP_KERNEL);
 	if (!bounce)
 		return -ENOMEM;
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_locked(pdev, &mapping, SZ_8K);
+	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, true,
+					     &parked);
 	for (done = 0; !ret && done < size; done += SZ_8K) {
 		u32 bytes = min_t(u64, size - done, SZ_8K);
 		u32 src, dst;
@@ -659,13 +680,15 @@ int parhelia_vram_move_pages(struct parhelia_device *pdev,
 	struct parhelia_aperture_mapping mapping = { };
 	struct ttm_tt *tt = bo->ttm;
 	u64 size = bo->base.size, done;
+	bool parked = false;
 	int ret;
 
 	if (!tt || !ttm_tt_is_populated(tt) || !tt->pages)
 		return -EINVAL;
 
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_locked(pdev, &mapping, SZ_8K);
+	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, true,
+					     &parked);
 	for (done = 0; !ret && done < size; ) {
 		u32 bytes = min_t(u64, size - done, SZ_8K);
 		u32 surface_address, in_window = 0;
@@ -718,16 +741,6 @@ int parhelia_vram_move_pages(struct parhelia_device *pdev,
 	return ret;
 }
 
-static void parhelia_host_descriptor_disable(struct parhelia_bo *bo)
-{
-	struct parhelia_device *pdev = to_parhelia(bo->gbo.bo.base.dev);
-
-	if (bo->host_aperture) {
-		parhelia_host_aperture_release(pdev, &bo->aperture);
-		bo->host_aperture = false;
-	}
-}
-
 void parhelia_host_aperture_fini(struct parhelia_device *pdev)
 {
 	unsigned int slot;
@@ -744,24 +757,6 @@ void parhelia_host_aperture_fini(struct parhelia_device *pdev)
 		pdev->aperture_live = false;
 	}
 	mutex_unlock(&pdev->aperture_lock);
-}
-
-static void parhelia_host_object_free(struct drm_gem_object *gem)
-{
-	struct parhelia_bo *bo = to_parhelia_bo(gem);
-	struct parhelia_device *pdev = to_parhelia(gem->dev);
-
-	parhelia_root_trace_check(pdev, "host_free:enter", bo->layout,
-				  gem->size, bo->aperture_slot);
-	/* A VMA owns a GEM reference, so this cannot run while the translated BAR
-	 * range remains accessible.  Revoke the descriptor before either address
-	 * range can return to TTM.
-	 */
-	parhelia_host_descriptor_disable(bo);
-	parhelia_vram_unpin(&bo->gbo);
-	parhelia_root_trace_check(pdev, "host_free:exit", bo->layout,
-				  gem->size, bo->aperture_slot);
-	drm_gem_vram_put(&bo->gbo);
 }
 
 static void parhelia_raw_object_free(struct drm_gem_object *gem)
@@ -801,26 +796,17 @@ static void parhelia_raw_object_vunmap(struct drm_gem_object *gem,
 				  to_parhelia_bo(gem)->layout, gem->size, 0);
 }
 
-static int parhelia_raw_object_mmap(struct drm_gem_object *gem,
-				    struct vm_area_struct *vma)
-{
-	struct parhelia_device *pdev = to_parhelia(gem->dev);
-	int ret;
-
-	parhelia_root_trace_check(pdev, "raw_mmap:enter",
-				  to_parhelia_bo(gem)->layout, gem->size,
-				  vma->vm_end - vma->vm_start);
-	ret = drm_gem_ttm_mmap(gem, vma);
-	parhelia_root_trace_check(pdev, "raw_mmap:exit", (u64)(s64)ret,
-				  to_parhelia_bo(gem)->layout, gem->size);
-	return ret;
-}
+static void parhelia_view_object_free(struct drm_gem_object *gem);
+static int parhelia_view_object_mmap(struct drm_gem_object *gem,
+				     struct vm_area_struct *vma);
+static const struct vm_operations_struct parhelia_view_vm_ops;
 
 static const struct drm_gem_object_funcs parhelia_raw_object_funcs = {
-	.free = parhelia_raw_object_free,
+	.free = parhelia_view_object_free,
 	.vmap = parhelia_raw_object_vmap,
 	.vunmap = parhelia_raw_object_vunmap,
-	.mmap = parhelia_raw_object_mmap,
+	.mmap = parhelia_view_object_mmap,
+	.vm_ops = &parhelia_view_vm_ops,
 	.print_info = drm_gem_ttm_print_info,
 };
 
@@ -831,46 +817,6 @@ static const struct drm_gem_object_funcs parhelia_unmappable_object_funcs = {
 	.print_info = drm_gem_ttm_print_info,
 };
 
-static int parhelia_host_object_vmap(struct drm_gem_object *gem,
-				     struct iosys_map *map)
-{
-	struct parhelia_bo *bo = to_parhelia_bo(gem);
-	struct parhelia_device *pdev = to_parhelia(gem->dev);
-	void __iomem *addr;
-	int ret = 0;
-
-	parhelia_root_trace_check(pdev, "host_vmap:enter", bo->layout,
-				  gem->size, bo->aperture_slot);
-	mutex_lock(&pdev->aperture_lock);
-	if (!pdev->aperture_live || !bo->host_aperture) {
-		ret = -ENODEV;
-	} else {
-		addr = (u8 __iomem *)pdev->vram + bo->aperture_offset;
-		iosys_map_set_vaddr_iomem(map, addr);
-	}
-	mutex_unlock(&pdev->aperture_lock);
-	parhelia_root_trace_check(pdev, "host_vmap:exit", (u64)(s64)ret,
-				  bo->layout, gem->size);
-	return ret;
-}
-
-static void parhelia_host_object_vunmap(struct drm_gem_object *gem,
-					struct iosys_map *map)
-{
-	struct parhelia_device *pdev = to_parhelia(gem->dev);
-
-	parhelia_root_trace_check(pdev, "host_vunmap:enter",
-				  to_parhelia_bo(gem)->layout, gem->size, 0);
-	iosys_map_clear(map);
-	parhelia_root_trace_check(pdev, "host_vunmap:exit",
-				  to_parhelia_bo(gem)->layout, gem->size, 0);
-}
-
-static void parhelia_host_vm_open(struct vm_area_struct *vma)
-{
-	drm_gem_vm_open(vma);
-}
-
 static void parhelia_host_vm_close(struct vm_area_struct *vma)
 {
 	/* Publish outstanding WC stores before the mapping can release its final
@@ -880,62 +826,6 @@ static void parhelia_host_vm_close(struct vm_area_struct *vma)
 	drm_gem_vm_close(vma);
 }
 
-static const struct vm_operations_struct parhelia_host_vm_ops = {
-	.open = parhelia_host_vm_open,
-	.close = parhelia_host_vm_close,
-};
-
-static int parhelia_host_object_mmap(struct drm_gem_object *gem,
-				     struct vm_area_struct *vma)
-{
-	struct parhelia_bo *bo = to_parhelia_bo(gem);
-	struct parhelia_device *pdev = to_parhelia(gem->dev);
-	resource_size_t base;
-	u64 map_offset, node_start;
-	int ret;
-
-	parhelia_root_trace_check(pdev, "host_mmap:enter", bo->layout,
-				  gem->size, vma->vm_end - vma->vm_start);
-	mutex_lock(&pdev->aperture_lock);
-	if (!pdev->aperture_live || !bo->host_aperture) {
-		ret = -ENODEV;
-		goto out_unlock;
-	}
-	node_start = drm_vma_node_start(&gem->vma_node);
-	if (vma->vm_pgoff < node_start) {
-		ret = -EINVAL;
-		goto out_unlock;
-	}
-	map_offset = (u64)(vma->vm_pgoff - node_start) << PAGE_SHIFT;
-	if (map_offset >= bo->host_size ||
-	    vma->vm_end - vma->vm_start > bo->host_size - map_offset) {
-		ret = -EINVAL;
-		goto out_unlock;
-	}
-
-	base = pci_resource_start(pdev->pdev, 0) + bo->aperture_offset + map_offset;
-	/* drm_gem_mmap() has already consumed the fake GEM offset.  The physical
-	 * mapping begins at the descriptor's BAR0 aperture range.
-	 */
-	vma->vm_pgoff = 0;
-	vma->vm_ops = &parhelia_host_vm_ops;
-	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
-	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
-	ret = vm_iomap_memory(vma, base, bo->host_size - map_offset);
-out_unlock:
-	mutex_unlock(&pdev->aperture_lock);
-	parhelia_root_trace_check(pdev, "host_mmap:exit", (u64)(s64)ret,
-				  bo->layout, gem->size);
-	return ret;
-}
-
-static const struct drm_gem_object_funcs parhelia_host_object_funcs = {
-	.free = parhelia_host_object_free,
-	.vmap = parhelia_host_object_vmap,
-	.vunmap = parhelia_host_object_vunmap,
-	.mmap = parhelia_host_object_mmap,
-	.print_info = drm_gem_ttm_print_info,
-};
 
 /*
  * Native class targets have no permanent descriptor.  Like a GTT mmap, a CPU
@@ -943,20 +833,42 @@ static const struct drm_gem_object_funcs parhelia_host_object_funcs = {
  * into a free slot, inserts its BAR0 pages, and least recently used views are
  * revoked - user PTEs first - when slots or window space run out.  A view
  * stays valid until the object moves, which drops it under the engine park.
+ * Raw objects (linear storage, legacy targets) get untranslated type-0 views
+ * of their bytes in the same way: a raw BAR0 mapping above 16 MiB folds onto
+ * the live descriptor window instead of reaching the object.
  */
 struct parhelia_host_view {
 	struct parhelia_aperture_mapping mapping;
 	struct parhelia_bo *bo;
 	struct list_head bo_link;
 	struct list_head lru_link;
-	u32 first_row;
-	u32 rows;
+	/* the CPU mapping's bytes this view serves */
+	u64 offset;
+	u32 size;
+	u32 vmap_count;
+	bool raw;
 };
 
-/* Objects whose CPU view fits this window are bound whole, larger ones in
- * row bands of about a mebibyte. */
-#define PARHELIA_HOST_VIEW_WHOLE	SZ_4M
-#define PARHELIA_HOST_VIEW_BAND		SZ_1M
+/* A type-3 view larger than 512 KiB is decoded shifted on the P690 (64x16:
+ * 768 KiB read from 256 KiB further in, wherever it sits), so objects are
+ * bound whole up to that size and in row bands of at most it beyond. */
+#define PARHELIA_HOST_VIEW_WHOLE	SZ_512K
+#define PARHELIA_HOST_VIEW_BAND		SZ_512K
+/* The type-0 window shape the transfer paths use: 8 KiB of raw bytes. */
+#define PARHELIA_RAW_VIEW		SZ_8K
+#define PARHELIA_RAW_VIEW_CTRL		0x10000020
+#define PARHELIA_RAW_VIEW_DIMS		0x00010001
+
+static bool parhelia_gem_has_views(const struct drm_gem_object *gem)
+{
+	return gem->funcs == &parhelia_view_object_funcs ||
+	       gem->funcs == &parhelia_raw_object_funcs;
+}
+
+static u64 parhelia_host_view_extent(const struct parhelia_bo *bo)
+{
+	return bo->host_view ? bo->host_size : bo->gbo.bo.base.size;
+}
 
 static void parhelia_host_view_destroy_locked(struct parhelia_device *pdev,
 					      struct parhelia_host_view *view)
@@ -967,13 +879,31 @@ static void parhelia_host_view_destroy_locked(struct parhelia_device *pdev,
 	if (bo) {
 		unmap_mapping_range(pdev->drm.anon_inode->i_mapping,
 			drm_vma_node_offset_addr(&bo->gbo.bo.base.vma_node) +
-			(u64)view->first_row * bo->host_pitch,
-			(u64)view->rows * bo->host_pitch, 1);
+			view->offset, view->size, 1);
 		list_del(&view->bo_link);
 	}
 	list_del(&view->lru_link);
 	parhelia_aperture_release_locked(pdev, &view->mapping);
 	kfree(view);
+}
+
+/* Revoke every raw (type-0) view; with @dry_run only report whether any. */
+static bool parhelia_raw_views_evict_locked(struct parhelia_device *pdev,
+					    bool dry_run)
+{
+	struct parhelia_host_view *view, *next;
+	bool found = false;
+
+	lockdep_assert_held(&pdev->aperture_lock);
+	list_for_each_entry_safe(view, next, &pdev->host_view_lru, lru_link) {
+		if (!view->raw)
+			continue;
+		found = true;
+		if (dry_run)
+			break;
+		parhelia_host_view_destroy_locked(pdev, view);
+	}
+	return found;
 }
 
 static bool parhelia_host_view_evict_one_locked(struct parhelia_device *pdev)
@@ -994,7 +924,7 @@ void parhelia_host_views_drop(struct parhelia_device *pdev,
 	struct parhelia_host_view *view, *next;
 	struct parhelia_bo *bo;
 
-	if (tbo->base.funcs != &parhelia_view_object_funcs)
+	if (!parhelia_gem_has_views(&tbo->base))
 		return;
 	bo = to_parhelia_bo(&tbo->base);
 	mutex_lock(&pdev->aperture_lock);
@@ -1007,7 +937,7 @@ void parhelia_host_views_drop(struct parhelia_device *pdev,
 void parhelia_host_views_revoke_cpu(struct parhelia_device *pdev,
 				    struct drm_gem_object *gem)
 {
-	if (gem->funcs != &parhelia_view_object_funcs)
+	if (!parhelia_gem_has_views(gem))
 		return;
 	mutex_lock(&pdev->aperture_lock);
 	if (!list_empty(&to_parhelia_bo(gem)->host_views))
@@ -1028,44 +958,64 @@ static u32 parhelia_host_view_rows(const struct parhelia_bo *bo)
 }
 
 static struct parhelia_host_view *
-parhelia_host_view_find_locked(struct parhelia_bo *bo, u32 row)
+parhelia_host_view_find_locked(struct parhelia_bo *bo, u64 offset)
 {
 	struct parhelia_host_view *view;
 
 	list_for_each_entry(view, &bo->host_views, bo_link)
-		if (row >= view->first_row && row - view->first_row < view->rows)
+		if (offset >= view->offset && offset - view->offset < view->size)
 			return view;
 	return NULL;
 }
 
 static struct parhelia_host_view *
 parhelia_host_view_create_locked(struct parhelia_device *pdev,
-				 struct parhelia_bo *bo, u32 row)
+				 struct parhelia_bo *bo, u64 offset)
 {
 	struct parhelia_host_view *view;
-	u32 band = parhelia_host_view_rows(bo), surface, format;
+	u32 surface, ctrl, dims, first_row = 0, rows = 0;
+	u64 gpu_offset, gpu_size;
 	int ret;
 
 	lockdep_assert_held(&pdev->aperture_lock);
 	view = kzalloc_obj(*view);
 	if (!view)
 		return ERR_PTR(-ENOMEM);
-	view->first_row = rounddown(row, band);
-	view->rows = min(band, bo->alloc_height - view->first_row);
-	ret = parhelia_vram_gpu_addr(pdev, &bo->gbo,
-				     (u64)view->first_row * bo->gpu_pitch,
-				     (u64)view->rows * bo->gpu_pitch, &surface);
+	if (bo->host_view) {
+		u32 band = parhelia_host_view_rows(bo), format;
+
+		first_row = rounddown((u32)(offset / bo->host_pitch), band);
+		rows = min(band, bo->alloc_height - first_row);
+		view->offset = (u64)first_row * bo->host_pitch;
+		view->size = rows * bo->host_pitch;
+		gpu_offset = (u64)first_row * bo->gpu_pitch;
+		gpu_size = (u64)rows * bo->gpu_pitch;
+		format = bo->cpp == 2 ? host_format_rgb565 :
+					PARHELIA_HOST_FORMAT_XRGB8888;
+		ctrl = (format << 24) | (3u << 16) | (bo->gpu_pitch / bo->cpp);
+		dims = BIT(16) | rows;
+	} else {
+		parhelia_raw_views_evict_locked(pdev, false);
+		view->raw = true;
+		view->offset = rounddown(offset, PARHELIA_RAW_VIEW);
+		view->size = min_t(u64, PARHELIA_RAW_VIEW,
+				   bo->gbo.bo.base.size - view->offset);
+		gpu_offset = view->offset;
+		gpu_size = view->size;
+		ctrl = PARHELIA_RAW_VIEW_CTRL;
+		dims = PARHELIA_RAW_VIEW_DIMS;
+	}
+	ret = parhelia_vram_gpu_addr(pdev, &bo->gbo, gpu_offset, gpu_size,
+				     &surface);
 	if (!ret)
 		ret = parhelia_aperture_alloc_locked(pdev, &view->mapping,
-						     view->rows * bo->host_pitch);
+						     view->size, view->raw);
 	if (ret) {
 		kfree(view);
 		return ERR_PTR(ret);
 	}
-	format = bo->cpp == 2 ? host_format_rgb565 : PARHELIA_HOST_FORMAT_XRGB8888;
-	parhelia_aperture_publish_locked(pdev, &view->mapping, surface,
-		(format << 24) | (3u << 16) | (bo->gpu_pitch / bo->cpp),
-		BIT(16) | view->rows, NULL);
+	parhelia_aperture_publish_locked(pdev, &view->mapping, surface, ctrl,
+					 dims, NULL);
 	view->bo = bo;
 	list_add(&view->bo_link, &bo->host_views);
 	list_add_tail(&view->lru_link, &pdev->host_view_lru);
@@ -1079,9 +1029,8 @@ static vm_fault_t parhelia_host_view_insert(struct vm_fault *vmf,
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct parhelia_device *pdev = to_parhelia(view->bo->gbo.bo.base.dev);
-	u64 view_offset = (u64)view->first_row * view->bo->host_pitch;
-	pgoff_t view_end = (view_offset + (u64)view->rows *
-			    view->bo->host_pitch) >> PAGE_SHIFT;
+	u64 view_offset = view->offset;
+	pgoff_t view_end = (view_offset + view->size) >> PAGE_SHIFT;
 	unsigned long address = vmf->address;
 	unsigned long pfn;
 	vm_fault_t ret = VM_FAULT_NOPAGE;
@@ -1114,14 +1063,14 @@ static vm_fault_t parhelia_host_view_fault(struct vm_fault *vmf)
 	pgoff_t page;
 	vm_fault_t ret;
 	long wait;
-	u32 row;
+	u64 offset;
 	int err;
 
 	page = vmf->pgoff - drm_vma_node_start(&gem->vma_node);
+	offset = (u64)page << PAGE_SHIFT;
 	if (vmf->pgoff < drm_vma_node_start(&gem->vma_node) ||
-	    ((u64)page << PAGE_SHIFT) >= bo->host_size)
+	    offset >= parhelia_host_view_extent(bo))
 		return VM_FAULT_SIGBUS;
-	row = ((u64)page << PAGE_SHIFT) / bo->host_pitch;
 
 	/* A bound view is current while the reservation holds the placement. */
 	if (dma_resv_lock_interruptible(gem->resv, NULL))
@@ -1133,7 +1082,7 @@ static vm_fault_t parhelia_host_view_fault(struct vm_fault *vmf)
 		return parhelia_host_view_errno(wait);
 	}
 	mutex_lock(&pdev->aperture_lock);
-	view = parhelia_host_view_find_locked(bo, row);
+	view = parhelia_host_view_find_locked(bo, offset);
 	ret = view ? parhelia_host_view_insert(vmf, view, page) : 0;
 	mutex_unlock(&pdev->aperture_lock);
 	dma_resv_unlock(gem->resv);
@@ -1152,9 +1101,9 @@ static vm_fault_t parhelia_host_view_fault(struct vm_fault *vmf)
 		return parhelia_host_view_errno(err);
 	}
 	mutex_lock(&pdev->aperture_lock);
-	view = parhelia_host_view_find_locked(bo, row);
+	view = parhelia_host_view_find_locked(bo, offset);
 	if (!view)
-		view = parhelia_host_view_create_locked(pdev, bo, row);
+		view = parhelia_host_view_create_locked(pdev, bo, offset);
 	ret = IS_ERR(view) ? parhelia_host_view_errno(PTR_ERR(view)) :
 			     parhelia_host_view_insert(vmf, view, page);
 	mutex_unlock(&pdev->aperture_lock);
@@ -1227,8 +1176,67 @@ static void parhelia_view_object_free(struct drm_gem_object *gem)
 		parhelia_raw_object_free(gem);
 }
 
+/* Kernel access (the cursor upload) to an object small enough for one view:
+ * the view stays bound and off the eviction list until vunmap. */
+static int parhelia_view_object_vmap(struct drm_gem_object *gem,
+				     struct iosys_map *map)
+{
+	struct parhelia_bo *bo = to_parhelia_bo(gem);
+	struct parhelia_device *pdev = to_parhelia(gem->dev);
+	struct parhelia_host_view *view;
+	int ret;
+
+	if (bo->host_size > PARHELIA_HOST_VIEW_WHOLE)
+		return -E2BIG;
+	if (pdev->submit_owner == current)
+		return -EBUSY;
+	ret = parhelia_vram_pin(&bo->gbo);
+	if (ret)
+		return ret;
+	ret = parhelia_submit_idle_lock(pdev);
+	if (ret) {
+		parhelia_vram_unpin(&bo->gbo);
+		return ret;
+	}
+	mutex_lock(&pdev->aperture_lock);
+	view = parhelia_host_view_find_locked(bo, 0);
+	if (!view)
+		view = parhelia_host_view_create_locked(pdev, bo, 0);
+	if (IS_ERR(view)) {
+		ret = PTR_ERR(view);
+	} else {
+		if (!view->vmap_count++)
+			list_del_init(&view->lru_link);
+		iosys_map_set_vaddr_iomem(map, (u8 __iomem *)pdev->vram +
+					  view->mapping.node.start);
+	}
+	mutex_unlock(&pdev->aperture_lock);
+	parhelia_submit_unlock(pdev);
+	if (ret)
+		parhelia_vram_unpin(&bo->gbo);
+	return ret;
+}
+
+static void parhelia_view_object_vunmap(struct drm_gem_object *gem,
+					struct iosys_map *map)
+{
+	struct parhelia_bo *bo = to_parhelia_bo(gem);
+	struct parhelia_device *pdev = to_parhelia(gem->dev);
+	struct parhelia_host_view *view;
+
+	mutex_lock(&pdev->aperture_lock);
+	view = parhelia_host_view_find_locked(bo, 0);
+	if (view && view->vmap_count && !--view->vmap_count)
+		list_add_tail(&view->lru_link, &pdev->host_view_lru);
+	mutex_unlock(&pdev->aperture_lock);
+	iosys_map_clear(map);
+	parhelia_vram_unpin(&bo->gbo);
+}
+
 static const struct drm_gem_object_funcs parhelia_view_object_funcs = {
 	.free = parhelia_view_object_free,
+	.vmap = parhelia_view_object_vmap,
+	.vunmap = parhelia_view_object_vunmap,
 	.mmap = parhelia_view_object_mmap,
 	.vm_ops = &parhelia_view_vm_ops,
 	.print_info = drm_gem_ttm_print_info,
@@ -1277,7 +1285,8 @@ int parhelia_vram_clear(struct parhelia_device *pdev,
 	int ret;
 
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_parking(pdev, &mapping, SZ_8K, &parked);
+	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, true,
+					     &parked);
 	for (done = 0; !ret && done < size; done += SZ_8K) {
 		u32 bytes = min_t(u64, size - done, SZ_8K);
 		u32 surface_address;
@@ -1323,7 +1332,8 @@ int parhelia_vram_write(struct parhelia_device *pdev,
 	if (offset > gbo->bo.base.size || len > gbo->bo.base.size - offset)
 		return -EINVAL;
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_parking(pdev, &mapping, SZ_8K, &parked);
+	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, true,
+					     &parked);
 	for (done = 0; !ret && done < len; done += SZ_8K) {
 		u32 bytes = min_t(u64, len - done, SZ_8K);
 		u32 surface_address;
@@ -1358,12 +1368,9 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 {
 	struct parhelia_device *pdev = to_parhelia(drm);
 	struct drm_gem_vram_object *gbo;
-	struct parhelia_bo *bo;
 	unsigned long native_align_pages;
 	u32 gpu_pitch_pixels, host_pitch_pixels, alloc_height, cpp, tile_width;
-	u32 surface_address;
 	size_t host_size, native_size, size;
-	bool parked = false;
 	u32 handle;
 	int ret;
 
@@ -1392,58 +1399,31 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	native_size = PAGE_ALIGN(native_size);
 	size = max(host_size, native_size);
 
-	/* The probe-time carveout keeps this real surface above the folded class-0
-	 * VA window.  Allocate its independent low logical address before pinning
-	 * and recording the physical dword-1 target.
-	 */
 	native_align_pages = pdev->chip->tile_layout == PARHELIA_TILE_64X32_8K ? 2 : 1;
 	gbo = drm_gem_vram_create(drm, size, native_align_pages);
 	if (IS_ERR(gbo))
 		return PTR_ERR(gbo);
-	bo = container_of(gbo, struct parhelia_bo, gbo);
-
-	/* Pin first: an eviction it causes takes the engine park and the
-	 * aperture lock itself. */
-	ret = parhelia_vram_pin(gbo);
+	parhelia_bo_set_layout(gbo, pdev->chip->tile_layout == PARHELIA_TILE_64X16_4K ?
+			       PARHELIA_BO_LAYOUT_NATIVE_64X16 :
+			       PARHELIA_BO_LAYOUT_NATIVE_64X32,
+			       args->width, args->height, gpu_pitch_pixels * cpp);
+	/* The CPU view is demand-bound like a native class target's; the
+	 * allocation still covers the whole view for generic dumb users. */
+	ret = parhelia_bo_init_host_view(gbo, cpp, alloc_height);
+	if (!ret && to_parhelia_bo(&gbo->bo.base)->host_pitch !=
+		    host_pitch_pixels * cpp)
+		ret = -EINVAL;
+	if (!ret)
+		ret = parhelia_vram_pin(gbo);
 	if (ret) {
 		drm_gem_object_put(&gbo->bo.base);
 		return ret;
 	}
-	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_parking(pdev, &bo->aperture, host_size,
-					      &parked);
-	if (ret)
-		goto out_unpin_gbo;
-	ret = parhelia_vram_gpu_addr(pdev, gbo, 0, gbo->bo.base.size,
-				     &surface_address);
-	if (ret)
-		goto out_aperture;
-
-	bo->width = args->width;
-	bo->height = args->height;
-	bo->gpu_pitch = gpu_pitch_pixels * cpp;
-	bo->host_pitch = host_pitch_pixels * cpp;
-	bo->alloc_height = alloc_height;
-	bo->aperture_offset = bo->aperture.node.start;
-	bo->host_size = host_size;
-	bo->layout = pdev->chip->tile_layout == PARHELIA_TILE_64X16_4K ?
-		PARHELIA_BO_LAYOUT_NATIVE_64X16 : PARHELIA_BO_LAYOUT_NATIVE_64X32;
-	bo->host_aperture = true;
-	gbo->bo.base.funcs = &parhelia_host_object_funcs;
-	parhelia_aperture_publish_locked(pdev, &bo->aperture, surface_address,
-		((cpp == 2 ? host_format_rgb565 :
-		  PARHELIA_HOST_FORMAT_XRGB8888) << 24) | (3u << 16) |
-		(bo->gpu_pitch / cpp), BIT(16) | bo->alloc_height, bo);
-	/* TTM no longer clears new P690 objects; use the object's own view. */
-	memset_io((u8 __iomem *)pdev->vram + bo->aperture.node.start, 0,
-		  host_size);
-	wmb();
-	parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(bo->aperture.slot));
-	mutex_unlock(&pdev->aperture_lock);
-	if (parked)
-		parhelia_submit_unlock(pdev);
-
-	ret = drm_gem_handle_create(file, &gbo->bo.base, &handle);
+	/* TTM does not clear new P690 objects. */
+	ret = parhelia_vram_clear(pdev, gbo);
+	parhelia_vram_unpin(gbo);
+	if (!ret)
+		ret = drm_gem_handle_create(file, &gbo->bo.base, &handle);
 	if (ret) {
 		drm_gem_object_put(&gbo->bo.base);
 		return ret;
@@ -1453,16 +1433,6 @@ int parhelia_dumb_create(struct drm_file *file, struct drm_device *drm,
 	args->size = host_size;
 	drm_gem_object_put(&gbo->bo.base);
 	return 0;
-
-out_aperture:
-	parhelia_aperture_free_unpublished_locked(&bo->aperture);
-out_unpin_gbo:
-	mutex_unlock(&pdev->aperture_lock);
-	if (parked)
-		parhelia_submit_unlock(pdev);
-	parhelia_vram_unpin(gbo);
-	drm_gem_object_put(&gbo->bo.base);
-	return ret;
 }
 
 int parhelia_get_bo_info_ioctl(struct drm_device *drm, void *data,
@@ -1483,8 +1453,7 @@ int parhelia_get_bo_info_ioctl(struct drm_device *drm, void *data,
 		return -EINVAL;
 	}
 	bo = to_parhelia_bo(gem);
-	args->flags = bo->host_aperture || bo->host_view ?
-		      PARHELIA_BO_INFO_HOST_APERTURE : 0;
+	args->flags = bo->host_view ? PARHELIA_BO_INFO_HOST_APERTURE : 0;
 	args->layout = bo->layout;
 	args->width = bo->width;
 	args->height = bo->height;
@@ -1508,6 +1477,7 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 	u32 surface_address;
 	u64 copied;
 	void *buffer;
+	bool parked = false;
 	int ret;
 
 	if (!pdev->raw_aperture_owned)
@@ -1558,7 +1528,8 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 	if (ret)
 		goto out_submit_unlock;
 	mutex_lock(&pdev->aperture_lock);
-	ret = parhelia_aperture_alloc_locked(pdev, &mapping, SZ_8K);
+	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, true,
+					     &parked);
 	if (ret)
 		goto out_aperture_unlock;
 
