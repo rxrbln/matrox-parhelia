@@ -5797,7 +5797,10 @@ ph_update_effective_views(struct ph_context *ctx)
 
       /* A render target keeps the surface order, the sampler's with y bits
        * 0 and 1 exchanged: it is sampled through a sampler-order copy that
-       * follows its content generation. */
+       * follows its content generation.  Storage order 0 is no linear
+       * alternative on the P690: --texture-volume-probe W 32 1 with
+       * PROBE_TEXELCODES=0 fetches x2..x4 and y2.. from one address, and the
+       * vendor's untiled 32-bit class writes order 2 (mtx2029). */
       if (bound && ((bound->u.tex.first_level &&
                      !ph_view_first_level(ph_resource(bound->texture),
                                           bound)) ||
