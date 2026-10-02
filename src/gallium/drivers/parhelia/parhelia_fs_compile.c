@@ -549,6 +549,7 @@ ph_fs_expand(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
    memset(p, 0, sizeof(*p));
    switch (alu->op) {
    case nir_op_mov:
+   case nir_op_fcanonicalize:
       return ph_fs_expand_src(ctx, alu, 0, lane, sel, p);
    case nir_op_fneg:
       return ph_fs_expand_src(ctx, alu, 0, lane, sel, &a) &&
@@ -994,19 +995,41 @@ ph_fs_uniform_only(nir_def *def, unsigned depth)
 }
 
 static bool
+ph_fs_pre_node_vec(struct ph_fs_ctx *ctx, nir_op op, unsigned bit_size,
+                   unsigned nsrc, const unsigned *ncomp,
+                   const struct ph_fs_pre_src (*src)[4],
+                   struct ph_fs_pre_src *out)
+{
+   struct ph_fs_pre_node *node;
+
+   if (!PH_FS_GROW(ctx, pre, pres, pre_cap))
+      return ph_fs_fail(ctx, "out of memory");
+   node = &ctx->pre[ctx->pres];
+   memset(node, 0, sizeof(*node));
+   node->op = op;
+   node->bit_size = bit_size;
+   node->nsrc = nsrc;
+   for (unsigned i = 0; i < nsrc; i++) {
+      node->ncomp[i] = ncomp[i];
+      memcpy(node->src[i], src[i], ncomp[i] * sizeof(src[i][0]));
+   }
+   *out = (struct ph_fs_pre_src){ .kind = PH_FS_PRE_RESULT,
+                                  .index = ctx->pres++ };
+   return true;
+}
+
+static bool
 ph_fs_pre_node(struct ph_fs_ctx *ctx, nir_op op, unsigned bit_size,
                unsigned nsrc, const struct ph_fs_pre_src *src,
                struct ph_fs_pre_src *out)
 {
-   if (!PH_FS_GROW(ctx, pre, pres, pre_cap))
-      return ph_fs_fail(ctx, "out of memory");
-   ctx->pre[ctx->pres] = (struct ph_fs_pre_node){ .op = op,
-                                                 .bit_size = bit_size,
-                                                 .nsrc = nsrc };
-   memcpy(ctx->pre[ctx->pres].src, src, nsrc * sizeof(*src));
-   *out = (struct ph_fs_pre_src){ .kind = PH_FS_PRE_RESULT,
-                                  .index = ctx->pres++ };
-   return true;
+   const unsigned ones[3] = { 1, 1, 1 };
+   struct ph_fs_pre_src vec[3][4];
+
+   for (unsigned i = 0; i < nsrc; i++)
+      vec[i][0] = src[i];
+   return ph_fs_pre_node_vec(ctx, op, bit_size, nsrc, ones,
+                             (const struct ph_fs_pre_src (*)[4])vec, out);
 }
 
 /* Component @comp of uniform-only @def as a preshader source. */
@@ -1080,8 +1103,34 @@ ph_fs_pre_scalar(struct ph_fs_ctx *ctx, nir_def *def, unsigned comp,
       break;
    }
    default:
-      if (info->output_size || info->num_inputs > 3)
+      if (info->num_inputs > 3 || info->output_size > 1)
          return ph_fs_fail(ctx, "a preshader operation that is not per component");
+      if (info->output_size == 1) {
+         /* A reduction (all, any, a vector compare): its sources keep their
+          * width and the one result is every component. */
+         struct ph_fs_pre_src vec[3][4];
+         unsigned ncomp[3];
+
+         for (unsigned i = 0; i < info->num_inputs; i++) {
+            ncomp[i] = info->input_sizes[i] ? info->input_sizes[i] :
+                       nir_ssa_alu_instr_src_components(alu, i);
+            if (ncomp[i] > 4)
+               return ph_fs_fail(ctx, "a preshader operation that is not per component");
+            if (!bit_size && !nir_alu_type_get_type_size(info->input_types[i]))
+               bit_size = alu->src[i].src.ssa->bit_size;
+            for (unsigned c = 0; c < ncomp[i]; c++)
+               if (!ph_fs_pre_scalar(ctx, alu->src[i].src.ssa,
+                                     alu->src[i].swizzle[c], &vec[i][c]))
+                  return false;
+         }
+         if (!nir_alu_type_get_type_size(info->output_type) && !bit_size)
+            bit_size = alu->def.bit_size;
+         if (!ph_fs_pre_node_vec(ctx, alu->op, bit_size ? bit_size : 32,
+                                 info->num_inputs, ncomp,
+                                 (const struct ph_fs_pre_src (*)[4])vec, out))
+            return false;
+         break;
+      }
       /* Unsized operations take the bit size of their unsized sources, as
        * nir_opt_constant_folding does. */
       if (!nir_alu_type_get_type_size(info->output_type))
@@ -1476,6 +1525,7 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
       return true;
    switch (alu->op) {
    case nir_op_mov:
+   case nir_op_fcanonicalize:
       return ph_fs_operand(ctx, alu, 0, lane, sel, out);
    case nir_op_fsat:
       return ph_fs_operand(ctx, alu, 0, lane, sel, out) &&
@@ -1537,6 +1587,29 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
       nir_alu_instr *b2b;
       int req;
 
+      if (ph_fs_uniform_only(alu->src[0].src.ssa, 0)) {
+         /* A condition of uniforms only: the preshader turns it into a 0/1
+          * float per channel. */
+         struct ph_fs_part part;
+
+         memset(&part, 0, sizeof(part));
+         part.lane = lane;
+         for (unsigned ch = 0; ch < ph_fs_lane_channels(lane); ch++) {
+            struct ph_fs_pre_src cs, f;
+            unsigned comp = alu->src[0].swizzle[sel < 0 ? ch : (unsigned)sel];
+
+            if (!ph_fs_pre_scalar(ctx, alu->src[0].src.ssa, comp, &cs) ||
+                !ph_fs_pre_node(ctx, nir_op_b2f32,
+                                alu->src[0].src.ssa->bit_size, 1, &cs, &f))
+               return false;
+            part.offset[ch] = PH_FS_PRE_BASE + f.index;
+         }
+         return ph_fs_part(ctx, &part, &a) &&
+                ph_fs_operand(ctx, alu, 1, lane, sel, &b) &&
+                ph_fs_operand(ctx, alu, 2, lane, sel, &c) &&
+                ph_fs_apply(ctx, lane, &a, P3D_COMB_MOD_NEG) &&
+                ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &c, &b, out);
+      }
       if (cond->type != nir_instr_type_alu)
          return ph_fs_fail(ctx, "a select on a condition that is no boolean value");
       b2b = nir_instr_as_alu(cond);
@@ -2525,19 +2598,22 @@ ph_fs_run_preshader(struct ph_fs_program *program, const float *values,
 
       memset(src, 0, sizeof(src));
       for (unsigned s = 0; s < node->nsrc; s++) {
-         const struct ph_fs_pre_src *in = &node->src[s];
+         for (unsigned c = 0; c < node->ncomp[s]; c++) {
+            const struct ph_fs_pre_src *in = &node->src[s][c];
 
-         if (in->kind == PH_FS_PRE_BUFFER)
-            src[s][0].f32 = values && (in->index + 1u) * sizeof(float) <= size ?
-                            values[in->index] : 0.0f;
-         else if (in->kind == PH_FS_PRE_RESULT)
-            src[s][0] = program->pre_value[in->index];
-         else
-            src[s][0] = in->literal;
+            if (in->kind == PH_FS_PRE_BUFFER)
+               src[s][c].f32 = values && (in->index + 1u) * sizeof(float) <= size ?
+                               values[in->index] : 0.0f;
+            else if (in->kind == PH_FS_PRE_RESULT)
+               src[s][c] = program->pre_value[in->index];
+            else
+               src[s][c] = in->literal;
+         }
          srcs[s] = src[s];
       }
       if (node->op == nir_op_mov)
          program->pre_value[i] = src[0][0];
+      /* A reduction evaluates once over its sources' width. */
       else
          nir_eval_const_opcode(node->op, &program->pre_value[i], &poison, 1,
                                node->bit_size, srcs, 0);

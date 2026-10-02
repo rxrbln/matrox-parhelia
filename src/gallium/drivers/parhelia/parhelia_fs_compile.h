@@ -39,7 +39,8 @@ struct ph_fs_pre_node {
    nir_op op;
    uint8_t bit_size;
    uint8_t nsrc;
-   struct ph_fs_pre_src src[3];
+   uint8_t ncomp[3];       /* components of each source (reductions take 2-4) */
+   struct ph_fs_pre_src src[3][4];
 };
 
 /* The fixed-function algebra a program computes, decided by evaluating it,
