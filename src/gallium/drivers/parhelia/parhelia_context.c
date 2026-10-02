@@ -582,6 +582,45 @@ ph_samples_unit0(const struct ph_context *ctx)
           ctx->sampler_views[0]->texture;
 }
 
+/* The fixed-function two-unit routes compute alpha as t0.a * v0.a * t1.a; a
+ * shape classified with a unit's alpha taken as 1.0 is exact only while that
+ * unit holds an alpha-less format. */
+static bool
+ph_serial_alpha_exact(const struct ph_context *ctx)
+{
+   const struct ph_fs *fs = ctx->fs;
+
+   for (unsigned u = 0; u < 2; u++) {
+      const struct pipe_sampler_view *view =
+         u < ctx->num_sampler_views ? ctx->sampler_views[u] : NULL;
+
+      if (!(fs->program.valid && (fs->program.alpha_one_mask & (1u << u))))
+         continue;
+      if (!view || util_format_has_alpha(view->format))
+         return false;
+   }
+   return true;
+}
+
+/* Whether a draw may bind the second unit the fragment shader samples.  A
+ * single-pipe chip runs only the classified two-unit shapes, and only when
+ * every unit whose alpha the shape takes as 1.0 holds an alpha-less format. */
+static bool
+ph_second_unit_bindable(const struct ph_context *ctx)
+{
+   const struct ph_fs *fs = ctx->fs;
+
+   if (!fs || !(fs->sampler_mask & BITFIELD_BIT(1)))
+      return false;
+   if (!ph_screen(ctx->base.screen)->single_texture_pipe)
+      return true;
+   /* A compiled two-unit program runs in one pass whatever its algebra. */
+   if (ctx->p690_multitexture && fs->program.valid &&
+       !(fs->program.sampler_mask & ~3u))
+      return true;
+   return fs->serial_op != PH_SERIAL_UNSUPPORTED && ph_serial_alpha_exact(ctx);
+}
+
 static unsigned
 ph_hardware_cull(const struct pipe_rasterizer_state *rasterizer)
 {
@@ -4198,9 +4237,7 @@ ph_submit_vertices(struct ph_context *ctx)
       if (ctx->num_samplers)
          sampler = ctx->samplers[0];
    }
-   if (texture && ctx->fs && (ctx->fs->sampler_mask & BITFIELD_BIT(1)) &&
-       (!ph_screen(ctx->base.screen)->single_texture_pipe ||
-        ctx->fs->serial_op != PH_SERIAL_UNSUPPORTED) &&
+   if (texture && ctx->fs && ph_second_unit_bindable(ctx) &&
        ctx->num_sampler_views > 1 && ctx->sampler_views[1] &&
        ctx->sampler_views[1]->texture) {
       texture1 = ph_resource(ctx->sampler_views[1]->texture);
@@ -4639,6 +4676,14 @@ ph_submit_vertices(struct ph_context *ctx)
       state.alpha_test = false;
       state.blend = false;
    }
+	/* One pass binds both units on the P690's pipes 0 and 2: any program
+	 * the combiner compiled, or the fixed-function MODULATE route. */
+	one_pass_multitexture = ctx->p690_multitexture && ctx->fs &&
+	   (ctx->native_sampled_alpha ?
+	       ctx->fs->serial_op == PH_SERIAL_MODULATE :
+	       texture1 && (state.comb ||
+	                    (ctx->fs->serial_op == PH_SERIAL_MODULATE &&
+	                     ph_serial_alpha_exact(ctx))));
 	if (ctx->stats_sync) {
 		const unsigned stride = ctx->rgb_alpha_two_pass ? 10 :
 		                        state.dw_per_vertex;
@@ -4656,8 +4701,7 @@ ph_submit_vertices(struct ph_context *ctx)
 		   (ctx->alpha_micro || ctx->alpha_micro_cutout) ?
 		      PH_STAT_ALPHA_MICRO :
 		   (texture1 && ph_screen(ctx->base.screen)->single_texture_pipe &&
-		    !(ctx->p690_multitexture && ctx->fs &&
-		      ctx->fs->serial_op == PH_SERIAL_MODULATE)) ? PH_STAT_SERIAL :
+		    !one_pass_multitexture) ? PH_STAT_SERIAL :
 		   (texture1 || ctx->native_sampled_alpha) ? PH_STAT_MULTITEX :
 		   !texture ? PH_STAT_COLOUR :
 		   texture_mipped ? PH_STAT_TEX_MIP :
@@ -4678,9 +4722,6 @@ ph_submit_vertices(struct ph_context *ctx)
 
    dpv = state.dw_per_vertex;
 	ph_trace_blend_alpha(ctx, &state, texture, sampler, texture_tiled);
-	one_pass_multitexture = (texture1 || ctx->native_sampled_alpha) &&
-	                        ctx->p690_multitexture && ctx->fs &&
-	                        ctx->fs->serial_op == PH_SERIAL_MODULATE;
 	if (!texture && ph_env("PARHELIA_TRACE") && ctx->triangles) {
 		const float *v = ctx->vertices;
 
@@ -4705,6 +4746,13 @@ ph_submit_vertices(struct ph_context *ctx)
       ret = ph_batch_primitives(ctx, batch, &state, color->handle,
                                 depth ? depth->handle : 0, texture_handle,
                                 texture1_handle, ctx->triangles);
+   } else if (texture1 && ph_screen(ctx->base.screen)->single_texture_pipe &&
+              !one_pass_multitexture &&
+              (ctx->fs->serial_op == PH_SERIAL_UNSUPPORTED ||
+               !ph_serial_alpha_exact(ctx))) {
+      PH_REFUSE("a two-texture draw with no one-pass or serial form is "
+                "dropped\n");
+      goto out;
    } else if (texture1 && ph_screen(ctx->base.screen)->single_texture_pipe &&
        !one_pass_multitexture) {
       struct p3d_state lightmap = state;
@@ -5195,9 +5243,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
    int texcoord = -1, texcoord1 = -1;
    bool textured = ph_samples_unit0(ctx);
 	bool multitextured = textured && ctx->fs &&
-                        (ctx->fs->sampler_mask & BITFIELD_BIT(1)) &&
-                        (!ph_screen(ctx->base.screen)->single_texture_pipe ||
-                         ctx->fs->serial_op != PH_SERIAL_UNSUPPORTED) &&
+                        ph_second_unit_bindable(ctx) &&
                         ctx->num_sampler_views > 1 &&
                         ctx->sampler_views[1] &&
                         ctx->sampler_views[1]->texture;
@@ -6973,9 +7019,7 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
    const struct pipe_rasterizer_state *rs = ctx->rasterizer;
    bool textured = ph_samples_unit0(ctx);
    bool multitextured = textured && ctx->fs &&
-                        (ctx->fs->sampler_mask & BITFIELD_BIT(1)) &&
-                        (!ph_screen(ctx->base.screen)->single_texture_pipe ||
-                         ctx->fs->serial_op != PH_SERIAL_UNSUPPORTED) &&
+                        ph_second_unit_bindable(ctx) &&
                         ctx->num_sampler_views > 1 && ctx->sampler_views[1] &&
                         ctx->sampler_views[1]->texture;
    bool depth = ctx->fb.zsbuf.texture != NULL;

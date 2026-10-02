@@ -88,6 +88,10 @@ struct ph_fs_program {
    unsigned fog_ops;
    bool valid;
    enum ph_fs_class cls;
+   /* Units whose texture alpha the classified two-unit algebra takes as
+    * 1.0: the fixed-function program of an alpha-less format leaves that
+    * factor out, so the route is exact only for such a bound format. */
+   uint8_t alpha_one_mask;
    /* The preshader: uniform-only scalars the CPU evaluates before each draw;
     * a constant reference at PH_FS_PRE_BASE + i reads result i. */
    struct ph_fs_pre_node *pre;

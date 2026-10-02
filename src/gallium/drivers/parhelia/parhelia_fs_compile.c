@@ -2276,7 +2276,7 @@ ph_fs_eval(const struct p3d_comb_program *prog, const float tex[4][4],
 }
 
 static enum ph_fs_class
-ph_fs_classify(const struct ph_fs_program *prog)
+ph_fs_classify(const struct ph_fs_program *prog, uint8_t *alpha_one_mask)
 {
    static const enum ph_fs_class classes[] = {
       PH_FS_CLASS_COLOUR, PH_FS_CLASS_REPLACE, PH_FS_CLASS_MODULATE,
@@ -2285,11 +2285,19 @@ ph_fs_classify(const struct ph_fs_program *prog)
    };
    uint32_t seed = 0x2545f491;
 
+   *alpha_one_mask = 0;
    if (prog->const_ref_count)
       return PH_FS_CLASS_OTHER;
+   /* Masks 1..3 pin a unit's texture alpha to 1.0; only the two-unit
+    * classes take them, the one-unit ones keep their exact match. */
+   for (unsigned m = 0; m < 4; m++)
    for (unsigned k = 0; k < sizeof(classes) / sizeof(classes[0]); k++) {
       const enum ph_fs_class cls = classes[k];
       bool match = true;
+
+      if (m && cls != PH_FS_CLASS_MODULATE2 && cls != PH_FS_CLASS_ADD2 &&
+          cls != PH_FS_CLASS_REPLACE1 && cls != PH_FS_CLASS_MODULATE2_TEX)
+         continue;
 
       for (unsigned trial = 0; trial < 16 && match; trial++) {
          float tex[4][4], colour[2][4], got[4], want[4];
@@ -2300,6 +2308,9 @@ ph_fs_classify(const struct ph_fs_program *prog)
             (i < 16 ? tex[i / 4] : colour[(i - 16) / 4])[i % 4] =
                ((seed >> 16) & 0xff) / 255.0f;
          }
+         for (unsigned u = 0; u < 2; u++)
+            if (m & (1u << u))
+               tex[u][3] = 1.0f;
          for (unsigned c = 0; c < 4; c++) {
             switch (cls) {
             case PH_FS_CLASS_COLOUR:    want[c] = v[c]; break;
@@ -2326,8 +2337,10 @@ ph_fs_classify(const struct ph_fs_program *prog)
             if (fabsf(got[c] - want[c]) > 1e-3f)
                match = false;
       }
-      if (match)
+      if (match) {
+         *alpha_one_mask = m;
          return cls;
+      }
    }
    return PH_FS_CLASS_OTHER;
 }
@@ -2501,7 +2514,7 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
       ctx.pre = NULL;
    }
    out->valid = true;
-   out->cls = ph_fs_classify(out);
+   out->cls = ph_fs_classify(out, &out->alpha_one_mask);
    ok = true;
 done:
    if (!ok) {
