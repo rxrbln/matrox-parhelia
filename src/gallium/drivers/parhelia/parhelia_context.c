@@ -20,6 +20,7 @@
 #include "draw/draw_fs.h"
 #include "draw/draw_pipe.h"
 #include "draw/draw_vertex.h"
+#include "tgsi/tgsi_from_mesa.h"
 #include "translate/translate.h"
 #include "translate/translate_cache.h"
 #include "pipe/p_context.h"
@@ -124,7 +125,16 @@ struct ph_fs {
     * x of the sample of GL unit depth_unit, the colour the vertex colour. */
    bool depth_from_texture;
    unsigned depth_unit;
+   /* The vertex output each GL unit's samples take their coordinate from,
+    * as ph_fs_find_coord_sources() traced it: unit k need not use set k. */
+   bool coord_src_known[PIPE_MAX_SAMPLERS];
+   uint8_t coord_src_name[PIPE_MAX_SAMPLERS];
+   uint8_t coord_src_index[PIPE_MAX_SAMPLERS];
 };
+
+/* Semantic index of the extra attribute carrying unit k's uniform coordinate,
+ * above every TEXCOORD a vertex shader exports. */
+#define PH_UNIFORM_COORD_INDEX(k) (32u + (k))
 
 struct ph_uniform_coord {
    nir_def *coord, *projector;
@@ -4904,8 +4914,15 @@ ph_unit_texcoord(const struct ph_context *ctx, unsigned unit)
 {
    const unsigned index = ctx->fs && ctx->fs->unit_remap ?
                           ctx->fs->unit_source[unit] : unit;
-   int texcoord = draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_GENERIC,
-                                          index);
+   int texcoord;
+
+   if (ctx->fs && index < PIPE_MAX_SAMPLERS && ctx->fs->coord_src_known[index]) {
+      texcoord = draw_find_shader_output(ctx->draw, ctx->fs->coord_src_name[index],
+                                         ctx->fs->coord_src_index[index]);
+      if (texcoord >= 0)
+         return texcoord;
+   }
+   texcoord = draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_GENERIC, index);
 
    if (texcoord < 0)
       texcoord = draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_TEXCOORD,
@@ -7251,6 +7268,84 @@ ph_fs_find_uniform_coords(struct ph_fs *fs, nir_shader *nir)
                .unit = tex->texture_index,
                .comps = tex->coord_components,
             };
+            if (tex->texture_index < PIPE_MAX_SAMPLERS) {
+               fs->coord_src_known[tex->texture_index] = true;
+               fs->coord_src_name[tex->texture_index] = TGSI_SEMANTIC_TEXCOORD;
+               fs->coord_src_index[tex->texture_index] =
+                  PH_UNIFORM_COORD_INDEX(tex->texture_index);
+            }
+         }
+      }
+   }
+}
+
+/* The input a sample's coordinate is read from, through movs and vecs whose
+ * channels all come from that one input. */
+static int
+ph_nir_coord_location(nir_def *def)
+{
+   for (unsigned hop = 0; hop < 8; hop++) {
+      nir_instr *instr = nir_def_instr(def);
+
+      if (instr->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+
+         switch (in->intrinsic) {
+         case nir_intrinsic_load_interpolated_input:
+         case nir_intrinsic_load_input:
+            return nir_intrinsic_io_semantics(in).location;
+         case nir_intrinsic_load_deref: {
+            nir_variable *var =
+               nir_deref_instr_get_variable(nir_src_as_deref(in->src[0]));
+
+            return var && var->data.mode == nir_var_shader_in ?
+                   (int)var->data.location : -1;
+         }
+         default:
+            return -1;
+         }
+      }
+      if (instr->type != nir_instr_type_alu)
+         return -1;
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      if (alu->op == nir_op_mov) {
+         def = alu->src[0].src.ssa;
+         continue;
+      }
+      if (!nir_op_is_vec(alu->op))
+         return -1;
+      for (unsigned i = 1; i < nir_op_infos[alu->op].num_inputs; i++)
+         if (alu->src[i].src.ssa != alu->src[0].src.ssa)
+            return -1;
+      def = alu->src[0].src.ssa;
+   }
+   return -1;
+}
+
+static void
+ph_fs_find_coord_sources(struct ph_fs *fs, nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_tex_instr *tex;
+            unsigned name, index;
+            int c, loc;
+
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            tex = nir_instr_as_tex(instr);
+            c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+            if (c < 0 || tex->texture_index >= PIPE_MAX_SAMPLERS ||
+                fs->coord_src_known[tex->texture_index] ||
+                (loc = ph_nir_coord_location(tex->src[c].src.ssa)) < 0)
+               continue;
+            /* draw scans NIR with TEXCOORD semantics. */
+            tgsi_get_gl_varying_semantic(loc, true, &name, &index);
+            fs->coord_src_known[tex->texture_index] = true;
+            fs->coord_src_name[tex->texture_index] = name;
+            fs->coord_src_index[tex->texture_index] = index;
          }
       }
    }
@@ -7267,9 +7362,6 @@ ph_fix_coords(struct ph_context *ctx, struct ph_quant_stage *q)
       nir_const_value v[NIR_MAX_VEC_COMPONENTS], w[NIR_MAX_VEC_COMPONENTS];
       float *out = q->coord[q->coord_count];
 
-      if (draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_GENERIC, u->unit) >= 0 ||
-          draw_find_shader_output(ctx->draw, TGSI_SEMANTIC_TEXCOORD, u->unit) >= 0)
-         continue;
       if (!ph_nir_eval_uniform(ctx, u->coord, v, 0) ||
           (u->projector && !ph_nir_eval_uniform(ctx, u->projector, w, 0)))
          return false;
@@ -7279,7 +7371,7 @@ ph_fix_coords(struct ph_context *ctx, struct ph_quant_stage *q)
          out[3] = w[0].f32;
       q->coord_slot[q->coord_count++] =
          draw_alloc_extra_vertex_attrib(ctx->draw, TGSI_SEMANTIC_TEXCOORD,
-                                        u->unit);
+                                        PH_UNIFORM_COORD_INDEX(u->unit));
    }
    return true;
 }
@@ -7436,7 +7528,7 @@ ph_zpix_tri(struct draw_stage *stage, struct prim_header *prim)
 
       for (int x = xmin; x <= xmax + 1; x++) {
          const float px = x + 0.5f, py = y + 0.5f;
-         float e[3], st[2], d, z = 0.0f;
+         float e[3] = { 0 }, st[2], d, z = 0.0f;
          bool inside = x <= xmax;
          int tx, ty;
 
@@ -8533,6 +8625,7 @@ static void *ph_create_fs(struct pipe_context *p,
             if (compile_nir->info.fs.uses_discard)
                fs->kill = ph_fs_build_kill(compile_nir, budget);
             ph_fs_find_uniform_coords(fs, s->ir.nir);
+            ph_fs_find_coord_sources(fs, s->ir.nir);
             if (s->ir.nir->info.outputs_written &
                 BITFIELD64_BIT(FRAG_RESULT_DEPTH))
                fs->depth_from_texture =
