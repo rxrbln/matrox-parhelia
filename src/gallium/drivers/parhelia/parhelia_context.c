@@ -2520,9 +2520,9 @@ ph_sampler_wrap_axes(const struct pipe_sampler_state *sampler,
 
 /* The LOD bias range the sampler is given: 0x11c0[24:16] is signed 4.4 with
  * a -4.0 offset, so it reaches -12 .. +19.9; the vendor clamps to +/-4.  On
- * the P690 biases to +/-5 are measured (tex-miplevel-selection) and the
- * rest of the symmetric +/-12 follows the field; the original family keeps
- * the vendor clamp. */
+ * the P690 biases -5 .. +11 select exactly the expected level (MEASURED,
+ * tex-miplevel-selection and a magnified 512^2 chain); -12 .. -6 follow
+ * the field.  The original family keeps the vendor clamp. */
 static float
 ph_max_lod_bias(const struct ph_context *ctx)
 {
