@@ -1609,6 +1609,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    }
    s->chip_id = chip.value;
    s->tile_layout = tile.value;
+   /* The vendor splits 2-D fills into strips on both families (P-series
+    * mtxpserd.dll 0x112480, Parhelia MTXPARD.dll 0x1105bd).  Measured on
+    * the P690; the original Parhelia follows the vendor until measured. */
+   parhelia_batch_set_fill_strips(true);
    s->single_texture_pipe =
       pipe_mode.value == PARHELIA_TEXTURE_PIPES_SINGLE;
    s->vram_size = vram.value;

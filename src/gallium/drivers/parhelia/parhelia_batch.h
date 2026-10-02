@@ -105,6 +105,7 @@ int parhelia_batch_zdiscard(struct parhelia_batch *batch,
 int parhelia_batch_zclear_word(struct parhelia_batch *batch,
                                uint32_t depth_handle, unsigned pitch,
                                unsigned format, uint32_t value, uint32_t word);
+void parhelia_batch_set_fill_strips(bool enable);
 /* One-shot Z-unit control words for @depth_handle, in order (probes). */
 int parhelia_batch_zcontrol(struct parhelia_batch *batch,
                             uint32_t depth_handle, unsigned pitch,
