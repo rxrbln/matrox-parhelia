@@ -8344,9 +8344,10 @@ ph_draw_depth_points(struct ph_context *ctx, const struct pipe_draw_info *info,
 
 /* A framebuffer with several colour buffers (GL_FRONT_AND_BACK binds the
  * front and the back) is drawn once per buffer; the engine has one colour
- * target.  The replay is exact while the draw writes no depth or stencil,
- * since every pass then tests the same depth and stencil contents; one
- * that writes them is drawn into the first buffer only. */
+ * target.  Every pass but the last runs with depth and stencil writes off,
+ * so all passes test the contents the draw found and the last one updates
+ * them; only primitives of one draw that overlap each other can see the
+ * difference. */
 static bool
 ph_draw_broadcast(struct ph_context *ctx, const struct pipe_draw_info *info,
                   unsigned drawid_offset,
@@ -8366,21 +8367,35 @@ ph_draw_broadcast(struct ph_context *ctx, const struct pipe_draw_info *info,
       bound += !!ctx->fb.cbufs[i].texture;
    if (bound < 2 && ctx->fb.cbufs[0].texture)
       return false;
-   if (zs_writes && bound > 1)
-      PH_REFUSE("a draw to several colour buffers that writes depth or "
-                "stencil reaches the first one only\n");
-   util_copy_framebuffer_state(&saved, &ctx->fb);
+   void *saved_dsa = ctx->dsa, *readonly = NULL;
+
+   if (zs_writes) {
+      struct pipe_depth_stencil_alpha_state ro = *dsa;
+
+      ro.depth_writemask = 0;
+      ro.stencil[0].writemask = ro.stencil[1].writemask = 0;
+      readonly = ctx->base.create_depth_stencil_alpha_state(&ctx->base, &ro);
+      if (!readonly)
+         return false;
+   }
+   /* The state tracker's surfaces: stand-ins are rebound per pass. */
+   util_copy_framebuffer_state(&saved, &ctx->fb_api);
    ctx->broadcasting = true;
-   for (unsigned i = 0; i < saved.nr_cbufs; i++) {
+   for (unsigned i = 0, done = 0; i < saved.nr_cbufs; i++) {
       if (!saved.cbufs[i].texture)
          continue;
       one = saved;
       one.nr_cbufs = 1;
       one.cbufs[0] = saved.cbufs[i];
       ctx->base.set_framebuffer_state(&ctx->base, &one);
+      if (readonly)
+         ctx->base.bind_depth_stencil_alpha_state(&ctx->base,
+            ++done < bound ? readonly : saved_dsa);
       ctx->base.draw_vbo(&ctx->base, info, drawid_offset, NULL, draws, 1);
-      if (zs_writes)
-         break;
+   }
+   if (readonly) {
+      ctx->base.bind_depth_stencil_alpha_state(&ctx->base, saved_dsa);
+      ctx->base.delete_depth_stencil_alpha_state(&ctx->base, readonly);
    }
    ctx->base.set_framebuffer_state(&ctx->base, &saved);
    ctx->broadcasting = false;
