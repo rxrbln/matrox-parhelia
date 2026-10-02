@@ -964,3 +964,44 @@ appears elsewhere in this file's history and has never been explained.
 Until it is, a driver wanting GL-correct magnitudes should pre-scale the
 specular colour by 3/5 host-side; the builder takes the constant as given and
 does not apply a factor of its own.
+
+## Correction: the resident stage-6 image is an ELF symbol body (2026-10-03)
+
+The "stage-c.bin is not contiguous anywhere in mtx_parhelia.o" result above
+used the wrong file offset.  The vendor object's `.data` has `sh_addr
+0x14be0` and file offset `0xdce00`, so a `.data` symbol's bytes are at
+`0xdce00 + st_value - 0x14be0` (checked: `mtx251.bin` is found at
+`0x1646a0`, exactly that).  With that offset, MEASURED byte for byte on the
+shipped firmware:
+
+* `stage-c.bin` = a two-instruction prefix (`ctl0d`, `nop`) followed by
+  **`mtx847`** (registry index `0x133`, 278 instructions): 278 of 278
+  instructions identical at offset 2.  It sits directly after `mtx3605` in
+  `.data`.
+* `mtx1706` (index `0x132`, 280 instructions) shares 232 of its 280
+  instructions with `stage-c.bin` at offset 0 - a sibling variant.
+* `mtx3733`, `mtx1591`, `mtx1789`, `mtx1343`, `mtx775`, `mtx457`, `mtx2240`
+  and `mtx2369` match in fewer than 10 instructions; the earlier
+  `mtx3733 + mtx1591` and `mtx1789/mtx1343` attributions do not hold.
+
+So the stage-6 family is a set of canned symbol bodies in the registry range
+`0x120..0x13e` ("monolithic / mtx2884 literal"), not a generated image, and a
+clip-capable variant can be taken from the object once the selection is
+known.
+
+`mtx2884` decoding so far (`.text+0xa5870`; arguments `engine, key, variant,
+glstate (rbp), ctx+0xdc (r13), ctx+0x740`): variant 6 enters with `r8 = 4`
+(jump table `.rodata+0x3008`, entry 6 -> `0xa5978`).  The 675-entry table at
+`engine+0x9f8b0` is filled by `mtx222` (default `0x145`) and `mtx2788`
+(literal stores, 450 entries) and is indexed by
+`225*c2c + 75*r9 + 25*c30 + 5*(b + r15) + r8`, where `c2c` is 0 without user
+planes and `(n < 5 ? 1 : 2)` with `n = r13[8] >> 5` planes when
+`glstate[0xf] & 0x7e`, `r9 = (glstate[0xd] & 3) - 1` style selector (0/1/2),
+and `c30 = ((r13[8] & 3) != 1)`.  The variant-6 path also records field
+patches through `mtx2634(engine, kind, a, b)` (a patch list at
+`engine+0xc0` that `mtx3558` applies): kind `0x23` (imm32) with
+`1 << (n + 15)` for `n` planes, and kind `0x1d` pairs `(1, 0x118)`,
+`(6, 0x132)`, `(1, 0xcb)`, `(6, 0xe5)`.  `mtx847` (`0x133`) is not a literal
+in `mtx2884`, so the resident image is selected elsewhere (not yet found).
+Open: who selects `0x133`, how the clip variants map onto the registry, and
+what kind `0x1d` patches.
