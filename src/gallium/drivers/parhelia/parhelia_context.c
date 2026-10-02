@@ -9069,6 +9069,17 @@ static void *ph_create_fs(struct pipe_context *p,
 
             nir_shader *compile_nir = ph_fs_pack_units(fs, s->ir.nir);
 
+            /* Without native integers the uniforms hold floats, so the
+             * integer arithmetic GLSL produced becomes float arithmetic. */
+            if (compile_nir->options->no_integers) {
+               if (compile_nir == s->ir.nir)
+                  compile_nir = nir_shader_clone(NULL, s->ir.nir);
+               NIR_PASS(_, compile_nir, nir_lower_int_to_float);
+               NIR_PASS(_, compile_nir, nir_opt_algebraic);
+               NIR_PASS(_, compile_nir, nir_opt_constant_folding);
+               NIR_PASS(_, compile_nir, nir_opt_dce);
+            }
+
             if (ph_fs_compile(compile_nir, budget, &fs->program) &&
                 (fs->program.sampler_mask & ~fs->sampler_mask))
                ph_fs_program_fini(&fs->program), fs->program.valid = false;
