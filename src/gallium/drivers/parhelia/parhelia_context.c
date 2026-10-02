@@ -422,6 +422,7 @@ struct ph_context {
    /* The current draw's triangles come from expanded points or lines or
     * unfilled polygons: GL never face-culls those. */
    bool derived_triangles;
+   bool stencil_back;	/* the staged triangles face back: stencil[1] */
    /* Viewport 0 maps GL window y downwards (window-system framebuffer). */
    bool viewport_y_flip;
    /* PARHELIA_STATS: submission counters averaged over 100 frames.
@@ -475,6 +476,34 @@ ph_hardware_cull(const struct pipe_rasterizer_state *rasterizer)
    if (rasterizer->cull_face == PIPE_FACE_FRONT)
       return rasterizer->front_ccw ? 2 : 1;
    return 0;
+}
+
+/* GL two-sided stencil, which the engine has no state for (one stencil block,
+ * parhelia-fragment-ops.md section 5): triangles are split into single-face
+ * batches, each emitted with its face's stencil state. */
+static bool
+ph_two_sided_stencil(const struct ph_context *ctx)
+{
+   const struct pipe_stencil_state *s = ctx->dsa ? ctx->dsa->stencil : NULL;
+
+   return s && s[0].enabled && s[1].enabled && ctx->fb.zsbuf.texture &&
+          util_format_has_stencil(util_format_description(ctx->fb.zsbuf.format)) &&
+          (memcmp(&s[0], &s[1], sizeof(s[0])) ||
+           ctx->stencil_ref.ref_value[0] != ctx->stencil_ref.ref_value[1]);
+}
+
+/* The draw module's own facing rule (draw_pipe_cull.c) on window-space
+ * positions; derived primitives, points and lines take the front state. */
+static bool
+ph_triangle_back_facing(const struct ph_context *ctx,
+                        const struct prim_header *prim, int pos)
+{
+   const float *v0 = prim->v[0]->data[pos], *v1 = prim->v[1]->data[pos];
+   const float *v2 = prim->v[2]->data[pos];
+   const float det = (v0[0] - v2[0]) * (v1[1] - v2[1]) -
+                     (v0[1] - v2[1]) * (v1[0] - v2[0]);
+
+   return det != 0.0f && (det < 0.0f) != !!ctx->rasterizer->front_ccw;
 }
 
 static inline unsigned
@@ -1442,7 +1471,10 @@ ph_apply_fragment_state(struct ph_context *ctx, struct p3d_state *state,
       state->alpha_ref = CLAMP((int)lrintf(ctx->dsa->alpha_ref_value * 255.0f),
                                0, 255);
       if (has_depth) {
-         const struct pipe_stencil_state *s = &ctx->dsa->stencil[0];
+         /* No two-sided stencil in the engine: a batch holds one face. */
+         const unsigned face = ctx->stencil_back &&
+                               ctx->dsa->stencil[1].enabled;
+         const struct pipe_stencil_state *s = &ctx->dsa->stencil[face];
          state->depth_test = ctx->dsa->depth_enabled;
          state->depth_write = ctx->dsa->depth_writemask;
          state->depth_func = ph_compare(ctx->dsa->depth_func);
@@ -1451,7 +1483,7 @@ ph_apply_fragment_state(struct ph_context *ctx, struct p3d_state *state,
          state->stencil_fail = ph_stencil_op(s->fail_op);
          state->stencil_zfail = ph_stencil_op(s->zfail_op);
          state->stencil_zpass = ph_stencil_op(s->zpass_op);
-         state->stencil_ref = ctx->stencil_ref.ref_value[0];
+         state->stencil_ref = ctx->stencil_ref.ref_value[face];
          state->stencil_value_mask = s->valuemask;
          state->stencil_write_mask = s->writemask;
       }
@@ -4609,6 +4641,8 @@ out:
 	ctx->colour1 = false;
 	ctx->proj = false;
 	ctx->vertex_alpha = false;
+	ctx->stencil_back = false;
+	ctx->colour_alpha = false;
 	ctx->alpha_micro = false;
 	ctx->alpha_micro_cutout = false;
 	ctx->cpu_alpha_cutout = false;
@@ -4886,6 +4920,18 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
       ph_submit_vertices(ctx);
       if (ctx->submit_error)
          return;
+   }
+   if (pos >= 0) {
+      const bool back = !ctx->derived_triangles && ctx->rasterizer &&
+                        ph_two_sided_stencil(ctx) &&
+                        ph_triangle_back_facing(ctx, prim, pos);
+
+      if (ctx->triangles && ctx->stencil_back != back) {
+         ph_submit_vertices(ctx);
+         if (ctx->submit_error)
+            return;
+      }
+      ctx->stencil_back = back;
    }
 
 	vertex_alpha = ph_use_vertex_alpha(ctx, textured, multitextured, depth,
@@ -6386,7 +6432,7 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
       return false;
    if (!ctx->tcl_available || ctx->tcl_forced_off || !ctx->vs ||
        (!ctx->vs->ff_transform && !ctx->vs->hw_program) || !ctx->velems ||
-       ctx->derived_triangles ||
+       ctx->derived_triangles || ph_two_sided_stencil(ctx) ||
        !ctx->have_viewport || !ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture)
       return false;
    lay->program = !ctx->vs->ff_transform;
