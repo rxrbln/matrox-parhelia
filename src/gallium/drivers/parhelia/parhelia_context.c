@@ -1733,6 +1733,7 @@ ph_use_alpha_micro_cutout(struct ph_context *ctx, bool textured,
 static bool ph_auto_tiled_texture(const struct ph_context *ctx,
                                   const struct parhelia_resource *texture,
                                   const struct pipe_sampler_state *sampler);
+static bool ph_resource_uses_sampler_layout(const struct parhelia_resource *r);
 
 /* A native import with no linear companion, presented onto tiled storage,
  * on a chip that cannot sample it directly.  On the original board every
@@ -2273,7 +2274,9 @@ ph_auto_tiled_texture(const struct ph_context *ctx,
                       const struct pipe_sampler_state *sampler)
 {
    (void)sampler;
-   return texture &&
+   /* Render-target storage keeps the surface order, which is the sampler's
+    * with y bits 0 and 1 exchanged: it is sampled from its linear shadow. */
+   return texture && ph_resource_uses_sampler_layout(texture) &&
        ph_lx_family(ph_screen(ctx->base.screen)->chip_id) &&
        (texture->base.target == PIPE_TEXTURE_2D ||
         texture->base.target == PIPE_TEXTURE_1D ||
@@ -7388,6 +7391,38 @@ static void ph_noop_stipple(struct pipe_context *p,
                             const struct pipe_poly_stipple *s)
 { (void)p; (void)s; }
 
+/* Move an upload-class sampler image that is about to become a colour
+ * buffer into render-target storage, keeping its level-0 texels.  The upload
+ * class has no path back from the GPU, so rendering into it is refused; the
+ * state tracker marks every colour texture renderable, so the class is only
+ * decided for real here.  Lower levels exist only in the upload class. */
+static bool
+ph_promote_target(struct ph_context *ctx, struct pipe_resource *res)
+{
+   struct parhelia_resource *r = ph_resource(res), *storage;
+   const struct pipe_box box = {
+      .width = res->width0, .height = res->height0, .depth = 1,
+   };
+
+   if (!r->upload_texture)
+      return true;
+   if ((ctx->aggregate_batches && ph_drain_batch(ctx)) || ph_wait_async(ctx))
+      return false;
+   storage = ph_resource_create_target_storage(r);
+   if (!storage)
+      return false;
+   if ((r->mip_defined & BITFIELD_BIT(0)) &&
+       !ph_copy_texture_box(ctx, &storage->base, 0, 0, 0, res, 0, &box,
+                            res->width0, res->height0)) {
+      pipe_resource_reference((struct pipe_resource **)&storage, NULL);
+      return false;
+   }
+   ph_resource_swap_storage(r, storage);
+   r->content_generation = storage->content_generation + 1;
+   pipe_resource_reference((struct pipe_resource **)&storage, NULL);
+   return true;
+}
+
 static void
 ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *fb)
 {
@@ -7410,6 +7445,12 @@ ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *
        ctx->zinit_res != ph_resource(fb->zsbuf.texture))
       ph_zinit_resolve(ctx, ctx->zinit_res);
    ph_submit_vertices(ctx);
+   for (unsigned i = 0; fb && i < fb->nr_cbufs; i++)
+      if (fb->cbufs[i].texture && fb->cbufs[i].level == 0 &&
+          !ph_promote_target(ctx, fb->cbufs[i].texture))
+         fprintf(stderr, "parhelia: cannot move a %ux%u texture to "
+                 "render-target storage\n", fb->cbufs[i].texture->width0,
+                 fb->cbufs[i].texture->height0);
    util_copy_framebuffer_state(&ctx->fb, fb);
    if (fb && fb->zsbuf.texture)
       draw_set_zs_format(ctx->draw, fb->zsbuf.format);
@@ -8677,7 +8718,9 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
    }
    if ((usage & PIPE_MAP_READ) && level < ph_resource_mip_levels(r) &&
        (r->mip_defined & BITFIELD_BIT(level))) {
-      if (r->linear_map) {
+      /* A transfer shadow was just downloaded and is exact; the linear
+       * companion only follows it after a resolve blit. */
+      if (r->linear_map && !r->transfer_shadow) {
          ph_resource_resolve_linear(r);
          for (int y = 0; y < box->height; y++)
             for (int x = 0; x < box->width; x++)

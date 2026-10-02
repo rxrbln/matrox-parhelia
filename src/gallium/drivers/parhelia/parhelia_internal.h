@@ -215,6 +215,12 @@ bool ph_narrow_target_format(enum pipe_format format);
 void ph_resource_resolve_linear(struct parhelia_resource *r);
 void ph_resource_upload_tiled(struct parhelia_resource *r);
 int ph_resource_upload_texture(struct parhelia_resource *r);
+/* Render-target class storage for @r's template, never the upload class. */
+struct parhelia_resource *
+ph_resource_create_target_storage(struct parhelia_resource *r);
+/* Exchange everything but the pipe_resource header of @a and @b. */
+void ph_resource_swap_storage(struct parhelia_resource *a,
+                              struct parhelia_resource *b);
 int ph_resource_upload_shadow(struct parhelia_resource *r);
 int ph_resource_download_shadow(struct parhelia_resource *r);
 /* Transfer only the tile rows holding image rows [y0, y1). */

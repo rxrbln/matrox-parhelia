@@ -681,8 +681,11 @@ ph_resource_download_shadow_rows(struct parhelia_resource *r, unsigned y0,
 /* Each failure exit records where it left, for PARHELIA_TRACE. */
 #define PH_CREATE_FAIL() do { fail_line = __LINE__; goto fail; } while (0)
 
+/* @target_class: allocate in the render-target classes even where a small
+ * sampler image would take the upload class. */
 static struct pipe_resource *
-ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *templ)
+ph_resource_create_class(struct pipe_screen *pscreen,
+                         const struct pipe_resource *templ, bool target_class)
 {
    struct parhelia_screen *screen = ph_screen(pscreen);
    struct parhelia_resource *r = CALLOC_STRUCT(parhelia_resource);
@@ -695,7 +698,7 @@ ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *temp
     * surface has different sampler and render-target storage orders, so a
     * render target has to take the render one; ph_format_supported refuses
     * the ambiguous sampler+target combination outright. */
-   const bool sampler_storage = !share_native &&
+   const bool sampler_storage = !share_native && !target_class &&
       (templ->bind & PIPE_BIND_SAMPLER_VIEW) &&
       templ->width0 <= 512 && templ->height0 <= 512 &&
       !(templ->bind & PIPE_BIND_DEPTH_STENCIL) &&
@@ -1165,6 +1168,34 @@ fail:
    align_free(r->malloc_data);
    FREE(r);
    return NULL;
+}
+
+static struct pipe_resource *
+ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *templ)
+{
+   return ph_resource_create_class(pscreen, templ, false);
+}
+
+struct parhelia_resource *
+ph_resource_create_target_storage(struct parhelia_resource *r)
+{
+   struct pipe_resource *storage =
+      ph_resource_create_class(r->base.screen, &r->base, true);
+
+   return storage ? ph_resource(storage) : NULL;
+}
+
+void
+ph_resource_swap_storage(struct parhelia_resource *a,
+                         struct parhelia_resource *b)
+{
+   const struct pipe_resource base_a = a->base, base_b = b->base;
+   const struct parhelia_resource tmp = *a;
+
+   *a = *b;
+   *b = tmp;
+   a->base = base_a;
+   b->base = base_b;
 }
 
 static struct pipe_resource *
