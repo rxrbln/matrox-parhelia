@@ -46,6 +46,7 @@
 #include "parhelia_internal.h"
 #include "parhelia_sampler.h"
 #include "parhelia_texel.h"
+#include "parhelia_tile_copy.h"
 #include "parhelia_fs_compile.h"
 #include "parhelia_vs_compile.h"
 
@@ -11254,6 +11255,43 @@ ph_resource_uses_sampler_layout(const struct parhelia_resource *r)
                              PIPE_BIND_DEPTH_STENCIL)));
 }
 
+struct ph_texel_walk {
+   const struct parhelia_resource *r;
+   unsigned level, layer, cpp, sampler_pitch;
+   bool sampler;
+};
+
+/* Byte offset of texel (x,y) of the walk's level and layer in r->map. */
+static size_t
+ph_walk_texel_offset(const void *data, unsigned x, unsigned y)
+{
+   const struct ph_texel_walk *w = data;
+   const struct parhelia_resource *r = w->r;
+
+   if (!w->sampler)
+      return p3d_tile_offset_layout_cpp(x, y, r->stride, r->tile_layout,
+                                        r->cpp);
+   if (r->mip.levels)
+      return ph_mip_layer_texel_offset(&r->mip, w->level, w->layer, x, y,
+                                       false, w->cpp);
+   return p3d_texture_tile_offset_chip(x, y, w->sampler_pitch, w->cpp,
+                                       ph_screen(r->base.screen)->chip_id,
+                                       r->tile_layout);
+}
+
+static void
+ph_texel_walk_init(struct ph_texel_walk *w, const struct parhelia_resource *r,
+                   unsigned level, unsigned layer, unsigned cpp)
+{
+   *w = (struct ph_texel_walk){
+      .r = r, .level = level, .layer = layer, .cpp = cpp,
+      .sampler = ph_resource_uses_sampler_layout(r),
+   };
+   if (w->sampler && !r->mip.levels)
+      w->sampler_pitch = ph_sampler_storage_pitch(r->base.screen,
+                                                  r->base.width0, cpp);
+}
+
 /* Move the S3TC blocks of @box between a block-linear staging image and the
  * macrotiled hardware image.  Block rows of the staging image are @stride
  * bytes apart; the hardware address comes from ph_dxt_block_offset(). */
@@ -11438,32 +11476,24 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
                           (uint8_t *)t->staging + y * t->base.stride, false,
                           swap_rb, cpp);
       } else {
-         for (unsigned z = 0; z < layers; z++)
-         for (int y = 0; y < box->height; y++)
-            for (int x = 0; x < box->width; x++)
-               ph_copy_texel_from_gpu((uint8_t *)t->staging +
-                                          z * t->base.layer_stride +
-                                          y * t->base.stride + x * cpp,
-                                      (uint8_t *)r->map +
-                                      (ph_resource_uses_sampler_layout(r) &&
-                                       r->mip.levels ?
-                                       ph_mip_layer_texel_offset(&r->mip, level,
-                                                           box->z + z,
-                                                           box->x + x, box->y + y,
-                                                           false, cpp) :
-                                       ph_resource_uses_sampler_layout(r) ?
-                                       p3d_texture_tile_offset_chip(
-                                          box->x + x, box->y + y,
-                                          ph_sampler_storage_pitch(
-                                             r->base.screen,
-                                             r->base.width0, cpp),
-                                          cpp,
-                                          ph_screen(r->base.screen)->chip_id,
-                                          r->tile_layout) :
-                                       p3d_tile_offset_layout_cpp(
-                                          box->x + x, box->y + y, r->stride,
-                                          r->tile_layout, r->cpp)),
-                                      swap_rb, cpp);
+         struct ph_swizzle sw, inv;
+
+         if (swap_rb) {
+            memcpy(sw.src, swap_rb->byte, sizeof(sw.src));
+            ph_swizzle_inverse(&inv, &sw);
+         }
+         for (unsigned z = 0; z < layers; z++) {
+            struct ph_texel_walk walk;
+
+            ph_texel_walk_init(&walk, r, level, box->z + z, cpp);
+            for (int y = 0; y < box->height; y++)
+               ph_tile_row_copy((uint8_t *)r->map, r->size,
+                  ph_walk_texel_offset, &walk, box->x, box->y + y,
+                  box->width,
+                  (uint8_t *)t->staging + z * t->base.layer_stride +
+                     y * t->base.stride,
+                  false, swap_rb ? &inv : NULL, cpp);
+         }
       }
    } else if (usage & PIPE_MAP_READ) {
       /* A lower level outside the P690-supported backing remains a valid
@@ -11565,57 +11595,37 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
                           swap_rb, cpp);
       }
       if (r->map) {
-         struct ph_span span = { .base = (uint8_t *)r->map };
+         struct ph_swizzle sw;
+         unsigned skipped = 0;
 
-         for (unsigned z = 0; z < MAX2(transfer->box.depth, 1); z++)
-         for (int y = 0; y < transfer->box.height; y++)
-            for (int x = 0; x < transfer->box.width; x++) {
-            const size_t off = (ph_resource_uses_sampler_layout(r) ?
-                                   (r->mip.levels ?
-                                    ph_mip_layer_texel_offset(&r->mip, transfer->level,
-                                                        transfer->box.z + z,
-                                                        transfer->box.x + x,
-                                                        transfer->box.y + y, false, cpp) :
-                                    p3d_texture_tile_offset_chip(
-                                       transfer->box.x + x,
-                                       transfer->box.y + y,
-                                       ph_sampler_storage_pitch(
-                                          r->base.screen,
-                                          r->base.width0, cpp), cpp,
-                                       ph_screen(r->base.screen)->chip_id,
-                                       r->tile_layout)) :
-                                   p3d_tile_offset_layout_cpp(
-                                      transfer->box.x + x,
-                                      transfer->box.y + y, r->stride,
-                                      r->tile_layout, r->cpp));
+         if (swap_rb)
+            memcpy(sw.src, swap_rb->byte, sizeof(sw.src));
+         for (unsigned z = 0; z < MAX2(transfer->box.depth, 1); z++) {
+            struct ph_texel_walk walk;
 
-            /* A layout that addresses past the storage would corrupt the
-             * heap; refuse the texel and say where. */
-            if (off + cpp > r->size) {
-               static bool said;
+            ph_texel_walk_init(&walk, r, transfer->level,
+                               transfer->box.z + z, cpp);
+            for (int y = 0; y < transfer->box.height; y++)
+               skipped += ph_tile_row_copy((uint8_t *)r->map, r->size,
+                  ph_walk_texel_offset, &walk, transfer->box.x,
+                  transfer->box.y + y, transfer->box.width,
+                  (uint8_t *)t->staging + z * transfer->layer_stride +
+                     y * transfer->stride,
+                  true, swap_rb ? &sw : NULL, cpp);
+         }
+         /* A layout that addresses past the storage would corrupt the
+          * heap; such texels were refused. */
+         if (skipped) {
+            static bool said;
 
-               if (!said) {
-                  said = true;
-                  fprintf(stderr,
-                          "parhelia: texel %d,%d level %u at %#zx is outside the %zu-byte storage of %ux%u\n",
-                          transfer->box.x + x, transfer->box.y + y,
-                          transfer->level, off, (size_t)r->size,
-                          r->base.width0, r->base.height0);
-               }
-               continue;
+            if (!said) {
+               said = true;
+               fprintf(stderr,
+                       "parhelia: %u texels of level %u are outside the %zu-byte storage of %ux%u\n",
+                       skipped, transfer->level, (size_t)r->size,
+                       r->base.width0, r->base.height0);
             }
-            const uint8_t *src = (uint8_t *)t->staging +
-                                 z * transfer->layer_stride +
-                                 y * transfer->stride + x * cpp;
-
-            /* A transfer shadow is cached memory: no span to gather. */
-            if (r->transfer_shadow)
-               ph_copy_texel_to_gpu((uint8_t *)r->map + off, src, swap_rb,
-                                    cpp);
-            else
-               ph_span_put(&span, off, src, swap_rb, cpp);
-            }
-         ph_span_flush(&span);
+         }
       }
       /* Both representations were updated when a presentation/sampler
        * backing exists; otherwise the tiled render image is authoritative.
