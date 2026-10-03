@@ -4820,6 +4820,33 @@ ph_fs_ref_saturated(const struct ph_fs_program *program,
           h->src[0].mod == P3D_COMB_MOD_NONE;
 }
 
+/* nir_opt_vectorize: every ALU may widen to the four combiner lanes. */
+static uint8_t
+ph_fs_vectorize_width(const nir_instr *instr, const void *data)
+{
+   return 4;
+}
+
+/* @nir with the per-channel chains of its scalarised arithmetic merged,
+ * NULL when nothing merged. */
+static nir_shader *
+ph_fs_vectorized(const nir_shader *nir)
+{
+   nir_shader *v = nir_shader_clone(NULL, nir);
+   bool merged = false;
+
+   NIR_PASS(_, v, nir_opt_copy_prop);
+   NIR_PASS(_, v, nir_opt_cse);
+   NIR_PASS(merged, v, nir_opt_vectorize, ph_fs_vectorize_width, NULL);
+   if (!merged) {
+      ralloc_free(v);
+      return NULL;
+   }
+   NIR_PASS(_, v, nir_opt_copy_prop);
+   NIR_PASS(_, v, nir_opt_dce);
+   return v;
+}
+
 /* Recompile for the exponents the current constants need, which only grow,
  * so a program settles after a few variants rather than alternating.
  * Returns 1 when it recompiled, 0 when nothing changed, -1 on failure. */
@@ -4831,6 +4858,7 @@ ph_fs_rescale(struct ph_fs_program *program, const float *values,
    struct ph_fs_program variant;
    unsigned count = program->uexp_count, scaled = program->scaled_key;
    bool grown = false;
+   nir_shader *vec = NULL;
 
    if (!program->nir)
       return 0;
@@ -4876,9 +4904,15 @@ ph_fs_rescale(struct ph_fs_program *program, const float *values,
       free(uexp);
       return 0;
    }
+   /* A domain or exponent variant that outgrows the slots may fit with the
+    * channels of each step in one instruction. */
    if (!ph_fs_compile_key(program->nir, program->budget, uexp, count,
                           program->ramps, program->ramp_count, scaled,
-                          &variant)) {
+                          &variant) &&
+       (!(vec = ph_fs_vectorized(program->nir)) ||
+        !ph_fs_compile_key(vec, program->budget, uexp, count, program->ramps,
+                           program->ramp_count, scaled, &variant))) {
+      ralloc_free(vec);
       /* The program stays as it was: only this draw is refused. */
       if (getenv("PARHELIA_TRACE_FS")) {
          fprintf(stderr, "parhelia: fs variant refused: %s; exponents",
@@ -4893,6 +4927,11 @@ ph_fs_rescale(struct ph_fs_program *program, const float *values,
    memcpy(variant.ramps, program->ramps, sizeof(variant.ramps));
    variant.ramp_count = program->ramp_count;
    memcpy(variant.drv, program->drv, sizeof(variant.drv));
+   /* Later variants start from the merged form. */
+   if (vec) {
+      ralloc_free(program->nir);
+      program->nir = vec;
+   }
    variant.nir = program->nir;
    variant.budget = program->budget;
    variant.uexp = uexp;
