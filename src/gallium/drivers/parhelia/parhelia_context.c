@@ -6099,7 +6099,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	      !cpu_alpha_cutout && !rgb_alpha_two_pass && !alpha_micro &&
 	      !alpha_micro_cutout && !three_coord && !ph_env("PARHELIA_NO_OOW");
 	if (oow)
-	   dpv = (multitextured ? 10 : 8) + 1 + !!vertex_alpha;
+	   dpv = (multitextured ? 10 : 8) + 1 + !!vertex_alpha +
+	         (colour1 ? 3 + !!(colour1 & 2) + !!(colour1 & 4) : 0);
 	/* Original-family units 2 and 3 add their coordinate sets. */
 	extra = multitextured ? ph_extra_units(ctx) : 0;
 	if (extra && !ctx->warp_four_sets) {
