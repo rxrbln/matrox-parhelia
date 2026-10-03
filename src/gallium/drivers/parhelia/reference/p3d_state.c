@@ -1099,6 +1099,7 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			if (tu->coord_mode)
 				rw[0].val = (rw[0].val & ~0x00070000u) |
 					    ((tu->coord_mode & 7u) << 16);
+			rw[0].val |= (tu->ta_op & 0x1fu) << 19;
 			rw[1].reg = P3D_R_TEX_SURF_BASE; rw[1].val = tu->base;
 			rw[2].reg = P3D_R_TEX_SURF_W;
 			rw[2].val = (tu->width & 0x3fff) |

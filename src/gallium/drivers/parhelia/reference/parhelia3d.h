@@ -564,6 +564,10 @@ struct p3d_texture {
 	uint32_t	depth;
 	unsigned	type;
 	unsigned	coord_mode;
+	/* 0x1200+4u[23:19], the texture-address opcode: 0 samples, 2 is the
+	 * vendor's TEXCOORD (with coordinate mode 3), PROVEN in mtxpserd
+	 * 0x17bfe4 and KRN mtx1723; behaviour per docs/parhelia-fragment-isa.md. */
+	unsigned	ta_op;
 	unsigned	max_level;	/* 0x11e4[31:28] */
 	enum p3d_texenv	env;
 	/* GL_TEXTURE_ENV_COLOR for P3D_TEXENV_BLEND, in the hardware's own
