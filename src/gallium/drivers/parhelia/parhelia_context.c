@@ -292,7 +292,8 @@ ph_mip_layer_texel_offset(const struct ph_mip_layout *mip, unsigned level,
 
       return ph_64x32_cell_texel_offset(image->offset / 0x2000 * 2 +
                                         image->half + layer * cells,
-                                        x, y, image->pitch);
+                                        x + image->tail_x,
+                                        y + image->tail_y, image->pitch);
    }
    if (mip->native_64x32 && mip->slices && !linear)
       return mip->level[level].offset +
@@ -4877,10 +4878,9 @@ ph_submit_vertices(struct ph_context *ctx)
       }
       tex.max_level = texture_mipped ?
          ph_view_mip_levels(texture, ctx->sampler_views[0]) - 1 : 0;
-      /* PARHELIA_0528_CUBE_LEVEL_FIELD=1 (diagnostic): the vendor's cube level
-       * field holds the level count, not count - 1 (mtx3887 0x279ad) */
-      if (texture->mip.native_64x32 && texture->mip.cube &&
-          ph_env("PARHELIA_0528_CUBE_LEVEL_FIELD"))
+      /* The vendor's cube level field holds the level count, not count - 1
+       * (mtx3887 0x279ad); the 0528 samples both alike (MEASURED). */
+      if (texture->mip.native_64x32 && texture->mip.cube && texture_mipped)
          tex.max_level++;
       ph_apply_view_base(texture, ctx->sampler_views[0], texture_tiled, &tex);
       tex.filter = ph_sampler_filter_word(&tex, sampler, ph_max_lod_bias(ctx));

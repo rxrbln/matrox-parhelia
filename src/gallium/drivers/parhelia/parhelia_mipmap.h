@@ -402,6 +402,47 @@ ph_mip_native_64x32_chain_exact(unsigned width, unsigned height,
    return true;
 }
 
+/* The original family's cube chain (vendor mtx3887 order, MEASURED on the
+ * 0528 at 32, 64 and 128): level-major with the six faces of a level in
+ * consecutive 32x32 cells; from the first level of 16 or less each face
+ * gets one tail cell holding that level in slot 0 and the smaller ones in
+ * the vendor tail slots. */
+static inline bool
+ph_mip_layout_cube_64x32(struct ph_mip_layout *mip, unsigned faces)
+{
+   size_t cell = 0, tail_cell = 0;
+   unsigned tail = 0;
+
+   mip->native_64x32 = true;
+   for (unsigned l = 0; l < mip->levels; l++) {
+      struct ph_mip_level *level = &mip->level[l];
+
+      level->tail_x = level->tail_y = 0;
+      if (level->width <= 16) {
+         if (!tail) {
+            tail_cell = cell;
+            cell += faces;
+         } else if (tail >= 5) {
+            return false;
+         }
+         ph_mip_tail_position(tail++, &level->tail_x, &level->tail_y);
+         level->pitch = 32;
+         level->offset = tail_cell / 2 * 0x2000;
+         level->half = tail_cell & 1;
+         level->bytes = 0x1000;
+         continue;
+      }
+      level->pitch = ph_mip_align(level->width, 32);
+      level->offset = cell / 2 * 0x2000;
+      level->half = cell & 1;
+      level->bytes = (size_t)level->pitch / 32 *
+                     (ph_mip_align(level->height, 32) / 32) * 0x1000;
+      cell += level->bytes / 0x1000 * faces;
+   }
+   mip->size = (cell + 1) / 2 * 0x2000;
+   return true;
+}
+
 static inline unsigned
 ph_mip_log2(unsigned value)
 {

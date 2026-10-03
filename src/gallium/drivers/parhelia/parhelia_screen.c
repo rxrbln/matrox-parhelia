@@ -838,11 +838,10 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    const bool cube_probe = cube_target && p690_native_texture32 &&
                            ph_env("PARHELIA_CUBE_PROBE");
    const bool cube_chain = cube_target && p690_native_texture32;
-   /* PARHELIA_0528_CUBE_CHAIN=1 (diagnostic): an original-family cube chain in
-    * the vendor order (mtx3887: level-major, six faces per level), in 32x32
-    * cells, to measure */
-   const bool o528_cube_chain_probe = cube_target && o528_layered &&
-                                      ph_env("PARHELIA_0528_CUBE_CHAIN");
+   /* Original-family cube chains in the vendor order, exact for power-of-two
+    * faces 1..128 (ph_mip_layout_cube_64x32); 256 differs, keeps level 0. */
+   const bool o528_cube_chain = cube_target && o528_layered &&
+      !(templ->width0 & (templ->width0 - 1)) && templ->width0 <= 128;
    /* P690 NPOT chains, 2-D and cube, are exact for every texel of every
     * level up to 256 (fixfn cubeprobe); larger NPOT bases keep level 0 until
     * measured (a 600x20 probe met a concurrent lockup: inconclusive).  The original family's
@@ -855,7 +854,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
                                       templ->last_level + 1);
    mip_levels = ((p690_native_texture32 && (pot || p690_npot)) ||
                  (native_64x32_texture && (pot || o528_npot))) &&
-                (!layered || cube_chain || o528_cube_chain_probe) ?
+                (!layered || cube_chain || o528_cube_chain) ?
                    templ->last_level + 1 : 1;
    if (!ph_mip_layout_init_cpp(&r->mip, templ->width0, templ->height0,
                                mip_levels, true, p690_native_texture32, cpp))
@@ -936,23 +935,8 @@ ph_resource_create_class(struct pipe_screen *pscreen,
          r->mip.size = ((((cells - 1) | 1) * slices + slices - 1) / 2 + 1) *
                        0x2000;
       }
-      if (o528_cube_chain_probe) {
-         size_t cell = 0;
-
-         for (unsigned l = 0; l < mip_levels; l++) {
-            struct ph_mip_level *level = &r->mip.level[l];
-            const size_t cells = ph_mip_align(level->width, 32) / 32 *
-                                 (ph_mip_align(level->height, 32) / 32);
-
-            level->pitch = ph_mip_align(level->width, 32);
-            level->tail_x = level->tail_y = 0;
-            level->offset = cell / 2 * 0x2000;
-            level->half = cell & 1;
-            level->bytes = cells * 0x1000;
-            cell += cells * slices;
-         }
-         r->mip.size = (cell + 1) / 2 * 0x2000;
-      }
+      if (o528_cube_chain && !ph_mip_layout_cube_64x32(&r->mip, slices))
+         PH_CREATE_FAIL();
       /* The P690 cube chain (PARHELIA_CUBE_PROBE, every texel of 32..256
        * cubes): levels above 16x16 hold six whole face images, each the
        * vendor's level size apart (mtx3887); the 2-D tail block follows,
