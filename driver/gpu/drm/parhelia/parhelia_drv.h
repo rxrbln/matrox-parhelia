@@ -184,8 +184,6 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 #define PARHELIA_HOST_APERTURE_ALIGN	SZ_256K
 #define PARHELIA_HOST_APERTURE_LIMIT	SZ_16M
 #define PARHELIA_HOST_APERTURE_FIRST	(2 * PARHELIA_HOST_APERTURE_ALIGN)
-/* A descriptor's VRAM address drops its low five bits (MEASURED, P690). */
-#define PARHELIA_APERTURE_ADDR_UNIT	32
 /* Kernel-built requests only: @delta is a class-3 bus address. */
 #define PARHELIA_RELOC_KERNEL_BUS	0x80000000u
 #define PARHELIA_DC_LUT_INDEX		0x038
@@ -851,6 +849,13 @@ static inline bool parhelia_original_family(const struct parhelia_device *pdev)
 {
 	return pdev->pdev->device == PARHELIA_512 ||
 	       pdev->pdev->device == PARHELIA_8X;
+}
+
+/* A descriptor's VRAM address drops its low five bits on the P690 and its
+ * low six on the 0528 (MEASURED, partial transfers at 32-byte steps). */
+static inline u32 parhelia_aperture_addr_unit(const struct parhelia_device *pdev)
+{
+	return parhelia_original_family(pdev) ? 64 : 32;
 }
 
 void parhelia_t2_prime_once(struct parhelia_device *pdev, struct drm_file *file,

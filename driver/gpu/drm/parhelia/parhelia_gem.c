@@ -1630,9 +1630,10 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 		goto out_aperture_unlock;
 
 	for (copied = 0; copied < args->size;) {
-		/* The descriptor addresses VRAM in 32-byte units: publish the unit
+		/* The descriptor addresses VRAM in 32/64-byte units: publish the unit
 		 * holding the offset and copy from inside the window. */
-		u32 skew = (args->offset + copied) & (PARHELIA_APERTURE_ADDR_UNIT - 1);
+		u32 skew = (args->offset + copied) &
+			   (parhelia_aperture_addr_unit(pdev) - 1);
 		u32 bytes = min_t(u64, args->size - copied, SZ_8K - skew);
 		u32 root_before[3], root_after[3];
 		bool watch_root;
