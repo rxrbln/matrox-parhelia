@@ -218,6 +218,10 @@ struct ph_sampler_view {
    struct pipe_sampler_view base;
    struct pipe_sampler_view *shadow_view;
    uint64_t shadow_generation;
+   /* A copy written with its source view's swizzle: the border colour
+    * needs the same swizzle. */
+   bool baked, baked_depth;
+   uint8_t baked_swizzle[4];
 };
 
 struct ph_context;
@@ -2585,15 +2589,24 @@ ph_sampler_wrap(unsigned wrap, enum p3d_wrap *code)
  * packs it for the sampled format's class.  GL clamps to [0,1] here, which
  * the vendor's own stack does not. */
 static uint32_t
-ph_sampler_border_colour(const struct pipe_sampler_state *sampler)
+ph_sampler_border_colour(const struct pipe_sampler_state *sampler,
+                         const struct pipe_sampler_view *view)
 {
    static const unsigned shift[4] = {16, 8, 0, 24};
+   const struct ph_sampler_view *pv = (const struct ph_sampler_view *)view;
    uint32_t colour = 0;
 
    if (!sampler)
       return 0;
    for (unsigned i = 0; i < 4; i++) {
-      float v = CLAMP(sampler->border_color.f[i], 0.0f, 1.0f);
+      const unsigned s = pv && pv->baked ? pv->baked_swizzle[i] : i;
+      /* A depth copy holds (z, 0, 0, 1) before the swizzle. */
+      const bool z = pv && pv->baked_depth;
+      const float c[6] = { sampler->border_color.f[0],
+                           z ? 0.0f : sampler->border_color.f[1],
+                           z ? 0.0f : sampler->border_color.f[2],
+                           z ? 1.0f : sampler->border_color.f[3], 0.0f, 1.0f };
+      float v = CLAMP(s <= PIPE_SWIZZLE_1 ? c[s] : 0.0f, 0.0f, 1.0f);
 
       colour |= (uint32_t)(v * 255.0f + 0.5f) << shift[i];
    }
@@ -2605,6 +2618,7 @@ ph_sampler_border_colour(const struct pipe_sampler_state *sampler)
  * GL_TEXTURE_WRAP_R the unit cannot express never refuses a 2-D draw. */
 static bool
 ph_sampler_wrap_axes(const struct pipe_sampler_state *sampler,
+                     const struct pipe_sampler_view *view,
                      enum pipe_texture_target target, struct p3d_texture *tex)
 {
    const bool three = target == PIPE_TEXTURE_3D ||
@@ -2615,7 +2629,7 @@ ph_sampler_wrap_axes(const struct pipe_sampler_state *sampler,
       tex->wrap_s = tex->wrap_t = tex->wrap_r = P3D_WRAP_REPEAT;
       return true;
    }
-   tex->border_colour = ph_sampler_border_colour(sampler);
+   tex->border_colour = ph_sampler_border_colour(sampler, view);
    /* A 1-D image is one row of a 2-D surface and GL ignores t for it, so
     * its T axis must never reach the border or a filtered neighbour row. */
    if (target == PIPE_TEXTURE_1D) {
@@ -4777,7 +4791,8 @@ ph_submit_vertices(struct ph_context *ctx)
          sampler ? sampler->max_anisotropy : 0);
       tex.mip_filter = texture_mipped ? ph_sampler_mip_filter(sampler) :
                                        P3D_MIP_NONE;
-      if (!ph_sampler_wrap_axes(sampler, texture->base.target, &tex)) {
+      if (!ph_sampler_wrap_axes(sampler, ctx->sampler_views[0],
+                                texture->base.target, &tex)) {
          ph_warn_once("texture wrap mode %u/%u/%u has no hardware address "
                       "code; the draw is dropped rather than rendered with a "
                       "different one\n", sampler->wrap_s, sampler->wrap_t,
@@ -4823,7 +4838,8 @@ ph_submit_vertices(struct ph_context *ctx)
             sampler1 ? sampler1->max_anisotropy : 0);
          tex1.mip_filter = texture1_mipped ? ph_sampler_mip_filter(sampler1) :
                                             P3D_MIP_NONE;
-         if (!ph_sampler_wrap_axes(sampler1, texture1->base.target, &tex1)) {
+         if (!ph_sampler_wrap_axes(sampler1, ctx->sampler_views[1],
+                                   texture1->base.target, &tex1)) {
             ph_warn_once("texture wrap mode %u/%u/%u has no hardware address "
                          "code on the second unit; the draw is dropped\n",
                          sampler1->wrap_s, sampler1->wrap_t, sampler1->wrap_r);
@@ -6661,6 +6677,16 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
       pipe_resource_reference(&shadow, NULL);
       if (!v->shadow_view)
          return NULL;
+      if (depth || swizzled) {
+         struct ph_sampler_view *sv = (struct ph_sampler_view *)v->shadow_view;
+
+         sv->baked = true;
+         sv->baked_depth = depth;
+         sv->baked_swizzle[0] = v->base.swizzle_r;
+         sv->baked_swizzle[1] = v->base.swizzle_g;
+         sv->baked_swizzle[2] = v->base.swizzle_b;
+         sv->baked_swizzle[3] = v->base.swizzle_a;
+      }
       v->shadow_generation = ~0ull;
    }
    if (v->shadow_generation != r->content_generation) {
