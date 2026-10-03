@@ -1873,8 +1873,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * one GL enum, independent pipes are measured on the P690 and the 0528. */
    caps->blend_equation_separate = true;
    /* Colour and depth surfaces carry their own pitch and base, and draws and
-    * clears are bounded by the framebuffer state, the attachments' minimum. */
-   caps->mixed_framebuffer_sizes = s->chip_id == 0x2539;
+    * clears are bounded by the framebuffer state, the attachments' minimum
+    * (measured on the P690 and the 0528). */
+   caps->mixed_framebuffer_sizes = s->chip_id == 0x2539 ||
+                                   s->chip_id == 0x0527 || s->chip_id == 0x0528;
    caps->alpha_test = true;
    caps->user_vertex_buffers = true;
    caps->vertex_color_unclamped = true;
