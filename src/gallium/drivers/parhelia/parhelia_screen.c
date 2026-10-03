@@ -1862,8 +1862,8 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * vendor OpenGL driver's advertised 2. */
    caps->max_texture_lod_bias = s->chip_id == 0x2539 ? 12.0f : 2.0f;
    /* BLENDCTL has an equation field per pipe; the vendor writes both from
-    * one GL enum, independent pipes are measured on the P690 only. */
-   caps->blend_equation_separate = s->chip_id == 0x2539;
+    * one GL enum, independent pipes are measured on the P690 and the 0528. */
+   caps->blend_equation_separate = true;
    /* Colour and depth surfaces carry their own pitch and base, and draws and
     * clears are bounded by the framebuffer state, the attachments' minimum. */
    caps->mixed_framebuffer_sizes = s->chip_id == 0x2539;
