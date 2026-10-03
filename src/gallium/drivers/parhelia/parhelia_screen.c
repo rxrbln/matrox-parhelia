@@ -1902,13 +1902,8 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    fs->max_temps = 16;
    /* The chip's own count, from the kernel: four on the original Parhelia
     * (0x0527/0x0528), two on the LX family, whose pair executes through one
-    * physical pipe.  Bounded by what a draw can actually drive - the state
-    * emitter banks all four units and the selftest covers three and four, but
-    * a draw past two also needs a WARP program writing o3..o6, a vertex
-    * layout carrying that many coordinate sets and matching combiner stages.
-    * Raising PH_TEXTURE_UNITS_DRIVEN is what turns the extra units on. */
-   fs->max_texture_samplers = fs->max_sampler_views =
-      MIN2(s->texture_units, PH_TEXTURE_UNITS_DRIVEN);
+    * physical pipe. */
+   fs->max_texture_samplers = fs->max_sampler_views = ph_units_driven(s);
    fs->supported_irs = 1 << PIPE_SHADER_IR_NIR;
    s->base.destroy = ph_destroy;
    s->base.context_create = ph_context_create;

@@ -182,6 +182,12 @@ int parhelia_batch_state_run(struct parhelia_batch *batch,
                              uint32_t texture0_handle,
                              uint32_t texture1_handle,
                              const struct p3d_state *state, unsigned vertices);
+/* The same with one texture handle per unit, for three or four units. */
+int parhelia_batch_state_run_units(struct parhelia_batch *batch,
+                                   uint32_t colour_handle, uint32_t depth_handle,
+                                   const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS],
+                                   const struct p3d_state *state,
+                                   unsigned vertices);
 int parhelia_batch_submit(int fd, const struct parhelia_batch *batch,
                          const void *vertices, unsigned vertex_dwords,
                          uint32_t *fence);

@@ -504,6 +504,11 @@ struct ph_context {
    /* Pass-through without the T2 write, for the RGBA colour stream. */
    uint32_t warp_rgba;
    uint32_t warp_no_colour[2];
+   /* The pass-through moving o3..o6 from v7..v10, for three or four
+    * coordinate sets (texture_units_probe on the 0528). */
+   uint32_t warp_four_sets;
+   /* Units past the second the staged triangles carry coordinates for. */
+   unsigned extra_units;
    float point_radius;
    bool tcl_available;
    bool tcl_forced_off;
@@ -4069,10 +4074,11 @@ ph_no_colour_program(struct ph_context *ctx, bool two_sets)
 }
 
 static int
-ph_batch_primitives(struct ph_context *ctx, struct parhelia_batch *batch,
-                    struct p3d_state *state, uint32_t colour_handle,
-                    uint32_t depth_handle, uint32_t texture0_handle,
-                    uint32_t texture1_handle, unsigned primitives)
+ph_batch_primitives_units(struct ph_context *ctx, struct parhelia_batch *batch,
+                          struct p3d_state *state, uint32_t colour_handle,
+                          uint32_t depth_handle,
+                          const uint32_t handles[P3D_MAX_TEXTURE_UNITS],
+                          unsigned primitives)
 {
    const unsigned per_prim = p3d_vertices_per_primitive(state->prim);
    /* Only triangle lists are proven to carry a run of primitives in one
@@ -4104,9 +4110,19 @@ ph_batch_primitives(struct ph_context *ctx, struct parhelia_batch *batch,
    else if (state->warp_entry == ctx->warp_passthrough &&
             state->prim == P3D_TRIANGLES && group >= 2)
       ctx->restore_after_transform = false;
-   return parhelia_batch_state_run(batch, colour_handle, depth_handle,
-                                   texture0_handle, texture1_handle, state,
-                                   primitives * per_prim);
+   return parhelia_batch_state_run_units(batch, colour_handle, depth_handle,
+                                         handles, state, primitives * per_prim);
+}
+
+static int
+ph_batch_primitives(struct ph_context *ctx, struct parhelia_batch *batch,
+                    struct p3d_state *state, uint32_t colour_handle,
+                    uint32_t depth_handle, uint32_t texture0_handle,
+                    uint32_t texture1_handle, unsigned primitives)
+{
+   return ph_batch_primitives_units(ctx, batch, state, colour_handle,
+      depth_handle, (const uint32_t[P3D_MAX_TEXTURE_UNITS]){
+         texture0_handle, texture1_handle }, primitives);
 }
 
 static int
@@ -4329,6 +4345,52 @@ ph_rgba_program(struct ph_context *ctx)
    return true;
 }
 
+/* The kernel's textured pass-through grown to four coordinate sets, the form
+ * the 0528's three- and four-unit draws were measured with.  Uploaded once
+ * per context; the upload drains the engine. */
+static bool
+ph_four_set_program(struct ph_context *ctx)
+{
+   const struct p3d_warp_shape shape = {
+      .write_t2 = 1, .clip_copy = 1, .texcoords = 4,
+   };
+   uint32_t code[32 * 3];
+   struct drm_parhelia_warp_program program = {
+      .code = (uintptr_t)code,
+   };
+
+   if (ctx->warp_four_sets)
+      return true;
+   program.count = p3d_warp_build(&shape, code, 32);
+   if (!program.count || !ctx->warp_program_instructions ||
+       ioctl(ph_screen(ctx->base.screen)->fd, DRM_IOCTL_PARHELIA_WARP_PROGRAM,
+             &program))
+      return false;
+   ctx->warp_four_sets = (uint32_t)program.entry;
+   return true;
+}
+
+/* Units 2 and 3 of an original-family draw: the program samples GL units
+ * 0..n-1 one to one, n of 3 or 4, each with a bound view. */
+static unsigned
+ph_extra_units(const struct ph_context *ctx)
+{
+   const struct ph_fs *fs = ctx->fs;
+   const unsigned driven = ph_units_driven(ph_screen(ctx->base.screen));
+   unsigned n;
+
+   if (!fs || !(fs->sampler_mask & ~3u) || fs->unit_remap || driven < 3)
+      return 0;
+   n = util_last_bit(fs->sampler_mask);
+   if (n > driven || fs->sampler_mask != BITFIELD_MASK(n) ||
+       ctx->num_sampler_views < n)
+      return 0;
+   for (unsigned u = 0; u < n; u++)
+      if (!ctx->sampler_views[u] || !ctx->sampler_views[u]->texture)
+         return 0;
+   return n - 2;
+}
+
 /* The pass-through with one move that forwards the second colour attribute to
  * output 2, so the combiner sees it as v1.  Uploaded once per context, on the
  * first draw whose fragment program reads it. */
@@ -4470,6 +4532,48 @@ ph_fs_reads_routed_v0(const struct ph_fs *fs)
    return fs && fs->program.valid && fs->program.route[0] >= 0;
 }
 
+/* Ready unit @u (2 or 3) of an original-family draw: its texture must live in
+ * the sampler storage, uploaded, and its descriptor is unit 1's form.  False
+ * drops the draw. */
+static bool
+ph_extra_unit(struct ph_context *ctx, unsigned u, uint32_t *handle,
+              struct p3d_texture *tex)
+{
+   struct parhelia_resource *r = ph_resource(ctx->sampler_views[u]->texture);
+   const struct pipe_sampler_state *sampler =
+      ctx->num_samplers > u ? ctx->samplers[u] : NULL;
+   bool mipped;
+
+   if (!r->upload_texture || !r->handle || r->mip.slices ||
+       r->base.width0 > 0x3fff || ph_resource_upload_texture(r))
+      return false;
+   if (r->rgb5a1_packed)
+      ph_restore_rgba_tiled(r);
+   mipped = ph_use_mips(r, sampler, ctx->sampler_views[u]);
+   memset(tex, 0, sizeof(*tex));
+   tex->width = r->base.width0;
+   tex->height = r->base.height0;
+   ph_texture_descriptor_format(r, false, true, tex);
+   tex->min_filter = ph_sampler_image_filter(
+      sampler && sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR,
+      sampler ? sampler->max_anisotropy : 0);
+   tex->mag_filter = ph_sampler_image_filter(
+      sampler && sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR,
+      sampler ? sampler->max_anisotropy : 0);
+   tex->mip_filter = mipped ? ph_sampler_mip_filter(sampler) : P3D_MIP_NONE;
+   if (!ph_sampler_wrap_axes(sampler, ctx->sampler_views[u], r->base.target,
+                             tex))
+      return false;
+   tex->max_level = mipped ?
+      ph_view_mip_levels(r, ctx->sampler_views[u]) - 1 : 0;
+   ph_apply_view_base(r, ctx->sampler_views[u], true, tex);
+   tex->filter = ph_sampler_filter_word(tex, sampler, ph_max_lod_bias(ctx));
+   tex->wrap = ph_sampler_wrap_word(tex, sampler);
+   tex->env = P3D_TEXENV_MODULATE;
+   *handle = r->handle;
+   return true;
+}
+
 static void
 ph_submit_vertices(struct ph_context *ctx)
 {
@@ -4544,6 +4648,17 @@ ph_submit_vertices(struct ph_context *ctx)
       texture1 = NULL;
       sampler1 = NULL;
       ctx->transform = false;
+   }
+   /* Original-family units 2 and 3, as the staged stream carries them. */
+   const unsigned extra = texture && texture1 ? ctx->extra_units : 0;
+   uint32_t handles[P3D_MAX_TEXTURE_UNITS] = { 0 };
+   struct p3d_texture tex_x[2];
+
+   if (texture && ctx->fs && (ctx->fs->sampler_mask & ~3u) &&
+       extra + 2 != util_last_bit(ctx->fs->sampler_mask)) {
+      PH_REFUSE("a draw sampling units its stream carries no coordinates for "
+                "is dropped\n");
+      goto out;
    }
    /* An explicit env setting remains a force-enable for the established Q3
     * launch. Without it, use only the P690 base-level format/dimension shape
@@ -4945,6 +5060,26 @@ ph_submit_vertices(struct ph_context *ctx)
          ph_pass_unit_state(ctx, 1, &tex1);
       }
    }
+   if (extra) {
+      handles[0] = texture_handle;
+      handles[1] = texture1_handle;
+      for (unsigned i = 0; i < extra; i++)
+         if (!ph_extra_unit(ctx, 2 + i, &handles[2 + i], &tex_x[i])) {
+            PH_REFUSE("a draw whose third or fourth texture the unit cannot "
+                      "address is dropped\n");
+            goto out;
+         }
+      state.tex2 = &tex_x[0];
+      state.tex3 = extra > 1 ? &tex_x[1] : NULL;
+      state.dw_per_vertex += 2 * extra;
+      state.warp_entry = ctx->warp_four_sets;
+      /* the texenv fallback would combine units 0 and 1 only */
+      if (!state.comb) {
+         PH_REFUSE("a three- or four-texture draw without a compiled program "
+                   "is dropped\n");
+         goto out;
+      }
+   }
    if (depth) {
       state.depth.pitch = depth->stride;
       state.depth.fmt = depth->surf_fmt;
@@ -5144,7 +5279,11 @@ ph_submit_vertices(struct ph_context *ctx)
                                   ctx->triangles * 3 * packed_dpv,
                                   color, depth, texture1, NULL);
       }
-   } else
+   } else if (extra)
+      ret = ph_batch_primitives_units(ctx, batch, &state, color->handle,
+                                      depth ? depth->handle : 0, handles,
+                                      ctx->triangles);
+   else
       ret = ph_batch_primitives(ctx, batch, &state, color->handle,
                                 depth ? depth->handle : 0,
                                 texture ? texture_handle : 0,
@@ -5619,7 +5758,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
       return;
    int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
    int col = ph_v_output(stage->draw, ctx, 0);
-   int texcoord = -1, texcoord1 = -1;
+   int texcoord = -1, texcoord1 = -1, texcoord_x[2] = { -1, -1 };
+   unsigned extra = 0;
    bool textured = ph_samples_unit0(ctx);
 	bool multitextured = textured && ctx->fs &&
                         ph_second_unit_bindable(ctx) &&
@@ -5855,6 +5995,19 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	      !alpha_micro_cutout && !three_coord && !ph_env("PARHELIA_NO_OOW");
 	if (oow)
 	   dpv = (multitextured ? 10 : 8) + 1 + !!vertex_alpha;
+	/* Original-family units 2 and 3 add their coordinate sets. */
+	extra = multitextured ? ph_extra_units(ctx) : 0;
+	if (extra && !ctx->warp_four_sets) {
+	   /* the upload drains the engine: publish the staged batch first */
+	   if (ctx->triangles || ctx->points || ctx->lines) {
+	      ph_submit_vertices(ctx);
+	      if (ctx->submit_error)
+	         return;
+	   }
+	   if (!ph_four_set_program(ctx))
+	      extra = 0;
+	}
+	dpv += 2 * extra;
 	/* A projector other than one switches unit 0 to the per-fragment
 	 * divide, which reads q from a four-component coordinate set. */
 	proj = (three_coord ? !ph_resource(ctx->sampler_views[0]->texture)->mip.cube :
@@ -5868,6 +6021,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	 * extra guard keeps a future draw-stage change from mixing 7- and 8-dword
 	 * streams if the exact blend predicate changes within a primitive list. */
 	if (ctx->triangles && (ctx->colour1 != colour1 ||
+	                       ctx->extra_units != extra ||
 	                       ctx->oow != oow || ctx->proj != proj ||
 	                       ctx->colour_alpha != colour_alpha ||
 	                       ctx->line_coverage != ctx->ov_valid ||
@@ -5895,6 +6049,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
       texcoord = ph_unit_texcoord(ctx, 0);
       if (multitextured)
          texcoord1 = ph_unit_texcoord(ctx, 1);
+      for (unsigned i = 0; i < extra; i++)
+         texcoord_x[i] = ph_unit_texcoord(ctx, 2 + i);
    }
    /* A program that samples only unit 1 - GL1's unit-1 REPLACE - leaves
     * unit 0 without a coordinate set, and the draw was dropped.  Stage unit
@@ -5912,10 +6068,12 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
                  info->output_semantic_name[i], info->output_semantic_index[i]);
    }
    if (ctx->submit_error || pos < 0 || (textured && texcoord < 0) ||
-       (multitextured && texcoord1 < 0))
+       (multitextured && texcoord1 < 0) ||
+       (extra > 0 && texcoord_x[0] < 0) || (extra > 1 && texcoord_x[1] < 0))
       return;
 	ctx->colour1 = colour1;
 	ctx->oow = oow;
+	ctx->extra_units = extra;
 	ctx->proj = proj;
 	ctx->colour_alpha = colour_alpha;
 	ctx->line_coverage = ctx->ov_valid;
@@ -6048,6 +6206,12 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
             const float *tc1 = prim->v[v]->data[texcoord1];
             *dst++ = tc1[0];
             *dst++ = tc1[1];
+            for (unsigned i = 0; i < extra; i++) {
+               const float *tcx = prim->v[v]->data[texcoord_x[i]];
+
+               *dst++ = tcx[0];
+               *dst++ = tcx[1];
+            }
          }
       }
    }
@@ -7798,6 +7962,9 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
 
    /* The transform stream feeds unit u from GL coordinate set u. */
    if (ctx->fs && ctx->fs->unit_remap)
+      return ph_tcl_no(ctx, PH_TCL_NO_UNIT_REMAP);
+   /* Units 2 and 3 ride on the software path's four-set stream. */
+   if (ctx->fs && (ctx->fs->sampler_mask & ~3u))
       return ph_tcl_no(ctx, PH_TCL_NO_UNIT_REMAP);
    if (!ctx->tcl_available || ctx->tcl_forced_off || !ctx->vs ||
        (!ctx->vs->ff_transform && !ctx->vs->hw_program) || !ctx->velems ||
@@ -10759,6 +10926,17 @@ ph_fs_route_class(struct ph_fs *fs, bool single_texture_pipe)
    }
 }
 
+/* Combiner slots the texture stages leave a program: the two merges of the
+ * paired route, or the original family's three- and four-unit forms - one
+ * merge for [3,4,8], none for four units (p3d_orig_multi_mask). */
+static unsigned
+ph_comb_budget(const struct parhelia_screen *s, unsigned units)
+{
+   if (units > 2 && ph_original_family(s->chip_id))
+      return P3D_COMB_QUANTUM - (units == 3);
+   return P3D_COMB_QUANTUM - (units > 0) - (units > 1);
+}
+
 /* Use the compiled combiner program when it matches this draw.  The special
  * alpha routes own their own combiner words, and the serial multitexture
  * passes rewrite the environment per pass, so they keep the fixed-function
@@ -11409,7 +11587,7 @@ static void *ph_create_fs(struct pipe_context *p,
              * quantum is the program's.  A program may sample fewer units
              * than the shader declares, never more. */
             unsigned units = util_bitcount(fs->sampler_mask);
-            unsigned budget = P3D_COMB_QUANTUM - (units > 0) - (units > 1);
+            unsigned budget = ph_comb_budget(ph_screen(p->screen), units);
 
             nir_shader *compile_nir = ph_fs_pack_units(fs, s->ir.nir);
 
@@ -11451,7 +11629,7 @@ static void *ph_create_fs(struct pipe_context *p,
                fs->sampler_mask |= 1u << fs->taps[t].unit;
             if (fs->tap_count) {
                units = util_bitcount(fs->sampler_mask);
-               budget = P3D_COMB_QUANTUM - (units > 0) - (units > 1);
+               budget = ph_comb_budget(ph_screen(p->screen), units);
             }
             /* floor() of a varying samples a ramp texture on a free unit. */
             const uint32_t unramped_mask = fs->sampler_mask;
@@ -11494,7 +11672,7 @@ static void *ph_create_fs(struct pipe_context *p,
                   NIR_PASS(progress, compile_nir, nir_opt_dce);
                }
                units = util_bitcount(fs->sampler_mask | ramp_mask);
-               budget = P3D_COMB_QUANTUM - (units > 0) - (units > 1);
+               budget = ph_comb_budget(ph_screen(p->screen), units);
                fs->sampler_mask |= ramp_mask;
                fs->uses_texture = true;
             }

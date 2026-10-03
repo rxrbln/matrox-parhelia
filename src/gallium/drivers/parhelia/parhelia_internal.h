@@ -20,11 +20,8 @@
       ph_env_cached_ = getenv(name) != NULL; \
    ph_env_cached_ != 0; })
 
-/* Texture units a draw can actually drive today.  The state emitter banks all
- * four of the original Parhelia's units, and the host selftest covers three
- * and four, but a draw past two still needs a WARP program writing o3..o6, a
- * vertex layout with that many coordinate sets and the matching combiner
- * stages.  Raise this when those land. */
+/* Texture units the fragment compiler spreads taps, ramps and lookups over.
+ * GL samplers reach all of a family's driven units (ph_units_driven()). */
 #define PH_TEXTURE_UNITS_DRIVEN 2u
 
 #define PH_VRAM_VERTEX_LEGACY_SLOTS 3
@@ -169,6 +166,17 @@ static inline struct parhelia_screen *
 ph_screen(struct pipe_screen *s)
 {
    return (struct parhelia_screen *)s;
+}
+
+/* Texture units a draw drives: all four of the original family's (three and
+ * four in the vendor pipe forms, measured on the 0528), two on the LX class. */
+static inline unsigned
+ph_units_driven(const struct parhelia_screen *s)
+{
+   const unsigned family = s->chip_id == 0x0527 || s->chip_id == 0x0528 ?
+                           4u : 2u;
+
+   return s->texture_units < family ? s->texture_units : family;
 }
 
 static inline struct parhelia_resource *
