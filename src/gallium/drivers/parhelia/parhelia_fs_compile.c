@@ -129,6 +129,23 @@ static bool ph_fs_lower(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
                         struct ph_fs_src *out);
 static bool ph_fs_uniform_only(nir_def *def, unsigned depth);
 
+/* A constant index or offset.  nir_lower_int_to_float turns every integer
+ * constant, address sources included, into a float of the same value, so
+ * 1.0f reads as index 1; no real index reaches 0x3f800000. */
+static uint64_t
+ph_fs_index(nir_src src)
+{
+   const uint64_t u = nir_src_as_uint(src);
+
+   if (nir_src_bit_size(src) == 32 && u >= 0x3f800000u) {
+      const float f = nir_src_as_float(src);
+
+      if (f >= 1.0f && f < 16777216.0f && f == floorf(f))
+         return (uint64_t)f;
+   }
+   return u;
+}
+
 static bool
 ph_fs_grow(void **array, unsigned count, unsigned *cap, size_t size)
 {
@@ -963,23 +980,23 @@ ph_fs_uniform_offset(const nir_intrinsic_instr *load, unsigned *offset)
 {
    switch (load->intrinsic) {
    case nir_intrinsic_load_ubo_vec4:
-      if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+      if (!nir_src_is_const(load->src[0]) || ph_fs_index(load->src[0]) ||
           !nir_src_is_const(load->src[1]))
          return false;
-      *offset = (nir_intrinsic_base(load) + nir_src_as_uint(load->src[1])) * 4u +
+      *offset = (nir_intrinsic_base(load) + ph_fs_index(load->src[1])) * 4u +
                 nir_intrinsic_component(load);
       return true;
    case nir_intrinsic_load_ubo:
-      if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
-          !nir_src_is_const(load->src[1]) || nir_src_as_uint(load->src[1]) % 4u)
+      if (!nir_src_is_const(load->src[0]) || ph_fs_index(load->src[0]) ||
+          !nir_src_is_const(load->src[1]) || ph_fs_index(load->src[1]) % 4u)
          return false;
-      *offset = nir_src_as_uint(load->src[1]) / 4u;
+      *offset = ph_fs_index(load->src[1]) / 4u;
       return true;
    case nir_intrinsic_load_uniform:
       if (!nir_src_is_const(load->src[0]) ||
-          (nir_intrinsic_base(load) + nir_src_as_uint(load->src[0])) % 4u)
+          (nir_intrinsic_base(load) + ph_fs_index(load->src[0])) % 4u)
          return false;
-      *offset = (nir_intrinsic_base(load) + nir_src_as_uint(load->src[0])) / 4u;
+      *offset = (nir_intrinsic_base(load) + ph_fs_index(load->src[0])) / 4u;
       return true;
    default:
       return false;
@@ -1259,26 +1276,26 @@ ph_fs_intrinsic(struct ph_fs_ctx *ctx, const nir_intrinsic_instr *load,
                            lane, sel, out);
    case nir_intrinsic_load_ubo_vec4:
       /* The starting channel is the intrinsic's component index. */
-      if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+      if (!nir_src_is_const(load->src[0]) || ph_fs_index(load->src[0]) ||
           !nir_src_is_const(load->src[1]))
          break;
       return ph_fs_uniform(ctx, (nir_intrinsic_base(load) +
-                                 nir_src_as_uint(load->src[1])) * 4u +
+                                 ph_fs_index(load->src[1])) * 4u +
                                 nir_intrinsic_component(load),
                            lane, sel, out);
    case nir_intrinsic_load_ubo:
-      if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+      if (!nir_src_is_const(load->src[0]) || ph_fs_index(load->src[0]) ||
           !nir_src_is_const(load->src[1]) ||
-          nir_src_as_uint(load->src[1]) % 4u)
+          ph_fs_index(load->src[1]) % 4u)
          break;
-      return ph_fs_uniform(ctx, nir_src_as_uint(load->src[1]) / 4u, lane,
+      return ph_fs_uniform(ctx, ph_fs_index(load->src[1]) / 4u, lane,
                            sel, out);
    case nir_intrinsic_load_uniform:
       if (!nir_src_is_const(load->src[0]) ||
-          (nir_intrinsic_base(load) + nir_src_as_uint(load->src[0])) % 4u)
+          (nir_intrinsic_base(load) + ph_fs_index(load->src[0])) % 4u)
          break;
       return ph_fs_uniform(ctx, (nir_intrinsic_base(load) +
-                                 nir_src_as_uint(load->src[0])) / 4u,
+                                 ph_fs_index(load->src[0])) / 4u,
                            lane, sel, out);
    default:
       break;
@@ -1368,12 +1385,12 @@ ph_fs_fog_expr(struct ph_fs_ctx *ctx, nir_def *def, unsigned comp, bool *coord)
          break;
       }
       case nir_intrinsic_load_ubo_vec4:
-         if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
+         if (!nir_src_is_const(load->src[0]) || ph_fs_index(load->src[0]) ||
              !nir_src_is_const(load->src[1]))
             return -1;
          op.kind = PH_FOG_UNIFORM;
          op.offset = (nir_intrinsic_base(load) +
-                      nir_src_as_uint(load->src[1])) * 4u +
+                      ph_fs_index(load->src[1])) * 4u +
                      nir_intrinsic_component(load) + comp;
          return ph_fs_fog_push(ctx, op);
       default:
@@ -2938,6 +2955,8 @@ ph_fs_compile_key(nir_shader *nir, unsigned max_instructions,
    memset(out, 0, sizeof(*out));
    ctx.uexp = uexp;
    ctx.uexp_count = uexp_count;
+   if (getenv("PARHELIA_TRACE_FS_NIR"))
+      nir_print_shader(nir, stderr);
    for (unsigned u = 0; u < 4; u++)
       for (unsigned c = 0; c < 4; c++)
          ctx.tex_hi[u][c] = 1.0f;
@@ -3541,6 +3560,14 @@ ph_fs_run_preshader(struct ph_fs_program *program, const float *values,
       else
          nir_eval_const_opcode(node->op, &program->pre_value[i], &poison, 1,
                                node->bit_size, srcs, 0);
+      if (getenv("PARHELIA_TRACE_PRE"))
+         fprintf(stderr, "pre %u: %s/%u size %u (%u:%u %g, %u:%u %g, %u:%u %g) -> %#llx %g\n", i,
+                 nir_op_infos[node->op].name, node->bit_size, size,
+                 node->src[0][0].kind, node->src[0][0].index, src[0][0].f32,
+                 node->src[1][0].kind, node->src[1][0].index, src[1][0].f32,
+                 node->src[2][0].kind, node->src[2][0].index, src[2][0].f32,
+                 (unsigned long long)program->pre_value[i].u64,
+                 program->pre_value[i].f32);
    }
 }
 
