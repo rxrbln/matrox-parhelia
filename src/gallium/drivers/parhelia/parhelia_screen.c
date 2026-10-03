@@ -782,6 +782,9 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    r->base.screen = pscreen;
    r->tile_layout = screen->tile_layout;
    r->native_shared = share_native;
+   /* Other processes write shared images: their contents are always defined. */
+   if (share_native)
+      r->mip_defined = BITFIELD_BIT(0);
    if (!sampler_storage)
       ph_target_format(templ->format, &target_code, &target_cpp);
    /* Sampler storage keeps its own 32-bit row ABI and mip.cpp; only a
@@ -1367,6 +1370,7 @@ ph_resource_from_handle(struct pipe_screen *pscreen,
          r->stride = info.pitch / r->cpp;
          r->tile_layout = screen->tile_layout;
          r->native_shared = true;
+         r->mip_defined = BITFIELD_BIT(0);
          pipe_reference_init(&r->base.reference, 1);
          if (ph_env("PARHELIA_TRACE"))
             fprintf(stderr,
