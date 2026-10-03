@@ -713,3 +713,22 @@ the first resolve of a boot in 3 of 10 cases and on a later resolve in 6
 of 8 [MEASURED].  Placement is not the cause; the lockup is inside the
 draw-plus-resolve span.  What carries over from one resolve to the next
 is OPEN.
+
+### 11.14 Frames in one process (module faa0528-10)
+
+The vendor zeroes the fragment buffer once, when it allocates it
+(`sub_9E690`, CPU clear at `0x9e7a2`).  `sub_9E690` is called only from the
+size setup `0x9fbb0` and from `0x9ff30` on the `[fragctx+0xc4]` state 3/5
+transitions, never per frame or per resolve [PROVEN].
+
+Ten frames of draw + resolve + `0x107`/`0x207` fences on one set of
+objects in one process [MEASURED]:
+
+| variant | frames completed before the lockup |
+|---|---|
+| buffer zeroed once | 4 |
+| buffer re-zeroed before every frame | 4 (same fence numbers) |
+| 500 ms idle before every frame | 1 |
+| no host transfers between frames | 1 |
+
+Re-zeroing the buffer is not the cause, and an idle wait does not help.
