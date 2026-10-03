@@ -904,3 +904,16 @@ three identical vertices (Mesa's `ph_prime_warp()` at context creation,
 measured healing a poisoned quad completely); only a client sending an RGBA
 colour with a channel above its alpha (or alpha 0) through the kernel
 pass-through poisons it, which Mesa does not do on the LX class.
+
+### 12.2 An unfetched input keeps the previous draw's value (MEASURED)
+
+A WARP input the vertex fetch does not deliver keeps whatever the last draw
+- of any process - left there.  The kernel's textured and replace programs
+read v5 even for streams without a colour (REPLACE without z, the
+three-coordinate cube/volume stream); after a draw whose colour had a channel
+above its alpha (gl-2.0-vertexattribpointer's (0,1,0,0)), incomplete-cubemap
+drew nothing, 100%, until an inside colour was drawn.  A program writing o1
+from swizzle constants (`add o1, v0.1111, v0.0000`) and reading only fetched
+inputs is immune (Mesa `parhelia: textured programs for streams without a
+colour read no stale v5`).  Together with the v6 lock-up above: a program
+must read only inputs its stream fetches.
