@@ -1920,9 +1920,25 @@ ph_target_no_dest_alpha(enum pipe_format format)
           format == PIPE_FORMAT_B5G6R5_UNORM;
 }
 
+static bool
+ph_blend_factor_src_alpha(unsigned factor)
+{
+   switch (factor) {
+   case PIPE_BLENDFACTOR_SRC_ALPHA:
+   case PIPE_BLENDFACTOR_INV_SRC_ALPHA:
+   case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE:
+   case PIPE_BLENDFACTOR_SRC1_ALPHA:
+   case PIPE_BLENDFACTOR_INV_SRC1_ALPHA:
+      return true;
+   default:
+      return false;
+   }
+}
+
 /* The vertex colour's alpha reaches a visible result: an alpha test, a blend,
  * or a target that stores alpha.  Otherwise the RGB stream and the default
- * attribute's alpha of 1.0 (0x112c) are equivalent and one dword shorter. */
+ * attribute's alpha of 1.0 (0x112c) are equivalent and one dword shorter.
+ * The original family asks the blend whether its colour factors read it. */
 static bool
 ph_colour_alpha_observable(const struct ph_context *ctx)
 {
@@ -1931,7 +1947,10 @@ ph_colour_alpha_observable(const struct ph_context *ctx)
 
    if (ctx->dsa && ctx->dsa->alpha_enabled)
       return true;
-   if (blend && blend->blend_enable)
+   if (blend && blend->blend_enable &&
+       (!ph_original_family(ph_screen(ctx->base.screen)->chip_id) ||
+        ph_blend_factor_src_alpha(blend->rgb_src_factor) ||
+        ph_blend_factor_src_alpha(blend->rgb_dst_factor)))
       return true;
    return ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture &&
           util_format_has_alpha(ctx->fb.cbufs[0].format) &&
