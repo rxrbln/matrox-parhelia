@@ -359,10 +359,9 @@ static const char *const ph_stat_kind_names[PH_STAT_KINDS] = {
 struct ph_context {
    struct pipe_context base;
    struct draw_context *draw;
-   /* The Z unit's trunc(d * 2^n) grid (P690 and 0528), and, measured on
-    * the P690 only (chip 0x2539): the raster op's wide source colour, and the
-    * combiner alpha that carries a discard into the alpha test.  The
-    * original family keeps its previous paths until measured there. */
+   /* Measured on the P690 and the original Parhelia (0528): the Z unit's
+    * trunc(d * 2^n) grid, the raster op's wide source colour, and the
+    * combiner alpha that carries a discard into the alpha test. */
    bool z_grid, logicop_grid, kill_alpha;
    bool broadcasting;      /* ph_draw_broadcast is replaying a draw */
    /* Polygon stipple: the pattern as a 32x32 kill texture, see
@@ -14277,9 +14276,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->z_grid = ph_screen(screen)->chip_id == 0x2539 ||
                  ph_original_family(ph_screen(screen)->chip_id);
    ctx->logicop_grid = debug_get_bool_option("PARHELIA_LOGICOP_GRID",
-                                             ph_screen(screen)->chip_id == 0x2539);
-   ctx->kill_alpha = debug_get_bool_option("PARHELIA_KILL_ALPHA",
-                                           ph_screen(screen)->chip_id == 0x2539);
+                                             ctx->z_grid);
+   ctx->kill_alpha = debug_get_bool_option("PARHELIA_KILL_ALPHA", ctx->z_grid);
    ctx->colour_fs.uses_color = true;
    ctx->colour_fs.texenv = P3D_TEXENV_MODULATE;
    ctx->colour_fs.serial_op = PH_SERIAL_UNSUPPORTED;
