@@ -9,6 +9,8 @@
 #include <linux/delay.h>
 #include <linux/module.h>
 
+#include <drm/drm_debugfs.h>
+#include <drm/drm_file.h>
 #include <drm/drm_managed.h>
 
 #include "parhelia_drv.h"
@@ -144,10 +146,30 @@ static int parhelia_miscio_pre_xfer(struct i2c_adapter *adap)
 	struct parhelia_miscio_i2c *port = i2c_get_adapdata(adap);
 	struct parhelia_device *pdev = port->pdev;
 
+	unsigned int i;
+
 	mutex_lock(&pdev->ddc_lock);
-	if (port->mux >= 0) {
+	parhelia_miscio_set(port, port->sda, 1);
+	parhelia_miscio_set(port, port->scl, 1);
+	udelay(10);
+	/* a slave left mid-byte holds SDA low: clock it out, then STOP */
+	for (i = 0; i < 9 && !parhelia_miscio_getsda(port); i++) {
+		parhelia_miscio_set(port, port->scl, 0);
+		udelay(5);
+		parhelia_miscio_set(port, port->scl, 1);
+		udelay(5);
+	}
+	if (i) {
+		parhelia_miscio_set(port, port->scl, 0);
+		parhelia_miscio_set(port, port->sda, 0);
+		udelay(5);
+		parhelia_miscio_set(port, port->scl, 1);
+		udelay(5);
 		parhelia_miscio_set(port, port->sda, 1);
-		udelay(10);
+		udelay(5);
+		dev_warn_ratelimited(&pdev->pdev->dev,
+				     "%s: released SDA after %u clocks\n",
+				     port->adap.name, i);
 	}
 	return 0;
 }
@@ -409,4 +431,49 @@ int parhelia_ch7301_init(struct parhelia_device *pdev)
 	if (!pdev->ch7301[1])
 		pdev->ch7301[1] = parhelia_ch7301_probe(pdev, ports[1], 0x75);
 	return 0;
+}
+
+/* Read-only register dump through the kernel's bus and lock, so no user tool
+ * has to bit-bang 0x1c4c behind the driver's back. */
+static int parhelia_ch7301_show(struct seq_file *m, void *data)
+{
+	static const u8 regs[] = { 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x23, 0x31,
+				   0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x48, 0x49,
+				   0x4a, 0x4b, 0x4d, 0x56, 0x70 };
+	struct drm_info_node *node = m->private;
+	struct parhelia_device *pdev = to_parhelia(node->minor->dev);
+	unsigned int i, r;
+	int v;
+
+	for (i = 0; i < ARRAY_SIZE(pdev->ch7301); i++) {
+		struct parhelia_ch7301 *ch = pdev->ch7301[i];
+
+		if (!ch)
+			continue;
+		seq_printf(m, "DVO%u 0x%02x:", i + 1, ch->addr);
+		for (r = 0; r < ARRAY_SIZE(regs); r++) {
+			v = ch7301_read(ch, regs[r]);
+			if (v < 0)
+				seq_printf(m, " %02x:NAK", regs[r]);
+			else
+				seq_printf(m, " %02x=%02x", regs[r], v);
+		}
+		seq_putc(m, '\n');
+	}
+	seq_printf(m, "0x1c4c=%08x\n", parhelia_read(pdev, PARHELIA_REG_MISCIO));
+	return 0;
+}
+
+static const struct drm_info_list parhelia_ch7301_debugfs_list[] = {
+	{ "parhelia_ch7301", parhelia_ch7301_show, 0 },
+};
+
+void parhelia_ch7301_debugfs_init(struct drm_minor *minor)
+{
+	struct parhelia_device *pdev = to_parhelia(minor->dev);
+
+	if (pdev->ch7301[0] || pdev->ch7301[1])
+		drm_debugfs_create_files(parhelia_ch7301_debugfs_list,
+					 ARRAY_SIZE(parhelia_ch7301_debugfs_list),
+					 minor->debugfs_root, minor);
 }

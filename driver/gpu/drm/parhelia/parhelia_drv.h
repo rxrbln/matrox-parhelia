@@ -766,6 +766,7 @@ bool parhelia_bios_ddc_pins(const struct parhelia_bios *bios,
 			    unsigned int line, u8 *scl, u8 *sda);
 int parhelia_ddc_init(struct parhelia_output *output);
 int parhelia_ch7301_init(struct parhelia_device *pdev);
+void parhelia_ch7301_debugfs_init(struct drm_minor *minor);
 void parhelia_ch7301_enable(struct parhelia_device *pdev, unsigned int dvo,
 			    u32 clock_khz);
 irqreturn_t parhelia_irq_handler(int irq, void *arg);

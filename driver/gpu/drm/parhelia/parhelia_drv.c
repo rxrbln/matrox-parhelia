@@ -182,6 +182,7 @@ static void parhelia_debugfs_init(struct drm_minor *minor)
 {
 	drm_vram_mm_debugfs_init(minor);
 	parhelia_submit_debugfs_init(minor);
+	parhelia_ch7301_debugfs_init(minor);
 }
 
 #define PARHELIA_TRACED_IOCTL(_name, _fn, _a0, _a1, _a2)                \
