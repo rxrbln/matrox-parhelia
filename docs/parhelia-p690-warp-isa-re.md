@@ -883,3 +883,25 @@ v0.0000, v0.0001`, `add T2, v5.0000, v5.0001`, `mul T2, v0.000w, r1.0000`,
 constant-swizzle digits do not give (0,0,0,1) in that slot).  `mul T2, v6,
 r1.0000` (an input the stream does not fetch) **stopped the engine** (watchdog
 power cycle 02:56) - never read an unfetched input.
+
+### 12.1 Which instruction feeds the latch is not settled (MEASURED)
+
+Programs loaded with `COLOUR_ALPHA_PROGHEX`, each `add o0, v0, v0.0000; <X>
+| mov o11, v0; add o1, v5, r1.0000; end; wra`, drawing the quad with colour
+(0,1,0,a): `X` = `mul T2, v5, r1.0000` (kernel form), `add T2, v5, v0.0001`,
+`mul T2, v5, v0.0001`, `add T2, v5, v0.000w` all draw with a = 1 and draw
+nothing with a = 0 and a = 0.5 - even the forms that should give T2 =
+(0,1,0,1) or (0,1,0,1.5), which are inside.  Moving the T2 arithmetic
+before or after the `mov o11` bundle (`add T2, v0, -v0` then `add T2, T2,
+v0.0001`, or the kernel form followed by `add T2, T2, v0.0001`) changes
+nothing either.  So the latched clip-test value follows the vertex colour v5
+of these programs regardless of the T2 instruction's form; "T2 =
+v5" describes the kernel pass-through's effect, not a proven mechanism, and
+an encoding that writes a colour-independent inside value is not known.
+
+What is proven and sufficient in practice: one pass-through draw with an
+inside colour restores the latch for every later T2-free draw, including
+three identical vertices (Mesa's `ph_prime_warp()` at context creation,
+measured healing a poisoned quad completely); only a client sending an RGBA
+colour with a channel above its alpha (or alpha 0) through the kernel
+pass-through poisons it, which Mesa does not do on the LX class.
