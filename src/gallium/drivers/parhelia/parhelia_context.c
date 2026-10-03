@@ -2673,7 +2673,7 @@ ph_sampler_wrap_axes(const struct pipe_sampler_state *sampler,
 static float
 ph_max_lod_bias(const struct ph_context *ctx)
 {
-   return ph_screen(ctx->base.screen)->chip_id == 0x2539 ? 12.0f : 4.0f;
+   return ph_screen(ctx->base.screen)->max_lod_bias;
 }
 
 static uint32_t

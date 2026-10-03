@@ -61,6 +61,8 @@ struct parhelia_screen {
     * images. */
    bool volume_targets;
    bool cube_targets;
+   /* the sampler LOD bias clamp, advertised as the GL limit */
+   float max_lod_bias;
    /* Zero means GET_PARAM was unavailable or returned an invalid value. */
    uint32_t kernel_max_packets;
    uint64_t vram_size;
