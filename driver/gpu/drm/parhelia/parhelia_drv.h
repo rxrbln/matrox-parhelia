@@ -583,6 +583,8 @@ struct parhelia_device {
 	bool aperture_live;
 	/* BAR0 address bits 27:25, part of every descriptor coordinate */
 	u32 aperture_coord_base;
+	/* Descriptor bank as firmware left it, restored at teardown */
+	u32 *fw_aperture;
 	/* Default-off root corruption tracer.  The saved sample survives across
 	 * ioctl and mmap boundaries, so a userspace store between two kernel
 	 * entries is reported at the next boundary. */
@@ -790,6 +792,7 @@ bool parhelia_gem_is_owned(const struct drm_gem_object *gem);
 void parhelia_root_trace_check(struct parhelia_device *pdev,
 			       const char *event, u64 arg0, u64 arg1, u64 arg2);
 void parhelia_host_aperture_fini(struct parhelia_device *pdev);
+int parhelia_host_aperture_snapshot(struct parhelia_device *pdev);
 int parhelia_host_aperture_reserve_bootstrap(struct parhelia_device *pdev);
 void parhelia_host_aperture_init(struct parhelia_device *pdev);
 int parhelia_host_aperture_acquire(struct parhelia_device *pdev,

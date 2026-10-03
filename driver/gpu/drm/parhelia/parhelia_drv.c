@@ -437,6 +437,9 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	pdev->mmio = pcim_iomap(pci, mmio_bar, 0);
 	if (!pdev->vram || !pdev->mmio)
 		return dev_err_probe(&pci->dev, -ENOMEM, "cannot map BARs\n");
+	ret = parhelia_host_aperture_snapshot(pdev);
+	if (ret)
+		return ret;
 	dev_info(&pci->dev,
 		 "%s: mapped %pa-byte VRAM BAR0 and MMIO BAR%u, tile layout %u, "
 		 "MC %s, clock %s, output %u, reset %s\n",

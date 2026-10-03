@@ -771,6 +771,38 @@ int parhelia_vram_move_pages(struct parhelia_device *pdev,
 	return ret;
 }
 
+/* Record the whole descriptor bank before engine init replaces it. */
+int parhelia_host_aperture_snapshot(struct parhelia_device *pdev)
+{
+	unsigned int i, n = PARHELIA_HOST_APERTURE_SLOTS * 4;
+
+	pdev->fw_aperture = devm_kcalloc(&pdev->pdev->dev, n,
+					 sizeof(*pdev->fw_aperture), GFP_KERNEL);
+	if (!pdev->fw_aperture)
+		return -ENOMEM;
+	for (i = 0; i < n; i++)
+		pdev->fw_aperture[i] = parhelia_read(pdev, i * 4);
+	return 0;
+}
+
+/* Hand the bank back as firmware left it, the way the vendor's WARP
+ * self-test restores it: every slot invalid, then payloads, then dword 0. */
+static void parhelia_host_aperture_restore(struct parhelia_device *pdev)
+{
+	unsigned int slot, i;
+
+	for (slot = 0; slot < PARHELIA_HOST_APERTURE_SLOTS; slot++)
+		parhelia_write(pdev, PARHELIA_HOST_APERTURE_SLOT(slot), 0);
+	for (slot = 0; slot < PARHELIA_HOST_APERTURE_SLOTS; slot++)
+		for (i = 1; i < 4; i++)
+			parhelia_write(pdev, PARHELIA_HOST_APERTURE_SLOT(slot) + i * 4,
+				       pdev->fw_aperture[slot * 4 + i]);
+	for (slot = 0; slot < PARHELIA_HOST_APERTURE_SLOTS; slot++)
+		parhelia_write(pdev, PARHELIA_HOST_APERTURE_SLOT(slot),
+			       pdev->fw_aperture[slot * 4]);
+	parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(0));
+}
+
 void parhelia_host_aperture_fini(struct parhelia_device *pdev)
 {
 	unsigned int slot;
@@ -785,6 +817,10 @@ void parhelia_host_aperture_fini(struct parhelia_device *pdev)
 		parhelia_read(pdev,
 			      PARHELIA_HOST_APERTURE_SLOT(PARHELIA_HOST_APERTURE_SLOTS - 1));
 		pdev->aperture_live = false;
+	}
+	if (pdev->raw_aperture_owned && pdev->fw_aperture) {
+		parhelia_host_aperture_restore(pdev);
+		pdev->fw_aperture = NULL;
 	}
 	mutex_unlock(&pdev->aperture_lock);
 }
