@@ -12,7 +12,7 @@ libparhelia_batch = static_library(
 libparhelia = static_library(
   'parhelia',
   files('parhelia_screen.c', 'parhelia_context.c', 'parhelia_fs_compile.c',
-        'parhelia_vs_compile.c'),
+        'parhelia_vs_compile.c', 'parhelia_fs_lookup.c'),
   include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
   dependencies : [dep_libdrm, idep_mesautil, idep_nir],
   link_with : libparhelia_batch,

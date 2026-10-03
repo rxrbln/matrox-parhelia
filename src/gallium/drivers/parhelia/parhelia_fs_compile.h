@@ -81,11 +81,20 @@ struct ph_fs_fog_op {
    float value;            /* PH_FOG_LITERAL */
 };
 
+enum ph_fs_ramp_kind {
+   PH_FS_RAMP_FLOOR = 0,
+   PH_FS_RAMP_DIRECTION,   /* a function lookup, see parhelia_fs_lookup.h */
+};
+
+struct ph_fs_lookup;
+
 /* A floor of a varying, evaluated by a nearest-sampled ramp texture on a
  * free unit: texel j of dimension d holds code j * step, the floor is
  * code * 255 / step + k * lo[d], and the unit reads the varying's
  * components comp[] staged as (x - lo) / span. */
 struct ph_fs_ramp {
+   uint8_t kind;           /* enum ph_fs_ramp_kind */
+   const struct ph_fs_lookup *fn;
    uint8_t unit;
    uint8_t location;       /* VARYING_SLOT_* */
    uint8_t dims;           /* floored components, 1..3 */

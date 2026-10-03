@@ -50,6 +50,7 @@
 #include "parhelia_texel.h"
 #include "parhelia_tile_copy.h"
 #include "parhelia_fs_compile.h"
+#include "parhelia_fs_lookup.h"
 #include "parhelia_vs_compile.h"
 
 struct ph_velems {
@@ -152,6 +153,8 @@ struct ph_fs {
     * expression the combiner can evaluate; everything else keeps the
     * instruction-shape matcher above and the draw module. */
    struct ph_fs_program program;
+   /* The evaluator of a program that samples its own lookup texture. */
+   struct ph_fs_lookup *lookup;
    /* A discard folded into the alpha test, see ph_fs_build_kill(). */
    struct ph_fs_kill *kill;
    /* Samples whose coordinate is a uniform (a constant glTexCoord), which
@@ -343,6 +346,16 @@ struct ph_context {
    unsigned ramp_tex_count, ramp_tex_cap;
    void *ramp_sampler;
    bool ramping;
+   /* Lookup textures of fragment programs (ph_lookup_view). */
+   struct ph_lookup_tex {
+      uint32_t uid;
+      uint8_t *constants;
+      unsigned size;
+      struct pipe_resource *tex;
+      struct pipe_sampler_view *view;
+   } *lookup_tex;
+   unsigned lookup_tex_count, lookup_tex_cap;
+   void *lookup_sampler;
    /* The framebuffer as the state tracker set it, and the stand-in render
     * resources for surfaces the engine cannot address in place (a mip level
     * above 0 or a slice): ctx->fb binds the stand-ins. */
@@ -8068,6 +8081,10 @@ ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
       const float *src = v->data[q->ramp_src[i]];
       float *c = out->data[q->ramp_slot[i]];
 
+      if (r->kind != PH_FS_RAMP_FLOOR) {
+         ph_fs_lookup_stage(r, src, c);
+         continue;
+      }
       c[0] = c[1] = c[2] = 0.5f;
       c[3] = 1.0f;
       for (unsigned d = 0; d < r->dims; d++)
@@ -8092,7 +8109,7 @@ ph_quant_ramps_in_range(const struct ph_quant_stage *q,
                         const struct prim_header *prim, unsigned n)
 {
    for (unsigned i = 0; i < q->ramp_count; i++)
-      for (unsigned v = 0; v < n; v++)
+      for (unsigned v = 0; v < n && q->ramp[i].kind == PH_FS_RAMP_FLOOR; v++)
          for (unsigned d = 0; d < q->ramp[i].dims; d++) {
             const float x = prim->v[v]->data[q->ramp_src[i]][q->ramp[i].comp[d]];
 
@@ -8996,6 +9013,78 @@ ph_draw_stippled(struct ph_context *ctx, const struct pipe_draw_info *info,
    return true;
 }
 
+/* The lookup texture of @r's program for the current fragment constants:
+ * one per program, rebuilt when the constants change. */
+static struct pipe_sampler_view *
+ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
+{
+   const unsigned n = r->size[0];
+   struct pipe_resource templ = {
+      .target = PIPE_TEXTURE_CUBE,
+      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      .width0 = n, .height0 = n, .depth0 = 1, .array_size = 6,
+      .bind = PIPE_BIND_SAMPLER_VIEW,
+   };
+   struct ph_lookup_tex *t = NULL;
+   struct pipe_sampler_view vt;
+   struct pipe_box box;
+   uint8_t *data;
+
+   ph_fs_snapshot_constants(ctx);
+   for (unsigned i = 0; i < ctx->lookup_tex_count; i++)
+      if (ctx->lookup_tex[i].uid == r->fn->uid)
+         t = &ctx->lookup_tex[i];
+   if (t && t->view && t->size == ctx->fs_const_snap_size &&
+       (!t->size || !memcmp(t->constants, ctx->fs_const_snap, t->size)))
+      return t->view;
+   if (!t) {
+      if (ctx->lookup_tex_count == ctx->lookup_tex_cap) {
+         const unsigned cap = ctx->lookup_tex_cap ? ctx->lookup_tex_cap * 2 : 4;
+         struct ph_lookup_tex *grown =
+            realloc(ctx->lookup_tex, cap * sizeof(*grown));
+
+         if (!grown)
+            return NULL;
+         ctx->lookup_tex = grown;
+         ctx->lookup_tex_cap = cap;
+      }
+      t = &ctx->lookup_tex[ctx->lookup_tex_count++];
+      memset(t, 0, sizeof(*t));
+      t->uid = r->fn->uid;
+   }
+   /* Queued draws keep sampling the old texture. */
+   if (ctx->triangles || ctx->points || ctx->lines)
+      ph_submit_vertices(ctx);
+   pipe_sampler_view_reference(&t->view, NULL);
+   pipe_resource_reference(&t->tex, NULL);
+   free(t->constants);
+   t->constants = ctx->fs_const_snap_size ?
+                  malloc(ctx->fs_const_snap_size) : NULL;
+   t->size = t->constants ? ctx->fs_const_snap_size : 0;
+   if (t->size)
+      memcpy(t->constants, ctx->fs_const_snap, t->size);
+   data = malloc((size_t)n * n * 6 * 4);
+   if (!data)
+      return NULL;
+   if (!ph_fs_lookup_fill(r->fn, n, ctx->fs_const_snap,
+                          ctx->fs_const_snap_size, data)) {
+      free(data);
+      return NULL;
+   }
+   t->tex = ctx->base.screen->resource_create(ctx->base.screen, &templ);
+   if (t->tex) {
+      u_box_3d(0, 0, 0, n, n, 6, &box);
+      ctx->base.texture_subdata(&ctx->base, t->tex, 0, PIPE_MAP_WRITE, &box,
+                                data, n * 4, n * n * 4);
+      u_sampler_view_default_template(&vt, t->tex, t->tex->format);
+      t->view = ctx->base.create_sampler_view(&ctx->base, t->tex, &vt);
+   }
+   free(data);
+   if (!t->view)
+      pipe_resource_reference(&t->tex, NULL);
+   return t->view;
+}
+
 /* The ramp texture of @r: texel (x, y, z) holds code index * step in the
  * channel of each floored component, zero elsewhere. */
 static struct pipe_sampler_view *
@@ -9014,9 +9103,13 @@ ph_ramp_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
    struct pipe_box box;
    uint8_t *data;
 
+   if (r->kind != PH_FS_RAMP_FLOOR)
+      return ph_lookup_view(ctx, r);
    for (unsigned i = 0; i < ctx->ramp_tex_count; i++) {
       const struct ph_fs_ramp *k = &ctx->ramp_tex[i].key;
 
+      if (k->kind != PH_FS_RAMP_FLOOR)
+         continue;
       if (k->dims == r->dims && !memcmp(k->size, r->size, sizeof(k->size)) &&
           !memcmp(k->comp, r->comp, sizeof(k->comp)))
          return ctx->ramp_tex[i].view;
@@ -9090,8 +9183,21 @@ ph_draw_ramped(struct ph_context *ctx, const struct pipe_draw_info *info,
 
       ctx->ramp_sampler = ctx->base.create_sampler_state(&ctx->base, &templ);
    }
+   if (!ctx->lookup_sampler) {
+      const struct pipe_sampler_state templ = {
+         .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .min_img_filter = PIPE_TEX_FILTER_LINEAR,
+         .mag_img_filter = PIPE_TEX_FILTER_LINEAR,
+         .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
+      };
+
+      ctx->lookup_sampler = ctx->base.create_sampler_state(&ctx->base, &templ);
+   }
    for (unsigned i = 0; i < prog->ramp_count; i++)
-      if (!ctx->ramp_sampler || !ph_ramp_view(ctx, &prog->ramps[i])) {
+      if (!ctx->ramp_sampler || !ctx->lookup_sampler ||
+          !ph_ramp_view(ctx, &prog->ramps[i])) {
          PH_REFUSE("a draw whose floor ramp texture cannot be built is dropped\n");
          return true;
       }
@@ -9105,7 +9211,8 @@ ph_draw_ramped(struct ph_context *ctx, const struct pipe_draw_info *info,
       ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, u, 1, 0,
                                   &view);
       ctx->base.bind_sampler_states(&ctx->base, MESA_SHADER_FRAGMENT, u, 1,
-                                    &ctx->ramp_sampler);
+                                    prog->ramps[i].kind == PH_FS_RAMP_FLOOR ?
+                                    &ctx->ramp_sampler : &ctx->lookup_sampler);
    }
    ctx->base.draw_vbo(&ctx->base, info, drawid_offset, NULL, draws, 1);
    for (unsigned i = 0; i < prog->ramp_count; i++) {
@@ -10266,6 +10373,34 @@ static void *ph_create_fs(struct pipe_context *p,
                        (fs->program.sampler_mask & ~fs->sampler_mask)) {
                ph_fs_program_fini(&fs->program), fs->program.valid = false;
             }
+            /* A colour beyond the combiner that is a function of one varying
+             * samples a lookup texture of the program on unit 0. */
+            if (!fs->program.valid && ramped && !ramp_count &&
+                !fs->unit_remap && !compile_nir->info.fs.uses_discard) {
+               struct ph_fs_program lookup_prog;
+               struct ph_fs_ramp lookup_ramp;
+               const char *lookup_reject = NULL;
+
+               if (ph_fs_lower_lookup(compile_nir,
+                      ph_nir_sampler_mask(compile_nir),
+                      MIN2(ph_screen(p->screen)->texture_units,
+                           PH_TEXTURE_UNITS_DRIVEN),
+                      &lookup_ramp, &fs->lookup, &lookup_reject)) {
+                  if (ph_fs_compile_ramps(compile_nir, P3D_COMB_QUANTUM - 1,
+                                          &lookup_ramp, 1, &lookup_prog)) {
+                     ph_fs_program_fini(&fs->program);
+                     fs->program = lookup_prog;
+                     fs->sampler_mask |= 1u;
+                     fs->uses_texture = true;
+                  } else {
+                     ph_fs_lookup_free(fs->lookup);
+                     fs->lookup = NULL;
+                  }
+               } else if (ph_env("PARHELIA_TRACE")) {
+                  fprintf(stderr, "parhelia: fs=%p has no lookup form: %s\n",
+                          (void *)fs, lookup_reject);
+               }
+            }
             if (compile_nir->info.fs.uses_discard)
                fs->kill = ph_fs_build_kill(compile_nir, budget);
             ph_fs_find_uniform_coords(fs, s->ir.nir);
@@ -10373,6 +10508,7 @@ static void ph_delete_fs(struct pipe_context *p, void *s)
       FREE(fs->kill);
       free(fs->ucoord);
       ph_fs_program_fini(&fs->program);
+      ph_fs_lookup_free(fs->lookup);
    }
    FREE(fs);
 }
@@ -12658,6 +12794,14 @@ ph_destroy_context(struct pipe_context *p)
    free(ctx->ramp_tex);
    if (ctx->ramp_sampler)
       p->delete_sampler_state(p, ctx->ramp_sampler);
+   for (unsigned i = 0; i < ctx->lookup_tex_count; i++) {
+      pipe_sampler_view_reference(&ctx->lookup_tex[i].view, NULL);
+      pipe_resource_reference(&ctx->lookup_tex[i].tex, NULL);
+      free(ctx->lookup_tex[i].constants);
+   }
+   free(ctx->lookup_tex);
+   if (ctx->lookup_sampler)
+      p->delete_sampler_state(p, ctx->lookup_sampler);
    util_unreference_framebuffer_state(&ctx->fb_api);
    util_unreference_framebuffer_state(&ctx->fb);
    if (p->stream_uploader)

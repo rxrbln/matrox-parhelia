@@ -3042,7 +3042,7 @@ ph_fs_compile_key(nir_shader *nir, unsigned max_instructions,
          ctx.tex_hi[u][c] = 1.0f;
    /* A ramp texel holds only its own components; the rest are zero. */
    for (unsigned r = 0; r < ramp_count; r++) {
-      if (ramps[r].unit >= 4)
+      if (ramps[r].unit >= 4 || ramps[r].kind != PH_FS_RAMP_FLOOR)
          continue;
       for (unsigned c = 0; c < 4; c++)
          ctx.tex_hi[ramps[r].unit][c] = 0.0f;
