@@ -1518,3 +1518,64 @@ lights the monitor.
 * **`0x1c58` bit 6 (line ~243):** on this family `HSLPAREnableDVO` sets it
   (`b0b59 -> b0db1`); the clear at `b0b5f` needs `board_flag != 0`, which is
   always 0 for 0x0527/0x0528.
+
+## 15. The DVO ports end in external Chrontel CH7301C transmitters (2026-10-03)
+
+Correction to sections 6, 9 and 13: on this board the "integrated serializer"
+registers (`0x1c20` crossbar byte, `0x1c00` DVO clock, `0x1c24` power) drive the
+**DVO port**; the TMDS link itself comes from an external **Chrontel CH7301C**
+per connector on the MISC-IO (`0x1c4c`) I2C bus.  Its TMDS PLL must be retuned
+for every pixel clock, which is why DVI ran at 154 MHz only after a VBE boot.
+
+* **Probe, PROVEN `rom0528 0x8508`:** I2C port 4 (`0x4c26`: gated on
+  `PInS[0x88]` bit 2; SDA = MISC-IO id 1, SCL = id 2 through the nibble table
+  `PInS[0x188]`/`[0x18c]` = pins 0/1; channel select id 5 driven low, else id 8
+  driven high = pin 8 high here), slave `0xec` (7-bit `0x76`) -> runtime flag
+  `[0x7fed] |= 0x40`, address `[0x7fec]`; second transmitter at `0xea` (`0x75`)
+  on port 4, else `0xec`/`0xea` on port 5 (ids 3/4, `PInS[0x88]` bit 3) ->
+  `[0x7fea]/[0x7feb]`; VID register `0x4a` -> `[0x7fe7]` (`0x8634`).  DVO1 pairs
+  with `0x76`, DVO2 with `0x75` (same `[0x7fdd]` selection in `0x9d88` and
+  `0x7428`).  MEASURED from the running BIOS shadow at `0xc7fe0`: `0x7fe7 = 0x95`,
+  `0x7fec = 0xec`, `0x7fea/0x7feb = 04/ea`, `0x7fed = 0x41`; over I2C both
+  chips answer VID `0x95`, DID `0x17` (CH7301C).
+* **Per-mode programming, PROVEN `rom0528 0x7461` (from the hi-res set
+  `0x68e4` -> `0x6a0d`, clock in MHz) and `mtx740 HSLCHREnable .text+0x932b0` /
+  `HSLCHREnableDigitalMode +0x8e2f0` (clock `vidparm[0x24]` kHz):** reset
+  `0x48 = 08, 18, 10` (`0x7577`, `HSLCHRReset +0x907a0`, which also writes
+  `0x49 = 1e` and keeps `0x1e`'s high nibble); `0x1c = 04`, `0x1f = 80`,
+  `0x49 = de`; for VID `0x85`/`0x95` (vendor also `0x80`) `0x23 =
+  PInS[0x88] & 0x8000 ? 6 : 4`; VID `0x95`/`0x80` also `0x70 = a0`; then
+  `0x31..0x37` from the band table; `0x48 = 18`; PLL lock check.
+
+  | VID | band | `0x31..0x37` | ROM | mtx740 |
+  |---|---|---|---|---|
+  | `0x95`/`0x80` | < 65 MHz | `00 23 08 16 30 60 00` | `0x740c` | `ChrVerCDVIParam[0]` `.data 0x33c310` |
+  | `0x95`/`0x80` | >= 65 MHz | `00 2d 06 26 70 a0 00` | `0x741a` | `ChrVerCDVIParam[1]` |
+  | `0x85` | <= 32 / < 65 / >= 65 MHz | `..30 10..` / `..30 60..` / `2d 06 26 30 a0` | `0x73e2/0x73f0/0x73fe` | `ChrVerBDVIParam` `0x33c320` |
+  | other | any | `00 2d 07 26 30 e0 00` | `0x73d4` | `ChrDVIParam` `0x33c335` |
+
+* **PLL lock check, PROVEN `rom0528 0x773a`:** `0x23 |= 8`, `0x35 |= 0x40`; poll
+  `0x4d` bit 2 until 3 consecutive set within 150 reads, then require 20 more in
+  a row; on failure toggle `0x48` bit 3 (up to three restarts), then toggle
+  `0x49` bit 6 once and try again.  The vendor `HSLCHRPllCheck` (`+0x93120`)
+  is the same state machine but ORs `0x23` bit **2**
+  (`HSLCHRPllCheck_AccessPllLockBit +0x92f1a`); the chip reads `0x23 = 0x0e`
+  after the VBIOS ran, i.e. the VBIOS form.
+* **The vendor HAL calls it from `HSLPAREnableDVI`** (`.text+0xb5fc5`) when
+  `dev[0x3a4] & 0x3000000` (Chrontel found) - the branch section 6.8 missed.
+* **MEASURED failing state** (text boot, our module before ae34aa5, 1920x1200
+  154 MHz): `0x76` holds the < 65 MHz table, `0x4d = 00` - **the TMDS PLL is
+  not locked**.  A text-mode POST tunes for 28 MHz, a `vga=0x31f` boot for
+  162 MHz, and the MMIO dumps were identical because the state lives in the
+  I2C device.
+* **`0x1fde`, PROVEN `rom0528`:** set to 1 at `0x94ba` in the hi-res set
+  (with GCTL06 = graphics, A0000/64K), ORed with granularity flags at `0x60ac`
+  inside the VBE window function `0x5fc6` (its far pointer is stored into the
+  ModeInfoBlock at `0x5c45`; the same routine writes the bank number to
+  `0x19f0`), and cleared at `0x5330`/`0x8376` on the way back to VGA.  It is the
+  VGA aperture window/bank control, not a display register; the native vendor
+  path writes it only in `HSLPARSetVGAEnable` (`.text+0xd7656`).
+
+Kernel: `parhelia_ch7301.c` (commit ae34aa5 on p0528-dvi0528) implements the
+probe and the vendor enable sequence with this board's lock check, called at
+the end of the original family's DVO mode set.
