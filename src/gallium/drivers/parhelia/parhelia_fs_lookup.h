@@ -29,6 +29,8 @@ struct ph_fs_lookup {
    uint8_t out_mask;       /* colour channels the program writes */
    unsigned num_defs;
    bool *varies;           /* per SSA def: depends on the varying */
+   nir_instr **steps;      /* what runs per texel, in program order */
+   unsigned step_count;
 };
 
 /* Texels per dimension of a lookup of @kind (a cube map's face edge). */
@@ -57,6 +59,11 @@ bool ph_fs_saturate_colour(nir_shader *nir);
 bool ph_fs_lookup_fill(const struct ph_fs_lookup *fn,
                        const struct ph_fs_ramp *r,
                        const void *constants, unsigned size, uint8_t *texels);
+
+/* The uniform values @fn's table depends on, as *@count dwords in *@key
+ * (malloc'ed); false as for ph_fs_lookup_fill(). */
+bool ph_fs_lookup_key(const struct ph_fs_lookup *fn, const void *constants,
+                      unsigned size, uint32_t **key, unsigned *count);
 
 /* The colour @fn computes for varying value @v (components in coordinate
  * order), unclamped; false as for ph_fs_lookup_fill(). */

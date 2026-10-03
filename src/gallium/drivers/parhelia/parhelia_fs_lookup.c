@@ -283,6 +283,7 @@ ph_fs_lookup_free(struct ph_fs_lookup *fn)
       return;
    ralloc_free(fn->nir);
    free(fn->varies);
+   free(fn->steps);
    free(fn);
 }
 
@@ -422,6 +423,26 @@ ph_fs_lower_lookup(nir_shader *nir, unsigned used_units, unsigned max_units,
    fn->num_defs = nir_shader_get_entrypoint(fn->nir)->ssa_alloc;
    fn->varies = varies;
    varies = NULL;
+   nir_foreach_block(block, nir_shader_get_entrypoint(fn->nir)) {
+      nir_foreach_instr(instr, block) {
+         nir_def *def = nir_instr_def(instr);
+         unsigned first, mask;
+         nir_instr **grown;
+
+         if (def ? !fn->varies[def->index] :
+             instr->type != nir_instr_type_intrinsic ||
+             !ph_fs_lookup_colour_store(nir_instr_as_intrinsic(instr),
+                                        &first, &mask))
+            continue;
+         grown = realloc(fn->steps, (fn->step_count + 1) * sizeof(*grown));
+         if (!grown) {
+            *reject = "out of memory";
+            goto done;
+         }
+         fn->steps = grown;
+         fn->steps[fn->step_count++] = instr;
+      }
+   }
 
    {
       /* The colour stores move to the end and take the cube map's texel. */
@@ -527,18 +548,97 @@ ph_fs_lookup_read_uniform(struct ph_fs_lookup_eval *e, nir_intrinsic_instr *in,
    return true;
 }
 
+/* The common 32-bit float operations, as NIR's constant evaluator computes
+ * them, without its per-call generality; false for anything else. */
+static bool
+ph_fs_lookup_fast_alu(const nir_alu_instr *alu, nir_const_value *val,
+                      nir_const_value *dst)
+{
+   const unsigned n = alu->def.num_components;
+   const nir_const_value *s[3] = { NULL };
+   float d = 0.0f;
+
+   if (alu->def.bit_size != 32)
+      return false;
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+      if (alu->src[i].src.ssa->bit_size != 32 || i >= 3)
+         return false;
+      s[i] = &val[alu->src[i].src.ssa->index * 16];
+   }
+#define A(c) s[0][alu->src[0].swizzle[c]].f32
+#define B(c) s[1][alu->src[1].swizzle[c]].f32
+#define C(c) s[2][alu->src[2].swizzle[c]].f32
+   switch (alu->op) {
+   case nir_op_fdot2:
+   case nir_op_fdot3:
+   case nir_op_fdot4:
+      for (unsigned k = 0; k < nir_op_infos[alu->op].input_sizes[0]; k++)
+         d += A(k) * B(k);
+      for (unsigned c = 0; c < n; c++)
+         dst[c].f32 = d;
+      return true;
+   case nir_op_vec2:
+   case nir_op_vec3:
+   case nir_op_vec4:
+      for (unsigned c = 0; c < n; c++)
+         dst[c] = val[alu->src[c].src.ssa->index * 16 + alu->src[c].swizzle[0]];
+      return true;
+   default:
+      break;
+   }
+   for (unsigned c = 0; c < n; c++) {
+      float r;
+
+      switch (alu->op) {
+      case nir_op_mov:  dst[c] = s[0][alu->src[0].swizzle[c]]; continue;
+      case nir_op_fneg: r = -A(c); break;
+      case nir_op_fabs: r = fabsf(A(c)); break;
+      case nir_op_fadd: r = A(c) + B(c); break;
+      case nir_op_fsub: r = A(c) - B(c); break;
+      case nir_op_fmul: r = A(c) * B(c); break;
+      case nir_op_ffma: r = fmaf(A(c), B(c), C(c)); break;
+      case nir_op_fmax: r = fmaxf(A(c), B(c)); break;
+      case nir_op_fmin: r = fminf(A(c), B(c)); break;
+      case nir_op_fsat: r = A(c) > 1.0f ? 1.0f : A(c) <= 0.0f ? 0.0f : A(c); break;
+      case nir_op_frsq: r = 1.0f / sqrtf(A(c)); break;
+      case nir_op_fsqrt: r = sqrtf(A(c)); break;
+      case nir_op_frcp: r = 1.0f / A(c); break;
+      case nir_op_fdiv: r = A(c) / B(c); break;
+      case nir_op_fpow: r = powf(A(c), B(c)); break;
+      case nir_op_fexp2: r = exp2f(A(c)); break;
+      case nir_op_flog2: r = log2f(A(c)); break;
+      case nir_op_flrp: r = A(c) * (1.0f - C(c)) + B(c) * C(c); break;
+      default:
+         return false;
+      }
+      dst[c].f32 = r;
+   }
+#undef A
+#undef B
+#undef C
+   return true;
+}
+
 /* Evaluate the program's instructions that vary (@varying) or not. */
 static bool
 ph_fs_lookup_run(struct ph_fs_lookup_eval *e, const float *v, bool varying)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(e->fn->nir);
    const unsigned mode = e->fn->nir->info.float_controls_execution_mode;
+   nir_block *block = nir_start_block(impl);
+   unsigned step = 0;
 
-   nir_foreach_block(block, impl) {
-      nir_foreach_instr(instr, block) {
-         nir_def *def = nir_instr_def(instr);
+   /* The varying part walks its step list, the rest the whole program. */
+   for (nir_instr *instr = varying ? NULL : nir_block_first_instr(block);
+        varying ? step < e->fn->step_count : instr != NULL;
+        instr = varying ? NULL : nir_instr_next(instr)) {
+      {
+         nir_def *def;
          nir_const_value *dst;
 
+         if (varying)
+            instr = e->fn->steps[step++];
+         def = nir_instr_def(instr);
          if (def && e->fn->varies[def->index] != varying)
             continue;
          dst = def ? &e->val[def->index * 16] : NULL;
@@ -558,6 +658,8 @@ ph_fs_lookup_run(struct ph_fs_lookup_eval *e, const float *v, bool varying)
             unsigned bit_size = 0;
             uint16_t poison = 0;
 
+            if (ph_fs_lookup_fast_alu(alu, e->val, dst))
+               break;
             if (!nir_alu_type_get_type_size(info->output_type))
                bit_size = alu->def.bit_size;
             for (unsigned i = 0; i < info->num_inputs; i++) {
@@ -619,6 +721,43 @@ ph_fs_lookup_begin(struct ph_fs_lookup_eval *e, const struct ph_fs_lookup *fn,
       free(e->val);
       return false;
    }
+   return true;
+}
+
+bool
+ph_fs_lookup_key(const struct ph_fs_lookup *fn, const void *constants,
+                 unsigned size, uint32_t **key, unsigned *count)
+{
+   struct ph_fs_lookup_eval e;
+   uint32_t *k = NULL;
+   unsigned n = 0;
+
+   *key = NULL;
+   *count = 0;
+   if (!ph_fs_lookup_begin(&e, fn, constants, size))
+      return false;
+   nir_foreach_block(block, nir_shader_get_entrypoint(fn->nir)) {
+      nir_foreach_instr(instr, block) {
+         nir_intrinsic_instr *in;
+         uint32_t *grown;
+
+         if (instr->type != nir_instr_type_intrinsic ||
+             !ph_fs_lookup_uniform_load(in = nir_instr_as_intrinsic(instr)))
+            continue;
+         grown = realloc(k, (n + in->def.num_components) * sizeof(*k));
+         if (!grown) {
+            free(k);
+            free(e.val);
+            return false;
+         }
+         k = grown;
+         for (unsigned c = 0; c < in->def.num_components; c++)
+            k[n++] = e.val[in->def.index * 16 + c].u32;
+      }
+   }
+   free(e.val);
+   *key = k;
+   *count = n;
    return true;
 }
 

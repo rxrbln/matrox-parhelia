@@ -51,6 +51,7 @@
 #include "parhelia_tile_copy.h"
 #include "parhelia_fs_compile.h"
 #include "parhelia_fs_lookup.h"
+#include "util/os_time.h"
 #include "parhelia_vs_compile.h"
 
 struct ph_velems {
@@ -364,12 +365,16 @@ struct ph_context {
    /* Lookup textures of fragment programs (ph_lookup_view). */
    struct ph_lookup_tex {
       uint32_t uid;
-      uint8_t *constants;
-      unsigned size;
+      uint32_t *key;          /* the uniform values the table was built for */
+      unsigned key_count, size_px;
+      size_t bytes;
+      uint64_t last_use;
       struct pipe_resource *tex;
       struct pipe_sampler_view *view;
    } *lookup_tex;
    unsigned lookup_tex_count, lookup_tex_cap;
+   size_t lookup_bytes;
+   uint64_t lookup_clock;
    void *lookup_sampler;
    /* The framebuffer as the state tracker set it, and the stand-in render
     * resources for surfaces the engine cannot address in place (a mip level
@@ -9346,83 +9351,113 @@ ph_draw_stippled(struct ph_context *ctx, const struct pipe_draw_info *info,
    return true;
 }
 
-/* Drop the lookup texture of program @uid, whose shader is deleted. */
+static void
+ph_lookup_release(struct ph_context *ctx, unsigned i)
+{
+   struct ph_lookup_tex *t = &ctx->lookup_tex[i];
+
+   /* Queued draws keep sampling it until they are submitted. */
+   if (ctx->triangles || ctx->points || ctx->lines)
+      ph_submit_vertices(ctx);
+   ctx->lookup_bytes -= t->bytes;
+   pipe_sampler_view_reference(&t->view, NULL);
+   pipe_resource_reference(&t->tex, NULL);
+   free(t->key);
+   *t = ctx->lookup_tex[--ctx->lookup_tex_count];
+}
+
+/* Drop the lookup textures of program @uid, whose shader is deleted. */
 static void
 ph_lookup_forget(struct ph_context *ctx, uint32_t uid)
 {
-   for (unsigned i = 0; i < ctx->lookup_tex_count; i++) {
-      struct ph_lookup_tex *t = &ctx->lookup_tex[i];
-
-      if (t->uid != uid)
-         continue;
-      if (ctx->triangles || ctx->points || ctx->lines)
-         ph_submit_vertices(ctx);
-      pipe_sampler_view_reference(&t->view, NULL);
-      pipe_resource_reference(&t->tex, NULL);
-      free(t->constants);
-      *t = ctx->lookup_tex[--ctx->lookup_tex_count];
-      return;
-   }
+   for (unsigned i = ctx->lookup_tex_count; i-- > 0;)
+      if (ctx->lookup_tex[i].uid == uid)
+         ph_lookup_release(ctx, i);
 }
 
-/* The lookup texture of @r's program for the current fragment constants:
- * one per program, rebuilt when the constants change. */
+/* The lookup texture of @r's program for the uniform values it reads.
+ * Tables stay cached, least recently used first out, within a memory
+ * budget (PARHELIA_LOOKUP_CACHE_MB, default 16). */
 static struct pipe_sampler_view *
 ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
 {
    const unsigned n = r->size[0];
+   const size_t bytes = (size_t)n * n * 6 * 4;
    struct pipe_resource templ = {
       .target = PIPE_TEXTURE_CUBE,
       .format = PIPE_FORMAT_B8G8R8A8_UNORM,
       .width0 = n, .height0 = n, .depth0 = 1, .array_size = 6,
       .bind = PIPE_BIND_SAMPLER_VIEW,
    };
-   struct ph_lookup_tex *t = NULL;
+   static size_t budget;
+   struct ph_lookup_tex *t;
    struct pipe_sampler_view vt;
    struct pipe_box box;
+   uint32_t *key;
+   unsigned key_count;
    uint8_t *data;
 
-   ph_fs_snapshot_constants(ctx);
-   for (unsigned i = 0; i < ctx->lookup_tex_count; i++)
-      if (ctx->lookup_tex[i].uid == r->fn->uid)
-         t = &ctx->lookup_tex[i];
-   if (t && t->view && t->size == ctx->fs_const_snap_size &&
-       (!t->size || !memcmp(t->constants, ctx->fs_const_snap, t->size)))
-      return t->view;
-   if (!t) {
-      if (ctx->lookup_tex_count == ctx->lookup_tex_cap) {
-         const unsigned cap = ctx->lookup_tex_cap ? ctx->lookup_tex_cap * 2 : 4;
-         struct ph_lookup_tex *grown =
-            realloc(ctx->lookup_tex, cap * sizeof(*grown));
+   if (!budget) {
+      const char *e = getenv("PARHELIA_LOOKUP_CACHE_MB");
 
-         if (!grown)
-            return NULL;
-         ctx->lookup_tex = grown;
-         ctx->lookup_tex_cap = cap;
+      budget = (size_t)(e && atoi(e) > 0 ? atoi(e) : 16) << 20;
+   }
+   ph_fs_snapshot_constants(ctx);
+   if (!ph_fs_lookup_key(r->fn, ctx->fs_const_snap, ctx->fs_const_snap_size,
+                         &key, &key_count))
+      return NULL;
+   ctx->lookup_clock++;
+   for (unsigned i = 0; i < ctx->lookup_tex_count; i++) {
+      t = &ctx->lookup_tex[i];
+      if (t->uid == r->fn->uid && t->size_px == n &&
+          t->key_count == key_count &&
+          !memcmp(t->key, key, key_count * sizeof(*key))) {
+         t->last_use = ctx->lookup_clock;
+         free(key);
+         return t->view;
       }
-      t = &ctx->lookup_tex[ctx->lookup_tex_count++];
-      memset(t, 0, sizeof(*t));
-      t->uid = r->fn->uid;
    }
-   /* Queued draws keep sampling the old texture. */
-   if (ctx->triangles || ctx->points || ctx->lines)
-      ph_submit_vertices(ctx);
-   pipe_sampler_view_reference(&t->view, NULL);
-   pipe_resource_reference(&t->tex, NULL);
-   free(t->constants);
-   t->constants = ctx->fs_const_snap_size ?
-                  malloc(ctx->fs_const_snap_size) : NULL;
-   t->size = t->constants ? ctx->fs_const_snap_size : 0;
-   if (t->size)
-      memcpy(t->constants, ctx->fs_const_snap, t->size);
-   data = malloc((size_t)n * n * 6 * 4);
-   if (!data)
-      return NULL;
-   if (!ph_fs_lookup_fill(r->fn, r, ctx->fs_const_snap,
-                          ctx->fs_const_snap_size, data)) {
-      free(data);
+   while (ctx->lookup_tex_count && ctx->lookup_bytes + bytes > budget) {
+      unsigned lru = 0;
+
+      for (unsigned i = 1; i < ctx->lookup_tex_count; i++)
+         if (ctx->lookup_tex[i].last_use < ctx->lookup_tex[lru].last_use)
+            lru = i;
+      ph_lookup_release(ctx, lru);
+   }
+   if (ctx->lookup_tex_count == ctx->lookup_tex_cap) {
+      const unsigned cap = ctx->lookup_tex_cap ? ctx->lookup_tex_cap * 2 : 4;
+      struct ph_lookup_tex *grown =
+         realloc(ctx->lookup_tex, cap * sizeof(*grown));
+
+      if (!grown) {
+         free(key);
+         return NULL;
+      }
+      ctx->lookup_tex = grown;
+      ctx->lookup_tex_cap = cap;
+   }
+   data = malloc(bytes);
+   if (!data) {
+      free(key);
       return NULL;
    }
+   {
+      const int64_t t0 = os_time_get_nano();
+
+      if (!ph_fs_lookup_fill(r->fn, r, ctx->fs_const_snap,
+                             ctx->fs_const_snap_size, data)) {
+         free(data);
+         free(key);
+         return NULL;
+      }
+      if (ph_env("PARHELIA_TRACE"))
+         fprintf(stderr, "parhelia: lookup %u filled %ux%u in %.1f ms "
+                 "(%u cached)\n", r->fn->uid, n, n,
+                 (os_time_get_nano() - t0) / 1e6, ctx->lookup_tex_count);
+   }
+   t = &ctx->lookup_tex[ctx->lookup_tex_count];
+   memset(t, 0, sizeof(*t));
    t->tex = ctx->base.screen->resource_create(ctx->base.screen, &templ);
    if (t->tex) {
       u_box_3d(0, 0, 0, n, n, 6, &box);
@@ -9432,8 +9467,19 @@ ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
       t->view = ctx->base.create_sampler_view(&ctx->base, t->tex, &vt);
    }
    free(data);
-   if (!t->view)
+   if (!t->view) {
       pipe_resource_reference(&t->tex, NULL);
+      free(key);
+      return NULL;
+   }
+   t->uid = r->fn->uid;
+   t->size_px = n;
+   t->key = key;
+   t->key_count = key_count;
+   t->bytes = bytes;
+   t->last_use = ctx->lookup_clock;
+   ctx->lookup_bytes += bytes;
+   ctx->lookup_tex_count++;
    return t->view;
 }
 
@@ -13230,7 +13276,7 @@ ph_destroy_context(struct pipe_context *p)
    for (unsigned i = 0; i < ctx->lookup_tex_count; i++) {
       pipe_sampler_view_reference(&ctx->lookup_tex[i].view, NULL);
       pipe_resource_reference(&ctx->lookup_tex[i].tex, NULL);
-      free(ctx->lookup_tex[i].constants);
+      free(ctx->lookup_tex[i].key);
    }
    free(ctx->lookup_tex);
    if (ctx->lookup_sampler)
