@@ -5185,8 +5185,12 @@ void parhelia_t2_prime_once(struct parhelia_device *pdev, struct drm_file *file,
 	    width < 64 || height < 16)
 		return;
 	ret = parhelia_t2_prime(pdev, file, gbo, pitch_pixels);
-	if (!ret)
+	if (!ret) {
 		pdev->t2_primed = true;
+		dev_info(&pdev->pdev->dev,
+			 "WARP T2 prime: %u slots on a %ux%u target\n",
+			 PARHELIA_T2_PRIME_SLOTS, width, height);
+	}
 	else if (ret != -EINTR && ret != -ERESTARTSYS)
 		dev_warn_ratelimited(&pdev->pdev->dev,
 				     "WARP T2 prime failed (%d)\n", ret);
