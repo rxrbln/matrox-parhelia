@@ -583,3 +583,15 @@ The buffer therefore behaves like the write-back target of a per-pipe tile
 cache rather than a growing fragment heap in this setup; what the vendor
 binds or enables so that these lines go back to the colour target is the
 open item.
+
+### 11.7 The resolve works when it follows the draw in one command stream
+
+Issuing the accumulation draw and the `sub_2E360`/`DWGCTL 9` resolve in a
+single submission (no kernel drain between them, as in the vendor's
+command buffer) makes the hardware merge fragments: 193 high-contrast edge
+pixels of the probe triangle come out at exactly k/8 of the way from
+background to triangle colour, matching the analytic pixel coverage to
+0.07 on average [MEASURED, run o1, module faa0528-3].  The resolve is
+therefore the vendor's `sub_9E860` sequence; what still fails are pixels in
+tiles whose data was already relocated or overwritten during accumulation,
+and any draw with several fragments per pixel stalls (runs g4, o2).
