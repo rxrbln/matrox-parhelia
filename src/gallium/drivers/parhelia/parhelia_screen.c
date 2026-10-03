@@ -836,8 +836,8 @@ ph_resource_create_class(struct pipe_screen *pscreen,
                            ph_env("PARHELIA_CUBE_PROBE");
    const bool cube_chain = cube_target && p690_native_texture32;
    /* P690 NPOT chains, 2-D and cube, are exact for every texel of every
-    * level up to 256 (fixfn cubeprobe); a 600x20 chain locked the engine, so
-    * larger NPOT bases keep level 0 until measured.  The original family's
+    * level up to 256 (fixfn cubeprobe); larger NPOT bases keep level 0 until
+    * measured (a 600x20 probe met a concurrent lockup: inconclusive).  The original family's
     * chain is measured for power-of-two bases only. */
    const bool pot = !(templ->width0 & (templ->width0 - 1)) &&
                     !(templ->height0 & (templ->height0 - 1));
