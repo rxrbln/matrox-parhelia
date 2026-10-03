@@ -1130,6 +1130,11 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 		 * (an unowned pipe reads alpha 1). */
 		const int pair = nunit > 1 && st->single_texture_pipe &&
 				 !st->sampled_alpha_companion;
+		/* original family, three or four units: one merge for a gang on
+		 * pipes 0+1, then one stage per unit */
+		const int orig_multi = p3d_orig_multi(st, nunit);
+		const unsigned merges = orig_multi &&
+			p3d_orig_multi_mask(st, nunit, 0) == 0x3u ? 1u : 0u;
 		/* PSER 0x1dbe58 / KRN mtx2422 LX masks for three and four units */
 		static const uint8_t lx_pipes[2][4] = {
 			{ 0x1, 0x2, 0x8 }, { 0x1, 0x2, 0x4, 0x8 },
@@ -1162,7 +1167,9 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			 * table - parhelia-multitexture.md section 1.3).
 			 */
 			static const uint32_t pipe_pair[2] = { 0x3u, 0xcu };
-			const uint32_t pipes = nunit > 2 ? 1u << u :
+			const uint32_t pipes = orig_multi ?
+					       p3d_orig_multi_mask(st, nunit, u) :
+					       nunit > 2 ? 1u << u :
 					       st->single_texture_pipe ? pipe_pair[u] :
 					       p3d_orig_unit_pipes(tu, u);
 
@@ -1239,12 +1246,13 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 				p3d_reglist(cs, rw, 2);
 			}
 		} else if (nunit >= 3) {
-			/* Every unit is claimed; the vendor's table-driven tail is
-			 * all pads at four units and only 0x120c at three
-			 * (parhelia-multitexture.md section 1.2). */
+			/* The vendor's table-driven tail is all pads at four
+			 * units and only 0x120c at three, which parks the pipes no
+			 * unit owns (KRN mtx1381 0x3f86b: [1,2,8] parks 0x00010004). */
 			if (nunit == 3) {
 				rw[0].reg = P3D_R_TEX_ENABLE + 12;
-				rw[0].val = 0;
+				rw[0].val = orig_union != 0xfu ?
+					    0x00010000u | (~orig_union & 0xfu) : 0;
 				p3d_reglist(cs, rw, 1);
 			}
 		} else if (nunit == 1) {
@@ -1291,13 +1299,13 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 		rw[5].reg = 0x127c; rw[5].val = 0;
 		rw[6].reg = 0x1280; rw[6].val = 0;
 		rw[7].reg = 0x1284; rw[7].val = 0;
-		if (!pair)
+		if (!pair && (!orig_multi || merges))
 			p3d_reglist(cs, rw, 8);
 
 		/* MODULATE = MUL(TEX, PREV).  REPLACE drops the alpha slot and
 		 * leaves 0x1268 at its resting value, exactly as the capture's
 		 * texrepl differs from tex. */
-		if (nunit > 1 && !pair) {
+		if (nunit > 1 && !pair && !orig_multi) {
 			/* slot 2: the second unit's texture-address stage.  On
 			 * PARD's P690 two-unit route, logical unit 1 occupies physical
 			 * pipe 2 (0x1204 = 0x40104), and live hardware proved that the
@@ -1320,9 +1328,10 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			rw[7].reg = 0x1284; rw[7].val = 0;
 			p3d_reglist(cs, rw, 8);
 		}
-		if (st->comb && pair) {
+		if (st->comb && (pair || orig_multi)) {
 			p3d_emit_comb_program_units(cs, st, nunit,
-						    st->comb_slot_base);
+						    st->comb_slot_base ?
+						    st->comb_slot_base : merges);
 			return;
 		}
 		if (st->comb && !st->sampled_alpha_companion) {
@@ -1332,21 +1341,22 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 					      (nunit > 1 ? 2u : 1u));
 			return;
 		}
-		p3d_emit_texenv(cs, pair ? 0u : nunit > 1 ? 4u : 2u, 0, 1, t,
-				st->comb_op);
-		if (pair) {
-			/* one stage per unit in slots 0, 2, 4, 8, then pads */
+		if (pair || orig_multi) {
+			/* one stage per unit in slots 0, 2, 4, 8 after the merge,
+			 * then pads */
 			static const uint32_t slot[] = { 0, 2, 4, 8, 10 };
 
+			p3d_emit_texenv(cs, slot[merges], 0, 1, t, st->comb_op);
 			for (u = 1; u < nunit; u++)
-				p3d_emit_texenv(cs, slot[u],
+				p3d_emit_texenv(cs, slot[u + merges],
 						p3d_state_unit_treg(st, nunit, u),
 						0, p3d_state_unit(st, u),
 						st->comb_op);
-			for (u = nunit; u < 5; u++)
+			for (u = nunit + merges; u < 5; u++)
 				p3d_emit_comb_pad(cs, slot[u]);
 			return;
 		}
+		p3d_emit_texenv(cs, nunit > 1 ? 4u : 2u, 0, 1, t, st->comb_op);
 
 		if (nunit > 1) {
 			if (st->sampled_alpha_companion) {

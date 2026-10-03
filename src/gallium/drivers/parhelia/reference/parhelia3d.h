@@ -899,6 +899,9 @@ struct p3d_state {
 	 * only: it additionally retains the vendor's disabled unit-1 pipe mask
 	 * (0x0001000c), while issuing no second sampler descriptor. */
 	int		   single_texture_pipe;
+	/* Original family, three units: the vendor form without a gang,
+	 * [1,2,8] with pipe 2 parked, instead of [3,4,8]. */
+	int		   orig_single_pipes;
 	/* Vendor LX-class pipe allocation (parhelia-p690-texture-pipes-re.md,
 	 * parhelia-p690-ganged-pipe-ta-re.md): one stage ganged on pipes 0+2
 	 * and merged in combiner slot 0, leftover pipes parked on the next
@@ -985,10 +988,38 @@ p3d_state_unit(const struct p3d_state *st, unsigned u)
 	}
 }
 
+/* The original family's pipe mask for unit @u of a three- or four-unit draw
+ * (KRN mtx936 candidates, PROVEN): four units take one pipe each, three gang
+ * unit 0 over pipes 0+1 as [3,4,8] when its stage may be ganged (TEX,
+ * TEXBEM, TEXREG2AR/GB; KRN mtx1414), else [1,2,8].  Which three-unit entry
+ * the vendor's score picks is DERIVED. */
+static inline uint32_t
+p3d_orig_multi_mask(const struct p3d_state *st, unsigned nunit, unsigned u)
+{
+	static const uint8_t four[4] = { 0x1, 0x2, 0x4, 0x8 };
+	static const uint8_t gang3[3] = { 0x3, 0x4, 0x8 };
+	static const uint8_t single3[3] = { 0x1, 0x2, 0x8 };
+	const unsigned op = st->tex ? st->tex->ta_op : 0;
+	const int gang = !st->orig_single_pipes &&
+		(op == 0 || op == 4 || op == 0x10 || op == 0x11);
+
+	if (nunit >= 4)
+		return four[u & 3];
+	return gang ? gang3[u % 3] : single3[u % 3];
+}
+
+/* Whether @st is an original-family draw of three or four units. */
+static inline int
+p3d_orig_multi(const struct p3d_state *st, unsigned nunit)
+{
+	return !st->single_texture_pipe && !st->sampled_alpha_companion &&
+	       nunit > 2 && nunit <= 4;
+}
+
 /* The combiner register (t0..t3) holding unit @u's sample: the first pipe of
  * the unit's mask.  P690 units sit alone on pipes [0], [0,2], [0,1,3] or
- * [0,1,2,3] (PSER 0x177770); the ganged pairs of the original family merge
- * into t0/t1. */
+ * [0,1,2,3] (PSER 0x177770); the original family's two ganged pairs merge
+ * into t0/t1, three or four units read their mask's first pipe (KRN mtx1080). */
 static inline unsigned
 p3d_state_unit_treg(const struct p3d_state *st, unsigned nunit, unsigned u)
 {
@@ -996,6 +1027,11 @@ p3d_state_unit_treg(const struct p3d_state *st, unsigned nunit, unsigned u)
 		{ 0 }, { 0 }, { 0, 2 }, { 0, 1, 3 }, { 0, 1, 2, 3 },
 	};
 
+	if (p3d_orig_multi(st, nunit)) {
+		const uint32_t mask = p3d_orig_multi_mask(st, nunit, u);
+
+		return mask & 1u ? 0 : mask & 2u ? 1 : mask & 4u ? 2 : 3;
+	}
 	if (!st->single_texture_pipe || st->sampled_alpha_companion ||
 	    nunit > 4)
 		return u;
