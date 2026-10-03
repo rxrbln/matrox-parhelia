@@ -2319,6 +2319,33 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
       return ph_fs_literal_scalar(ctx, lane, 1.0f, &b) &&
              ph_fs_literal_scalar(ctx, lane, 0.0f, &c) &&
              ph_fs_cond(ctx, alu->src[0].src.ssa, lane, req, &b, &c, out);
+   case nir_op_slt:
+   case nir_op_sge:
+   case nir_op_seq:
+   case nir_op_sne: {
+      /* ARB SLT/SGE/SEQ/SNE: 1.0 or 0.0 from t = a - b, CMP being
+       * t >= 0 ? b : c; equality holds where t >= 0 and -t >= 0. */
+      struct ph_fs_src one, zero, d, t, nt;
+      const bool eq = alu->op == nir_op_seq;
+
+      if (!ph_fs_operand(ctx, alu, 0, lane, sel, &a) ||
+          !ph_fs_operand(ctx, alu, 1, lane, sel, &d) ||
+          !ph_fs_literal_scalar(ctx, lane, 1.0f, &one) ||
+          !ph_fs_literal_scalar(ctx, lane, 0.0f, &zero) ||
+          !ph_fs_apply(ctx, lane, &d, P3D_COMB_MOD_NEG) ||
+          !ph_fs_node(ctx, lane, P3D_COMB_ADD, &a, &d, NULL, &t))
+         return false;
+      if (alu->op == nir_op_slt)
+         return ph_fs_node(ctx, lane, P3D_COMB_CMP, &t, &zero, &one, out);
+      if (alu->op == nir_op_sge)
+         return ph_fs_node(ctx, lane, P3D_COMB_CMP, &t, &one, &zero, out);
+      nt = t;
+      return ph_fs_node(ctx, lane, P3D_COMB_CMP, &t, eq ? &one : &zero,
+                        eq ? &zero : &one, &b) &&
+             ph_fs_apply(ctx, lane, &nt, P3D_COMB_MOD_NEG) &&
+             ph_fs_node(ctx, lane, P3D_COMB_CMP, &nt, &b, eq ? &zero : &one,
+                        out);
+   }
    case nir_op_fcsel_gt:
       /* a > 0 ? b : c is -a >= 0 ? c : b. */
       return ph_fs_operand(ctx, alu, 0, lane, sel, &a) &&
