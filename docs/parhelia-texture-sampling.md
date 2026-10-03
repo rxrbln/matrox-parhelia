@@ -1304,3 +1304,12 @@ against the Mesa parhelia driver. All results MEASURED on the P690 (0x2539).
   pixel half a pixel off a quad diagonal, whose green channel is 0.8 LSB. The
   dither stores it as 0, so the test reports "glCopyPixels appeared to fail"
   although the copy itself is exact (`copypix.c`).
+* **NPOT mip chains** (`cubeprobe.c W [H]`, H = 0 for a cube): the P690 address
+  unit derives NPOT 2-D and cube chains exactly as the driver lays them out:
+  align32 pitch, 16-row levels, the shared tail block, and cube faces one level
+  size apart with the tail faces as volume slices. Every texel of every level
+  and face is exact for 2-D 96x40, 129x65, 100x100, 13x7, 3x1, 1x64, 255x3,
+  200x30, 33x17, 250x250 and cubes 3, 6, 12, 24, 25, 48, 50, 100. Mesa f332ab0
+  enables these chains up to 256. A 600x20 run coincided with a lockup that
+  other clients' submits also hit, so it is INCONCLUSIVE. It needs an
+  exclusive-slot re-run before NPOT bases above 256 get chains.
