@@ -327,6 +327,27 @@ ph_fs_node(struct ph_fs_ctx *ctx, int lane, unsigned op,
 }
 
 /* A node no other operand can observe, so its scale or saturate may change. */
+/* @def has one user: a single source, or the channels of one vecN that
+ * assembles it (gl_FragColor = vec4(x.x, x.y, x.z, a)). */
+static bool
+ph_fs_one_user(const nir_def *def)
+{
+   const nir_instr *parent = NULL;
+
+   if (list_is_singular(&def->uses))
+      return true;
+   nir_foreach_use_including_if(use, def) {
+      const nir_instr *user = nir_src_is_if(use) ? NULL : nir_src_use_instr(use);
+
+      if (!user || user->type != nir_instr_type_alu ||
+          !nir_op_is_vec(nir_instr_as_alu(user)->op) ||
+          (parent && parent != user))
+         return false;
+      parent = user;
+   }
+   return true;
+}
+
 static bool
 ph_fs_owned(const struct ph_fs_ctx *ctx, const struct ph_fs_src *src)
 {
@@ -338,7 +359,7 @@ ph_fs_owned(const struct ph_fs_ctx *ctx, const struct ph_fs_src *src)
    if (node->uses || node->refs != 1 || node->output ||
        node->lane == PH_LANE_BOTH)
       return false;
-   return !node->memo || (node->def && list_is_singular(&node->def->uses));
+   return !node->memo || (node->def && ph_fs_one_user(node->def));
 }
 
 static bool
@@ -579,10 +600,14 @@ ph_fs_expand(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
       return true;
    }
    if (instr->type != nir_instr_type_alu ||
-       (!root && !list_is_singular(&def->uses)) ||
-       ph_fs_uniform_only(def, 0))
+       (!root && !ph_fs_one_user(def)))
       goto leaf;
    alu = nir_instr_as_alu(instr);
+   /* A uniform expression is one preshaded atom, but a negated or moved
+    * uniform stays the uniform's own atom so terms in it cancel. */
+   if (ph_fs_uniform_only(def, 0) && alu->op != nir_op_fneg &&
+       alu->op != nir_op_mov && alu->op != nir_op_fcanonicalize)
+      goto leaf;
    memset(p, 0, sizeof(*p));
    switch (alu->op) {
    case nir_op_mov:
@@ -754,15 +779,32 @@ ph_fs_linear(struct ph_fs_ctx *ctx, int lane, uint16_t atom, float k, float c0,
 static bool ph_fs_select(struct ph_fs_ctx *ctx, int lane,
                          const struct ph_fs_poly *p, struct ph_fs_src *out);
 
-/* A polynomial that is one atom with coefficient one, or a constant. */
+/* A polynomial a source reads without an instruction: a constant, or one
+ * atom as x, -x or 1 - x. */
 static bool
-ph_fs_poly_simple(const struct ph_fs_poly *p)
+ph_fs_poly_source(const struct ph_fs_poly *p)
 {
-   return !p->n || (p->n == 1 && (!p->term[0].n ||
-                   (p->term[0].n == 1 && ph_fs_near(p->term[0].coef, 1.0f))));
+   float c0 = 0.0f;
+   int lin = -1;
+
+   for (unsigned i = 0; i < p->n; i++) {
+      if (!p->term[i].n)
+         c0 = p->term[i].coef;
+      else if (p->term[i].n == 1 && lin < 0)
+         lin = i;
+      else
+         return false;
+   }
+   if (lin < 0)
+      return true;
+   if (ph_fs_near(p->term[lin].coef, 1.0f) || ph_fs_near(p->term[lin].coef, -1.0f))
+      return ph_fs_near(c0, 0.0f) ||
+             (ph_fs_near(p->term[lin].coef, -1.0f) && ph_fs_near(c0, 1.0f));
+   return false;
 }
 
-/* a * t + b * (1 - t) = a*t + b - b*t for an atom t. */
+/* a * t + b * (1 - t) = a*t + b - b*t for an atom t, or t * x + y as one
+ * MAD when x and y are sources. */
 static bool
 ph_fs_try_lrp(struct ph_fs_ctx *ctx, int lane, const struct ph_fs_poly *p,
               struct ph_fs_src *out)
@@ -790,14 +832,15 @@ ph_fs_try_lrp(struct ph_fs_ctx *ctx, int lane, const struct ph_fs_poly *p,
                usable = ph_fs_poly_add(&y, term);
                continue;
             }
-            if (term->n != 2) {
+            /* t alone contributes its coefficient to a */
+            if (term->n != 2 && term->n != 1) {
                usable = false;
                continue;
             }
             memset(&rest, 0, sizeof(rest));
             rest.coef = term->coef;
-            rest.n = 1;
-            rest.atom[0] = term->atom[1 - at];
+            rest.n = term->n - 1;
+            rest.atom[0] = term->n == 2 ? term->atom[1 - at] : 0;
             usable = ph_fs_poly_add(&x, &rest);
          }
          if (!usable || !y.n)
@@ -805,13 +848,87 @@ ph_fs_try_lrp(struct ph_fs_ctx *ctx, int lane, const struct ph_fs_poly *p,
          a = x;
          if (!ph_fs_poly_sum(&a, &y, 1.0f))
             continue;
-         if (!ph_fs_poly_simple(&a) || !ph_fs_poly_simple(&y))
+         if (ph_fs_poly_source(&x) && ph_fs_poly_source(&y) &&
+             !ph_fs_poly_source(&a)) {
+            if (!ph_fs_lower_atom_id(ctx, t, &sa) ||
+                !ph_fs_select(ctx, lane, &y, &sb) ||
+                !ph_fs_select(ctx, lane, &x, &sc))
+               return false;
+            return ph_fs_node(ctx, lane, P3D_COMB_MAD, &sa, &sb, &sc, out);
+         }
+         if (!ph_fs_poly_source(&a) || !ph_fs_poly_source(&y))
             continue;
          if (!ph_fs_select(ctx, lane, &a, &sa) ||
              !ph_fs_select(ctx, lane, &y, &sb) ||
              !ph_fs_lower_atom_id(ctx, t, &sc))
             return false;
          return ph_fs_node(ctx, lane, P3D_COMB_LRP, &sa, &sb, &sc, out);
+      }
+   }
+   return false;
+}
+
+/* The coefficient of the lone atom @a in @p, 0 when absent. */
+static float
+ph_fs_poly_linear_coef(const struct ph_fs_poly *p, uint16_t a)
+{
+   for (unsigned i = 0; i < p->n; i++)
+      if (p->term[i].n == 1 && p->term[i].atom[0] == a)
+         return p->term[i].coef;
+   return 0.0f;
+}
+
+/* c * x * y + bx * x + by * y + ... = (s1 (x + by/c)) * (s2 (y + bx/c)) + r
+ * with s1 s2 = c = +-1: one MAD when both factors and r are sources, as in
+ * GL_MODULATE_ADD of inverted operands, (1 - t.a) * (1 - t) + k. */
+static bool
+ph_fs_try_affine_mad(struct ph_fs_ctx *ctx, int lane,
+                     const struct ph_fs_poly *p, struct ph_fs_src *out)
+{
+   for (unsigned i = 0; i < p->n; i++) {
+      const struct ph_fs_term *t = &p->term[i];
+      const float c = t->coef;
+
+      if (t->n != 2 || t->atom[0] == t->atom[1] ||
+          !(ph_fs_near(c, 1.0f) || ph_fs_near(c, -1.0f)))
+         continue;
+      for (int s1 = -1; s1 <= 1; s1 += 2) {
+         const float s2 = c / (float)s1;
+         struct ph_fs_poly f1, f2, prod, r;
+         struct ph_fs_term term;
+         struct ph_fs_src sa, sb, sc;
+         const float alpha = ph_fs_poly_linear_coef(p, t->atom[1]) / c;
+         const float beta = ph_fs_poly_linear_coef(p, t->atom[0]) / c;
+
+         memset(&f1, 0, sizeof(f1));
+         memset(&f2, 0, sizeof(f2));
+         memset(&term, 0, sizeof(term));
+         term.n = 1;
+         term.coef = (float)s1;
+         term.atom[0] = t->atom[0];
+         ph_fs_poly_add(&f1, &term);
+         term.coef = s2;
+         term.atom[0] = t->atom[1];
+         ph_fs_poly_add(&f2, &term);
+         memset(&term, 0, sizeof(term));
+         term.coef = s1 * alpha;
+         ph_fs_poly_add(&f1, &term);
+         term.coef = s2 * beta;
+         ph_fs_poly_add(&f2, &term);
+         if (!ph_fs_poly_source(&f1) || !ph_fs_poly_source(&f2) ||
+             !ph_fs_poly_mul(&prod, &f1, &f2))
+            continue;
+         memset(&r, 0, sizeof(r));
+         if (!ph_fs_poly_sum(&r, p, 1.0f) || !ph_fs_poly_sum(&r, &prod, -1.0f) ||
+             !ph_fs_poly_source(&r))
+            continue;
+         if (!ph_fs_select(ctx, lane, &f1, &sa) ||
+             !ph_fs_select(ctx, lane, &f2, &sc))
+            return false;
+         if (!r.n)
+            return ph_fs_node(ctx, lane, P3D_COMB_MUL, &sa, NULL, &sc, out);
+         return ph_fs_select(ctx, lane, &r, &sb) &&
+                ph_fs_node(ctx, lane, P3D_COMB_MAD, &sa, &sb, &sc, out);
       }
    }
    return false;
@@ -923,6 +1040,10 @@ ph_fs_select(struct ph_fs_ctx *ctx, int lane, const struct ph_fs_poly *p,
       }
    }
    if (ph_fs_try_lrp(ctx, lane, p, out))
+      return true;
+   if (ctx->reject)
+      return false;
+   if (ph_fs_try_affine_mad(ctx, lane, p, out))
       return true;
    if (ctx->reject)
       return false;
@@ -2590,6 +2711,15 @@ ph_fs_range_pass(struct ph_fs_ctx *ctx)
             goto out;
          f = ph_fs_range_add(ph_fs_range_mul(r[0], r[2]),
                              ph_fs_range_mul(r[1], inv));
+         /* an interpolant in [0, 1] keeps the result between A and B */
+         {
+            bool convex = true;
+
+            for (unsigned c = 0; c < 4; c++)
+               convex &= r[2].lo[c] >= 0.0f && r[2].hi[c] <= 1.0f;
+            if (convex)
+               f = ph_fs_range_hull(r[0], r[1]);
+         }
          f.e = r[0].e;
          break;
       }
