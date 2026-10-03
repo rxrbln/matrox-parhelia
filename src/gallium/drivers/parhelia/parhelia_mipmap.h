@@ -49,6 +49,9 @@ struct ph_mip_level {
    /* Storage one image of this level occupies.  A cube map's six faces are
     * this many bytes apart; a volume's slices are interleaved instead. */
    size_t bytes;
+   /* A P690 cube map's tail level: the six faces interleave in the volume
+    * order at the tail position. */
+   bool face_tail;
 };
 
 struct ph_mip_layout {
@@ -73,6 +76,10 @@ struct ph_mip_layout {
    bool native_64x16_32;
    /* The original Parhelia's 32-bit sampler order: 64x32-texel tiles. */
    bool native_64x32;
+   /* PARHELIA_CUBE_PROBE: every level and face row-linear, back to back, so
+    * a sampled texel names the address the unit read. */
+   bool probe_linear;
+   size_t tail_base;
 };
 
 static inline unsigned

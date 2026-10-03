@@ -829,8 +829,11 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    const bool native_64x32_texture = sampler_storage && !block_bytes &&
       p3d_texture_uses_native_64x32(screen->chip_id, screen->tile_layout,
                                     cpp);
+   const bool cube_probe = cube_target && p690_native_texture32 &&
+                           ph_env("PARHELIA_CUBE_PROBE");
+   const bool cube_chain = cube_target && p690_native_texture32;
    mip_levels = (p690_native_texture32 || native_64x32_texture) &&
-                !layered &&
+                (!layered || cube_chain) &&
                 !(templ->width0 & (templ->width0 - 1)) &&
                 !(templ->height0 & (templ->height0 - 1)) ?
                    templ->last_level + 1 : 1;
@@ -941,6 +944,58 @@ ph_resource_create_class(struct pipe_screen *pscreen,
       r->mip.level[0].bytes = (size_t)r->mip.level[0].pitch *
                               ph_mip_align(templ->height0, 16) * 4;
       r->mip.size = ph_mip_align(r->mip.level[0].bytes * slices, 0x2000);
+      /* The P690 cube chain (PARHELIA_CUBE_PROBE, every texel of 32..256
+       * cubes): levels above 16x16 hold six whole face images, each the
+       * vendor's level size apart (mtx3887); the 2-D tail block follows,
+       * its levels at the 2-D tail positions with the faces interleaved as
+       * volume slices. */
+      if (cube_chain && !cube_probe) {
+         size_t next = 0;
+         unsigned tail = 0;
+
+         for (unsigned l = 0; l < mip_levels; l++) {
+            struct ph_mip_level *level = &r->mip.level[l];
+
+            if (level->width <= 16) {
+               if (!tail)
+                  r->mip.tail_base = next;
+               ph_mip_tail_position(tail++, &level->tail_x, &level->tail_y);
+               level->offset = r->mip.tail_base;
+               level->pitch = 32;
+               level->face_tail = true;
+               level->bytes = 0;
+               continue;
+            }
+            level->pitch = ph_mip_align(level->width, 32);
+            level->tail_x = level->tail_y = 0;
+            level->offset = next;
+            level->bytes = (size_t)level->pitch *
+                           ph_mip_align(level->height, 16) * 4;
+            next += level->bytes * slices;
+         }
+         if (tail)
+            next = r->mip.tail_base +
+                   ph_volume_texel_offset(31, 15, slices - 1, 32, slices, 4) + 4;
+         r->mip.size = ph_mip_align(next, 0x2000);
+      }
+      if (cube_probe) {
+         size_t next = 0, vendor = 0;
+
+         r->mip.probe_linear = true;
+         for (unsigned l = 0; l < mip_levels; l++) {
+            struct ph_mip_level *level = &r->mip.level[l];
+
+            level->pitch = level->width;
+            level->tail_x = level->tail_y = 0;
+            level->offset = next;
+            level->bytes = (size_t)level->width * level->height * 4;
+            next += level->bytes * slices;
+            /* the vendor's chain (mtx3887): 6 x align32(w) x align16(h) */
+            vendor += (size_t)slices * ph_mip_align(level->width, 32) *
+                      ph_mip_align(level->height, 16) * 4;
+         }
+         r->mip.size = ph_mip_align(MAX2(next, vendor), 0x2000);
+      }
    }
    /* CREATE_RENDER has a bounded height.  Retain the historical level-zero
     * allocation for an unusually large chain rather than rejecting an
@@ -964,6 +1019,14 @@ ph_resource_create_class(struct pipe_screen *pscreen,
          r->mip.size = ph_mip_align(r->mip.level[0].pitch *
                                    ph_mip_align(templ->height0, 32) * 4,
                                    0x2000);
+      }
+      /* A cube map too large for its chain keeps six level-0 faces. */
+      if (layered) {
+         r->mip.slices = slices;
+         r->mip.cube = cube_target;
+         r->mip.level[0].bytes = (size_t)r->mip.level[0].pitch *
+                                 ph_mip_align(templ->height0, 16) * 4;
+         r->mip.size = ph_mip_align(r->mip.level[0].bytes * slices, 0x2000);
       }
    }
    /* The allocation ABI only describes 32-bit texture rows.  A chain, or an

@@ -227,6 +227,14 @@ ph_mip_layer_texel_offset(const struct ph_mip_layout *mip, unsigned level,
                           unsigned layer, unsigned x, unsigned y, bool linear,
                           unsigned cpp)
 {
+   if (mip->probe_linear && !linear)
+      return mip->level[level].offset + (size_t)layer * mip->level[level].bytes +
+             ((size_t)y * mip->level[level].width + x) * cpp;
+   if (mip->level[level].face_tail && !linear)
+      return mip->level[level].offset +
+         ph_volume_texel_offset(x + mip->level[level].tail_x,
+                                y + mip->level[level].tail_y, layer, 32,
+                                mip->slices, cpp);
    if (mip->slices && !mip->cube && !linear)
       return mip->level[level].offset +
          ph_volume_texel_offset(x, y, layer, mip->level[level].pitch,
