@@ -667,6 +667,29 @@ p3d_emit_comb_program(struct p3d_cs *cs, const struct p3d_comb_program *prog,
 		p3d_emit_comb_pad(cs, p3d_comb_slot[emitted]);
 }
 
+/* Emit @prog with texture register t1 renamed to @t1, the physical pipe that
+ * holds unit 1's sample. */
+static void
+p3d_emit_comb_program_t1(struct p3d_cs *cs, const struct p3d_comb_program *prog,
+			 unsigned first, uint8_t t1)
+{
+	struct p3d_comb_program p = *prog;
+	unsigned i, h, k;
+
+	for (i = 0; i < p.count && i < P3D_COMB_MAX_INSTRUCTIONS; i++) {
+		struct p3d_comb_half *half[2] = { &p.inst[i].rgb, &p.inst[i].alpha };
+
+		for (h = 0; h < 2; h++) {
+			if (half[h]->dst == P3D_COMB_T1)
+				half[h]->dst = t1;
+			for (k = 0; k < 3; k++)
+				if (half[h]->src[k].reg == P3D_COMB_T1)
+					half[h]->src[k].reg = t1;
+		}
+	}
+	p3d_emit_comb_program(cs, &p, first);
+}
+
 /* Emit one fixed-function texture-environment ALU stage.  The texture-address
  * stages occupy slots 0 (and 2 for unit 1), so the matching ALU stages are 2
  * or 4 for one unit and 4 / 8 for two.  The encodings are the measured table
@@ -1081,6 +1104,10 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	if (st->tex) {
 		const struct p3d_texture *t = st->tex;
 		unsigned nunit = p3d_state_units(st), u;
+		/* P690 two units sit alone on pipes 0 and 2: the vendor emits no
+		 * merges and the ALU reads t0 and t2 (an unowned pipe reads alpha 1). */
+		const int pair = nunit > 1 && st->single_texture_pipe &&
+				 !st->sampled_alpha_companion;
 
 		rw[0].reg = 0x121c; rw[0].val = 0;
 		p3d_reglist(cs, rw, 1);
@@ -1211,12 +1238,13 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 		rw[5].reg = 0x127c; rw[5].val = 0;
 		rw[6].reg = 0x1280; rw[6].val = 0;
 		rw[7].reg = 0x1284; rw[7].val = 0;
-		p3d_reglist(cs, rw, 8);
+		if (!pair)
+			p3d_reglist(cs, rw, 8);
 
 		/* MODULATE = MUL(TEX, PREV).  REPLACE drops the alpha slot and
 		 * leaves 0x1268 at its resting value, exactly as the capture's
 		 * texrepl differs from tex. */
-		if (nunit > 1) {
+		if (nunit > 1 && !pair) {
 			/* slot 2: the second unit's texture-address stage.  On
 			 * PARD's P690 two-unit route, logical unit 1 occupies physical
 			 * pipe 2 (0x1204 = 0x40104), and live hardware proved that the
@@ -1239,6 +1267,11 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			rw[7].reg = 0x1284; rw[7].val = 0;
 			p3d_reglist(cs, rw, 8);
 		}
+		if (st->comb && pair) {
+			p3d_emit_comb_program_t1(cs, st->comb,
+						 st->comb_slot_base, P3D_COMB_T2);
+			return;
+		}
 		if (st->comb && !st->sampled_alpha_companion) {
 			p3d_emit_comb_program(cs, st->comb,
 					      st->comb_slot_base ?
@@ -1246,8 +1279,17 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 					      (nunit > 1 ? 2u : 1u));
 			return;
 		}
-		p3d_emit_texenv(cs, nunit > 1 ? 4u : 2u, 0, 1, t,
+		p3d_emit_texenv(cs, pair ? 0u : nunit > 1 ? 4u : 2u, 0, 1, t,
 				st->comb_op);
+		if (pair) {
+			static const uint32_t pad[] = { 4, 8, 10 };
+
+			p3d_emit_texenv(cs, 2, P3D_COMB_T2, 0, st->tex1,
+					st->comb_op);
+			for (u = 0; u < 3; u++)
+				p3d_emit_comb_pad(cs, pad[u]);
+			return;
+		}
 
 		if (nunit > 1) {
 			if (st->sampled_alpha_companion) {
