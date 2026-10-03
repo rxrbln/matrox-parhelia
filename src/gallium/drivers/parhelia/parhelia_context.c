@@ -931,10 +931,14 @@ ph_create_vertex_ring(struct ph_context *ctx)
               screen->async_slots);
 }
 
-/* The P690 draw programs depend on WARP temporary T2, which only the
- * passthrough, multitexture and replace programs write; after power-on it
- * holds garbage and textured draws are rejected until one of them ran.  A
- * degenerate passthrough triangle at context creation initializes it. */
+/* The P690 draw programs depend on a per-vertex latch (WARP T2) that the
+ * setup unit rejects against like a clip-space position; only the
+ * passthrough, multitexture and replace programs write it, from the vertex
+ * colour, and every other program inherits it.  It exists once per primitive
+ * slot of a draw packet: after power-on the second slot held a rejecting
+ * value and Mesa's two-triangle packets lost their second triangle until a
+ * two-primitive passthrough packet ran.  Prime every slot with black
+ * triangles in packets as wide as this context's. */
 static void
 ph_prime_warp(struct ph_context *ctx)
 {
@@ -943,9 +947,9 @@ ph_prime_warp(struct ph_context *ctx)
       .flags = PARHELIA_CREATE_RENDER_NATIVE_COLOR, .width = 64, .height = 16,
    };
    struct parhelia_batch *batch = &ctx->build_batch;
-   static const float point[3][5] = {
-      {1, 1, 0, 0, 0}, {1, 1, 0, 0, 0}, {1, 1, 0, 0, 0},
-   };
+   float point[PH_BATCH_MAX_PACKET_VERTICES][5];
+   const unsigned group = MIN2(MAX2(ctx->prims_per_packet, 1u),
+                               PH_BATCH_MAX_PACKET_VERTICES / 3);
    uint32_t fence = 0;
 
    if (screen->chip_id != 0x2539 ||
@@ -955,10 +959,19 @@ ph_prime_warp(struct ph_context *ctx)
       .colour = {.pitch = target.pitch / 4, .fmt = 0x32},
       .screen_w = 64, .screen_h = 16, .prim = P3D_TRIANGLES,
       .warp_entry = ctx->warp_passthrough, .dw_per_vertex = 5,
+      .vertices_per_packet = 3 * group,
    };
 
-   if (!parhelia_batch_state(batch, target.handle, 0, &state, 1) &&
-       !parhelia_batch_submit_async(screen->fd, batch, point, 15, &fence))
+   /* distinct small black triangles along the target */
+   for (unsigned v = 0; v < 3 * group; v++) {
+      point[v][0] = (float)((v / 3) * 4 % 60 + (v % 3 == 1) * 3);
+      point[v][1] = (float)((v % 3 == 2) * 3);
+      point[v][2] = point[v][3] = point[v][4] = 0.0f;
+   }
+   if (!parhelia_batch_state_run(batch, target.handle, 0, 0, 0, &state,
+                                 3 * group) &&
+       !parhelia_batch_submit_async(screen->fd, batch, point, 15 * group,
+                                    &fence))
       parhelia_wait_fence(screen->fd, fence, 2000000000ll, NULL);
    struct drm_gem_close close_bo = {.handle = target.handle};
    ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close_bo);
