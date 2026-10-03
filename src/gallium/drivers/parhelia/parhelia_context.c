@@ -11568,6 +11568,12 @@ static void *ph_create_fs(struct pipe_context *p,
                     fs->program.comb.count, fs->program.const_ref_count,
                     fs->program.cls);
          }
+         if (ph_env("PARHELIA_TRACE_FS_DUMP") && fs->program.valid) {
+            fprintf(stderr, "parhelia: fs=%p route %d %d ramps %u taps %u\n",
+                    (void *)fs, fs->program.route[0], fs->program.route[1],
+                    fs->program.ramp_count, fs->tap_count);
+            ph_fs_dump(&fs->program, stderr);
+         }
          if (ph_env("PARHELIA_TRACE")) {
             fprintf(stderr,
                     "parhelia: create fs=%p samplers=%#x serial=%u texenv=%u inputs=%u uses_color=%u coord=%u/%u\n",
