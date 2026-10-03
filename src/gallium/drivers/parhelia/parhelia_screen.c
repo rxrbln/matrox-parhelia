@@ -835,10 +835,16 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    const bool cube_probe = cube_target && p690_native_texture32 &&
                            ph_env("PARHELIA_CUBE_PROBE");
    const bool cube_chain = cube_target && p690_native_texture32;
-   mip_levels = (p690_native_texture32 || native_64x32_texture) &&
-                (!layered || cube_chain) &&
-                !(templ->width0 & (templ->width0 - 1)) &&
-                !(templ->height0 & (templ->height0 - 1)) ?
+   /* P690 NPOT chains, 2-D and cube, are exact for every texel of every
+    * level up to 256 (fixfn cubeprobe); a 600x20 chain locked the engine, so
+    * larger NPOT bases keep level 0 until measured.  The original family's
+    * chain is measured for power-of-two bases only. */
+   const bool pot = !(templ->width0 & (templ->width0 - 1)) &&
+                    !(templ->height0 & (templ->height0 - 1));
+   const bool p690_npot = templ->width0 <= 256 && templ->height0 <= 256;
+   mip_levels = ((p690_native_texture32 && (pot || p690_npot)) ||
+                 (native_64x32_texture && pot)) &&
+                (!layered || cube_chain) ?
                    templ->last_level + 1 : 1;
    if (!ph_mip_layout_init_cpp(&r->mip, templ->width0, templ->height0,
                                mip_levels, true, p690_native_texture32, cpp))
