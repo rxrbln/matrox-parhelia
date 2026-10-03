@@ -860,15 +860,22 @@ So T2 is the clip-space position the setup stage trivially rejects against
 * the RGBA pass-through rejecting a triangle whose colour has a channel above
   its alpha or alpha 0 (section 5.2's finding);
 * T2-free programs (the RGBA program, the textured programs, the transform
-  programs) drawing nothing or dropping triangles depending on which T2 the
-  last T2-writing draw - of any client - left behind: after power-on and the
-  `parhelia-up.sh` warm-up, Mesa's 7-dword RGBA quads lost their second
-  triangle (vertex-count, 5 of 5 power cycles) until a draw that writes T2 in
-  every vertex lane with an inside value (fog-modes, fogcoord-dp3, a TCL
-  draw) ran.  Mesa's `ph_prime_warp()` draws three identical vertices, which
-  reach only one lane;
+  programs) drawing nothing whenever the last T2-writing draw - of any
+  client, in any process - left an outside value (an RGBA colour with a
+  channel above its alpha, or alpha 0, through the kernel pass-through);
+  a later pass-through draw with an inside colour restores it.
+
+  The power-on vertex-count failure (Mesa's 7-dword RGBA quads losing their
+  second triangle after `parhelia-up.sh`) is **not** this: in that state the
+  probe's own T2-free quads, large and small (`COLOUR_ALPHA_QXY="75 85"`),
+  drew both triangles, and Mesa priming T2 with four distinct covering
+  triangles did not help.  A native-target probe quad
+  (`COLOUR_ALPHA_NATIVE=1`) cleared it - still open;
 * vendor setup programs computing clip codes on T2 (`mtx1066`:
   `slt T2., T2.xxxx, -T2.yyyy` ...).
+
+Never read a WARP input the vertex stream does not fetch: the probe below
+stopped the engine.
 
 Not yet working: writing an inside T2 from the RGBA program itself.  `add T2,
 v0.0000, v0.0001`, `add T2, v5.0000, v5.0001`, `mul T2, v0.000w, r1.0000`,
