@@ -224,6 +224,58 @@ generic:
    return 0;
 }
 
+bool
+ph_fs_saturate_colour(nir_shader *nir)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_intrinsic_instr *in;
+            unsigned first, mask, si;
+            nir_def *value;
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            in = nir_instr_as_intrinsic(instr);
+            if (!ph_fs_lookup_colour_store(in, &first, &mask))
+               continue;
+            si = in->intrinsic == nir_intrinsic_store_deref;
+            value = in->src[si].ssa;
+            if (nir_def_instr(value)->type == nir_instr_type_alu &&
+                nir_def_as_alu(value)->op == nir_op_fsat)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            if (nir_def_is_const(value) && value->bit_size == 32) {
+               /* a literal converts as GL converts to fixed point, NaN to 0 */
+               nir_const_value c[NIR_MAX_VEC_COMPONENTS];
+               bool changed = false;
+
+               for (unsigned k = 0; k < value->num_components; k++) {
+                  const nir_const_value v = nir_def_as_load_const(value)->value[k];
+                  const float f = v.f32 > 0.0f ? MIN2(v.f32, 1.0f) : 0.0f;
+
+                  c[k] = nir_const_value_for_float(f, 32);
+                  changed |= c[k].u32 != v.u32;
+               }
+               if (!changed)
+                  continue;
+               nir_src_rewrite(&in->src[si],
+                               nir_build_imm(&b, value->num_components, 32, c));
+            } else {
+               nir_src_rewrite(&in->src[si], nir_fsat(&b, value));
+            }
+            progress = true;
+         }
+      }
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 void
 ph_fs_lookup_free(struct ph_fs_lookup *fn)
 {

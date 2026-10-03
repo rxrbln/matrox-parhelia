@@ -47,6 +47,10 @@ bool ph_fs_lower_lookup(nir_shader *nir, unsigned used_units,
 
 void ph_fs_lookup_free(struct ph_fs_lookup *fn);
 
+/* Saturate every colour store of @nir: the colour targets are fixed-point,
+ * where GL clamps the fragment colour anyway.  True when a store changed. */
+bool ph_fs_saturate_colour(nir_shader *nir);
+
 /* Fill the B8G8R8A8 texels of @fn's texture of @r's size and domain for
  * the fragment constants @constants (@size bytes): a cube map is six faces
  * in GL face order.  False when the program reads constants beyond @size. */

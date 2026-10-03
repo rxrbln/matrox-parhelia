@@ -153,6 +153,8 @@ struct ph_fs {
     * expression the combiner can evaluate; everything else keeps the
     * instruction-shape matcher above and the draw module. */
    struct ph_fs_program program;
+   /* The program saturates the colour, exact for fixed-point targets. */
+   bool colour_saturated;
    /* The evaluator of a program that samples its own lookup texture. */
    struct ph_fs_lookup *lookup;
    /* A discard folded into the alpha test, see ph_fs_build_kill(). */
@@ -9320,6 +9322,13 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                 "express are dropped (%s)\n", ctx->fs->drop_reason);
       return;
    }
+   if (ctx->fs && ctx->fs->colour_saturated && ctx->fb.nr_cbufs &&
+       ctx->fb.cbufs[0].texture &&
+       !util_format_is_unorm(ctx->fb.cbufs[0].format)) {
+      PH_REFUSE("a saturated-colour program on a target that does not "
+                "clamp is dropped\n");
+      return;
+   }
    {
       struct ph_fs_program *kill_prog;
       enum pipe_compare_func kill_func;
@@ -10432,6 +10441,34 @@ static void *ph_create_fs(struct pipe_context *p,
                                            ramp_count, &fs->program) &&
                        (fs->program.sampler_mask & ~fs->sampler_mask)) {
                ph_fs_program_fini(&fs->program), fs->program.valid = false;
+            }
+            /* The colour targets are fixed-point: a program refused for a
+             * value beyond the combiner's range may fit saturated. */
+            if (!fs->program.valid && ramped && !ramp_count) {
+               nir_shader *sat = nir_shader_clone(NULL, compile_nir);
+               struct ph_fs_program sat_prog;
+               bool progress;
+
+               if (sat && ph_fs_saturate_colour(sat)) {
+                  do {
+                     progress = false;
+                     NIR_PASS(progress, sat, nir_opt_algebraic);
+                     NIR_PASS(progress, sat, nir_opt_constant_folding);
+                     NIR_PASS(progress, sat, nir_opt_copy_prop);
+                     NIR_PASS(progress, sat, nir_opt_cse);
+                     NIR_PASS(progress, sat, nir_opt_dce);
+                  } while (progress);
+                  if (ph_fs_compile(sat, budget, &sat_prog)) {
+                     if (sat_prog.sampler_mask & ~fs->sampler_mask) {
+                        ph_fs_program_fini(&sat_prog);
+                     } else {
+                        ph_fs_program_fini(&fs->program);
+                        fs->program = sat_prog;
+                        fs->colour_saturated = true;
+                     }
+                  }
+               }
+               ralloc_free(sat);
             }
             /* A colour beyond the combiner that is a function of one varying
              * samples a lookup texture of the program on unit 0. */
