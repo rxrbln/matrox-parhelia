@@ -1326,6 +1326,7 @@ int parhelia_vram_clear_range(struct parhelia_device *pdev,
 {
 	struct parhelia_aperture_mapping mapping = { };
 	u64 done;
+	u32 bytes = 0;
 	bool parked = false;
 	int ret;
 
@@ -1335,12 +1336,13 @@ int parhelia_vram_clear_range(struct parhelia_device *pdev,
 		return 0;
 	mutex_lock(&pdev->aperture_lock);
 	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, &parked);
-	for (done = 0; !ret && done < len; done += SZ_8K) {
-		u32 bytes = min_t(u64, len - done, SZ_8K);
+	for (done = 0; !ret && done < len; done += bytes) {
+		u32 skew = (offset + done) & (parhelia_aperture_addr_unit(pdev) - 1);
 		u32 surface_address;
 
-		ret = parhelia_vram_gpu_addr(pdev, gbo, offset + done, bytes,
-					     &surface_address);
+		bytes = min_t(u64, len - done, SZ_8K - skew);
+		ret = parhelia_vram_gpu_addr(pdev, gbo, offset + done - skew,
+					     bytes + skew, &surface_address);
 		if (ret)
 			break;
 		if (!mapping.active)
@@ -1349,8 +1351,8 @@ int parhelia_vram_clear_range(struct parhelia_device *pdev,
 		else
 			parhelia_aperture_retarget_locked(pdev, &mapping,
 				surface_address, 0x10000020, 0x00010001);
-		memset_io((u8 __iomem *)pdev->vram + mapping.node.start, 0,
-			  bytes);
+		memset_io((u8 __iomem *)pdev->vram + mapping.node.start + skew,
+			  0, bytes);
 		wmb();
 		parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(mapping.slot));
 	}
@@ -1380,6 +1382,7 @@ int parhelia_vram_write(struct parhelia_device *pdev,
 {
 	struct parhelia_aperture_mapping mapping = { };
 	u64 done;
+	u32 bytes = 0;
 	bool parked = false;
 	int ret;
 
@@ -1387,12 +1390,13 @@ int parhelia_vram_write(struct parhelia_device *pdev,
 		return -EINVAL;
 	mutex_lock(&pdev->aperture_lock);
 	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, &parked);
-	for (done = 0; !ret && done < len; done += SZ_8K) {
-		u32 bytes = min_t(u64, len - done, SZ_8K);
+	for (done = 0; !ret && done < len; done += bytes) {
+		u32 skew = (offset + done) & (parhelia_aperture_addr_unit(pdev) - 1);
 		u32 surface_address;
 
-		ret = parhelia_vram_gpu_addr(pdev, gbo, offset + done, bytes,
-					     &surface_address);
+		bytes = min_t(u64, len - done, SZ_8K - skew);
+		ret = parhelia_vram_gpu_addr(pdev, gbo, offset + done - skew,
+					     bytes + skew, &surface_address);
 		if (ret)
 			break;
 		if (!mapping.active)
@@ -1401,7 +1405,7 @@ int parhelia_vram_write(struct parhelia_device *pdev,
 		else
 			parhelia_aperture_retarget_locked(pdev, &mapping,
 				surface_address, 0x10000020, 0x00010001);
-		memcpy_toio((u8 __iomem *)pdev->vram + mapping.node.start,
+		memcpy_toio((u8 __iomem *)pdev->vram + mapping.node.start + skew,
 			    (const u8 *)src + done, bytes);
 		wmb();
 		parhelia_read(pdev, PARHELIA_HOST_APERTURE_SLOT(mapping.slot));
