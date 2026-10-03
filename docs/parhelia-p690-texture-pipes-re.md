@@ -353,6 +353,43 @@ Two consequences follow:
   - Pipes 0 and 2 are the two halves that can work one stage together.
   - The halved cap reflects half the per-clock pixel width of Parhelia-512.
 
+### 8.1 Three and four units (2026-10-03)
+
+- **PROVEN:** the LX candidate tables (PSER `0x1dbe58`; KRN `mtx2422`
+  `0x1c3c0`, `mtx3991` `0x1bd60`, `mtx1278` `0x1b700`, byte-identical) give:
+  - three units `[1,2,8]`, pipe owners `0,1,-,2`;
+  - four units `[1,2,4,8]`.
+- **PROVEN:** with three units the leftover pipe 2 is parked on unit 3,
+  `0x120c = 0x00010004` (PSER `0xcbac8..0xcbb0f`, KRN `0x3f878..0x3f8d5`).
+- **PROVEN:** the per-bank `0x11e8` values (PSER `0x1d63f0`, KRN `mtx1783`):
+  - three units: `0x01600000, 0x01600000, 0x00400000`, and `0` on the parked
+    unit;
+  - four units: `0x01600000` on every unit.
+- **PROVEN:** `0x12f4` drops to 16.0 (`0x41800000`) with three or more units
+  (KRN `mtx958` `0x6974a`).
+- **PROVEN:** no merge instruction is emitted with two or more units. The
+  combiner reads each unit from the first pipe of its mask (PSER `0x177770`).
+  With three units that is t0, t1, t3; with four, t0..t3.
+- **Correction:** earlier notes said the LX units "share one physical pipe".
+  That is wrong: the LX chips have four texture pipes, organised as the pairs
+  (0,1) and (2,3).
+- **INCONCLUSIVE (P690):** the first draw of the vendor three-unit pipe form
+  above, combined with only **two** coordinate sets, timed out. Another
+  probe locked up the engine at the same moment, and after one stall every
+  later submit times out, so this form is not proven to stall.
+  - Coordinate setup of that draw: the kernel multitexture WARP program
+    (o3/o4), `0x1110 = 0x301`, descriptors `0x20c00000 / 0x20c70050 /
+    0xa0c80070` (the measured two-unit words), and `0x1118 = 0x4343`, so units 2/3 reused
+    sets 0/1.
+  - Combiner: `MOV r0, t0`.
+  - dmesg: `fence made no progress for 2002 ms; wedged`, `BM=00000000`,
+    `DWGCTL=00000307`, `status450=fbefdf0f`. A power cycle was needed.
+  - Re-run it only in an exclusive hardware slot.
+  - The vendor always enables one coordinate set per unit, so this form has
+    no vendor reference.
+  - OPEN: the vendor's three-unit WARP program and attribute setup (`0x1110`
+    bits 10/11, descriptor kinds 9/10). Probe only that form next.
+
 ## 9. Differences from the current open driver
 
 | vendor (LX) | open driver (`reference/p3d_state.c`) |
