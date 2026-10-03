@@ -1451,8 +1451,9 @@ ph_fs_operand(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, unsigned i,
  * its natural channels, is multiplied by a 0/1 mask of the channels it fills
  * and accumulated with multiply-adds; the literal channels are added last. */
 static bool
-ph_fs_assemble(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, int lane,
-               float *literal, struct ph_fs_src *out)
+ph_fs_assemble(struct ph_fs_ctx *ctx, nir_def *const defs[3],
+               const uint8_t comps[3], int lane, float *literal,
+               struct ph_fs_src *out)
 {
    struct { nir_def *def; int sel; float mask[3]; } group[3];
    unsigned groups = 0;
@@ -1462,15 +1463,15 @@ ph_fs_assemble(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, int lane,
    if (lane != PH_LANE_RGB)
       return ph_fs_fail(ctx, "RGB assembled from separate values");
    for (unsigned i = 0; i < 3; i++) {
-      nir_def *def = alu->src[i].src.ssa;
+      nir_def *def = defs[i];
       nir_instr *instr = nir_def_instr(def);
-      int sel = alu->src[i].swizzle[0] == i ? -1 : alu->src[i].swizzle[0];
+      int sel = comps[i] == i ? -1 : comps[i];
       unsigned g;
 
       literal[i] = 0.0f;
       if (instr->type == nir_instr_type_load_const) {
          literal[i] = nir_const_value_as_float(
-            nir_instr_as_load_const(instr)->value[alu->src[i].swizzle[0]], 32);
+            nir_instr_as_load_const(instr)->value[comps[i]], 32);
          have_literal |= literal[i] != 0.0f;
          continue;
       }
@@ -1529,6 +1530,17 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
    switch (alu->op) {
    case nir_op_mov:
    case nir_op_fcanonicalize:
+      /* A channel permutation the replicates cannot express (.abgr) is
+       * rebuilt from replicated channels and masks. */
+      if (lane == PH_LANE_RGB && sel < 0 &&
+          !ph_fs_translate(alu, 0, lane, sel, &(int){0})) {
+         nir_def *defs[3] = { alu->src[0].src.ssa, alu->src[0].src.ssa,
+                              alu->src[0].src.ssa };
+         float literal[3];
+
+         return ph_fs_assemble(ctx, defs, alu->src[0].swizzle, lane, literal,
+                               out);
+      }
       return ph_fs_operand(ctx, alu, 0, lane, sel, out);
    case nir_op_fsat:
       return ph_fs_operand(ctx, alu, 0, lane, sel, out) &&
@@ -1692,7 +1704,15 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
          return ph_fs_lower(ctx, alu->src[sel].src.ssa, lane,
                             alu->src[sel].swizzle[0], out);
       }
-      return ph_fs_assemble(ctx, alu, lane, value, out);
+      {
+         nir_def *defs[3] = { alu->src[0].src.ssa, alu->src[1].src.ssa,
+                              alu->src[2].src.ssa };
+         const uint8_t comps[3] = { alu->src[0].swizzle[0],
+                                    alu->src[1].swizzle[0],
+                                    alu->src[2].swizzle[0] };
+
+         return ph_fs_assemble(ctx, defs, comps, lane, value, out);
+      }
    }
    default:
       return ph_fs_fail(ctx, nir_op_infos[alu->op].name);
