@@ -1892,11 +1892,16 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    ((struct pipe_shader_caps *)&s->base.shader_caps[MESA_SHADER_VERTEX])->max_sampler_views = 0;
    struct pipe_shader_caps *fs =
       (struct pipe_shader_caps *)&s->base.shader_caps[MESA_SHADER_FRAGMENT];
-   fs->max_instructions = fs->max_alu_instructions = 64;
-   fs->max_tex_instructions = fs->max_tex_indirections = 8;
-   fs->max_inputs = 8;
+   /* What a program may declare, at least ARB_fragment_program's minimums:
+    * the compiler, not these limits, refuses what the combiner cannot run
+    * (a GLSL link failure, an ARB program's draws dropped). */
+   fs->max_instructions = fs->max_alu_instructions = 72;
+   fs->max_tex_instructions = 24;
+   fs->max_tex_indirections = 8;
+   fs->max_inputs = 10;	/* ARB_fragment_program attribs; routing decides */
    fs->max_outputs = 1;
-   fs->max_const_buffer0_size = 16 * 4 * sizeof(float);
+   /* the preshader reads uniforms from the buffer at any offset */
+   fs->max_const_buffer0_size = 32 * 4 * sizeof(float);
    fs->max_const_buffers = 1;
    fs->max_temps = 16;
    /* The chip's own count, from the kernel: four on the original Parhelia
