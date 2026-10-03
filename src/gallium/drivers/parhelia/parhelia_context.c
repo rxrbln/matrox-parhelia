@@ -11075,10 +11075,13 @@ static void *ph_create_fs(struct pipe_context *p,
          /* nir_tgsi_scan_shader relies on optional NIR usage bitsets which
           * are not populated for all internal Mesa/glamor shaders.  Inspect
           * the actual IR as the authoritative source for texture use. */
+         /* A declared sampler no instruction reads (a texenv source
+          * algebra folded away) leaves the draw untextured; binding it
+          * would need a coordinate set the vertex program does not write,
+          * and the draw was dropped. */
          fs->sampler_mask = info->samplers_declared;
          if (s->type == PIPE_SHADER_IR_NIR) {
-            fs->sampler_mask |= s->ir.nir->info.textures_used[0];
-            fs->sampler_mask |= ph_nir_sampler_mask(s->ir.nir);
+            fs->sampler_mask = ph_nir_sampler_mask(s->ir.nir);
             fs->projective_mask = ph_nir_projective_mask(s->ir.nir);
          }
          fs->uses_texture = fs->sampler_mask != 0 ||
