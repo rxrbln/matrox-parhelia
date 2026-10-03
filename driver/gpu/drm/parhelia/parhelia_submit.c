@@ -3637,6 +3637,29 @@ module_param(trace_depth_window, bool, 0644);
 MODULE_PARM_DESC(trace_depth_window,
 	"Log each original-Parhelia colour/depth window pairing (diagnostic)");
 
+/* The engine address of an object's current VRAM placement, pinned or not:
+ * drm_gem_vram_offset() warns on unpinned objects, so read the resource under
+ * the reservation.  -ENODEV when the object is not in VRAM. */
+static int parhelia_vram_resident_gpu(struct parhelia_device *pdev,
+				      struct drm_gem_vram_object *bo, u64 *gpu)
+{
+	u64 bank_size = pdev->vram_size >> 1, phys;
+	int ret;
+
+	ret = ttm_bo_reserve(&bo->bo, true, false, NULL);
+	if (ret)
+		return ret;
+	if (!bo->bo.resource || bo->bo.resource->mem_type != TTM_PL_VRAM) {
+		ttm_bo_unreserve(&bo->bo);
+		return -ENODEV;
+	}
+	phys = (u64)bo->bo.resource->start << PAGE_SHIFT;
+	ttm_bo_unreserve(&bo->bo);
+	*gpu = phys < bank_size ? phys :
+	       PARHELIA_LOCAL_BANK_B_BASE + phys - bank_size;
+	return 0;
+}
+
 /* The original Parhelia's depth unit takes the upper bits of the Z surface
  * address from the colour target: Z only lands in the 16 MiB engine window
  * directly above the colour target's (glprobe, every other window mixes both
@@ -3667,12 +3690,12 @@ static int parhelia_pin_depth_window(struct parhelia_device *pdev,
 		return parhelia_vram_pin(depth);
 	}
 	if (trace_depth_window) {
-		u32 before = 0;
+		u64 before = 0;
 
-		parhelia_vram_gpu_addr(pdev, depth, 0, depth->bo.base.size, &before);
+		parhelia_vram_resident_gpu(pdev, depth, &before);
 		dev_info_ratelimited(&pdev->pdev->dev,
-			"depth window: colour %#x+%#zx depth %#x+%#zx pinned %u window %#llx-%#llx\n",
-			gpu, colour->bo.base.size, before, depth->bo.base.size,
+			"depth window: colour %#x+%#zx depth %#llx+%#zx pinned %u window %#llx-%#llx\n",
+			gpu, colour->bo.base.size, (unsigned long long)before, depth->bo.base.size,
 			depth->bo.pin_count, (unsigned long long)lo,
 			(unsigned long long)hi);
 	}
@@ -3687,12 +3710,12 @@ static int parhelia_pin_depth_window(struct parhelia_device *pdev,
 		parhelia_submit_unlock(pdev);
 	}
 	if (trace_depth_window) {
-		u32 after = 0;
+		u64 after = 0;
 
-		parhelia_vram_gpu_addr(pdev, depth, 0, depth->bo.base.size, &after);
+		parhelia_vram_resident_gpu(pdev, depth, &after);
 		dev_info_ratelimited(&pdev->pdev->dev,
-			"depth window: result %d after %d tries, depth now %#x\n",
-			ret, tries, after);
+			"depth window: result %d after %d tries, depth now %#llx\n",
+			ret, tries, (unsigned long long)after);
 	}
 	if (ret == -EBUSY || ret == -ENOMEM || ret == -ENOSPC) {
 		dev_warn_ratelimited(&pdev->pdev->dev,
