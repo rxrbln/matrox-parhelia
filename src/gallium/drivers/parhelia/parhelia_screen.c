@@ -776,9 +776,9 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    const bool native_64x32_texture = sampler_storage && !block_bytes &&
       p3d_texture_uses_native_64x32(screen->chip_id, screen->tile_layout,
                                     cpp);
-   /* Original-family cube faces as whole 64x32-order images (screen gate). */
-   const bool o528_cube = cube_target && native_64x32_texture &&
-                          screen->cube_targets;
+   /* Original-family volumes and cube maps in the 64x32 orders. */
+   const bool o528_layered = layered && native_64x32_texture &&
+      (cube_target ? screen->cube_targets : screen->volume_targets);
    unsigned mip_levels;
    int fail_line = 0;
    if (!r)
@@ -812,7 +812,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
     * classes have. */
    if (templ->width0 > max_width || templ->height0 > max_height ||
        (util_format_is_compressed(templ->format) && !block_bytes) ||
-       (layered && (!(p690_native_texture32 || o528_cube) || block_bytes ||
+       (layered && (!(p690_native_texture32 || o528_layered) || block_bytes ||
                        slices > 256 ||
                        (cube_target && templ->width0 != templ->height0))) ||
        (templ->target != PIPE_TEXTURE_3D && templ->depth0 != 1) ||
@@ -838,6 +838,11 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    const bool cube_probe = cube_target && p690_native_texture32 &&
                            ph_env("PARHELIA_CUBE_PROBE");
    const bool cube_chain = cube_target && p690_native_texture32;
+   /* PARHELIA_0528_CUBE_CHAIN=1 (diagnostic): levels above 0 of an original-
+    * family cube far beyond level 0, so an address fill shows where the
+    * unit reads them */
+   const bool o528_cube_chain_probe = cube_target && o528_layered &&
+                                      ph_env("PARHELIA_0528_CUBE_CHAIN");
    /* P690 NPOT chains, 2-D and cube, are exact for every texel of every
     * level up to 256 (fixfn cubeprobe); larger NPOT bases keep level 0 until
     * measured (a 600x20 probe met a concurrent lockup: inconclusive).  The original family's
@@ -852,7 +857,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    const bool o528_level_4k = o528_npot && !strcmp(o528_npot_env, "4k");
    mip_levels = ((p690_native_texture32 && (pot || p690_npot)) ||
                  (native_64x32_texture && (pot || o528_npot))) &&
-                (!layered || cube_chain) ?
+                (!layered || cube_chain || o528_cube_chain_probe) ?
                    templ->last_level + 1 : 1;
    if (!ph_mip_layout_init_cpp(&r->mip, templ->width0, templ->height0,
                                mip_levels, true, p690_native_texture32, cpp))
@@ -897,9 +902,13 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    }
    /* The original's sampler reads single-level 32-bit storage in 64x32 tiles
     * at a 32-aligned pitch; cover every tile its row bands reach. */
-   if (native_64x32_texture && (!layered || o528_cube)) {
-      if (!ph_mip_layout_native_64x32(&r->mip, o528_level_4k))
+   if (native_64x32_texture && (!layered || o528_layered)) {
+      if (layered) {
+         r->mip.native_64x32 = true;
+         r->mip.level[0].pitch = ph_mip_align(templ->width0, 32);
+      } else if (!ph_mip_layout_native_64x32(&r->mip, o528_level_4k)) {
          PH_CREATE_FAIL();
+      }
       if (ph_env("PARHELIA_TRACE"))
          for (unsigned l = 0; l < mip_levels; l++)
             fprintf(stderr,
@@ -919,8 +928,31 @@ ph_resource_create_class(struct pipe_screen *pscreen,
        * height (mtx1444, .text+0x5b972). */
       r->mip.level[0].bytes = (size_t)r->mip.level[0].pitch *
                               ph_mip_align(templ->height0,
-                                           o528_cube ? 32 : 16) * 4;
+                                           o528_layered ? 32 : 16) * 4;
       r->mip.size = ph_mip_align(r->mip.level[0].bytes * slices, 0x2000);
+      /* the last 8 KiB tile the original family's volume order reaches */
+      if (o528_layered && !cube_target) {
+         const size_t cells = (size_t)ph_mip_align(templ->height0, 32) / 32 *
+                              (r->mip.level[0].pitch / 32);
+
+         r->mip.size = ((((cells - 1) | 1) * slices + slices - 1) / 2 + 1) *
+                       0x2000;
+      }
+      if (o528_cube_chain_probe) {
+         size_t next = r->mip.size * 4;
+
+         for (unsigned l = 1; l < mip_levels; l++) {
+            struct ph_mip_level *level = &r->mip.level[l];
+
+            level->pitch = ph_mip_align(level->width, 32);
+            level->tail_x = level->tail_y = 0;
+            level->offset = next;
+            level->bytes = (size_t)level->pitch *
+                           ph_mip_align(level->height, 32) * 4;
+            next += ph_mip_align(level->bytes * slices, 0x2000);
+         }
+         r->mip.size = next;
+      }
       /* The P690 cube chain (PARHELIA_CUBE_PROBE, every texel of 32..256
        * cubes): levels above 16x16 hold six whole face images, each the
        * vendor's level size apart (mtx3887); the 2-D tail block follows,
@@ -1728,14 +1760,14 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * slice and of all six cube faces at the GL level.  See
     * docs/parhelia-p690-volume-cube-targets.md.  PARHELIA_NO_VOLUME_TARGETS=1
     * returns the driver to 2-D and 1-D only. */
-   s->volume_targets = s->texture_upload && s->chip_id == 0x2539 &&
-      p3d_texture_uses_native_64x16(s->chip_id, s->tile_layout, 4) &&
+   /* The original family's volume order and its cube faces, stacked as rows
+    * of one 64x32-order image, are measured the same way on the 0528. */
+   s->volume_targets = s->texture_upload &&
+      ((s->chip_id == 0x2539 &&
+        p3d_texture_uses_native_64x16(s->chip_id, s->tile_layout, 4)) ||
+       p3d_texture_uses_native_64x32(s->chip_id, s->tile_layout, 4)) &&
       !ph_env("PARHELIA_NO_VOLUME_TARGETS");
    s->cube_targets = s->volume_targets;
-   /* PARHELIA_0528_CUBE=1 (diagnostic): original-family cube maps, level 0 */
-   if (s->texture_upload && s->tile_layout == PARHELIA_TILE_64X32_8K &&
-       ph_env("PARHELIA_0528_CUBE"))
-      s->cube_targets = true;
    /* 16-bit render targets: ask the kernel for a two-byte-per-pixel native
     * colour allocation.  Only a kernel that knows the 128-pixel tile row can
     * place one, and only the P690's measured order is implemented.

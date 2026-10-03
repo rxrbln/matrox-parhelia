@@ -283,6 +283,14 @@ ph_mip_layer_texel_offset(const struct ph_mip_layout *mip, unsigned level,
          ph_volume_texel_offset(x + mip->level[level].tail_x,
                                 y + mip->level[level].tail_y, layer, 32,
                                 mip->slices, cpp);
+   /* the original family stacks cube faces as rows of one 64x32 image */
+   if (mip->native_64x32 && mip->slices && !linear)
+      return mip->level[level].offset + (mip->cube ?
+         p3d_texture_tile_offset_64x32(x, y + layer *
+                                       ph_mip_align(mip->level[level].height, 32),
+                                       mip->level[level].pitch) :
+         ph_volume_texel_offset_64x32(x, y, layer, mip->level[level].pitch,
+                                      mip->slices, cpp));
    if (mip->slices && !mip->cube && !linear)
       return mip->level[level].offset +
          ph_volume_texel_offset(x, y, layer, mip->level[level].pitch,

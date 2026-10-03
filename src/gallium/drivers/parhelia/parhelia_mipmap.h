@@ -420,6 +420,26 @@ ph_volume_texel_offset(unsigned x, unsigned y, unsigned z, unsigned pitch,
            ((slot >> 1) << 10)) * cpp;
 }
 
+/* The original family's volume order: the P690 rule above on 64x32 tiles.
+ * The in-tile bits are the 2-D 64x32 order's, bit 7 is z0 ^ x5 ^ trow, and
+ * bits 11.. are (s * @slices + z) >> 1 with s the 32x32 cell index whose
+ * bit 0 is that same half selector (--texture-volume-probe on the 0528:
+ * 32x32x2, 32x32x6, 32x64x4, 64x32x3, 64x64x8 and 128x32x4, every texel). */
+static inline size_t
+ph_volume_texel_offset_64x32(unsigned x, unsigned y, unsigned z,
+                             unsigned pitch, unsigned slices, unsigned cpp)
+{
+   const unsigned trow = y >> 5, iy = y & 31u;
+   const unsigned half = ((x >> 5) ^ trow) & 1u;
+   const unsigned cell = trow * (pitch >> 5) + (x >> 5);
+   const unsigned granule = (x & 7u) | (((iy >> 1) & 1u) << 3) |
+                            (((x >> 3) & 3u) << 4) | ((iy & 1u) << 6) |
+                            ((iy >> 2) << 8);
+   const size_t slot = (size_t)((cell & ~1u) | half) * slices + z;
+
+   return (granule | (((z & 1u) ^ half) << 7) | ((slot >> 1) << 11)) * cpp;
+}
+
 static inline unsigned
 ph_mip_ready_levels(uint16_t defined, unsigned levels)
 {
