@@ -865,12 +865,11 @@ So T2 is the clip-space position the setup stage trivially rejects against
   channel above its alpha, or alpha 0, through the kernel pass-through);
   a later pass-through draw with an inside colour restores it.
 
-  The power-on vertex-count failure (Mesa's 7-dword RGBA quads losing their
-  second triangle after `parhelia-up.sh`) is **not** this: in that state the
-  probe's own T2-free quads, large and small (`COLOUR_ALPHA_QXY="75 85"`),
-  drew both triangles, and Mesa priming T2 with four distinct covering
-  triangles did not help.  A native-target probe quad
-  (`COLOUR_ALPHA_NATIVE=1`) cleared it - still open;
+  The latch exists **per primitive slot of a draw packet**: the power-on
+  vertex-count failure (Mesa's two-triangle RGBA packets losing their second
+  triangle after `parhelia-up.sh`) was slot 1 holding a rejecting value,
+  which one-primitive packets (the probe's, `--render`, Mesa's old prime)
+  never touch - see `parhelia-raster-clip.md`, "Resolved";
 * vendor setup programs computing clip codes on T2 (`mtx1066`:
   `slt T2., T2.xxxx, -T2.yyyy` ...).
 

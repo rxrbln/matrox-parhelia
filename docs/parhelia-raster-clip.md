@@ -1153,3 +1153,20 @@ between the failing Mesa batch and the working probe batch are the 2-D
 clear in the same submit (which writes `0x12c0 = 0xffffffff`, DWGCTL fill),
 the batch-boundary relocation, the `0x11e8` write and the target geometry;
 the healing Mesa batch shares all of them.  Open.
+
+### Resolved: the latch exists per primitive slot of a draw packet
+
+Found offline after the window, reproduced without a power cycle (MEASURED,
+Mesa p690-raster `d2c9891`, `1482232`): in the failing state Mesa passes
+with `PARHELIA_PRIMS_PER_PACKET=1`, and the probe reproduces it once its
+quad is one two-primitive packet (`COLOUR_ALPHA_PPP=2`).  A two-primitive
+alpha-0 RGBA pass-through packet poisons both slots; a one-primitive
+pass-through prime restores only slot 0 (18336 + 0 px, Mesa vertex-count
+fails), a two-primitive prime both (18336 + 17955 px, vertex-count passes).
+Every non-healer above drew one primitive per packet (drm-test, `--render`,
+Mesa's old prime); every healer was a Mesa two-triangle pass-through or
+colour-1 packet.  So the WARP T2 latch of section 12 in
+`parhelia-p690-warp-isa-re.md` is per primitive slot, power-on leaves slot 1
+rejecting, and Mesa now primes every slot (`1482232`).  The kernel's own
+warm-up and any non-Mesa client should do the same: a pass-through packet of
+as many black triangles as the widest packet any client emits.
