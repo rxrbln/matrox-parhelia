@@ -501,6 +501,9 @@ struct ph_context {
    /* Pass-through plus "mov o2, v6": the second colour reaches the combiner
     * as v1, which is where a lowered GL fog expression reads its coordinate. */
    uint32_t warp_colour1;
+   /* The textured pass-through plus "mov o2, v6", for a textured draw whose
+    * program reads v1 (GL_SEPARATE_SPECULAR_COLOR). */
+   uint32_t warp_colour1_tex;
    /* Pass-through without the T2 write, for the RGBA colour stream. */
    uint32_t warp_rgba;
    uint32_t warp_no_colour[2];
@@ -4448,6 +4451,52 @@ ph_colour1_program(struct ph_context *ctx)
    return true;
 }
 
+/* The kernel's textured pass-through (no T2 write) plus "mov o2, v6": the
+ * second colour of a one-set textured stream reaches the combiner as v1. */
+static bool
+ph_colour1_textured_program(struct ph_context *ctx)
+{
+   static const uint32_t head[] = {
+      0x00083e00, 0x00440000, 0xb89a2249,
+      0x08087ebf, 0x00440215, 0xb89a2249,
+      0x0078023f, 0x00440200, 0xb01a21a2,
+   };
+   static const uint32_t tail[] = {
+      0x00000200, 0x00040000, 0x14c00000,
+      0x00080200, 0x00440000, 0x301a21a2,
+   };
+   struct drm_parhelia_warp_program program = {0};
+   struct p3d_warp_inst move = {
+      .op = P3D_WARP_WRA,
+      .sop = P3D_WARP_SOP_MOV,
+      .sdst_file = P3D_WARP_FILE_DST_O,
+      .sdst_index = 2,
+      .sdst_mask = 0xf,
+      .nsrc = 3,
+   };
+   uint32_t code[ARRAY_SIZE(head) + 3 + ARRAY_SIZE(tail)];
+
+   if (ctx->warp_colour1_tex)
+      return true;
+   if (!ctx->warp_program_instructions)
+      return false;
+   for (unsigned i = 0; i < 3; i++) {
+      move.src[i].file = P3D_WARP_FILE_V;
+      move.src[i].index = P3D_WARP_V_COLOUR1;
+      move.src[i].swizzle = P3D_WARP_SWZ_IDENTITY;
+   }
+   memcpy(code, head, sizeof(head));
+   p3d_warp_encode(&move, code + ARRAY_SIZE(head));
+   memcpy(code + ARRAY_SIZE(head) + 3, tail, sizeof(tail));
+   program.code = (uintptr_t)code;
+   program.count = ARRAY_SIZE(code) / 3;
+   if (ioctl(ph_screen(ctx->base.screen)->fd, DRM_IOCTL_PARHELIA_WARP_PROGRAM,
+             &program))
+      return false;
+   ctx->warp_colour1_tex = (uint32_t)program.entry;
+   return true;
+}
+
 /* The sized-point program: the kernel's pass-through with two adds that state
  * the point's extent as o9 = (x - r, y - r, x + r, y + r), r from c0.x.  It is
  * uploaded once per context, on the first wide point, because the upload
@@ -4900,11 +4949,13 @@ ph_submit_vertices(struct ph_context *ctx)
 	/* The staged stream carries a second colour: declare the kind-6
 	 * attribute and bind the program that forwards it to output 2, so the
 	 * combiner sees it as v1. */
-	if (ctx->colour1 && !texture && ctx->warp_colour1) {
+	if (ctx->colour1 && (texture ? ctx->warp_colour1_tex && !texture1 :
+	                                ctx->warp_colour1)) {
 		state.vertex_colour1 = ctx->colour1;
 		state.dw_per_vertex += 3 + !!(ctx->colour1 & 2) +
 				      !!(ctx->colour1 & 4);
-		state.warp_entry = ctx->warp_colour1;
+		state.warp_entry = texture ? ctx->warp_colour1_tex :
+		                             ctx->warp_colour1;
 	}
 	/* ph_stage_tri selected the exact one-texture MODULATE source-alpha
 	 * predicate.  Re-evaluate it against the resolved depth/texture resources,
@@ -5015,6 +5066,8 @@ ph_submit_vertices(struct ph_context *ctx)
          ph_warp_entry(ctx, true, texture1 || ctx->native_sampled_alpha,
                        !ctx->fs->uses_color && !ctx->alpha_micro &&
                        !ph_fs_reads_routed_v0(ctx->fs));
+      if (state.vertex_colour1)
+         state.warp_entry = ctx->warp_colour1_tex;
       if (ctx->native_sampled_alpha) {
          tex1 = tex;
          tex1.reloc_offset = 0;
@@ -5781,6 +5834,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	bool oow = false;
 	bool proj = false;
 	unsigned colour1;
+	bool textured_colour1;
 	bool colour_alpha;
    float *dst;
    const int fogc = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_FOG, 0);
@@ -5935,12 +5989,19 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	 * useful when the compiled combiner is the thing that reads v1; with
 	 * the fixed-function combiner it would widen the stream for nothing.
 	 * PARHELIA_NO_FOG_COLOUR1 turns it off on its own. */
+	/* The original family also carries it in a one-set textured stream
+	 * (separate specular), x,y[,z,1/w],rgb,rgb1,st. */
+	textured_colour1 = textured && !multitextured && !three_coord &&
+	                   !native_sampled_alpha && !rgb_alpha_two_pass &&
+	                   !alpha_micro && !alpha_micro_cutout &&
+	                   !cpu_alpha_cutout &&
+	                   ph_original_family(ph_screen(ctx->base.screen)->chip_id);
 	colour1 = !ph_env("PARHELIA_FS_TEXENV") &&
 	          !ph_env("PARHELIA_NO_FOG_COLOUR1") &&
-	          !textured && !vertex_alpha && ctx->fs &&
+	          (!textured || textured_colour1) && !vertex_alpha && ctx->fs &&
 	          ctx->fs->program.valid && ctx->fs->program.uses_color1 &&
 	          (ctx->fs->program.uses_fogc ? fogc : col1) >= 0;
-	if (colour1 && !ctx->warp_colour1) {
+	if (colour1 && !(textured ? ctx->warp_colour1_tex : ctx->warp_colour1)) {
 	   /* Uploading a program drains the engine, so never do it with
 	    * vertices already staged: the batch under construction would be
 	    * submitted around the stall and the draws after it read stale
@@ -5950,7 +6011,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	      if (ctx->submit_error)
 	         return;
 	   }
-	   colour1 = ph_colour1_program(ctx);
+	   colour1 = textured ? ph_colour1_textured_program(ctx) :
+	                        ph_colour1_program(ctx);
 	}
 	/* An alpha the program reads widens that colour set to four
 	 * components. */
@@ -5990,7 +6052,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	/* PARHELIA_NO_OOW=1 (diagnostic) keeps the affine stream. */
 	/* The stipple's window coordinates interpolate linearly. */
 	oow = textured && !ctx->fs->stipple_affine &&
-	      !native_sampled_alpha && !colour1 &&
+	      !native_sampled_alpha &&
 	      !cpu_alpha_cutout && !rgb_alpha_two_pass && !alpha_micro &&
 	      !alpha_micro_cutout && !three_coord && !ph_env("PARHELIA_NO_OOW");
 	if (oow)

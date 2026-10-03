@@ -441,6 +441,25 @@ p3d_descriptors(struct p3d_rw *out, int textured, int with_z,
 		out[n].reg = P3D_R_DESC; out[n].val = 0; n++;
 		return n;
 	}
+	/* One coordinate set after both colours (original family, separate
+	 * specular): x,y[,z],rgb[a],rgb[a]1,st; derived from the measured
+	 * two-colour and textured words. */
+	if (textured && vertex_colour1 && ntex == 1 && !texcoord3) {
+		const unsigned first = with_z ? 3u : 2u;
+		const unsigned st = first + (vertex_colour1 & 4 ? 4u : 3u) +
+				    (vertex_colour1 & 2 ? 4u : 3u);
+
+		out[n].reg = P3D_R_DESC;
+		out[n].val = with_z ? 0x21c00000u : 0x20c00000u;
+		n++;
+		n = p3d_colour1_descriptors(out, n, first, vertex_colour1);
+		out[n - 1].val &= ~0x80000000u;
+		out[n].reg = P3D_R_DESC;
+		out[n].val = 0xa0c70000u | (st << 4);
+		n++;
+		out[n].reg = P3D_R_DESC; out[n].val = 0; n++;
+		return n;
+	}
 	/* A three-component coordinate set takes the dwords the colour would
 	 * occupy, so the stream is position then S,T,R and nothing else.  That
 	 * keeps dw_per_vertex at the two-component figure: 7 without a depth or

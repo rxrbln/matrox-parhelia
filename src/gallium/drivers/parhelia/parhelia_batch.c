@@ -828,10 +828,16 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 	          input->tex->type != P3D_TEX_TYPE_VOLUME))) ||
 	       /* 1/w follows z; the second colour and the three-coordinate
 	        * and probe layouts do not carry it. */
-	       (input->oow && (input->vertex_colour1 || input->texcoord3 ||
+	       (input->oow && ((input->vertex_colour1 && !input->tex) ||
+	                       input->texcoord3 ||
 	                       input->second_texcoord_probe)) ||
-	       /* The second colour is only wired for untextured draws. */
-	       (input->vertex_colour1 && (input->tex || input->vertex_alpha)) ||
+	       /* The second colour rides untextured draws and one-set textured
+	        * draws of the original family. */
+	       (input->vertex_colour1 &&
+	        (input->vertex_alpha ||
+	         (input->tex && (input->tex1 || input->texcoord3 ||
+	                         input->single_texture_pipe ||
+	                         p3d_state_coord_sets(input) != 1)))) ||
 	       (input->sampled_alpha_companion &&
 	        (!input->tex || !input->tex1 || input->single_texture_pipe != 1 ||
 	         input->vertex_alpha || input->transform || input->comb_op ||
