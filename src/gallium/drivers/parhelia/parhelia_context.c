@@ -12601,7 +12601,25 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
                     db.x + x >= info->scissor.maxx ||
                     wy < info->scissor.miny || wy >= info->scissor.maxy))
                   continue;
-               if (mask & PIPE_MASK_Z)
+               if ((mask & PIPE_MASK_Z) &&
+                   info->filter == PIPE_TEX_FILTER_LINEAR &&
+                   (sb.width != db.width || sb.height != db.height)) {
+                  /* Depth filters like colour (mipmap generation); stencil
+                   * stays nearest. */
+                  const float cx = CLAMP(fx, 0.0f, sb.width - 1.0f);
+                  const float cy = CLAMP(fy, 0.0f, sb.height - 1.0f);
+                  const int x0 = (int)cx, y0 = (int)cy;
+                  const int x1 = MIN2(x0 + 1, sb.width - 1);
+                  const int y1 = MIN2(y0 + 1, sb.height - 1);
+                  const double ax = cx - x0, ay = cy - y0;
+                  const double z =
+                     (zsrc[(size_t)y0 * sb.width + x0] * (1 - ax) +
+                      zsrc[(size_t)y0 * sb.width + x1] * ax) * (1 - ay) +
+                     (zsrc[(size_t)y1 * sb.width + x0] * (1 - ax) +
+                      zsrc[(size_t)y1 * sb.width + x1] * ax) * ay;
+
+                  zrow[x] = (uint32_t)MIN2(z + 0.5, 4294967295.0);
+               } else if (mask & PIPE_MASK_Z)
                   zrow[x] = zsrc[i];
                if (mask & PIPE_MASK_S)
                   srow[x] = ssrc[i];
