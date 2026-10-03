@@ -6690,6 +6690,11 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
          view.swizzle_b = PIPE_SWIZZLE_Z;
          view.swizzle_a = PIPE_SWIZZLE_W;
       }
+      /* An RGBX view of an RGBA image (texture_from_pixmap of a depth-24
+       * pixmap) gets an RGBX copy, so the sampler returns alpha 1. */
+      if (!depth && view.format != r->base.format &&
+          util_format_rgbx_to_rgba(view.format) == r->base.format)
+         templ.format = view.format;
       templ.width0 = u_minify(r->base.width0, first);
       templ.height0 = u_minify(r->base.height0, first);
       templ.last_level = last - first;
@@ -6758,10 +6763,10 @@ ph_sampled_through_copy(const struct parhelia_resource *r)
              r->base.target == PIPE_TEXTURE_RECT ||
              r->base.target == PIPE_TEXTURE_1D;
    /* A raw-mapped P690 16-bit target is copied from its mapping like a
-    * shadow (MEASURED on the P690 only). */
+    * shadow (MEASURED on the P690 only), a native import (texture_from_pixmap)
+    * from its shadow: every bind makes a new view and so a fresh copy. */
    return (r->transfer_shadow ||
            (r->map && ph_lx_family(ph_screen(r->base.screen)->chip_id))) &&
-          !r->native_shared &&
           !ph_resource_uses_sampler_layout(r) &&
           !(r->base.bind & PIPE_BIND_DEPTH_STENCIL) &&
           (r->base.target == PIPE_TEXTURE_2D ||

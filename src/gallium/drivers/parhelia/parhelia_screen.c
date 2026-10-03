@@ -1377,6 +1377,24 @@ ph_resource_from_handle(struct pipe_screen *pscreen,
          r->tile_layout = screen->tile_layout;
          r->native_shared = true;
          r->mip_defined = BITFIELD_BIT(0);
+         /* CPU access goes through a byte-exact shadow like that of the
+          * native targets this driver shares itself (an X pixmap's BO);
+          * transfers take the image extent from the one-level layout. */
+         if (screen->render_transfer) {
+            r->map = align_malloc(r->size, 64);
+            if (!r->map ||
+                !ph_mip_layout_init_cpp(&r->mip, templ->width0,
+                                        templ->height0, 1, true, false, 4)) {
+               align_free(r->map);
+               if (imported_owned) {
+                  struct drm_gem_close close = {.handle = imported_handle};
+                  ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
+               }
+               FREE(r);
+               return NULL;
+            }
+            r->transfer_shadow = true;
+         }
          pipe_reference_init(&r->base.reference, 1);
          if (ph_env("PARHELIA_TRACE"))
             fprintf(stderr,
