@@ -443,3 +443,24 @@ reference draw and dumps colour and fragment-buffer head/tail files.
 
 A stall in step 1 or 2 indicates base/window placement (try the buffer
 directly above the colour target inside its 16 MiB window, as for depth).
+
+## 11. Hardware measurements on the 0528 (2026-10-03)
+
+`--faa-probe` on a 102b:0528 rev 6, 256x256 target, gouraud triangle over a
+per-pixel background; all files in `campaign/results/faa0528/`.
+
+| setup | result |
+|---|---|
+| slot 2 bound, `0x12fc[1:0] = 0` | byte-identical to FAA off, buffer untouched [MEASURED] |
+| mode 3, no depth surface bound | engine stall on the first draw [MEASURED] |
+| mode 3, S8Z24 depth in slot 1 | no stall; 16-byte records `00RRGGBB, xxff8000, ffxxxxxx, 4020ffff` plus runs of the pixel depth (`0x00800000` for z 0.5) and `0x0100000x` words; colour spans near edges left unwritten, some records written into the colour target next to the edge pixels [MEASURED] |
+| buffer moved into the 16 MiB window above colour | same; window placement is not the cause [MEASURED] |
+| repeated runs | the record start offset drifts (0x10, 0x8010, 0xc100): persistent allocation pointers; after a `DWGCTL 9` resolve the next draw starts at 0 again [MEASURED] |
+| `DWGCTL 9` resolve | adds records instead of merging them; colour unchanged [MEASURED] |
+| mode 1 | inert (no fragments, image unchanged) [MEASURED] |
+| mode 2 | partially covered edge pixels drawn fully, alpha 0xff, buffer untouched [MEASURED] |
+
+So the fragment unit needs a bound depth surface, and mode 1 is most likely
+the "armed, no samples requested" state selected by `0xa05f3` [INFERRED].
+The next probe adds the vendor's fresh-context pointer load (`sub_9D790`),
+which needs indices f0..f3 (`0x13c0`) admitted by the kernel.
