@@ -324,10 +324,23 @@ then copies through a single 8 KiB aperture window, retargeting it per chunk
 (`parhelia_gem.c:883`).  **One readback therefore drains all 16 slots.**  Mesa
 has no other CPU read path — `ph_resource_shadow_transfer()` is the only one.
 
-0. **Do not implement it.**  `PIPE_CAP_OCCLUSION_QUERY` is already 0 by default
-   and the driver installs no query hooks, so Mesa does not expose
-   `GL_ARB_occlusion_query` and applications fall back.  Cost: zero.  This is the
-   recommendation.
+0. **Do not implement it.**  The screen leaves `caps.occlusion_query` 0 and the
+   driver installs no query hooks.  Cost: zero.  This is the recommendation.
+   *Correction (2026-10-03, Mesa 26.2.2 source):* Mesa core still exposes
+   `GL_ARB_occlusion_query` on every driver (`_mesa_init_extensions()` sets it
+   unconditionally; GL 1.5 needs the API).  The cap controls
+   `GL_QUERY_COUNTER_BITS` for `GL_SAMPLES_PASSED`: `_mesa_init_queryobj()`
+   reports 0 instead of 64, and `query_type_is_dummy()` in `queryobj.c` turns
+   every occlusion query into a dummy that never reaches the driver, is always
+   available and returns 0.  Zero counter bits are legal (ARB spec minimum-bits
+   formula "... or 0"); applications must check the bits before trusting
+   results.  `GL_ARB_occlusion_query2` stays off (gated on the cap).
+   piglit on P690 integ147 (MEASURED): `occlusion_query`,
+   `occlusion_query_lifetime`, `gen_delete_while_active` pass; `_order`,
+   `_meta_*`, `occlusion-query-discard`, `arb_occlusion_query2@*` and the
+   `GetQueryCounterBits` subtest skip on 0 bits; `occlusion_query_conform`
+   fails only in `GetObjivAval_multi2`, which compares results without
+   checking the counter bits and so fails on any 0-bit implementation.
 
 1. **Boolean predicate, `PIPE_QUERY_OCCLUSION_PREDICATE` only, deferred.**  Draw
    the proxy with `0x12a0 = 0` replaced by red-only, `0x1038 = 0` (no depth
@@ -358,6 +371,10 @@ has no other CPU read path — `ph_resource_shadow_transfer()` is the only one.
    queue drain at the end, so it only pays off when the proxy is large.
 
 Option 1 is the only one worth building, and only if something real needs it.
+It cannot be advertised as-is: Gallium has one `occlusion_query` cap for counter
+and predicate alike, and setting it makes Mesa report 64 `SAMPLES_PASSED` bits,
+so a predicate-only driver needs a Mesa core split of that cap, or exact counts
+(options 2/3).
 Note that its asynchronous half is free: the DWGSYNC tag mechanism maps exactly
 onto `GL_QUERY_RESULT_AVAILABLE`, so a well-behaved application that polls never
 stalls the engine at all.  It is `GL_QUERY_RESULT` that costs 16 slots.
