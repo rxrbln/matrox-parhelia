@@ -3657,6 +3657,20 @@ ph_fs_ref_value(const struct ph_fs_program *program,
           values[ref->offset[c]] : 0.0f;
 }
 
+/* A constant the instruction only moves into a saturated result: clamping
+ * it to the register range first changes nothing, at any magnitude. */
+static bool
+ph_fs_ref_saturated(const struct ph_fs_program *program,
+                    const struct ph_fs_const_ref *ref, unsigned c)
+{
+   const struct p3d_comb_inst *in = &program->comb.inst[ref->instruction];
+   const struct p3d_comb_half *h = c == 3 ? &in->alpha : &in->rgb;
+
+   return h->used && h->op == P3D_COMB_MOV && h->sat && !h->scale &&
+          h->src[0].reg == P3D_COMB_C0 + ref->slot &&
+          h->src[0].mod == P3D_COMB_MOD_NONE;
+}
+
 /* Recompile for the exponents the current constants need, which only grow,
  * so a program settles after a few variants rather than alternating.
  * Returns 1 when it recompiled, 0 when nothing changed, -1 on failure. */
@@ -3682,7 +3696,7 @@ ph_fs_rescale(struct ph_fs_program *program, const float *values,
          float m;
          unsigned e = 0, k;
 
-         if (!(ref->mask & (1u << c)))
+         if (!(ref->mask & (1u << c)) || ph_fs_ref_saturated(program, ref, c))
             continue;
          m = fabsf(ph_fs_ref_value(program, ref, c, values, size));
          while (m > 1.0f + 1e-6f && e < 16) {
@@ -3707,9 +3721,8 @@ ph_fs_rescale(struct ph_fs_program *program, const float *values,
    }
    if (!ph_fs_compile_key(program->nir, program->budget, uexp, count,
                           program->ramps, program->ramp_count, &variant)) {
+      /* The program stays as it was: only this draw is refused. */
       free(uexp);
-      program->valid = false;
-      program->reject = "a runtime constant beyond the combiner's range";
       return -1;
    }
    memcpy(variant.ramps, program->ramps, sizeof(variant.ramps));
@@ -3744,10 +3757,17 @@ ph_fs_update_constants(struct ph_fs_program *program, const void *constants,
       const struct ph_fs_const_ref *ref = &program->const_ref[i];
       float *target = program->comb.inst[ref->instruction].constant[ref->slot];
 
-      for (unsigned c = 0; c < 4; c++)
-         if (ref->mask & (1u << c))
-            target[c] = ldexpf(ph_fs_ref_value(program, ref, c, values, size),
-                               -(int)ref->e[c]);
+      for (unsigned c = 0; c < 4; c++) {
+         float v;
+
+         if (!(ref->mask & (1u << c)))
+            continue;
+         /* The register holds [-1, 1]; an infinity or NaN (log2(0)) must
+          * not reach the fixed-point conversion. */
+         v = ldexpf(ph_fs_ref_value(program, ref, c, values, size),
+                    -(int)ref->e[c]);
+         target[c] = isnan(v) ? 0.0f : CLAMP(v, -1.0f, 1.0f);
+      }
    }
    return rescaled >= 0;
 }
