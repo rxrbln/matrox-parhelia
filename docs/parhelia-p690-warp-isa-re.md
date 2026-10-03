@@ -838,3 +838,41 @@ Verifying glamor with the route on is what the default flip waits for.
 * Re-encoding the control class in the assembler (`getidx`, `f2b = 0`
   arithmetic, relative `mov`), needed only if a driver-generated program
   ever needs a loop.
+
+## 12. T2 is the setup unit's clip-space position (MEASURED 2026-10-03)
+
+`parhelia-drm-test --colour-alpha-probe` (Mesa p690-raster `1ee794a`):
+`COLOUR_ALPHA_T2="r g b [a]" COLOUR_ALPHA_T2N=6` draws two covering triangles
+through the kernel pass-through, whose `mul T2, v5, r1.0000` leaves **T2 =
+v5, the vertex colour** (the instruction does not zero it).  Then
+`COLOUR_ALPHA_QUAD=0 COLOUR_ALPHA_PROG=1` draws a quad through the T2-free
+RGBA program, which inherits that T2.  The quad draws if and only if the
+inherited T2 lies inside the homogeneous clip volume:
+
+| T2 written (r,g,b,a) | quad |
+|---|---|
+| (0,0,0,1) from an RGB colour (0,0,0), (1,1,1,1), (0,0,0,0.01), (0,0,0,2), (0,1,0,1) | drawn |
+| (0,1,0,0), (0,0,0,0), (0,0,0,-1), (0,1,0,0.5), (1,0,0,0.5), (0.5,0.5,0.5,0.25), (2,0,0,1) | nothing |
+
+So T2 is the clip-space position the setup stage trivially rejects against
+(`-w <= x,y,z <= w`, `w > 0`).  This explains, in one rule:
+
+* the RGBA pass-through rejecting a triangle whose colour has a channel above
+  its alpha or alpha 0 (section 5.2's finding);
+* T2-free programs (the RGBA program, the textured programs, the transform
+  programs) drawing nothing or dropping triangles depending on which T2 the
+  last T2-writing draw - of any client - left behind: after power-on and the
+  `parhelia-up.sh` warm-up, Mesa's 7-dword RGBA quads lost their second
+  triangle (vertex-count, 5 of 5 power cycles) until a draw that writes T2 in
+  every vertex lane with an inside value (fog-modes, fogcoord-dp3, a TCL
+  draw) ran.  Mesa's `ph_prime_warp()` draws three identical vertices, which
+  reach only one lane;
+* vendor setup programs computing clip codes on T2 (`mtx1066`:
+  `slt T2., T2.xxxx, -T2.yyyy` ...).
+
+Not yet working: writing an inside T2 from the RGBA program itself.  `add T2,
+v0.0000, v0.0001`, `add T2, v5.0000, v5.0001`, `mul T2, v0.000w, r1.0000`,
+`mul T2, v0.0001, r1.0000/r1.1111` all left the quad dropped (the
+constant-swizzle digits do not give (0,0,0,1) in that slot).  `mul T2, v6,
+r1.0000` (an input the stream does not fetch) **stopped the engine** (watchdog
+power cycle 02:56) - never read an unfetched input.
