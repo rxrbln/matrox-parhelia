@@ -15,6 +15,8 @@
 
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "util/u_pstipple.h"
+#include "util/u_sampler.h"
 #include "compiler/nir/nir_constant_expressions.h"
 #include "draw/draw_context.h"
 #include "draw/draw_fs.h"
@@ -170,6 +172,11 @@ struct ph_fs {
    bool coord_src_known[PIPE_MAX_SAMPLERS];
    uint8_t coord_src_name[PIPE_MAX_SAMPLERS];
    uint8_t coord_src_index[PIPE_MAX_SAMPLERS];
+   /* This program with the polygon stipple's kill on unit stipple_unit. */
+   struct ph_fs *stipple;
+   unsigned stipple_unit;
+   bool stipple_failed;
+   bool stipple_affine;    /* a stipple variant sampling nothing else */
 };
 
 /* Semantic index of the extra attribute carrying unit k's uniform coordinate,
@@ -180,6 +187,7 @@ struct ph_uniform_coord {
    nir_def *coord, *projector;
    unsigned unit;          /* the GL unit, as ph_unit_texcoord() looks it up */
    unsigned comps;
+   bool window;            /* the stipple's window position / 32 instead */
 };
 
 struct ph_transfer {
@@ -317,6 +325,13 @@ struct ph_context {
     * original family keeps its previous paths until measured there. */
    bool z_grid, logicop_grid, kill_alpha;
    bool broadcasting;      /* ph_draw_broadcast is replaying a draw */
+   /* Polygon stipple: the pattern as a 32x32 kill texture, see
+    * ph_draw_stippled(). */
+   uint32_t stipple[32];
+   bool stipple_dirty, stippling;
+   struct pipe_resource *stipple_tex;
+   struct pipe_sampler_view *stipple_view;
+   void *stipple_sampler;
    /* The framebuffer as the state tracker set it, and the stand-in render
     * resources for surfaces the engine cannot address in place (a mip level
     * above 0 or a slice): ctx->fb binds the stand-ins. */
@@ -5548,7 +5563,9 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	/* The textured stream carries z and 1/w, so the setup unit interpolates
 	 * perspective-correctly (ph-glprobe perspective, exact on the 0528). */
 	/* PARHELIA_NO_OOW=1 (diagnostic) keeps the affine stream. */
-	oow = textured && !native_sampled_alpha && !colour1 &&
+	/* The stipple's window coordinates interpolate linearly. */
+	oow = textured && !ctx->fs->stipple_affine &&
+	      !native_sampled_alpha && !colour1 &&
 	      !cpu_alpha_cutout && !rgb_alpha_two_pass && !alpha_micro &&
 	      !alpha_micro_cutout && !three_coord && !ph_env("PARHELIA_NO_OOW");
 	if (oow)
@@ -7894,6 +7911,8 @@ struct ph_quant_stage {
    unsigned coord_count;
    int coord_slot[P3D_MAX_TEXTURE_UNITS];
    float coord[P3D_MAX_TEXTURE_UNITS][4];
+   bool coord_window[P3D_MAX_TEXTURE_UNITS];
+   int win_slot;
    /* A constant window depth for every vertex (depth_uniform). */
    bool const_z;
    int pos_slot;
@@ -7935,8 +7954,15 @@ ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
    struct ph_quant_stage *q = (struct ph_quant_stage *)stage;
    struct vertex_header *out = dup_vert(stage, v, idx);
 
-   for (unsigned i = 0; i < q->coord_count; i++)
-      memcpy(out->data[q->coord_slot[i]], q->coord[i], sizeof(q->coord[i]));
+   for (unsigned i = 0; i < q->coord_count; i++) {
+      float *c = out->data[q->coord_slot[i]];
+
+      memcpy(c, q->coord[i], sizeof(q->coord[i]));
+      if (q->coord_window[i]) {
+         c[0] = out->data[q->win_slot][0] * (1.0f / 32.0f);
+         c[1] = out->data[q->win_slot][1] * (1.0f / 32.0f);
+      }
+   }
    if (q->const_z)
       out->data[q->pos_slot][2] = q->z;
    for (unsigned i = 0; i < q->rect_count; i++) {
@@ -8219,6 +8245,7 @@ static bool
 ph_fix_coords(struct ph_context *ctx, struct ph_quant_stage *q)
 {
    q->coord_count = 0;
+   q->win_slot = draw_current_shader_position_output(ctx->draw);
    for (unsigned i = 0; ctx->fs && i < ctx->fs->ucoord_count; i++) {
       const struct ph_uniform_coord *u = &ctx->fs->ucoord[i];
       nir_const_value v[NIR_MAX_VEC_COMPONENTS], w[NIR_MAX_VEC_COMPONENTS];
@@ -8231,6 +8258,7 @@ ph_fix_coords(struct ph_context *ctx, struct ph_quant_stage *q)
          out[c] = c < u->comps ? v[c].f32 : c == 3 ? 1.0f : 0.0f;
       if (u->projector)
          out[3] = w[0].f32;
+      q->coord_window[q->coord_count] = u->window;
       q->coord_slot[q->coord_count++] =
          draw_alloc_extra_vertex_attrib(ctx->draw, TGSI_SEMANTIC_TEXCOORD,
                                         PH_UNIFORM_COORD_INDEX(u->unit));
@@ -8664,6 +8692,153 @@ ph_draw_broadcast(struct ph_context *ctx, const struct pipe_draw_info *info,
    return true;
 }
 
+static void *ph_create_fs(struct pipe_context *p,
+                          const struct pipe_shader_state *s);
+static void ph_delete_fs(struct pipe_context *p, void *s);
+
+/* @fs with "discard if the stipple texel is set" on the unit after its
+ * samplers, which the discard path turns into an alpha test; the vendor
+ * kills through a texture unit the same way (TEXKILL on a 32x32 texture
+ * at window coordinates / 32).  NULL when the program cannot take it. */
+static struct ph_fs *
+ph_fs_stipple_variant(struct ph_context *ctx, struct ph_fs *fs)
+{
+   const unsigned unit = util_last_bit(fs->sampler_mask);
+   struct pipe_shader_state state = { .type = PIPE_SHADER_IR_NIR };
+   nir_shader *src, *nir;
+   nir_tex_instr *tex;
+   struct ph_fs *v;
+
+   if (fs->stipple || fs->stipple_failed)
+      return fs->stipple;
+   fs->stipple_failed = true;
+   if (!fs->draw || fs->draw->base.type != PIPE_SHADER_IR_NIR ||
+       unit >= P3D_MAX_TEXTURE_UNITS)
+      return NULL;
+   src = fs->draw->base.ir.nir;
+   if (src->info.fs.uses_discard)
+      return NULL;
+   nir = nir_shader_clone(NULL, src);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+
+   tex = nir_tex_instr_create(nir, 1);
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_float32;
+   tex->texture_index = tex->sampler_index = unit;
+   /* A placeholder: the vertex stage stages the window position. */
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord,
+                                     nir_imm_vec2(&b, 0.0f, 0.0f));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_discard_if(&b, nir_fneu_imm(&b, nir_channel(&b, &tex->def, 0), 0.0));
+   nir->info.fs.uses_discard = true;
+   BITSET_SET(nir->info.textures_used, unit);
+   BITSET_SET(nir->info.samplers_used, unit);
+   nir_progress(true, impl, nir_metadata_none);
+
+   state.ir.nir = nir;
+   v = ph_create_fs(&ctx->base, &state);
+   if (!v || v->drop_reason || !v->kill) {
+      ph_delete_fs(&ctx->base, v);
+      ralloc_free(nir);
+      return NULL;
+   }
+   for (unsigned i = 0; i < v->ucoord_count; i++)
+      v->ucoord[i].window = v->ucoord[i].unit == unit;
+   v->stipple_affine = !fs->sampler_mask;
+   fs->stipple = v;
+   fs->stipple_unit = unit;
+   fs->stipple_failed = false;
+   return v;
+}
+
+static bool
+ph_stipple_texture(struct ph_context *ctx)
+{
+   if (!ctx->stipple_tex) {
+      const struct pipe_resource templ = {
+         .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_R8_UNORM,
+         .width0 = 32, .height0 = 32, .depth0 = 1, .array_size = 1,
+         .bind = PIPE_BIND_SAMPLER_VIEW,
+      };
+      struct pipe_sampler_view vt;
+
+      ctx->stipple_tex = ctx->base.screen->resource_create(ctx->base.screen,
+                                                           &templ);
+      if (!ctx->stipple_tex)
+         return false;
+      u_sampler_view_default_template(&vt, ctx->stipple_tex,
+                                      ctx->stipple_tex->format);
+      ctx->stipple_view = ctx->base.create_sampler_view(&ctx->base,
+                                                        ctx->stipple_tex, &vt);
+      ctx->stipple_sampler = util_pstipple_create_sampler(&ctx->base);
+      ctx->stipple_dirty = true;
+   }
+   if (!ctx->stipple_view || !ctx->stipple_sampler)
+      return false;
+   if (ctx->stipple_dirty) {
+      util_pstipple_update_stipple_texture(&ctx->base, ctx->stipple_tex,
+                                           ctx->stipple);
+      ctx->stipple_dirty = false;
+   }
+   return true;
+}
+
+/* Polygon stipple for filled polygons: replay the draw with the stipple
+ * variant of the program and the pattern bound on its unit.  Like the
+ * vendor, a program without a free unit draws unstippled. */
+static bool
+ph_draw_stippled(struct ph_context *ctx, const struct pipe_draw_info *info,
+                 unsigned drawid_offset,
+                 const struct pipe_draw_start_count_bias *draws)
+{
+   const struct pipe_rasterizer_state *rs = ctx->rasterizer;
+   struct pipe_sampler_view *old_view = NULL;
+   struct ph_fs *fs = ctx->fs, *v;
+   bool all_on = true, all_off = true;
+   void *old_sampler;
+   unsigned unit;
+
+   if (ctx->stippling || !rs || !rs->poly_stipple_enable || !fs ||
+       u_reduced_prim(info->mode) != MESA_PRIM_TRIANGLES ||
+       rs->fill_front != PIPE_POLYGON_MODE_FILL ||
+       rs->fill_back != PIPE_POLYGON_MODE_FILL)
+      return false;
+   for (unsigned i = 0; i < 32; i++) {
+      all_on &= ctx->stipple[i] == ~0u;
+      all_off &= !ctx->stipple[i];
+   }
+   if (all_on)
+      return false;
+   if (all_off)
+      return true;
+   if (!(v = ph_fs_stipple_variant(ctx, fs)) || !ph_stipple_texture(ctx)) {
+      PH_REFUSE("polygon stipple needs a free texture unit and a discard-free program; drawn unstippled\n");
+      return false;
+   }
+   unit = fs->stipple_unit;
+   pipe_sampler_view_reference(&old_view, ctx->bound_views[unit]);
+   old_sampler = ctx->bound_samplers[unit];
+   ctx->stippling = true;
+   ctx->base.bind_fs_state(&ctx->base, v);
+   ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, unit, 1, 0,
+                               &ctx->stipple_view);
+   ctx->base.bind_sampler_states(&ctx->base, MESA_SHADER_FRAGMENT, unit, 1,
+                                 &ctx->stipple_sampler);
+   ctx->base.draw_vbo(&ctx->base, info, drawid_offset, NULL, draws, 1);
+   ctx->base.bind_sampler_states(&ctx->base, MESA_SHADER_FRAGMENT, unit, 1,
+                                 &old_sampler);
+   ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, unit, 1, 0,
+                               &old_view);
+   ctx->base.bind_fs_state(&ctx->base, fs);
+   ctx->stippling = false;
+   pipe_sampler_view_reference(&old_view, NULL);
+   return true;
+}
+
 static void
 ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
             unsigned drawid_offset, const struct pipe_draw_indirect_info *indirect,
@@ -8678,6 +8853,8 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       return;
    }
    if (!num_draws || indirect || ctx->submit_error)
+      return;
+   if (ph_draw_stippled(ctx, info, drawid_offset, draws))
       return;
    if (ph_draw_broadcast(ctx, info, drawid_offset, draws))
       return;
@@ -9820,6 +9997,12 @@ static void ph_delete_fs(struct pipe_context *p, void *s)
 {
    struct ph_fs *fs = s;
    if (fs) {
+      if (fs->stipple) {
+         nir_shader *nir = fs->stipple->draw->base.ir.nir;
+
+         ph_delete_fs(p, fs->stipple);
+         ralloc_free(nir);
+      }
       draw_delete_fragment_shader(ph_context(p)->draw, fs->draw);
       if (fs->kill) {
          ph_fs_program_fini(&fs->kill->alpha_x);
@@ -9982,9 +10165,17 @@ static void ph_set_stencil_ref(struct pipe_context *p,
 }
 static void ph_noop_sample_mask(struct pipe_context *p, unsigned m)
 { (void)p; (void)m; }
-static void ph_noop_stipple(struct pipe_context *p,
-                            const struct pipe_poly_stipple *s)
-{ (void)p; (void)s; }
+static void ph_set_polygon_stipple(struct pipe_context *p,
+                                   const struct pipe_poly_stipple *s)
+{
+   struct ph_context *ctx = ph_context(p);
+
+   if (!memcmp(ctx->stipple, s->stipple, sizeof(ctx->stipple)))
+      return;
+   ph_submit_vertices(ctx);
+   memcpy(ctx->stipple, s->stipple, sizeof(ctx->stipple));
+   ctx->stipple_dirty = true;
+}
 
 /* Move an upload-class sampler image that is about to become a colour
  * buffer into render-target storage, keeping its level-0 texels.  The upload
@@ -12095,6 +12286,10 @@ ph_destroy_context(struct pipe_context *p)
    for (unsigned i = 0; i < MESA_SHADER_STAGES; i++)
       pipe_resource_reference(&ctx->constants[i], NULL);
    ph_proxy_release(ctx);
+   pipe_sampler_view_reference(&ctx->stipple_view, NULL);
+   pipe_resource_reference(&ctx->stipple_tex, NULL);
+   if (ctx->stipple_sampler)
+      p->delete_sampler_state(p, ctx->stipple_sampler);
    util_unreference_framebuffer_state(&ctx->fb_api);
    util_unreference_framebuffer_state(&ctx->fb);
    if (p->stream_uploader)
@@ -12349,7 +12544,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.set_blend_color = ph_set_blend_color;
    ctx->base.set_stencil_ref = ph_set_stencil_ref;
    ctx->base.set_sample_mask = ph_noop_sample_mask;
-   ctx->base.set_polygon_stipple = ph_noop_stipple;
+   ctx->base.set_polygon_stipple = ph_set_polygon_stipple;
    ctx->base.buffer_map = ph_buffer_map;
    ctx->base.texture_map = ph_texture_map;
    ctx->base.buffer_unmap = ph_buffer_unmap;
