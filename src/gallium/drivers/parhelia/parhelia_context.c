@@ -283,14 +283,21 @@ ph_mip_layer_texel_offset(const struct ph_mip_layout *mip, unsigned level,
          ph_volume_texel_offset(x + mip->level[level].tail_x,
                                 y + mip->level[level].tail_y, layer, 32,
                                 mip->slices, cpp);
-   /* the original family stacks cube faces as rows of one 64x32 image */
+   /* The original family's cube faces follow each other in 32x32 cells,
+    * which for one level is the faces stacked as rows of one image. */
+   if (mip->native_64x32 && mip->cube && !linear) {
+      const struct ph_mip_level *image = &mip->level[level];
+      const size_t cells = image->pitch / 32 *
+                           (ph_mip_align(image->height, 32) / 32);
+
+      return ph_64x32_cell_texel_offset(image->offset / 0x2000 * 2 +
+                                        image->half + layer * cells,
+                                        x, y, image->pitch);
+   }
    if (mip->native_64x32 && mip->slices && !linear)
-      return mip->level[level].offset + (mip->cube ?
-         p3d_texture_tile_offset_64x32(x, y + layer *
-                                       ph_mip_align(mip->level[level].height, 32),
-                                       mip->level[level].pitch) :
+      return mip->level[level].offset +
          ph_volume_texel_offset_64x32(x, y, layer, mip->level[level].pitch,
-                                      mip->slices, cpp));
+                                      mip->slices, cpp);
    if (mip->slices && !mip->cube && !linear)
       return mip->level[level].offset +
          ph_volume_texel_offset(x, y, layer, mip->level[level].pitch,
@@ -4870,6 +4877,11 @@ ph_submit_vertices(struct ph_context *ctx)
       }
       tex.max_level = texture_mipped ?
          ph_view_mip_levels(texture, ctx->sampler_views[0]) - 1 : 0;
+      /* PARHELIA_0528_CUBE_LEVEL_FIELD=1 (diagnostic): the vendor's cube level
+       * field holds the level count, not count - 1 (mtx3887 0x279ad) */
+      if (texture->mip.native_64x32 && texture->mip.cube &&
+          ph_env("PARHELIA_0528_CUBE_LEVEL_FIELD"))
+         tex.max_level++;
       ph_apply_view_base(texture, ctx->sampler_views[0], texture_tiled, &tex);
       tex.filter = ph_sampler_filter_word(&tex, sampler, ph_max_lod_bias(ctx));
       tex.wrap = ph_sampler_wrap_word(&tex, sampler);

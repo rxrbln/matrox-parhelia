@@ -838,9 +838,9 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    const bool cube_probe = cube_target && p690_native_texture32 &&
                            ph_env("PARHELIA_CUBE_PROBE");
    const bool cube_chain = cube_target && p690_native_texture32;
-   /* PARHELIA_0528_CUBE_CHAIN=1 (diagnostic): levels above 0 of an original-
-    * family cube far beyond level 0, so an address fill shows where the
-    * unit reads them */
+   /* PARHELIA_0528_CUBE_CHAIN=1 (diagnostic): an original-family cube chain in
+    * the vendor order (mtx3887: level-major, six faces per level), in 32x32
+    * cells, to measure */
    const bool o528_cube_chain_probe = cube_target && o528_layered &&
                                       ph_env("PARHELIA_0528_CUBE_CHAIN");
    /* P690 NPOT chains, 2-D and cube, are exact for every texel of every
@@ -937,19 +937,21 @@ ph_resource_create_class(struct pipe_screen *pscreen,
                        0x2000;
       }
       if (o528_cube_chain_probe) {
-         size_t next = r->mip.size * 4;
+         size_t cell = 0;
 
-         for (unsigned l = 1; l < mip_levels; l++) {
+         for (unsigned l = 0; l < mip_levels; l++) {
             struct ph_mip_level *level = &r->mip.level[l];
+            const size_t cells = ph_mip_align(level->width, 32) / 32 *
+                                 (ph_mip_align(level->height, 32) / 32);
 
             level->pitch = ph_mip_align(level->width, 32);
             level->tail_x = level->tail_y = 0;
-            level->offset = next;
-            level->bytes = (size_t)level->pitch *
-                           ph_mip_align(level->height, 32) * 4;
-            next += ph_mip_align(level->bytes * slices, 0x2000);
+            level->offset = cell / 2 * 0x2000;
+            level->half = cell & 1;
+            level->bytes = cells * 0x1000;
+            cell += cells * slices;
          }
-         r->mip.size = next;
+         r->mip.size = (cell + 1) / 2 * 0x2000;
       }
       /* The P690 cube chain (PARHELIA_CUBE_PROBE, every texel of 32..256
        * cubes): levels above 16x16 hold six whole face images, each the

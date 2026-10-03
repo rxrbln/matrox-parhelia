@@ -21,6 +21,19 @@
 #include "parhelia_mipmap.h"
 #include "reference/parhelia3d.h"
 
+/* Byte offset of texel (x,y) of a 64x32-order image that starts at 32x32
+ * cell @cell: an odd start runs one cell later, next tile and other half. */
+static inline size_t
+ph_64x32_cell_texel_offset(size_t cell, unsigned x, unsigned y, unsigned pitch)
+{
+   size_t offset = p3d_texture_tile_offset_64x32(x, y, pitch);
+
+   if (cell & 1)
+      offset = (offset + ((((y >> 5) * (pitch >> 5) + (x >> 5)) & 1u) ?
+                          0x2000u : 0u)) ^ 0x200u;
+   return cell / 2 * 0x2000 + offset;
+}
+
 /* Byte offset of texel (x,y) of @level in a chain of @cpp-byte texels. */
 static inline size_t
 ph_mip_texel_offset_cpp(const struct ph_mip_layout *mip, unsigned level,
@@ -41,15 +54,9 @@ ph_mip_texel_offset_cpp(const struct ph_mip_layout *mip, unsigned level,
       return p3d_texture_tile_offset_64x16_at(image->offset, x, y,
                                               physical_pitch);
    /* ph_mip_physical_coords() has already added the level's tail position. */
-   if (mip->native_64x32) {
-      size_t offset = p3d_texture_tile_offset_64x32(x, y, image->pitch);
-
-      /* a right-half level runs one cell later: next tile, other half */
-      if (image->half)
-         offset = (offset + ((((y >> 5) * (image->pitch >> 5) + (x >> 5)) & 1u) ?
-                             0x2000u : 0u)) ^ 0x200u;
-      return image->offset + offset;
-   }
+   if (mip->native_64x32)
+      return ph_64x32_cell_texel_offset(image->offset / 0x2000 * 2 + image->half,
+                                        x, y, image->pitch);
    if (mip->p690_narrow)
       return image->offset +
          p3d_texture_tile_offset_p690_narrow(x, y, image->pitch, cpp);
