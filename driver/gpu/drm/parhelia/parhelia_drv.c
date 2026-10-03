@@ -134,10 +134,46 @@ MODULE_PARM_DESC(bind_uninitialized,
  * cold bring-up sequence is implemented. */
 static bool parhelia_firmware_initialized(struct pci_dev *pci)
 {
-	u16 command = 0;
+	u16 command = 0, pmcsr = 0;
+	u32 bar0 = 0;
 
 	pci_read_config_word(pci, PCI_COMMAND, &command);
-	return command & PCI_COMMAND_MEMORY;
+	if (command & PCI_COMMAND_MEMORY)
+		return true;
+	/* A D3hot->D0 transition (PMCSR, NoSoftRst-) also clears decode and the
+	 * BARs: tell that apart from a board firmware never POSTed. */
+	if (pci->pm_cap)
+		pci_read_config_word(pci, pci->pm_cap + PCI_PM_CTRL, &pmcsr);
+	pci_read_config_dword(pci, PCI_BASE_ADDRESS_0, &bar0);
+	dev_info(&pci->dev, "decode off: COMMAND %04x PMCSR %04x BAR0 %08x (resource %pa)\n",
+		 command, pmcsr, bar0, &pci->resource[0].start);
+	return false;
+}
+
+/* The vendor's chip liveness test (HSLS90/HSLPARInitializeHardware): a
+ * synthesiser register reading 0 or its power-on value means the clocks
+ * were never programmed, or were lost to a reset.  All ones means the
+ * device no longer answers at its MMIO BAR. */
+static int parhelia_chip_alive(struct parhelia_device *pdev)
+{
+	bool sun90 = pdev->chip->clock_family == PARHELIA_CLOCK_SUN90;
+	u32 reg = sun90 ? 0x0e24 : 0x0e00;
+	u32 cold = sun90 ? 0x80000000u : 0x40000000u;
+	u32 v = parhelia_read(pdev, reg);
+
+	if (v == ~0u) {
+		dev_err(&pdev->pdev->dev,
+			"MMIO %04x reads all ones: the device does not answer (link or BARs lost), a power cycle is required\n",
+			reg);
+		return -EIO;
+	}
+	if (v == 0 || v == cold) {
+		dev_err(&pdev->pdev->dev,
+			"MMIO %04x = %08x: chip clocks are not programmed (POST state lost), cold bring-up is required\n",
+			reg, v);
+		return -ENODEV;
+	}
+	return 0;
 }
 
 DEFINE_DRM_GEM_FOPS(parhelia_fops);
@@ -437,6 +473,11 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	pdev->mmio = pcim_iomap(pci, mmio_bar, 0);
 	if (!pdev->vram || !pdev->mmio)
 		return dev_err_probe(&pci->dev, -ENOMEM, "cannot map BARs\n");
+	if (posted) {
+		ret = parhelia_chip_alive(pdev);
+		if (ret)
+			return ret;
+	}
 	ret = parhelia_host_aperture_snapshot(pdev);
 	if (ret)
 		return ret;
