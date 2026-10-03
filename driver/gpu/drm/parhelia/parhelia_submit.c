@@ -3350,7 +3350,9 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 		drm_gem_object_put(&bo->bo.base);
 		return ret;
 	}
-	if ((args->flags & PARHELIA_CREATE_RENDER_NATIVE_COLOR) && cpp == 4)
+	/* the original family has no native classes: its plain targets */
+	if (((args->flags & PARHELIA_CREATE_RENDER_NATIVE_COLOR) ||
+	     (!args->flags && parhelia_original_family(pdev))) && cpp == 4)
 		parhelia_t2_prime_once(pdev, file, bo, args->width, args->height,
 				       pitch_pixels);
 	ret = parhelia_bo_clear(pdev, file, bo);
@@ -5163,6 +5165,15 @@ int parhelia_bo_clear(struct parhelia_device *pdev, struct drm_file *file,
  * emitter's own image for that draw into a 64x16 target (parhelia-drm-test
  * --t2-prime-dump 8 64); the WARP entry, pitch and guard band are patched. */
 #define PARHELIA_T2_PRIME_SLOTS	8u
+/* The original family's clients pack at most two primitives per packet,
+ * and only a two-primitive prime is measured there (0528). */
+#define PARHELIA_T2_PRIME_SLOTS_ORIGINAL	2u
+
+static u32 parhelia_t2_prime_slots(const struct parhelia_device *pdev)
+{
+	return parhelia_original_family(pdev) ?
+	       PARHELIA_T2_PRIME_SLOTS_ORIGINAL : PARHELIA_T2_PRIME_SLOTS;
+}
 
 static const u32 parhelia_t2_prime_words[] = {
 		0x00000023, 0xbebfcbca, 0x00000000, 0x00100040, 0x0bb80024, 0x007fe000,
@@ -5215,6 +5226,7 @@ static int parhelia_t2_prime(struct parhelia_device *pdev, struct drm_file *file
 	struct drm_parhelia_reloc *relocs;
 	struct drm_gem_object *objects[3] = { };
 	u32 vertices[PARHELIA_T2_PRIME_SLOTS * 3 * 5] = { };
+	const u32 slots = parhelia_t2_prime_slots(pdev);
 	u32 *commands, v;
 	int ret;
 
@@ -5235,10 +5247,11 @@ static int parhelia_t2_prime(struct parhelia_device *pdev, struct drm_file *file
 	commands[43] = commands[44] =
 		parhelia_warp_entry(pdev, PARHELIA_WARP_PASSTHROUGH_ENTRY);
 	commands[70] = pitch_pixels | (2u << 16) | (0x32u << 24);
-	/* the vendor's LX guard band, KRN mtx2572 */
-	commands[86] = 0x41f80000;
+	/* the vendor's LX guard band, KRN mtx2572; the original keeps 32.0 */
+	if (!parhelia_original_family(pdev))
+		commands[86] = 0x41f80000;
 	/* x, y, r, g, b: distinct small triangles, colour black */
-	for (v = 0; v < PARHELIA_T2_PRIME_SLOTS * 3; v++) {
+	for (v = 0; v < slots * 3; v++) {
 		vertices[v * 5] = parhelia_f32_from_small(
 			(v / 3) * 4 % 60 + (v % 3 == 1) * 3);
 		vertices[v * 5 + 1] = parhelia_f32_from_small((v % 3 == 2) * 3);
@@ -5248,14 +5261,14 @@ static int parhelia_t2_prime(struct parhelia_device *pdev, struct drm_file *file
 	relocs[1] = (struct drm_parhelia_reloc){
 		.packet = 5, .dword = 4, .type = PARHELIA_RELOC_VRAM };
 	relocs[2] = (struct drm_parhelia_reloc){
-		.packet = npackets - 1, .dword = 0, .delta = sizeof(vertices),
-		.type = PARHELIA_RELOC_DRAW };
+		.packet = npackets - 1, .dword = 0,
+		.delta = slots * 3 * 5 * sizeof(u32), .type = PARHELIA_RELOC_DRAW };
 	objects[0] = objects[1] = &gbo->bo.base;
 	args.command_dwords = ndwords;
 	args.packet_count = npackets;
 	args.reloc_count = 3;
 	args.vertices = (uintptr_t)vertices;
-	args.vertex_dwords = ARRAY_SIZE(vertices);
+	args.vertex_dwords = slots * 3 * 5;
 	args.flags = PARHELIA_SUBMIT_FENCE;
 	ret = parhelia_submit_check(&args);
 	if (!ret)
@@ -5275,7 +5288,8 @@ void parhelia_t2_prime_once(struct parhelia_device *pdev, struct drm_file *file,
 {
 	int ret;
 
-	if (pdev->pdev->device != PARHELIA_P690 || pdev->t2_primed ||
+	if ((pdev->pdev->device != PARHELIA_P690 &&
+	     !parhelia_original_family(pdev)) || pdev->t2_primed ||
 	    width < 64 || height < 16)
 		return;
 	ret = parhelia_t2_prime(pdev, file, gbo, pitch_pixels);
@@ -5283,7 +5297,7 @@ void parhelia_t2_prime_once(struct parhelia_device *pdev, struct drm_file *file,
 		pdev->t2_primed = true;
 		dev_info(&pdev->pdev->dev,
 			 "WARP T2 prime: %u slots on a %ux%u target\n",
-			 PARHELIA_T2_PRIME_SLOTS, width, height);
+			 parhelia_t2_prime_slots(pdev), width, height);
 	}
 	else if (ret != -EINTR && ret != -ERESTARTSYS)
 		dev_warn_ratelimited(&pdev->pdev->dev,

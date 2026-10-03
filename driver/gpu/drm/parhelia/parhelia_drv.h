@@ -833,6 +833,13 @@ int parhelia_vram_clear(struct parhelia_device *pdev,
 int parhelia_vram_clear_range(struct parhelia_device *pdev,
 			      struct drm_gem_vram_object *gbo, u64 offset,
 			      u64 len);
+/* 0x0527 / 0x0528, the original Parhelia */
+static inline bool parhelia_original_family(const struct parhelia_device *pdev)
+{
+	return pdev->pdev->device == PARHELIA_512 ||
+	       pdev->pdev->device == PARHELIA_8X;
+}
+
 void parhelia_t2_prime_once(struct parhelia_device *pdev, struct drm_file *file,
 			    struct drm_gem_vram_object *gbo, u32 width,
 			    u32 height, u32 pitch_pixels);
