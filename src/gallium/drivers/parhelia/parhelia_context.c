@@ -13681,6 +13681,13 @@ ph_prepare_rgb5a1(struct parhelia_resource *texture)
    }
    if (!texture->rgb5a1_eligible)
       return false;
+   /* The two-byte order must fit the four-byte image's storage. */
+   for (unsigned y = 0; y < texture->base.height0; y++)
+      for (unsigned x = 0; x < texture->base.width0; x++)
+         if (p3d_texture_tile_offset_chip(x, y, pitch, 2,
+                ph_screen(texture->base.screen)->chip_id,
+                texture->tile_layout) + 2 > texture->size)
+            return false;
    for (unsigned y = 0; y < texture->base.height0; y++)
       for (unsigned x = 0; x < texture->base.width0; x++) {
          const uint8_t *p = src + (size_t)y * texture->linear_stride + x * 4;

@@ -424,6 +424,31 @@ p3d_texture_tile_offset_64x32(uint32_t x, uint32_t y, uint32_t pitch)
 	return tile * P3D_TILE_BYTES + i * 4;
 }
 
+/* The original family reads a two-byte texel in 64x64 tiles of 8 KiB, x bit 5
+ * XORed with the tile-row parity like the 32-bit order (MEASURED on the 0528:
+ * self-indexing A1R5G5B5 images of 32, 64 and 128 texels through the sampler). */
+uint32_t
+p3d_texture_tile_offset_o528_16(uint32_t x, uint32_t y, uint32_t pitch)
+{
+	uint32_t trow = y / 64, iy = y % 64;
+	uint32_t tile = (trow * pitch + x) / 64;
+	uint32_t i;
+
+	i =  ( x         & 1)       |
+	     ((x >> 1)   & 1) << 1  |
+	     ( iy        & 1) << 2  |
+	     ((x >> 2)   & 1) << 3  |
+	     ((iy >> 1)  & 1) << 4  |
+	     ((x >> 3)   & 1) << 5  |
+	     ((x >> 4)   & 1) << 6  |
+	     (((x >> 5) ^ trow) & 1) << 7 |
+	     ((iy >> 5)  & 1) << 8  |
+	     ((iy >> 2)  & 1) << 9  |
+	     ((iy >> 3)  & 1) << 10 |
+	     ((iy >> 4)  & 1) << 11;
+	return tile * 8192u + i * 2;
+}
+
 bool
 p3d_texture_uses_native_64x32(uint32_t chip_id, uint32_t tile_layout,
 			      unsigned cpp)
@@ -473,5 +498,7 @@ p3d_texture_tile_offset_chip(uint32_t x, uint32_t y, uint32_t pitch,
 		return p3d_texture_tile_offset_p690_narrow(x, y, pitch, cpp);
 	if (p3d_texture_uses_native_64x32(chip_id, tile_layout, cpp))
 		return p3d_texture_tile_offset_64x32(x, y, pitch);
+	if (p3d_texture_uses_native_64x32(chip_id, tile_layout, 4) && cpp == 2)
+		return p3d_texture_tile_offset_o528_16(x, y, pitch);
 	return p3d_texture_tile_offset_cpp(x, y, pitch, cpp);
 }

@@ -1167,6 +1167,7 @@ uint32_t p3d_texture_tile_offset_p690_narrow(uint32_t x, uint32_t y,
 bool p3d_texture_uses_p690_narrow(uint32_t chip_id, uint32_t tile_layout,
 				  unsigned cpp);
 uint32_t p3d_texture_tile_offset_64x32(uint32_t x, uint32_t y, uint32_t pitch);
+uint32_t p3d_texture_tile_offset_o528_16(uint32_t x, uint32_t y, uint32_t pitch);
 bool p3d_texture_uses_native_64x32(uint32_t chip_id, uint32_t tile_layout,
 				   unsigned cpp);
 bool p3d_texture_uses_native_64x16(uint32_t chip_id, uint32_t tile_layout,
