@@ -11113,7 +11113,10 @@ ph_resource_copy_region(struct pipe_context *p,
    }
    if (dst->target == PIPE_BUFFER || src->target == PIPE_BUFFER)
       return;
-   bool ok = !dstz && !src_box->z &&
+   /* The direct copy writes the plain 2-D order; slice 0 of a volume
+    * interleaves with the others from texel row 16 on. */
+   bool ok = !dstz && !src_box->z && !ph_resource(dst)->mip.slices &&
+             !ph_resource(src)->mip.slices &&
              ph_copy_texture_box(ctx, dst, dst_level, dstx, dsty, src,
                                  src_level, src_box, src_box->width,
                                  src_box->height);
@@ -11125,9 +11128,9 @@ ph_resource_copy_region(struct pipe_context *p,
       ok = !ctx->submit_error;
    }
    if (ph_env("PARHELIA_TRACE_COPY"))
-      fprintf(stderr, "parhelia: copy %ux%u l%u -> %ux%u l%u at %d,%d box %d,%d %dx%d: %s (err %d)\n",
+      fprintf(stderr, "parhelia: copy %ux%u l%u -> %ux%u l%u at %d,%d,%d box %d,%d %dx%d: %s (err %d)\n",
               src->width0, src->height0, src_level, dst->width0,
-              dst->height0, dst_level, dstx, dsty, src_box->x, src_box->y,
+              dst->height0, dst_level, dstx, dsty, dstz, src_box->x, src_box->y,
               src_box->width, src_box->height, ok ? "ok" : "FAILED",
               ctx->submit_error);
 }
