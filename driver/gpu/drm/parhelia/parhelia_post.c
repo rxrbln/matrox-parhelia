@@ -174,6 +174,69 @@ bool parhelia_fs_solve(u32 target_khz, const struct parhelia_fs_limits *lim,
 	return best != U32_MAX;
 }
 
+/* PInS PLL record @index: the six limit words, megahertz in the record. */
+bool parhelia_fs_pins_limits(const struct parhelia_bios *bios,
+			     unsigned int index, struct parhelia_fs_limits *lim)
+{
+	unsigned int record = PARHELIA_PINS_PLL_RECORD(index);
+
+	if (!parhelia_pins_has(bios, record, 0x14))
+		return false;
+	lim->vco_min = parhelia_pins_u16(bios, record + 0x08) * 1000u;
+	lim->vco_max = parhelia_pins_u16(bios, record + 0x0a) * 1000u;
+	lim->vco2_min = parhelia_pins_u16(bios, record + 0x0c) * 1000u;
+	lim->vco2_max = parhelia_pins_u16(bios, record + 0x0e) * 1000u;
+	lim->out_min = parhelia_pins_u16(bios, record + 0x10) * 1000u;
+	lim->out_max = parhelia_pins_u16(bios, record + 0x12) * 1000u;
+	return lim->vco_min && lim->vco_max && lim->out_min && lim->out_max &&
+	       lim->vco2_min && lim->vco2_max;
+}
+
+/* §4.4a, the VBIOS SetPixelClock search: A, B, C, D first fit within 0.51 %.
+ * Returns the @skip'th acceptable candidate, so a caller can step past words
+ * that do not lock exactly as the ROM does. */
+bool parhelia_fs_rom_solve(u32 target_khz, const struct parhelia_fs_limits *lim,
+			   unsigned int skip, u32 *word, u32 *achieved_khz)
+{
+	const u32 ref = PARHELIA_FS_REFERENCE_KHZ;
+	u32 a_min = lim->vco_min / ref, a_max = lim->vco_max / ref;
+	u32 c_min = max(3u, a_min * ref / lim->out_max);
+	u32 c_max = a_max * ref / lim->out_min;
+	u32 b_min = max_t(u32, 3u, div_u64((u64)lim->vco2_max * c_min, a_max * ref));
+	u32 b_max = div_u64((u64)lim->vco2_min * c_max, a_min * ref);
+	u32 a, b, c, d;
+
+	if (!target_khz || !a_min || !c_max)
+		return false;
+	for (a = a_min; a <= a_max; a++)
+		for (b = b_min; b <= b_max; b++)
+			for (c = c_min; c <= c_max; c++)
+				for (d = 0; d <= 0x40; d += 2) {
+					u64 vco2 = (u64)ref * a * b;
+					u32 out = div_u64(vco2, c) / (d ? d : 2);
+
+					if (div_u64((u64)abs_diff(out, target_khz) * 10000,
+						    target_khz) >= 0x33)
+						continue;
+					if (a == 33 || d == 2)
+						continue;
+					if (ref * a < lim->vco_min ||
+					    ref * a > lim->vco_max ||
+					    ref * a / c < lim->out_min ||
+					    ref * a / c > lim->out_max ||
+					    div_u64(vco2, c) < lim->vco2_min ||
+					    div_u64(vco2, c) > lim->vco2_max)
+						continue;
+					if (skip--)
+						continue;
+					/* D == 0 is the ROM's spelling of the /2 bypass. */
+					*word = parhelia_fs_encode(a, b, c, d ? d : 2);
+					*achieved_khz = out;
+					return true;
+				}
+	return false;
+}
+
 /* §4.5: both lock bits, sampled 100 times after a fixed settle.  The primary
  * vendor path demands all 100; its fallback accepts 90. */
 bool parhelia_fs_locked(struct parhelia_device *pdev, u32 reg,

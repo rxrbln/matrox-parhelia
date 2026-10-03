@@ -397,11 +397,28 @@ static bool parhelia_sun90_clock_solve(u32 clock, u32 *word_out, u32 *actual_out
 	return false;
 }
 
+/* The original family takes its VBIOS's own search over the pixel
+ * synthesiser's PInS limits: the fixed-C solver above picks A = 33, which the
+ * vendor excludes and which ran 1680x1050 at twice its clock (MEASURED). */
+static bool parhelia_original_clock_solve(struct parhelia_device *pdev,
+					  u32 clock, unsigned int skip,
+					  u32 *word, u32 *actual)
+{
+	struct parhelia_fs_limits lim;
+
+	if (!parhelia_fs_pins_limits(&pdev->bios, PARHELIA_HSLPAR_PIXEL_FS, &lim))
+		return !skip && parhelia_hslpar_clock_solve(clock, word, actual);
+	return parhelia_fs_rom_solve(clock, &lim, skip, word, actual);
+}
+
 static bool parhelia_clock_solve(struct parhelia_device *pdev, u32 clock,
 				 u32 *word, u32 *actual)
 {
 	switch (pdev->chip->clock_family) {
 	case PARHELIA_CLOCK_HSLPAR:
+		if (parhelia_original_family(pdev))
+			return parhelia_original_clock_solve(pdev, clock, 0,
+							     word, actual);
 		return parhelia_hslpar_clock_solve(clock, word, actual);
 	case PARHELIA_CLOCK_SUN90:
 		return parhelia_sun90_clock_solve(clock, word, actual);
@@ -454,17 +471,26 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 
 	switch (pdev->chip->clock_family) {
 	case PARHELIA_CLOCK_HSLPAR:
-		/* Preserve the bits neither vendor writer ever sets. */
-		ctl = parhelia_read(pdev, 0x0e18) &
-		      (BIT(22) | BIT(23) | BIT(29));
-		parhelia_write(pdev, 0x0e18, ctl | word | BIT(31));
-		udelay(100);
-		parhelia_write(pdev, 0x0e18, ctl | word);
-		udelay(200);
-		if (!parhelia_fs_locked(pdev, 0x0e18, 90))
-			dev_warn(&pdev->pdev->dev,
-				 "pixel synthesiser reports no lock at %u kHz (word %#010x)\n",
-				 actual, word);
+		for (i = 1;; i++) {
+			/* Preserve the bits neither vendor writer ever sets. */
+			ctl = parhelia_read(pdev, 0x0e18) &
+			      (BIT(22) | BIT(23) | BIT(29));
+			parhelia_write(pdev, 0x0e18, ctl | word | BIT(31));
+			udelay(100);
+			parhelia_write(pdev, 0x0e18, ctl | word);
+			udelay(200);
+			if (parhelia_fs_locked(pdev, 0x0e18, 90))
+				break;
+			/* Like the VBIOS, step on to the next candidate. */
+			if (!parhelia_original_family(pdev) ||
+			    !parhelia_original_clock_solve(pdev, clock, i,
+							   &word, &actual)) {
+				dev_warn(&pdev->pdev->dev,
+					 "pixel synthesiser reports no lock at %u kHz (word %#010x)\n",
+					 actual, word);
+				break;
+			}
+		}
 		/* Route this head's own controller, then select the DC head's
 		 * clock source: without this write head 1's clock never
 		 * engaged on hardware. */

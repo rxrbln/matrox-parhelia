@@ -296,7 +296,8 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 #define PARHELIA_DVO_PWR_COMMON		BIT(2)
 /* The HSLPAR pixel path drives synthesiser index 2 (0x0e18) and a display
  * controller names it as clksel = index + 1 (section 10.1). */
-#define PARHELIA_HSLPAR_PIXEL_CLKSEL	3
+#define PARHELIA_HSLPAR_PIXEL_FS	2
+#define PARHELIA_HSLPAR_PIXEL_CLKSEL	(PARHELIA_HSLPAR_PIXEL_FS + 1)
 #define PARHELIA_REG_DVO_FORMAT2	0x1c54
 #define PARHELIA_REG_DVO_SYNC2		0x1c58
 #define PARHELIA_REG_DVO_DATA		0x1c70
@@ -743,6 +744,7 @@ enum parhelia_post_state {
 struct parhelia_fs_limits {
 	u32 vco_min, vco_max;
 	u32 out_min, out_max;
+	u32 vco2_min, vco2_max;
 };
 
 enum parhelia_post_state parhelia_post_state(struct parhelia_device *pdev);
@@ -751,6 +753,10 @@ bool parhelia_fs_solve(u32 target_khz, const struct parhelia_fs_limits *lim,
 		       u32 *word, u32 *achieved_khz);
 bool parhelia_fs_locked(struct parhelia_device *pdev, u32 reg,
 			unsigned int required);
+bool parhelia_fs_pins_limits(const struct parhelia_bios *bios,
+			     unsigned int index, struct parhelia_fs_limits *lim);
+bool parhelia_fs_rom_solve(u32 target_khz, const struct parhelia_fs_limits *lim,
+			   unsigned int skip, u32 *word, u32 *achieved_khz);
 void parhelia_bios_init(struct parhelia_device *pdev);
 bool parhelia_bios_parse(const u8 *rom, size_t size,
 			 struct parhelia_bios *bios);
