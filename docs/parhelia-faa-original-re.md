@@ -673,3 +673,43 @@ the FAA session between our batches.  Module faa0528-10 (`3263d41`) emits
 bit 3 keeps `0x307`) and admits `0x707` as an in-stream fence; the next
 hardware tests are the in-stream `0x707` fence between draw and resolve,
 then draw and resolve in separate batches.
+
+### 11.12 The vendor resolve submit, word for word [PROVEN, static]
+
+`sub_9E860` runs only while the FAA session flag `[ctx+0xe8]` is set
+(set by the session start `0x9d1b0`, cleared at the end of the resolve):
+
+1. On an owner change: retire the old owner and activate this one (4.2);
+   otherwise, when the global at `0x1d3ab0` is above 1, the engine preamble
+   `0x2dc20`.
+2. `0x2ec10(state, 0, 1)`: an ordinary validate of the current FAA state.
+3. `[4, 0x8d8c8988]` slots 0 and 2 (`0x1220`, `0x1224`, `0x1230`,
+   `0x1234`) and `[2, 0x21218b8a]` slot 1 (`0x1228`, `0x122c`), as saved at
+   session start.
+4. `sub_2E360`: `0x1324 = ~0`, `0x12cc`, `0x12d0`; `0x1300 = 0xc4`,
+   `0x132c = 0x0fff0fff`, `0x1328 = 0`, `0x12c8`; `0x12fc`; the 34-dword
+   setup-plane packet; then all state groups dirty (`|= 0x6400000f`).
+5. `[2, 0x2121c0c0]`: `DWGCTL = 9`, then the resume DWGCTL.
+6. `0x9d6e0(colour, 0x100)` and `0x9d6e0(depth, 0x200)`: tagged fences
+   `[4, 0xc0afafc0, 0x107 | 0x207, tag|1, tag, resume]`.
+7. All dirty words set to `~0`, state re-emitted (`0x2ce60`), session flag
+   cleared.
+
+The session start `0x9d1b0` sets `[depth+0x368] |= 8` and `[state+0x2c] = 1`,
+which makes the next validate emit the full engine preamble `0x2dc20`
+(guard band `0x12f4 = 31.0`, `DWGCTL 0x2010cc`, combiner defaults), and
+saves the slot words used in step 3.
+
+Our probe issues steps 3-5 in the same stream as the draw.  Adding step 6
+(runs b5, b6) does not prevent the lockup, which comes before the
+first post-resolve fence completes.
+
+### 11.13 Repeatability (module faa0528-10, `faa_boundary=8`)
+
+Over six boots with one placement throughout (colour `0x1986000`,
+fragment buffer `0x19c6000`, depth `0x2000000`), the draw alone never
+locked up (6 runs), while a submit with draw and resolve locked up on
+the first resolve of a boot in 3 of 8 cases and on a later resolve in 6
+of 8 [MEASURED].  Placement is not the cause; the lockup is inside the
+draw-plus-resolve span.  What carries over from one resolve to the next
+is OPEN.
