@@ -464,3 +464,33 @@ So the fragment unit needs a bound depth surface, and mode 1 is most likely
 the "armed, no samples requested" state selected by `0xa05f3` [INFERRED].
 The next probe adds the vendor's fresh-context pointer load (`sub_9D790`),
 which needs indices f0..f3 (`0x13c0`) admitted by the kernel.
+
+### 11.1 The tile-spill model (2026-10-03, later runs)
+
+Further runs with the vendor's fresh-context pointer load (zero
+`0x1340..0x134c`/`0x13c0..0x13cc`, admitted by the probe kernel) and dumps
+of all three surfaces replace the "window swap" reading above:
+
+* A pixel colour found in the fragment buffer sits at its own colour-target
+  offset minus k x 8 KiB with the low 13 bits unchanged: whole 8 KiB tiles
+  (one 64x32 tile at 32 bpp) of colour and of depth are moved into the
+  buffer, block by block in allocation order (colour tile `0x18000` to buffer
+  `0x0`, ...) [MEASURED, run w3].
+* The surface tile left behind holds 16-byte records at the pixel positions:
+  in colour `00RRGGBB, MMff8000, ffxxxxxx, 4020ffff` (MM varies like a
+  coverage byte), in depth words `0x010000nn` with nn counting up to the
+  number of buffer blocks used, i.e. block references [MEASURED r2z; field
+  meanings INFERRED].
+* After the pointer load, allocation starts at buffer offset 0 and nothing
+  lands outside the surfaces; without it the start drifts between runs.
+* `DWGCTL 9` with the restored accumulation state rasterises once more in
+  FAA mode (it allocates one more block) instead of merging [MEASURED].
+* `0x400`/`0x800` DWGCTL flushes occur only in `sub_9E000` (retire) and
+  `sub_9D790` (activate) as `sub_9D560(0xc00)`; every other `sub_9D560`
+  caller passes `0x100`/`0x200`/`0x300` (surface stamps) [C]. Untagged, the
+  `0x407`/`0xc07` pair stalled the 0528 [MEASURED]; the probe kernel
+  therefore builds it itself with its fence counters, the next measurement.
+
+No consumer of spilled tiles outside the fragment-context class was found
+in `MTXPARD.dll`; Present and blits reach FAA only through the resolve
+before clears and target changes (section 4.1) [C, negative search].
