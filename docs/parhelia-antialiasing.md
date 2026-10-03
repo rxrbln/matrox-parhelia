@@ -689,17 +689,26 @@ Independent of FAA; fully recovered from Linux `libGL`.
 |---|---|---|
 | `GL_POLYGON_SMOOTH` (0x0B41) | `ctx+0x9F4` | **silently ignored.**  Complete reference set: glEnable @0x125710, glDisable @0x125E14, glIsEnabled @0x1275B6 and the four `glGet` arms.  No renderer reads it.  (Contrast the adjacent `GL_POLYGON_STIPPLE` byte at `ctx+0x9F5`, consumed at 0xEAA2D / 0xF323D.) |
 | `GL_LINE_SMOOTH` (0x0B20) | `ctx+0xAAC` | **emulated in geometry.**  @0xE7245 the line routine branches to 0xE74E1, normalises the direction (`pow(dx²+dy², 0.5)`), offsets both endpoints by ±0.5·width and emits a float-positioned widened quad.  With smoothing off it replicates `(int)(width+0.5)` one-pixel lines.  No AA bit anywhere. |
-| `GL_POINT_SMOOTH` (0x0B10) | `ctx+0xAD0` | **the only one that reaches the chip.**  @0x114343 it picks the point-size clamp range: smooth → [0.25, 10.0] (`GL_SMOOTH_POINT_SIZE_RANGE`), aliased → [1.0, 2048.0] (`GL_ALIASED_POINT_SIZE_RANGE`), then emits the clamped **min** as opcode-0x0C state slot **0x9B** and the clamped **max** as slot **0xA6**. |
+| `GL_POINT_SMOOTH` (0x0B10) | `ctx+0xAD0` | **no AA state; only the vertex pre-pass changes.**  @0x114343 the code that picks a smooth clamp range [0.25, 10.0] or an aliased one [1.0, 2048.0] is dead (its `std::min`/`std::max` results are discarded).  The **min** and **max** go out unchanged as opcode-0x0C state slots **0x9B** / **0xA6** (the kernel's clamp range, block 0x173).  A smooth point skips the pixel snap (below). |
 
 Those are state slots, not registers (§6.4) — the MMIO addresses they end up in
-are unknown.  A second consumer @0xEBF31 routes smooth points into the 0xE6FD0
-fallback rasterizer.  Note in passing that the value `0x45000000 = 2048.0f`
+are unknown.  A second consumer @0xEBF31, in `Clip_Point_to_Sizedpoint`
+(0xEBF10), picks the vertex pre-pass: with `GL_POINT_SMOOTH` (state+0xAD0) or
+ctx+0x2688 set it calls 0xE6FD0, the plain transform, instead of 0xEA450, the
+window-space pixel snap.  Both paths then emit topology 9, the hardware sized
+point.  0xE6FD0 is not a fallback rasterizer (corrected 2026-10-04, frag0528).
+ctx+0x2688 is set @0xFCE1C under `GL_RENDER` with state+0xAD1 and a `GL_POINT`
+polygon mode.  Note in passing that the value `0x45000000 = 2048.0f`
 recorded in `parhelia-3d-state-complete.md`'s draw capture is the
 `GL_ALIASED_POINT_SIZE_RANGE` upper clamp emitted here, not a viewport scale —
 useful for whoever re-decodes that capture under the corrected grammar.
 
-So Parhelia has classic **antialiased points** (a real state change with a real
-clamp range), software-emulated smooth lines, and no polygon smoothing.  None of
+So Parhelia has **no antialiased points** either: a smooth point is the
+hardware sized point (a square) at its unsnapped position.  The 0x9B/0xA6 pair
+is only the point-size clamp range (block 0x173 d0/d1, `mtx3654` 0x8BBD7), and
+the ICD's smooth-dependent clamps are dead code
+(`parhelia-gl-state-encoding.md` §4.9).  Lines are software-emulated, and there
+is no polygon smoothing.  None of
 this touches the fragment buffer.
 
 ---
