@@ -635,7 +635,7 @@ passed on faa0528-3/-4 (o4, x2).  These runs therefore do not show that the
 pointer load is at fault.  Multi-fragment draw plus retire without the
 resolve never locked up [MEASURED].
 
-### 11.11 How the vendor keeps FAA alive between draws [PROVEN, static]
+### 11.11 How the vendor keeps FAA alive between draws (static)
 
 The contradiction "the vendor arms `0x307` per validate, yet `0x307`
 before the resolve locks it up" does not hold:
