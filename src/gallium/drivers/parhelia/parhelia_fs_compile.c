@@ -1741,9 +1741,163 @@ ph_fs_operand(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, unsigned i,
    return ph_fs_lower(ctx, alu->src[i].src.ssa, lane, req, out);
 }
 
+static bool ph_fs_poly_preshade(struct ph_fs_ctx *ctx, int lane,
+                                struct ph_fs_poly *p);
+
+/* Channel @c of an atom that is a constant part, as a preshader source. */
+static struct ph_fs_pre_src
+ph_fs_part_pre_src(const struct ph_fs_ctx *ctx, unsigned part, unsigned c)
+{
+   const struct ph_fs_part *pt = &ctx->part[part];
+   struct ph_fs_pre_src v = { .kind = PH_FS_PRE_LITERAL };
+
+   if (pt->literal) {
+      v.literal.f32 = pt->value[c];
+   } else if (pt->offset[c] >= PH_FS_PRE_BASE &&
+              pt->offset[c] < PH_FS_DRV_BASE) {
+      v.kind = PH_FS_PRE_RESULT;
+      v.index = pt->offset[c] - PH_FS_PRE_BASE;
+   } else {
+      v.kind = PH_FS_PRE_BUFFER;
+      v.index = pt->offset[c];
+   }
+   return v;
+}
+
+/* *@acc += @coef * @v as preshader nodes; @acc starts as a literal. */
+static bool
+ph_fs_pre_accumulate(struct ph_fs_ctx *ctx, struct ph_fs_pre_src *acc,
+                     float coef, const struct ph_fs_pre_src *v)
+{
+   struct ph_fs_pre_src srcs[2], term;
+
+   if (v->kind == PH_FS_PRE_LITERAL) {
+      if (acc->kind == PH_FS_PRE_LITERAL) {
+         acc->literal.f32 += coef * v->literal.f32;
+         return true;
+      }
+      term = *v;
+      term.literal.f32 *= coef;
+   } else {
+      srcs[0] = (struct ph_fs_pre_src){ .kind = PH_FS_PRE_LITERAL };
+      srcs[0].literal.f32 = coef;
+      srcs[1] = *v;
+      if (!ph_fs_pre_node(ctx, nir_op_fmul, 32, 2, srcs, &term))
+         return false;
+   }
+   srcs[0] = *acc;
+   srcs[1] = term;
+   return ph_fs_pre_node(ctx, nir_op_fadd, 32, 2, srcs, acc);
+}
+
+/* A constant RGB vector from preshader sources: a literal when every
+ * channel is one, so a program without uniforms needs no runtime update. */
+static bool
+ph_fs_pre_vector(struct ph_fs_ctx *ctx, int lane, struct ph_fs_pre_src v[3],
+                 struct ph_fs_src *out)
+{
+   struct ph_fs_part part;
+   float value[3];
+   bool literal = true;
+
+   for (unsigned i = 0; i < 3; i++) {
+      literal &= v[i].kind == PH_FS_PRE_LITERAL;
+      value[i] = v[i].literal.f32;
+   }
+   if (literal)
+      return ph_fs_literal(ctx, lane, value, out);
+   memset(&part, 0, sizeof(part));
+   part.lane = lane;
+   for (unsigned i = 0; i < 3; i++) {
+      if (v[i].kind != PH_FS_PRE_RESULT &&
+          !ph_fs_pre_node(ctx, nir_op_mov, 32, 1, &v[i], &v[i]))
+         return false;
+      part.offset[i] = PH_FS_PRE_BASE + v[i].index;
+   }
+   return ph_fs_part(ctx, &part, out);
+}
+
+/* Group value @poly as x * k + a with one non-constant atom x and constant
+ * k, a per channel; *@x is -1 when the value has no such form. */
+static bool
+ph_fs_affine_group(struct ph_fs_ctx *ctx, const struct ph_fs_poly *poly,
+                   const float mask[3], struct ph_fs_pre_src k[3],
+                   struct ph_fs_pre_src a[3], int *x)
+{
+   *x = -1;
+   for (unsigned t = 0; t < poly->n; t++) {
+      const struct ph_fs_term *term = &poly->term[t];
+      int tx = -1;
+
+      for (unsigned m = 0; m < term->n; m++) {
+         const struct ph_fs_atom *at = &ctx->atom[term->atom[m]];
+
+         if (at->part >= 0 || (at->def && ph_fs_uniform_only(at->def, 0)))
+            continue;
+         if (tx >= 0) {
+            *x = -1;
+            return true;
+         }
+         tx = term->atom[m];
+      }
+      if (tx >= 0) {
+         if (*x >= 0 && *x != tx) {
+            *x = -1;
+            return true;
+         }
+         *x = tx;
+      }
+   }
+   if (*x < 0)
+      return true;
+   for (unsigned c = 0; c < 3; c++) {
+      k[c] = (struct ph_fs_pre_src){ .kind = PH_FS_PRE_LITERAL };
+      a[c] = (struct ph_fs_pre_src){ .kind = PH_FS_PRE_LITERAL };
+   }
+   for (unsigned t = 0; t < poly->n; t++) {
+      const struct ph_fs_term *term = &poly->term[t];
+      bool has_x = false;
+
+      for (unsigned c = 0; c < 3; c++) {
+         struct ph_fs_pre_src v = { .kind = PH_FS_PRE_LITERAL };
+
+         if (!mask[c])
+            continue;
+         v.literal.f32 = 1.0f;
+         for (unsigned m = 0; m < term->n; m++) {
+            const struct ph_fs_atom *at = &ctx->atom[term->atom[m]];
+            struct ph_fs_pre_src f, srcs[2];
+
+            if (at->part >= 0) {
+               f = ph_fs_part_pre_src(ctx, at->part, c);
+            } else if (at->def && ph_fs_uniform_only(at->def, 0)) {
+               if (!ph_fs_pre_scalar(ctx, at->def,
+                                     at->sel >= 0 ? (unsigned)at->sel : c, &f))
+                  return false;
+            } else {
+               has_x = true;
+               continue;
+            }
+            if (v.kind == PH_FS_PRE_LITERAL && v.literal.f32 == 1.0f) {
+               v = f;
+               continue;
+            }
+            srcs[0] = v;
+            srcs[1] = f;
+            if (!ph_fs_pre_node(ctx, nir_op_fmul, 32, 2, srcs, &v))
+               return false;
+         }
+         if (!ph_fs_pre_accumulate(ctx, has_x ? &k[c] : &a[c], term->coef, &v))
+            return false;
+      }
+   }
+   return true;
+}
+
 /* RGB channels taken from different values: each value, replicated or in
  * its natural channels, is multiplied by a 0/1 mask of the channels it fills
- * and accumulated with multiply-adds; the literal channels are added last. */
+ * and accumulated with multiply-adds onto the constant channels - literals
+ * and uniform expressions, preshaded into one constant. */
 static bool
 ph_fs_assemble(struct ph_fs_ctx *ctx, nir_def *const defs[3],
                const uint8_t comps[3], int lane, float *literal,
@@ -1751,7 +1905,9 @@ ph_fs_assemble(struct ph_fs_ctx *ctx, nir_def *const defs[3],
 {
    struct { nir_def *def; int sel; float mask[3]; } group[3];
    unsigned groups = 0;
-   bool have_acc = false, have_literal = false;
+   bool have_acc = false, have_literal = false, have_uniform = false;
+   nir_def *uniform_def[3] = { NULL };
+   unsigned uniform_comp[3] = { 0 };
    struct ph_fs_src acc;
 
    if (lane != PH_LANE_RGB)
@@ -1786,6 +1942,12 @@ ph_fs_assemble(struct ph_fs_ctx *ctx, nir_def *const defs[3],
          have_literal |= literal[i] != 0.0f;
          continue;
       }
+      if (ph_fs_uniform_only(def, 0)) {
+         uniform_def[i] = def;
+         uniform_comp[i] = comp;
+         have_uniform = true;
+         continue;
+      }
       for (g = 0; g < groups; g++)
          if (group[g].def == def && group[g].sel == sel)
             break;
@@ -1797,14 +1959,79 @@ ph_fs_assemble(struct ph_fs_ctx *ctx, nir_def *const defs[3],
       }
       group[g].mask[i] = 1.0f;
    }
+   /* A group affine in one value with constant factors, x * k + a, is
+    * that value's multiply-add onto the constant channels. */
+   struct ph_fs_pre_src gk[3][3], ga[3][3];
+   int gx[3] = { -1, -1, -1 };
+   bool affine = false;
+
+   for (unsigned g = 0; g < groups; g++) {
+      struct ph_fs_poly poly;
+
+      if (!ph_fs_expand(ctx, group[g].def, lane, group[g].sel, true, &poly)) {
+         if (ctx->reject)
+            return false;
+         continue;
+      }
+      if (!ph_fs_poly_preshade(ctx, lane, &poly) ||
+          !ph_fs_affine_group(ctx, &poly, group[g].mask, gk[g], ga[g], &gx[g]))
+         return false;
+      affine |= gx[g] >= 0;
+   }
+   /* Literal factors beyond a source's range keep the masked form, whose
+    * literals the range pass can still rescale. */
+   for (unsigned i = 0; affine && i < 3; i++) {
+      bool wide = fabsf(literal[i]) > 1.0f;
+
+      for (unsigned g = 0; g < groups; g++)
+         if (gx[g] >= 0 && group[g].mask[i])
+            wide |= (gk[g][i].kind == PH_FS_PRE_LITERAL &&
+                     fabsf(gk[g][i].literal.f32) > 1.0f) ||
+                    (ga[g][i].kind == PH_FS_PRE_LITERAL &&
+                     fabsf(ga[g][i].literal.f32 + literal[i]) > 1.0f);
+      if (wide) {
+         for (unsigned g = 0; g < groups; g++)
+            gx[g] = -1;
+         affine = false;
+      }
+   }
+   if (have_uniform || affine) {
+      /* the constant channels as one preshaded constant */
+      struct ph_fs_pre_src v[3];
+
+      for (unsigned i = 0; i < 3; i++) {
+         v[i] = (struct ph_fs_pre_src){ .kind = PH_FS_PRE_LITERAL };
+         v[i].literal.f32 = literal[i];
+         if (uniform_def[i] &&
+             !ph_fs_pre_scalar(ctx, uniform_def[i], uniform_comp[i], &v[i]))
+            return false;
+         for (unsigned g = 0; g < groups; g++)
+            if (gx[g] >= 0 && group[g].mask[i] &&
+                !ph_fs_pre_accumulate(ctx, &v[i], 1.0f, &ga[g][i]))
+               return false;
+      }
+      if (!ph_fs_pre_vector(ctx, lane, v, &acc))
+         return false;
+      have_acc = true;
+      have_literal = false;
+   }
    if (!groups)
-      return ph_fs_literal(ctx, lane, literal, out);
+      return have_acc ? (*out = acc, true) :
+                        ph_fs_literal(ctx, lane, literal, out);
    for (unsigned g = 0; g < groups; g++) {
       struct ph_fs_src term, mask;
 
+      if (gx[g] >= 0) {
+         if (!ph_fs_lower_atom_id(ctx, gx[g], &term) ||
+             !ph_fs_pre_vector(ctx, lane, gk[g], &mask) ||
+             !ph_fs_node(ctx, lane, P3D_COMB_MAD, &term, &acc, &mask, &acc))
+            return false;
+         continue;
+      }
       if (!ph_fs_lower(ctx, group[g].def, lane, group[g].sel, &term))
          return false;
-      if (group[g].mask[0] && group[g].mask[1] && group[g].mask[2]) {
+      if (group[g].mask[0] && group[g].mask[1] && group[g].mask[2] &&
+          !have_acc) {
          acc = term;
          have_acc = true;
          continue;
@@ -4469,6 +4696,13 @@ ph_fs_rescale(struct ph_fs_program *program, const float *values,
                           program->ramps, program->ramp_count, scaled,
                           &variant)) {
       /* The program stays as it was: only this draw is refused. */
+      if (getenv("PARHELIA_TRACE_FS")) {
+         fprintf(stderr, "parhelia: fs variant refused: %s; exponents",
+                 variant.reject ? variant.reject : "?");
+         for (unsigned k = 0; k < count; k++)
+            fprintf(stderr, " %u:%u", uexp[k].offset, uexp[k].e);
+         fprintf(stderr, "\n");
+      }
       free(uexp);
       return -1;
    }
