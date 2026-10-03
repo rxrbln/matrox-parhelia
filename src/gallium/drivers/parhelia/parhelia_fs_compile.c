@@ -1558,11 +1558,108 @@ ph_fs_assemble(struct ph_fs_ctx *ctx, nir_def *const defs[3],
    return true;
 }
 
+/* @cond ? *b : *c with the condition read as (@lane, @sel).  Without native
+ * integers a boolean is 0.0 or 1.0, and CMP is a >= 0 ? b : c. */
+static bool
+ph_fs_cond(struct ph_fs_ctx *ctx, nir_def *cond, int lane, int sel,
+           const struct ph_fs_src *b, const struct ph_fs_src *c,
+           struct ph_fs_src *out)
+{
+   nir_instr *instr = nir_def_instr(cond);
+   struct ph_fs_src a, d, t, bb = *b, cc = *c;
+   nir_alu_instr *op;
+   int req[2];
+
+   if (ph_fs_uniform_only(cond, 0)) {
+      /* A condition of uniforms only: the preshader turns it into a 0/1
+       * float per channel. */
+      struct ph_fs_part part;
+
+      memset(&part, 0, sizeof(part));
+      part.lane = lane;
+      for (unsigned ch = 0; ch < ph_fs_lane_channels(lane); ch++) {
+         struct ph_fs_pre_src cs, f;
+
+         if (!ph_fs_pre_scalar(ctx, cond, sel < 0 ? ch : (unsigned)sel, &cs) ||
+             !ph_fs_pre_node(ctx, nir_op_b2f32, cond->bit_size, 1, &cs, &f))
+            return false;
+         part.offset[ch] = PH_FS_PRE_BASE + f.index;
+      }
+      return ph_fs_part(ctx, &part, &a) &&
+             ph_fs_apply(ctx, lane, &a, P3D_COMB_MOD_NEG) &&
+             ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &cc, &bb, out);
+   }
+   if (instr->type != nir_instr_type_alu)
+      return ph_fs_fail(ctx, "a select on a condition that is no boolean value");
+   op = nir_instr_as_alu(instr);
+   for (unsigned i = 0; i < 2 && i < nir_op_infos[op->op].num_inputs; i++)
+      if (!ph_fs_translate(op, i, lane, sel, &req[i]))
+         return ph_fs_fail(ctx, "a swizzle the replicates cannot express");
+   switch (op->op) {
+   case nir_op_flt:
+   case nir_op_fge:
+      /* x < y ? b : c is x - y >= 0 ? c : b; x >= y ? b : c directly. */
+      if (!ph_fs_operand(ctx, op, 0, lane, sel, &a) ||
+          !ph_fs_operand(ctx, op, 1, lane, sel, &d) ||
+          !ph_fs_apply(ctx, lane, &d, P3D_COMB_MOD_NEG) ||
+          !ph_fs_node(ctx, lane, P3D_COMB_ADD, &a, &d, NULL, &a))
+         return false;
+      return op->op == nir_op_fge ?
+             ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &bb, &cc, out) :
+             ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &cc, &bb, out);
+   case nir_op_feq:
+   case nir_op_fneu: {
+      /* x == y holds where both x - y >= 0 and y - x >= 0. */
+      const bool eq = op->op == nir_op_feq;
+
+      if (!ph_fs_operand(ctx, op, 0, lane, sel, &a) ||
+          !ph_fs_operand(ctx, op, 1, lane, sel, &d) ||
+          !ph_fs_apply(ctx, lane, &d, P3D_COMB_MOD_NEG) ||
+          !ph_fs_node(ctx, lane, P3D_COMB_ADD, &a, &d, NULL, &a) ||
+          !ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, eq ? &bb : &cc,
+                      eq ? &cc : &bb, &t))
+         return false;
+      d = a;
+      return ph_fs_apply(ctx, lane, &d, P3D_COMB_MOD_NEG) &&
+             ph_fs_node(ctx, lane, P3D_COMB_CMP, &d, &t, eq ? &cc : &bb, out);
+   }
+   case nir_op_b2b1:
+      return ph_fs_operand(ctx, op, 0, lane, sel, &a) &&
+             ph_fs_apply(ctx, lane, &a, P3D_COMB_MOD_NEG) &&
+             ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &cc, &bb, out);
+   case nir_op_inot:
+      return ph_fs_cond(ctx, op->src[0].src.ssa, lane, req[0], &cc, &bb, out);
+   case nir_op_iand:
+      /* a && b ? x : y is a ? (b ? x : y) : y */
+      return ph_fs_cond(ctx, op->src[1].src.ssa, lane, req[1], &bb, &cc, &t) &&
+             ph_fs_cond(ctx, op->src[0].src.ssa, lane, req[0], &t, &cc, out);
+   case nir_op_ior:
+      return ph_fs_cond(ctx, op->src[1].src.ssa, lane, req[1], &bb, &cc, &t) &&
+             ph_fs_cond(ctx, op->src[0].src.ssa, lane, req[0], &bb, &t, out);
+   case nir_op_ixor:
+   case nir_op_ine:
+   case nir_op_ieq: {
+      /* a != b ? x : y is a ? (b ? y : x) : (b ? x : y) */
+      const bool same = op->op == nir_op_ieq;
+      struct ph_fs_src u;
+
+      return ph_fs_cond(ctx, op->src[1].src.ssa, lane, req[1],
+                        same ? &bb : &cc, same ? &cc : &bb, &t) &&
+             ph_fs_cond(ctx, op->src[1].src.ssa, lane, req[1],
+                        same ? &cc : &bb, same ? &bb : &cc, &u) &&
+             ph_fs_cond(ctx, op->src[0].src.ssa, lane, req[0], &t, &u, out);
+   }
+   default:
+      return ph_fs_fail(ctx, "a select on a condition that is no boolean value");
+   }
+}
+
 static bool
 ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
                 struct ph_fs_src *out)
 {
    struct ph_fs_src a, b, c, d;
+   int req;
 
    /* The fog factor's outermost step: the saturate, or the exponential
     * when range analysis has removed a saturate it cannot need. */
@@ -1627,8 +1724,9 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
             return true;
          }
       if (!ph_fs_operand(ctx, alu, 0, PH_LANE_RGB, -1, &a) ||
-          !ph_fs_operand(ctx, alu, 1, PH_LANE_RGB, -1, &c) ||
-          !ph_fs_node(ctx, PH_LANE_BOTH, P3D_COMB_DP3, &a, NULL, &c, out))
+          !ph_fs_operand(ctx, alu, 1, PH_LANE_RGB, -1, &c))
+         return false;
+      if (!ph_fs_node(ctx, PH_LANE_BOTH, P3D_COMB_DP3, &a, NULL, &c, out))
          return false;
       ctx->node[out->index].def = &alu->def;
       return true;
@@ -1637,79 +1735,18 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
              ph_fs_operand(ctx, alu, 1, lane, sel, &b) &&
              ph_fs_operand(ctx, alu, 2, lane, sel, &c) &&
              ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &b, &c, out);
-   case nir_op_bcsel: {
-      /* Without native integers a boolean is 0.0 or 1.0 (b2b1 of a float),
-       * so b ? x : y is -b >= 0 ? y : x. */
-      nir_instr *cond = nir_def_instr(alu->src[0].src.ssa);
-      nir_alu_instr *b2b;
-      int req;
-
-      if (ph_fs_uniform_only(alu->src[0].src.ssa, 0)) {
-         /* A condition of uniforms only: the preshader turns it into a 0/1
-          * float per channel. */
-         struct ph_fs_part part;
-
-         memset(&part, 0, sizeof(part));
-         part.lane = lane;
-         for (unsigned ch = 0; ch < ph_fs_lane_channels(lane); ch++) {
-            struct ph_fs_pre_src cs, f;
-            unsigned comp = alu->src[0].swizzle[sel < 0 ? ch : (unsigned)sel];
-
-            if (!ph_fs_pre_scalar(ctx, alu->src[0].src.ssa, comp, &cs) ||
-                !ph_fs_pre_node(ctx, nir_op_b2f32,
-                                alu->src[0].src.ssa->bit_size, 1, &cs, &f))
-               return false;
-            part.offset[ch] = PH_FS_PRE_BASE + f.index;
-         }
-         return ph_fs_part(ctx, &part, &a) &&
-                ph_fs_operand(ctx, alu, 1, lane, sel, &b) &&
-                ph_fs_operand(ctx, alu, 2, lane, sel, &c) &&
-                ph_fs_apply(ctx, lane, &a, P3D_COMB_MOD_NEG) &&
-                ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &c, &b, out);
-      }
-      if (cond->type != nir_instr_type_alu)
-         return ph_fs_fail(ctx, "a select on a condition that is no boolean value");
-      b2b = nir_instr_as_alu(cond);
+   case nir_op_bcsel:
       if (!ph_fs_translate(alu, 0, lane, sel, &req))
          return ph_fs_fail(ctx, "a swizzle the replicates cannot express");
-      if (b2b->op == nir_op_flt || b2b->op == nir_op_fge) {
-         /* x < y ? b : c is x - y >= 0 ? c : b; x >= y ? b : c directly. */
-         if (!ph_fs_operand(ctx, b2b, 0, lane, req, &a) ||
-             !ph_fs_operand(ctx, b2b, 1, lane, req, &d) ||
-             !ph_fs_apply(ctx, lane, &d, P3D_COMB_MOD_NEG) ||
-             !ph_fs_node(ctx, lane, P3D_COMB_ADD, &a, &d, NULL, &a) ||
-             !ph_fs_operand(ctx, alu, 1, lane, sel, &b) ||
-             !ph_fs_operand(ctx, alu, 2, lane, sel, &c))
-            return false;
-         return b2b->op == nir_op_fge ?
-                ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &b, &c, out) :
-                ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &c, &b, out);
-      }
-      if (b2b->op == nir_op_feq || b2b->op == nir_op_fneu) {
-         /* x == y holds where both x - y >= 0 and y - x >= 0. */
-         struct ph_fs_src t, n;
-         const bool eq = b2b->op == nir_op_feq;
-
-         if (!ph_fs_operand(ctx, b2b, 0, lane, req, &a) ||
-             !ph_fs_operand(ctx, b2b, 1, lane, req, &d) ||
-             !ph_fs_apply(ctx, lane, &d, P3D_COMB_MOD_NEG) ||
-             !ph_fs_node(ctx, lane, P3D_COMB_ADD, &a, &d, NULL, &a) ||
-             !ph_fs_operand(ctx, alu, eq ? 1 : 2, lane, sel, &b) ||
-             !ph_fs_operand(ctx, alu, eq ? 2 : 1, lane, sel, &c) ||
-             !ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &b, &c, &t))
-            return false;
-         n = a;
-         return ph_fs_apply(ctx, lane, &n, P3D_COMB_MOD_NEG) &&
-                ph_fs_node(ctx, lane, P3D_COMB_CMP, &n, &t, &c, out);
-      }
-      if (b2b->op != nir_op_b2b1)
-         return ph_fs_fail(ctx, "a select on a condition that is no boolean value");
-      return ph_fs_operand(ctx, b2b, 0, lane, req, &a) &&
-             ph_fs_operand(ctx, alu, 1, lane, sel, &b) &&
+      return ph_fs_operand(ctx, alu, 1, lane, sel, &b) &&
              ph_fs_operand(ctx, alu, 2, lane, sel, &c) &&
-             ph_fs_apply(ctx, lane, &a, P3D_COMB_MOD_NEG) &&
-             ph_fs_node(ctx, lane, P3D_COMB_CMP, &a, &c, &b, out);
-   }
+             ph_fs_cond(ctx, alu->src[0].src.ssa, lane, req, &b, &c, out);
+   case nir_op_b2f32:
+      if (!ph_fs_translate(alu, 0, lane, sel, &req))
+         return ph_fs_fail(ctx, "a swizzle the replicates cannot express");
+      return ph_fs_literal_scalar(ctx, lane, 1.0f, &b) &&
+             ph_fs_literal_scalar(ctx, lane, 0.0f, &c) &&
+             ph_fs_cond(ctx, alu->src[0].src.ssa, lane, req, &b, &c, out);
    case nir_op_fcsel_gt:
       /* a > 0 ? b : c is -a >= 0 ? c : b. */
       return ph_fs_operand(ctx, alu, 0, lane, sel, &a) &&
