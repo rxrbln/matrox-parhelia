@@ -846,15 +846,13 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    /* P690 NPOT chains, 2-D and cube, are exact for every texel of every
     * level up to 256 (fixfn cubeprobe); larger NPOT bases keep level 0 until
     * measured (a 600x20 probe met a concurrent lockup: inconclusive).  The original family's
-    * chain is measured for power-of-two bases only. */
+    * NPOT chain is measured up to 255 and taken when no level loses a cell. */
    const bool pot = !(templ->width0 & (templ->width0 - 1)) &&
                     !(templ->height0 & (templ->height0 - 1));
    const bool p690_npot = templ->width0 <= 256 && templ->height0 <= 256;
-   /* PARHELIA_0528_NPOT_CHAIN=8k|4k (diagnostic): lay out an original-family
-    * NPOT chain with whole-tile or vendor 4 KiB level alignment, to measure. */
-   const char *o528_npot_env = getenv("PARHELIA_0528_NPOT_CHAIN");
-   const bool o528_npot = o528_npot_env && p690_npot;
-   const bool o528_level_4k = o528_npot && !strcmp(o528_npot_env, "4k");
+   const bool o528_npot = p690_npot && native_64x32_texture && !layered &&
+      ph_mip_native_64x32_chain_exact(templ->width0, templ->height0,
+                                      templ->last_level + 1);
    mip_levels = ((p690_native_texture32 && (pot || p690_npot)) ||
                  (native_64x32_texture && (pot || o528_npot))) &&
                 (!layered || cube_chain || o528_cube_chain_probe) ?
@@ -906,7 +904,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
       if (layered) {
          r->mip.native_64x32 = true;
          r->mip.level[0].pitch = ph_mip_align(templ->width0, 32);
-      } else if (!ph_mip_layout_native_64x32(&r->mip, o528_level_4k)) {
+      } else if (!ph_mip_layout_native_64x32(&r->mip)) {
          PH_CREATE_FAIL();
       }
       if (ph_env("PARHELIA_TRACE"))

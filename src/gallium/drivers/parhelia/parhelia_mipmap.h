@@ -52,6 +52,8 @@ struct ph_mip_level {
    /* A P690 cube map's tail level: the six faces interleave in the volume
     * order at the tail position. */
    bool face_tail;
+   /* An original-family level that starts in the right half of its tile. */
+   bool half;
 };
 
 struct ph_mip_layout {
@@ -326,17 +328,18 @@ ph_mip_layout_init(struct ph_mip_layout *out, unsigned width, unsigned height,
 }
 
 /* The original Parhelia's 32-bit chain in 64x32 tiles at a 32-aligned pitch.
- * Levels wider or taller than 32 lie back to back in whole tile rows.  The
- * first level no larger than 32x32 starts the tail tile: one larger than
- * 16x16 takes its left half and the smaller levels sit in the vendor tail
- * slots shifted right by 32; one of 16x16 or less is itself slot 0
- * (fixfn-cubeprobe with an address fill, every level of 256x256, 64x64,
- * 32x64, 64x32, 32x32, 16x16 and 8x8 chains).  @level_4k reserves 32-row
- * bands instead of whole tiles per level (diagnostic). */
+ * The unit steps from level to level in 32x32 cells, half a tile each: a
+ * level after an odd cell count starts in the right half (ph_mip_level.half)
+ * and its 64x32 order continues one cell later.  The first level no larger
+ * than 32x32 starts the two-cell tail: one larger than 16x16 takes its first
+ * cell and the smaller levels sit in the vendor tail slots shifted right by
+ * 32; one of 16x16 or less is itself slot 0 (fixfn-cubeprobe with an
+ * address fill, every level of POT chains from 1x1 to 256x256 and of NPOT
+ * chains up to 255). */
 static inline bool
-ph_mip_layout_native_64x32(struct ph_mip_layout *mip, bool level_4k)
+ph_mip_layout_native_64x32(struct ph_mip_layout *mip)
 {
-   size_t next = 0, tail_base = 0;
+   size_t cell = 0, tail_cell = 0;
    unsigned tail = 0, shift = 0;
 
    mip->native_64x32 = true;
@@ -347,8 +350,8 @@ ph_mip_layout_native_64x32(struct ph_mip_layout *mip, bool level_4k)
 
       if (level->width <= 32 && level->height <= 32) {
          if (!tail) {
-            tail_base = next;
-            next += 0x2000;
+            tail_cell = cell;
+            cell += 2;
             shift = level->width > 16 || level->height > 16 ? 32 : 0;
          }
          if (shift && !tail) {
@@ -362,19 +365,40 @@ ph_mip_layout_native_64x32(struct ph_mip_layout *mip, bool level_4k)
          }
          tail++;
          level->pitch = 64;
-         level->offset = tail_base;
+         level->offset = tail_cell / 2 * 0x2000;
+         level->half = tail_cell & 1;
          level->bytes = 0x2000;
          continue;
       }
       level->pitch = ph_mip_align(level->width, 32);
-      level->offset = next;
+      level->offset = cell / 2 * 0x2000;
+      level->half = cell & 1;
       level->tail_x = level->tail_y = 0;
-      level->bytes = level_4k ? rows * level->pitch * 32 * 4 :
-                     (rows * level->pitch + 63) / 64 * 0x2000;
-      next += level->bytes;
+      level->bytes = rows * (level->pitch / 32) * 0x1000;
+      cell += rows * (level->pitch / 32);
    }
-   if (next > mip->size)
-      mip->size = next;
+   if ((cell + 1) / 2 * 0x2000 > mip->size)
+      mip->size = (cell + 1) / 2 * 0x2000;
+   return true;
+}
+
+/* Whether the unit reads every cell of a 64x32 chain apart: a level of two
+ * or more cell rows with an even cell count per row that starts in a right
+ * half maps two of its cells onto one (96x96 level 1, MEASURED), so such a
+ * chain cannot be sampled past level 0. */
+static inline bool
+ph_mip_native_64x32_chain_exact(unsigned width, unsigned height,
+                                unsigned levels)
+{
+   struct ph_mip_layout mip;
+
+   if (!ph_mip_layout_init_cpp(&mip, width, height, levels, true, false, 4) ||
+       !ph_mip_layout_native_64x32(&mip))
+      return false;
+   for (unsigned l = 0; l < levels; l++)
+      if (mip.level[l].half && mip.level[l].height > 32 &&
+          !((mip.level[l].pitch / 32) & 1))
+         return false;
    return true;
 }
 
