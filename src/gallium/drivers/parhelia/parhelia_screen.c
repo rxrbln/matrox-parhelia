@@ -1777,6 +1777,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * create the ARGB rendering+scanout front buffer requested by glamor. */
    caps->dmabuf = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
    caps->max_render_targets = 1;
+   /* With one target, per-target blend state is rt[0], which every path
+    * reads; st needs it to pin destination alpha of RGB and emulated L/I
+    * targets to one. */
+   caps->indep_blend_enable = caps->indep_blend_func = true;
    /* Vendor ranges: aliased 1..2048, smooth 0.25..10 in 0.25 steps.  Sized
     * points and wide or smooth lines are expanded to triangles, so smooth
     * sizes below one pixel have no coverage path and start at 1.0. */
