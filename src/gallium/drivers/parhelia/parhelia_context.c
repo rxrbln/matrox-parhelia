@@ -14273,11 +14273,13 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       goto fail;
    draw_set_rasterize_stage(ctx->draw, stage);
    ctx->hw_stage = stage;
-   ctx->logicop_grid = ctx->kill_alpha =
-      ph_screen(screen)->chip_id == 0x2539;
    /* trunc(d * 2^n), measured on the P690 and the 0528 (--zcode-probe) */
    ctx->z_grid = ph_screen(screen)->chip_id == 0x2539 ||
                  ph_original_family(ph_screen(screen)->chip_id);
+   ctx->logicop_grid = debug_get_bool_option("PARHELIA_LOGICOP_GRID",
+                                             ph_screen(screen)->chip_id == 0x2539);
+   ctx->kill_alpha = debug_get_bool_option("PARHELIA_KILL_ALPHA",
+                                           ph_screen(screen)->chip_id == 0x2539);
    ctx->colour_fs.uses_color = true;
    ctx->colour_fs.texenv = P3D_TEXENV_MODULATE;
    ctx->colour_fs.serial_op = PH_SERIAL_UNSUPPORTED;
