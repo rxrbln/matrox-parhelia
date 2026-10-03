@@ -4947,6 +4947,103 @@ ph_fs_rescale(struct ph_fs_program *program, const float *values,
    return 1;
 }
 
+/* A screen derivative of gl_PointCoord: draw's sprites run s and t over
+ * [0, 1] linearly in window space, so the derivative is one constant per
+ * sprite size, staged per batch. */
+bool
+ph_fs_lower_point_derivatives(nir_shader *nir)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            nir_intrinsic_instr *d, *load;
+            nir_scalar s;
+            nir_def *c[4];
+            bool dx, ok = true;
+            unsigned n;
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            d = nir_instr_as_intrinsic(instr);
+            switch (d->intrinsic) {
+            case nir_intrinsic_ddx: case nir_intrinsic_ddx_fine:
+            case nir_intrinsic_ddx_coarse: dx = true; break;
+            case nir_intrinsic_ddy: case nir_intrinsic_ddy_fine:
+            case nir_intrinsic_ddy_coarse: dx = false; break;
+            default: continue;
+            }
+            n = MIN2(d->def.num_components, 4);
+            b.cursor = nir_before_instr(instr);
+            nir_def *deriv = nir_load_ubo_vec4(&b, 4, 32,
+               nir_imm_int(&b, PH_FS_DRV_UBO),
+               nir_imm_int(&b, PH_FS_DRV_PNTC_DERIV_VEC4));
+            for (unsigned i = 0; ok && i < n; i++) {
+               unsigned loc = ~0u, first = 0;
+
+               s = nir_scalar_resolved(d->src[0].ssa, i);
+               if (!nir_scalar_is_intrinsic(s)) {
+                  ok = false;
+                  break;
+               }
+               load = nir_def_as_intrinsic(s.def);
+               if (load->intrinsic == nir_intrinsic_load_deref) {
+                  nir_deref_instr *deref = nir_src_as_deref(load->src[0]);
+
+                  if (deref && deref->deref_type == nir_deref_type_var &&
+                      (deref->var->data.mode & nir_var_shader_in)) {
+                     loc = deref->var->data.location;
+                     first = deref->var->data.location_frac;
+                  }
+               } else if (load->intrinsic == nir_intrinsic_load_input ||
+                          load->intrinsic == nir_intrinsic_load_interpolated_input) {
+                  loc = nir_intrinsic_io_semantics(load).location;
+                  first = nir_intrinsic_component(load);
+               }
+               if (loc != VARYING_SLOT_PNTC || first + s.comp > 1) {
+                  ok = false;
+                  break;
+               }
+               c[i] = nir_channel(&b, deriv, (dx ? 0 : 2) + first + s.comp);
+            }
+            if (!ok)
+               continue;
+            nir_def_replace(&d->def, nir_vec(&b, c, n));
+            progress = true;
+         }
+      }
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
+void
+ph_fs_set_point_derivatives(struct ph_fs_program *program, const float deriv[4])
+{
+   memcpy(&program->drv[PH_FS_DRV_PNTC_DERIV_VEC4 * 4u], deriv,
+          4 * sizeof(float));
+}
+
+bool
+ph_fs_reads_user_constants(const struct ph_fs_program *program)
+{
+   for (unsigned i = 0; i < program->const_ref_count; i++)
+      for (unsigned c = 0; c < 4; c++)
+         if ((program->const_ref[i].mask & (1u << c)) &&
+             program->const_ref[i].offset[c] < PH_FS_PRE_BASE)
+            return true;
+   for (unsigned i = 0; i < program->pre_count; i++)
+      for (unsigned s = 0; s < program->pre[i].nsrc; s++)
+         for (unsigned c = 0; c < program->pre[i].ncomp[s]; c++)
+            if (program->pre[i].src[s][c].kind == PH_FS_PRE_BUFFER &&
+                program->pre[i].src[s][c].index < PH_FS_DRV_BASE)
+               return true;
+   return false;
+}
+
 void
 ph_fs_set_domain(struct ph_fs_program *program, unsigned carrier,
                  const float lo[4], const float span[4])

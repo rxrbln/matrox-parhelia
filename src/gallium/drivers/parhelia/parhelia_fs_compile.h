@@ -40,7 +40,10 @@ struct ph_fs_uexp {
  * 2 + u the coordinate of unit u; per channel span then lo. */
 #define PH_FS_DRV_BASE 0xa000u
 #define PH_FS_CARRIERS 6u
-#define PH_FS_DRV_COUNT (PH_FS_CARRIERS * 8u)
+/* After the carriers, one vec4 of gl_PointCoord's screen derivatives:
+ * d(s)/dx, d(t)/dx, d(s)/dy, d(t)/dy of the batch's sprites. */
+#define PH_FS_DRV_PNTC_DERIV_VEC4 (PH_FS_CARRIERS * 2u)
+#define PH_FS_DRV_COUNT (PH_FS_CARRIERS * 8u + 4u)
 #define PH_FS_DRV_SPAN(carrier, c) ((carrier) * 8u + (c))
 #define PH_FS_DRV_LO(carrier, c) ((carrier) * 8u + 4u + (c))
 /* In NIR the driver constants are constant buffer 1, one vec4 of spans and
@@ -198,6 +201,19 @@ bool ph_fs_compile_ramps(nir_shader *nir, unsigned max_instructions,
 /* The domain carrier @carrier currently interpolates: the stored value is
  * (x - lo) / span.  A program reading it through the identity domain is
  * recompiled to scale on the next ph_fs_update_constants(). */
+/* Replace screen derivatives of gl_PointCoord by the driver constants of
+ * PH_FS_DRV_PNTC_DERIV_VEC4; true when one was replaced. */
+bool ph_fs_lower_point_derivatives(nir_shader *nir);
+
+/* The batch's gl_PointCoord derivatives, in the PH_FS_DRV_PNTC_DERIV_VEC4
+ * order. */
+void ph_fs_set_point_derivatives(struct ph_fs_program *program,
+                                 const float deriv[4]);
+
+/* Whether the program reads the application's constant buffer, not only
+ * driver constants. */
+bool ph_fs_reads_user_constants(const struct ph_fs_program *program);
+
 void ph_fs_set_domain(struct ph_fs_program *program, unsigned carrier,
                       const float lo[4], const float span[4]);
 

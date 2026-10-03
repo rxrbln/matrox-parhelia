@@ -169,6 +169,9 @@ struct ph_fs {
    struct ph_fs_program program;
    /* The program saturates the colour, exact for fixed-point targets. */
    bool colour_saturated;
+   /* The program reads gl_PointCoord's screen derivatives (driver constants
+    * staged per batch). */
+   bool point_deriv;
    /* The evaluator of a program that samples its own lookup texture. */
    struct ph_fs_lookup *lookup;
    /* A discard folded into the alpha test, see ph_fs_build_kill(). */
@@ -413,6 +416,8 @@ struct ph_context {
    /* The domain each varying carrier is staged in, (x - lo) / span, and
     * a compiled combiner refusing the batch it was asked for. */
    float dom_lo[PH_FS_CARRIERS][4], dom_span[PH_FS_CARRIERS][4];
+   /* gl_PointCoord's screen derivatives over the staged sprites. */
+   float pntc_deriv[4];
    bool comb_refused;
    /* The framebuffer as the state tracker set it, and the stand-in render
     * resources for surfaces the engine cannot address in place (a mip level
@@ -5802,6 +5807,31 @@ ph_routed_in_range(struct draw_context *draw, const struct ph_context *ctx,
    return true;
 }
 
+/* gl_PointCoord's window-space gradient over a sprite triangle, d(s)/dx,
+ * d(t)/dx, d(s)/dy, d(t)/dy; zero without a point coordinate. */
+static void
+ph_pntc_derivatives(struct draw_context *draw, const struct prim_header *prim,
+                    int pos, float d[4])
+{
+   const int pc = draw_find_shader_output(draw, TGSI_SEMANTIC_PCOORD, 0);
+   const float *p0 = prim->v[0]->data[pos], *p1 = prim->v[1]->data[pos],
+               *p2 = prim->v[2]->data[pos];
+   const float ax = p1[0] - p0[0], ay = p1[1] - p0[1];
+   const float bx = p2[0] - p0[0], by = p2[1] - p0[1];
+   const float det = ax * by - bx * ay;
+
+   memset(d, 0, 4 * sizeof(float));
+   if (pc < 0 || det == 0.0f)
+      return;
+   for (unsigned c = 0; c < 2; c++) {
+      const float fa = prim->v[1]->data[pc][c] - prim->v[0]->data[pc][c];
+      const float fb = prim->v[2]->data[pc][c] - prim->v[0]->data[pc][c];
+
+      d[c] = (fa * by - fb * ay) / det;
+      d[2 + c] = (ax * fb - bx * fa) / det;
+   }
+}
+
 static void
 ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 {
@@ -5880,6 +5910,19 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
             return;
       }
       ctx->stencil_back = back;
+   }
+   if (pos >= 0 && ctx->fs && ctx->fs->point_deriv) {
+      float d[4];
+
+      ph_pntc_derivatives(stage->draw, prim, pos, d);
+      if (memcmp(d, ctx->pntc_deriv, sizeof(d))) {
+         if (ctx->triangles) {
+            ph_submit_vertices(ctx);
+            if (ctx->submit_error)
+               return;
+         }
+         memcpy(ctx->pntc_deriv, d, sizeof(d));
+      }
    }
 
 	vertex_alpha = ph_use_vertex_alpha(ctx, textured, multitextured, depth,
@@ -11037,6 +11080,8 @@ ph_compiled_combiner(struct ph_context *ctx, bool two_units)
    for (unsigned k = 0; k < PH_FS_CARRIERS; k++)
       if (fs->program.carriers & (1u << k))
          ph_fs_set_domain(&fs->program, k, ctx->dom_lo[k], ctx->dom_span[k]);
+   if (fs->point_deriv)
+      ph_fs_set_point_derivatives(&fs->program, ctx->pntc_deriv);
    if (fs->program.const_ref_count || fs->program.carriers) {
       const uint8_t *live = NULL;
 
@@ -11062,7 +11107,8 @@ ph_compiled_combiner(struct ph_context *ctx, bool two_units)
                                 ctx->constant_size[MESA_SHADER_FRAGMENT]);
          return &fs->program.comb;
       }
-      if (!ctx->fs_const_snap_size && fs->program.const_ref_count)
+      if (!ctx->fs_const_snap_size && fs->program.const_ref_count &&
+          ph_fs_reads_user_constants(&fs->program))
          return NULL;
       if (!ph_fs_update_constants(&fs->program, ctx->fs_const_snap,
                                   ctx->fs_const_snap_size)) {
@@ -11679,6 +11725,11 @@ static void *ph_create_fs(struct pipe_context *p,
                   NIR_PASS(progress, compile_nir, nir_opt_cse);
                   NIR_PASS(progress, compile_nir, nir_opt_dce);
                } while (progress);
+               if (ph_fs_lower_point_derivatives(compile_nir)) {
+                  fs->point_deriv = true;
+                  NIR_PASS(_, compile_nir, nir_opt_algebraic);
+                  NIR_PASS(_, compile_nir, nir_opt_dce);
+               }
             }
 
             /* A texture sampled at several coordinates spreads its taps
