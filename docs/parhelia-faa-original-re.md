@@ -546,3 +546,21 @@ Two overlapping depth-tested triangles in mode 3 stall the engine on the
 first draw [MEASURED, g4].  The FAA unit is therefore an 8-sample coverage
 A-buffer; a working accumulation layout (placement/addressing of the
 buffer so that no surface tile is diverted) is still OPEN.
+
+### 11.5 Own-object placement (run h1/h4)
+
+* Records: 291 in the buffer, 247 written into the colour target as four
+  adjacent pixels; the decode of 11.4 holds for both, one record per single
+  pixel with an 8-sample mask [MEASURED].
+* Colour pixels that reach the buffer lie at their colour offset minus a
+  multiple of 8 KiB, and several colour tiles land on the same two or three
+  buffer blocks: an 8 KiB-granular aliasing between colour tiles and the
+  start of the buffer that loses data in both directions [MEASURED]. The
+  addressing the fragment unit expects is still OPEN.
+* Blending the surviving records over the surviving pixels in software
+  (c = popcount/8) matches the analytic edge coverage to 0.144 mean, 448 of
+  568 measured edge pixels within one sample [MEASURED]: the record model is
+  right.
+* Two overlapping triangles accumulate without a stall in this placement
+  (they stalled with the buffer inside the depth object); the resolve then
+  stalls [MEASURED].
