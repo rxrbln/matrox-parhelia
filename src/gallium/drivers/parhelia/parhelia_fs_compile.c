@@ -1097,6 +1097,11 @@ ph_fs_pre_scalar(struct ph_fs_ctx *ctx, nir_def *def, unsigned comp,
    struct ph_fs_pre_src src[3];
    unsigned offset;
 
+   /* a scalar read naturally replicates; any other channel must exist */
+   if (def->num_components == 1)
+      comp = 0;
+   if (comp >= def->num_components)
+      return ph_fs_fail(ctx, "a preshader channel past its value");
    for (unsigned i = 0; i < ctx->pre_memos; i++)
       if (ctx->pre_memo[i].def == def && ctx->pre_memo[i].comp == comp) {
          *out = ctx->pre_memo[i].src;
@@ -2114,10 +2119,17 @@ ph_fs_poly_preshade(struct ph_fs_ctx *ctx, int lane, struct ph_fs_poly *p)
 
                if (at->part >= 0 || !ph_fs_uniform_only(at->def, 0))
                   continue;
-               if (!ph_fs_pre_scalar(ctx, at->def,
-                                     at->sel >= 0 ? (unsigned)at->sel :
-                                     lane == PH_LANE_A ? 3 : c, &v))
+               const unsigned comp = at->sel >= 0 ? (unsigned)at->sel :
+                                     lane == PH_LANE_A ? 3 : c;
+
+               /* a natural read of a narrower value never uses the
+                * channels past its width */
+               if (at->sel < 0 && at->def->num_components > 1 &&
+                   comp >= at->def->num_components) {
+                  v = (struct ph_fs_pre_src){ .kind = PH_FS_PRE_LITERAL };
+               } else if (!ph_fs_pre_scalar(ctx, at->def, comp, &v)) {
                   return false;
+               }
                srcs[0] = f;
                srcs[1] = v;
                if (!ph_fs_pre_node(ctx, nir_op_fmul, 32, 2, srcs, &f))
