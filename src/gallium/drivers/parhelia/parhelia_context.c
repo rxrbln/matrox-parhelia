@@ -12188,7 +12188,10 @@ ph_zinit_clear(struct ph_context *ctx, struct parhelia_resource *r,
    unsigned tail;
    int ret;
 
-   if (!ph_zinit_enabled() || !r || !r->handle || ctx->submit_error)
+   /* The 640-tile coverage is measured on the LX tile layout only; on the
+    * original family an armed clear mixes depth into the colour target. */
+   if (!ph_zinit_enabled() || !ph_lx_family(ph_screen(ctx->base.screen)->chip_id) ||
+       !r || !r->handle || ctx->submit_error)
       return false;
    if (x || y || width != r->base.width0 || height != r->base.height0 ||
        write_mask != 0xffffffffu || r->upload_texture)
