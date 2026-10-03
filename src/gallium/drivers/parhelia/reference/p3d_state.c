@@ -728,6 +728,26 @@ p3d_emit_texenv(struct p3d_cs *cs, uint32_t slot, unsigned unit, int first,
 	p3d_reglist(cs, rw, 8);
 }
 
+/* Whether the vertex fetch of @st delivers a colour (attribute kind 5) to
+ * WARP input v5.  Without it v5 keeps the previous draw's value, from any
+ * client, and a program reading it inherits that colour. */
+int
+p3d_state_fetches_colour(const struct p3d_state *st)
+{
+	struct p3d_rw desc[8];
+	size_t nd = p3d_descriptors(desc, st->tex != NULL,
+				    p3d_position_has_z(st), st->pos_desc,
+				    st->col_desc,
+				    st->tex && st->tex->env == P3D_TEXENV_REPLACE,
+				    p3d_state_units(st), !!st->vertex_alpha,
+				    !!st->texcoord3, !!st->vertex_colour1);
+
+	for (size_t i = 0; i < nd; i++)
+		if (desc[i].val && ((desc[i].val >> 16) & 0xf) == 5)
+			return 1;
+	return 0;
+}
+
 void
 p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 {

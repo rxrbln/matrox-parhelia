@@ -440,6 +440,7 @@ struct ph_context {
    uint32_t warp_colour1;
    /* Pass-through without the T2 write, for the RGBA colour stream. */
    uint32_t warp_rgba;
+   uint32_t warp_no_colour[2];
    float point_radius;
    bool tcl_available;
    bool tcl_forced_off;
@@ -3928,6 +3929,47 @@ ph_restore_after_transform(struct ph_context *ctx,
    return ret;
 }
 
+/* The textured programs for a stream without a colour (a REPLACE draw
+ * without z, a cube or volume map's three coordinates): the kernel's
+ * textured and replace programs read v5, which such a stream never fetches,
+ * so they took the previous draw's colour - from any client - and a colour
+ * with a channel above its alpha made the setup unit reject the draw
+ * (incomplete-cubemap after gl-2.0-vertexattribpointer, measured).  These
+ * write o1 = (1,1,1,1) instead and read only fetched inputs; @two_sets adds
+ * coordinate set 1. */
+static uint32_t
+ph_no_colour_program(struct ph_context *ctx, bool two_sets)
+{
+   static const uint32_t code[] = {
+      0x00083e00, 0x00440000, 0xb89a2249,   /* add o0, v0, v0.0000 */
+      0x00087ebf, 0x00440200, 0xb8adb649,   /* add o1, v0.1111, v0.0000 | mov o11, v0 */
+      0x0078023f, 0x00440200, 0xb01a21a2,   /* mov o3, v7 */
+      0x0088024f, 0x00440200, 0xb01a21a2,   /* mov o4, v8 */
+      0x00000200, 0x00040000, 0x14c00000,   /* end */
+      0x00080200, 0x00440000, 0x301a21a2,   /* wra */
+   };
+   uint32_t words[18];
+   struct drm_parhelia_warp_program program = {
+      .code = (uintptr_t)words, .count = two_sets ? 6 : 5,
+   };
+
+   if (ctx->warp_no_colour[two_sets] || !ctx->warp_program_instructions)
+      return ctx->warp_no_colour[two_sets];
+   memcpy(words, code, 9 * sizeof(uint32_t));
+   if (two_sets) {
+      memcpy(words + 9, code + 9, 9 * sizeof(uint32_t));
+   } else {
+      memcpy(words + 9, code + 12, 6 * sizeof(uint32_t));
+   }
+   /* The upload drains the engine: submit the aggregated work first. */
+   if (ph_drain_batch(ctx) ||
+       ioctl(ph_screen(ctx->base.screen)->fd, DRM_IOCTL_PARHELIA_WARP_PROGRAM,
+             &program))
+      return 0;
+   ctx->warp_no_colour[two_sets] = (uint32_t)program.entry;
+   return ctx->warp_no_colour[two_sets];
+}
+
 static int
 ph_batch_primitives(struct ph_context *ctx, struct parhelia_batch *batch,
                     struct p3d_state *state, uint32_t colour_handle,
@@ -3943,6 +3985,14 @@ ph_batch_primitives(struct ph_context *ctx, struct parhelia_batch *batch,
 
    if (!per_prim || !primitives)
       return -EINVAL;
+   if (state->tex && !state->transform &&
+       ph_lx_family(ph_screen(ctx->base.screen)->chip_id) &&
+       !p3d_state_fetches_colour(state)) {
+      const uint32_t entry = ph_no_colour_program(ctx, state->tex1 != NULL);
+
+      if (entry)
+         state->warp_entry = entry;
+   }
    if (group > PH_BATCH_MAX_PACKET_VERTICES / per_prim)
       group = PH_BATCH_MAX_PACKET_VERTICES / per_prim;
    if (group > primitives)

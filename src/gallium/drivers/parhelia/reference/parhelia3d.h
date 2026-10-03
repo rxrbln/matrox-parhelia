@@ -1009,6 +1009,7 @@ static inline int p3d_position_has_z(const struct p3d_state *st)
 {
 	return st->has_depth || st->transform || st->oow || st->pos_z;
 }
+int	 p3d_state_fetches_colour(const struct p3d_state *st);
 size_t	 p3d_warp_lighting(uint32_t *out, size_t cap);
 /* GL_REPLACE: writes a constant white colour so MUL(TEX, PREV) passes TEX */
 size_t	 p3d_warp_replace(uint32_t *out, size_t cap);
