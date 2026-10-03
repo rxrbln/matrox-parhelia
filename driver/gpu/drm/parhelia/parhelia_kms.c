@@ -595,11 +595,11 @@ static void parhelia_hslpar_dvo_clock(struct parhelia_device *pdev, u32 clksel)
 	parhelia_write(pdev, PARHELIA_DCM_CLKCTL_A, v);
 }
 
-/* Bring one integrated TMDS serializer up for a digital monitor, in the order
+/* Bring one DVO port (external CH7301 TMDS) up for a digital monitor, in the order
  * the vendor's HSLPAREnableDVO uses: clock first, then release power, then
  * install the control byte.  Byte bit 0 and the second 0x1c20 pass are gated
  * on 0x2537..0x2539 in the vendor binary, so neither belongs on this family. */
-/* Bring one integrated serializer up in the order both the vendor HAL and this
+/* Bring one DVO port up in the order both the vendor HAL and this
  * board's own VBIOS use: gate its clock and power it down, install the board
  * configuration and the crossbar byte while it is quiet, and only then ungate
  * and power up.  Doing it the other way round changes the source select of a
@@ -672,6 +672,8 @@ static void parhelia_hslpar_enable_dvo(struct parhelia_device *pdev,
 		parhelia_read(pdev, PARHELIA_REG_DVO_XBAR),
 		parhelia_read(pdev, PARHELIA_REG_DVO_PWR),
 		parhelia_read(pdev, PARHELIA_DCM_CLKCTL_A));
+	/* the DVO port feeds an external CH7301 whose TMDS PLL is per clock */
+	parhelia_ch7301_enable(pdev, dvo2 ? 1 : 0, mode->clock);
 }
 
 static void parhelia_program_output(struct parhelia_device *pdev,
@@ -681,7 +683,7 @@ static void parhelia_program_output(struct parhelia_device *pdev,
 {
 	u32 dac_reg, power_mask, v, fmt;
 
-	/* A digital monitor on the original family takes the integrated
+	/* A digital monitor on the original family takes a DVO port and its CH7301
 	 * serializer; its analog pins stay unpowered and the DAC block below
 	 * is not involved. */
 	if (pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL &&
@@ -1474,6 +1476,9 @@ int parhelia_modeset_init(struct parhelia_device *pdev)
 	}
 	if (!pdev->num_outputs)
 		return -ENODEV;
+	ret = parhelia_ch7301_init(pdev);
+	if (ret)
+		return ret;
 	ret = drm_mode_crtc_set_gamma_size(&pdev->pipe.crtc, 256);
 	if (ret)
 		return ret;

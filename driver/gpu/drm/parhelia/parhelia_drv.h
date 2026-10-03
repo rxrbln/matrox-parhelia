@@ -539,6 +539,8 @@ static inline struct parhelia_bo *to_parhelia_bo(struct drm_gem_object *gem)
 	return container_of(drm_gem_vram_of_gem(gem), struct parhelia_bo, gbo);
 }
 
+struct parhelia_ch7301;
+
 struct parhelia_device {
 	struct drm_device drm;
 	/* VRAM helper TTM callbacks with the P690 move override */
@@ -563,6 +565,8 @@ struct parhelia_device {
 	 * connector in the table could ever light up. */
 	struct parhelia_output *active_output;
 	struct mutex ddc_lock;
+	/* Chrontel CH7301 DVI transmitters behind the original boards' DVO ports */
+	struct parhelia_ch7301 *ch7301[2];
 	/* Coherent class-3 buffer the 2-D engine copies render data through. */
 	struct mutex staging_lock;
 	void *staging_cpu;
@@ -763,6 +767,9 @@ bool parhelia_bios_parse(const u8 *rom, size_t size,
 bool parhelia_bios_ddc_pins(const struct parhelia_bios *bios,
 			    unsigned int line, u8 *scl, u8 *sda);
 int parhelia_ddc_init(struct parhelia_output *output);
+int parhelia_ch7301_init(struct parhelia_device *pdev);
+void parhelia_ch7301_enable(struct parhelia_device *pdev, unsigned int dvo,
+			    u32 clock_khz);
 irqreturn_t parhelia_irq_handler(int irq, void *arg);
 bool parhelia_engine_irq_enabled(void);
 int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
