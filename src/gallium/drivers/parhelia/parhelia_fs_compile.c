@@ -675,7 +675,10 @@ ph_fs_linear(struct ph_fs_ctx *ctx, int lane, uint16_t atom, float k, float c0,
       if (ph_fs_near(k, -2.0f) && ph_fs_near(c0, 1.0f))
          return ph_fs_apply(ctx, lane, out, P3D_COMB_MOD_SIGNED_NEG);
    }
-   if (!ph_fs_shift_of(k, &shift)) {
+   /* (x + c0 / k) * k needs c0 / k in a source's [-1, 1]; else multiply-add
+    * with k and c0 as constants. */
+   if (!ph_fs_shift_of(k, &shift) ||
+       (!ph_fs_near(c0, 0.0f) && fabsf(c0 / k) > 1.0f)) {
       /* |k| > 1 goes into the shift, the rest into a constant in [-1, 1]. */
       shift = fabsf(k) > 1.0f ? (int)ceil(log2(fabsf(k))) : 0;
       if (shift > 3)
@@ -2014,7 +2017,9 @@ ph_fs_rep(int half, int channel)
 }
 
 /* A stored constant and the read modifier that give @value exactly, or else
- * within the Q1.10 range. */
+ * within the Q1.10 range.  A source reads at most [-1, 1]: MEASURED on the
+ * P690, "1 - c" with c = -1 read as 1, not 2, so a literal outside that
+ * range has no encoding and the caller has to build it differently. */
 static bool
 ph_fs_encode(const float *value, unsigned n, uint8_t *mod, float *stored)
 {
@@ -2022,6 +2027,10 @@ ph_fs_encode(const float *value, unsigned n, uint8_t *mod, float *stored)
       P3D_COMB_MOD_NONE, P3D_COMB_MOD_INVERT, P3D_COMB_MOD_NEG,
       P3D_COMB_MOD_SIGNED, P3D_COMB_MOD_BIAS,
    };
+
+   for (unsigned c = 0; c < n; c++)
+      if (!(value[c] >= -1.0f && value[c] <= 1.0f))
+         return false;
 
    for (unsigned pass = 0; pass < 2; pass++) {
       for (unsigned m = 0; m < sizeof(mods); m++) {
