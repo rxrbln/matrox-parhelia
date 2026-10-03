@@ -416,6 +416,9 @@ ph_fs_lower_lookup(nir_shader *nir, unsigned used_units, unsigned max_units,
    fn->kind = kind;
    fn->location = location;
    fn->out_mask = out_mask;
+   fn->pixel = location == VARYING_SLOT_POS && !(comp_read & ~3u);
+   fn->origin_lower_left = !nir->info.fs.origin_upper_left;
+   fn->pixel_center_integer = nir->info.fs.pixel_center_integer;
    for (unsigned c = 0; c < 4; c++)
       if (comp_read & (1u << c))
          fn->comp[fn->comps++] = c;
@@ -823,12 +826,28 @@ ph_fs_lookup_fill(const struct ph_fs_lookup *fn, const struct ph_fs_ramp *r,
          for (unsigned x = 0; x < w; x++) {
             float d[3], len;
 
+            /* a pixel table's texels beyond the framebuffer are never sampled */
+            if (fn->pixel && ((r->extent[0] && x >= r->extent[0]) ||
+                              (r->extent[1] && y >= r->extent[1]))) {
+               memset(&value[4 * ((face * h + y) * w + x)], 0, 4 * sizeof(*value));
+               continue;
+            }
             if (fn->kind == PH_FS_RAMP_DIRECTION) {
                ph_fs_lookup_cube_dir(face, 2.0f * (x + 0.5f) / w - 1.0f,
                                      2.0f * (y + 0.5f) / h - 1.0f, d);
                len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
                for (unsigned c = 0; c < 3; c++)
                   d[c] /= len;
+            } else if (fn->pixel) {
+               /* the window position of pixel (x, y) as gl_FragCoord has it */
+               const float c = fn->pixel_center_integer ? 0.0f : 0.5f;
+
+               for (unsigned i = 0; i < fn->comps; i++) {
+                  const unsigned p = i ? y : x;
+
+                  d[i] = fn->comp[i] == 1 && fn->origin_lower_left ?
+                         r->extent[i] - p - 1 + c : p + c;
+               }
             } else {
                /* texel centres at the cell centres of the domain: the
                 * domain's ends are often where a function jumps (x = -1
@@ -849,7 +868,7 @@ ph_fs_lookup_fill(const struct ph_fs_lookup *fn, const struct ph_fs_ramp *r,
     * that changes faster than the texels (fract(x * y) over the window)
     * is refused, not sampled wrong; isolated jumps (atan's branch cut, a
     * comparison) pass. */
-   if (fn->kind != PH_FS_RAMP_DIRECTION) {
+   if (fn->kind != PH_FS_RAMP_DIRECTION && !fn->pixel) {
       const unsigned stride = h > 1 ? 3 : 1;
       unsigned checked = 0, bad = 0;
 

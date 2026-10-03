@@ -8300,6 +8300,22 @@ ph_pass_unit_state(const struct ph_context *ctx, unsigned unit,
 static struct pipe_sampler_view *
 ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *ramp);
 
+/* A pixel lookup's domain: window position [0, 2^n) per dimension covering
+ * the framebuffer, one texel per pixel. */
+static void
+ph_pixel_domain(const struct ph_context *ctx, const struct ph_fs_ramp *r,
+                float lo[3], float span[3])
+{
+   const unsigned fb[2] = { ctx->fb.width, ctx->fb.height };
+
+   for (unsigned d = 0; d < r->dims; d++) {
+      const unsigned e = r->comp[d] < 2 ? fb[r->comp[d]] : 1;
+
+      lo[d] = 0.0f;
+      span[d] = (float)CLAMP(util_next_power_of_two(MAX2(e, 1)), 8, 2048);
+   }
+}
+
 static void
 ph_domain_reset(struct ph_context *ctx)
 {
@@ -8393,7 +8409,30 @@ ph_quant_domains(struct ph_quant_stage *q, const struct prim_header *prim,
          continue;
       memcpy(lo, q->ctx->dom_lo[k], sizeof(lo));
       memcpy(span, q->ctx->dom_span[k], sizeof(span));
-      ph_quant_domain(q, prim, n, q->ramp_src[i], k, r->comp, r->dims);
+      if (r->fn->pixel) {
+         /* The unit interpolates perspective-correctly, the window
+          * position affinely: they agree at equal w only. */
+         for (unsigned v = 1; v < n; v++)
+            if (prim->v[v]->data[q->ramp_src[i]][3] !=
+                prim->v[0]->data[q->ramp_src[i]][3]) {
+               ph_warn_once("a lookup of the window position across corners "
+                            "of different w is not exact; the primitive is "
+                            "dropped\n");
+               return false;
+            }
+         float plo[3], pspan[3];
+
+         ph_pixel_domain(q->ctx, r, plo, pspan);
+         if (memcmp(plo, lo, r->dims * sizeof(float)) ||
+             memcmp(pspan, span, r->dims * sizeof(float))) {
+            if (q->ctx->triangles || q->ctx->points || q->ctx->lines)
+               ph_submit_vertices(q->ctx);
+            memcpy(q->ctx->dom_lo[k], plo, r->dims * sizeof(float));
+            memcpy(q->ctx->dom_span[k], pspan, r->dims * sizeof(float));
+         }
+      } else {
+         ph_quant_domain(q, prim, n, q->ramp_src[i], k, r->comp, r->dims);
+      }
       /* A new domain needs the table over it (the old batch is submitted). */
       if (memcmp(lo, q->ctx->dom_lo[k], sizeof(lo)) ||
           memcmp(span, q->ctx->dom_span[k], sizeof(span))) {
@@ -9746,7 +9785,18 @@ static struct pipe_sampler_view *
 ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *ramp)
 {
    const bool cube = ramp->kind == PH_FS_RAMP_DIRECTION;
-   const unsigned n = ramp->size[0], h = cube ? n : ramp->size[1];
+   struct ph_fs_ramp dom = *ramp;
+   const struct ph_fs_ramp *r = &dom;
+   float plo[3], pspan[3];
+
+   if (ramp->fn->pixel) {
+      ph_pixel_domain(ctx, ramp, plo, pspan);
+      for (unsigned d = 0; d < ramp->dims; d++) {
+         dom.size[d] = (uint16_t)pspan[d];
+         dom.extent[d] = ramp->comp[d] ? ctx->fb.height : ctx->fb.width;
+      }
+   }
+   const unsigned n = dom.size[0], h = cube ? n : dom.size[1];
    const size_t bytes = (size_t)n * h * (cube ? 6 : 1) * 4;
    struct pipe_resource templ = {
       .target = cube ? PIPE_TEXTURE_CUBE : PIPE_TEXTURE_2D,
@@ -9754,8 +9804,6 @@ ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *ramp)
       .width0 = n, .height0 = h, .depth0 = 1, .array_size = cube ? 6 : 1,
       .bind = PIPE_BIND_SAMPLER_VIEW,
    };
-   struct ph_fs_ramp dom = *ramp;
-   const struct ph_fs_ramp *r = &dom;
    static size_t budget;
    struct ph_lookup_tex *t;
    struct pipe_sampler_view vt;
@@ -9783,8 +9831,8 @@ ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *ramp)
       }
       key = grown;
       for (unsigned d = 0; d < r->dims; d++) {
-         dom.lo[d] = ctx->dom_lo[2 + r->unit][d];
-         dom.span[d] = ctx->dom_span[2 + r->unit][d];
+         dom.lo[d] = ramp->fn->pixel ? plo[d] : ctx->dom_lo[2 + r->unit][d];
+         dom.span[d] = ramp->fn->pixel ? pspan[d] : ctx->dom_span[2 + r->unit][d];
          memcpy(&key[key_count++], &dom.lo[d], 4);
          memcpy(&key[key_count++], &dom.span[d], 4);
       }
@@ -10001,7 +10049,8 @@ ph_draw_ramped(struct ph_context *ctx, const struct pipe_draw_info *info,
       ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, u, 1, 0,
                                   &view);
       ctx->base.bind_sampler_states(&ctx->base, MESA_SHADER_FRAGMENT, u, 1,
-                                    prog->ramps[i].kind == PH_FS_RAMP_FLOOR ?
+                                    prog->ramps[i].kind == PH_FS_RAMP_FLOOR ||
+                                    (prog->ramps[i].fn && prog->ramps[i].fn->pixel) ?
                                     &ctx->ramp_sampler : &ctx->lookup_sampler);
    }
    /* A tap's unit samples its texture through the same view and sampler. */

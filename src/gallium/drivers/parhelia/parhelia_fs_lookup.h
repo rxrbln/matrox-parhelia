@@ -27,6 +27,10 @@ struct ph_fs_lookup {
    uint8_t comps;
    uint8_t comp[4];        /* the varying components, in coordinate order */
    uint8_t out_mask;       /* colour channels the program writes */
+   /* A function of the window position alone: one texel per pixel,
+    * evaluated at the pixel centres and sampled nearest, exact. */
+   bool pixel;
+   bool origin_lower_left, pixel_center_integer;   /* gl_FragCoord's */
    unsigned num_defs;
    bool *varies;           /* per SSA def: depends on the varying */
    nir_instr **steps;      /* what runs per texel, in program order */

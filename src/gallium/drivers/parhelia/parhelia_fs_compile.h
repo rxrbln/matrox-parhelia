@@ -122,6 +122,7 @@ struct ph_fs_ramp {
    uint8_t comp[3];
    uint16_t size[3];       /* texels per dimension */
    float lo[3], span[3];   /* coordinate domain [lo, lo + span) */
+   uint16_t extent[2];     /* texels a pixel lookup fills: the framebuffer */
 };
 
 struct ph_fs_program {
