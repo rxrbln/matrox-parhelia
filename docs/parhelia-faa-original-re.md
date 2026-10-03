@@ -732,3 +732,230 @@ objects in one process [MEASURED]:
 | no host transfers between frames | 1 |
 
 Re-zeroing the buffer is not the cause, and an idle wait does not help.
+
+## 12. The vendor FAA frame pair, packet by packet (static, original family)
+
+Scope: `MTXPARD.dll` with `caps & 0x7fc00 == 0` (0x0527/0x0528), one D3D
+context that owns the fragment unit, an FAA target, cross-checked against
+`mtx_parhelia.o`.  Notation: `H` = `[D+0x30]` (the SetupHardware object
+`sub_2EC10` runs on), `blk` = `[D+0x2c]` (state block), `F` = `[H+0x20]`
+(pending flush flags), `tag` = the hardware fence counter `[[pDev]+4]+0x1c`
+after `+= 0x10`, `resume` = the last DWGCTL written (`[[pDev]+4]+0x4c`).
+Bracketed groups are the vendor's register-list packets; register =
+`0x1000 + 4 * index`, index `0x21` = pad.
+
+### 12.1 Corrections to sections 0, 3, 11.11 and 11.12
+
+* **`sub_2DC20` is not an engine preamble on the 0528.**  It tests
+  `caps & 0x3e` (0x0527 only) at `0x2dc2e..0x2dc3b`; on the 0528 it jumps to
+  `0x2e136`, which emits only `[0x1378 = <unwritten dword>]` (a strobe, see
+  `parhelia-minimal-draw-recipe.md`) when `[H+0x3c]` bit 2 is set, and returns
+  without clearing `[H+0x2c]`.  The guard band 31.0, `DWGCTL 0x2010cc`,
+  combiner defaults and `0x12f4` words of 11.12 belong to the 0x0527 branch.
+  In the resolve, `[H+0x3c]` has just been zeroed by `sub_2EB80` (`0x2ebf4`)
+  inside `sub_2EC10`, so both `sub_2DC20(1)` calls of `sub_9E860` (`0x9e8f7`,
+  `0x9e9ee`) emit nothing on the 0528 in the steady state.  [PROVEN]
+* **`sub_9D1B0` is not a session start.**  It runs after *every* primitive
+  emission (13 call sites, e.g. `0x140122` right after the section submit
+  `0x140111`), FAA or not: `[depth+0x368] |= 8` and `[H+0x2c] = 1`
+  unconditionally, then, only with `fragctx+0xa4 == 3`, pending flag and
+  snapshot.  `[depth+0x368]` bit 3 is read only by the clear (`0x9f733`,
+  `0x9fa06`, may Z-init skip the stencil bits); `[H+0x2c]` only gates the
+  `sub_2DC20` call.  Neither reaches a register on the 0528.  [PROVEN]
+* **`sub_2CE60` emits nothing.**  It ORs the mask into the current block's
+  dirty words (`0x2ce60..0x2ce95`); the re-emission happens in the next
+  validate (12.3 E).  [PROVEN]
+* **`sub_9DCC0` does emit on the original family.**  The non-LX branch
+  (`0x9dd6f`) compares the wanted Z tile-tracking state with `ds:0x1ebe20`
+  and, when it differs, emits `[DWGCTL = 0x20a (on) | 0x00a (off), resume]`
+  (`0x9dd8e..0x9dddd`); only the LX `0x207` fence and `0x800` bit are
+  family-gated.  Linux `mtx1538` (`0xcda0`, branch `0xcea6`) is the same.
+  Sections 0 and 3 ("skipped on the original family") are wrong.  [PROVEN]
+* `0x2cfa1` (guard band 31.0) and `0x2d2b6` (`[H+0x3c]` bit 4) are both
+  behind `caps & 0x7fc00` (`0x2cf92`, `0x2d2af`): LX only.  [PROVEN]
+* `[fragctx+0xe8]` only gates `sub_9E860` (`0x9e86f`).  [PROVEN]
+
+### 12.2 The building blocks [PROVEN]
+
+**Flush `sub_2E190`** (run by `sub_2EC10` when `F & 0x700`, `0x2ec6f`):
+`F' = (F & ~0x408) | 6`, then one of
+`[DWGCTL = F', 0x12bc = tag|1, 0x12bc = tag, DWGCTL = resume]` (`[H+0x28]`),
+`[DWGCTL = F', 0x12bc = tag|1, DWGCTL = resume]` (`[H+0x24]`), or untagged
+`[DWGCTL = F', DWGCTL = resume]`; and when the old `F` had bit 10 a second
+group `[DWGCTL = 4, DWGCTL = (F' & 0xff) | 0x400, 0x12bc = tag|1,
+0x12bc = tag, DWGCTL = resume]` (`0x2e2bb..0x2e34f`).  `F = 0x100`
+(the `0x12fc` bit-1 change of `sub_9AB30`) gives `0x106`; `F = 0x701`
+gives `0x307` followed by `4, 0x407`.  `0x701` is set by a state-block switch
+(`sub_2CD90`, `0x2ce51`), by `sub_2D220` (3-D re-entry, below) and by the 3-D
+hand-over `sub_2C070` (`0x2c0f7`, `0x2c129`).
+
+**3-D re-entry `sub_2D220`** (`0x2ec5d`: when `[[pDev]+4]+0xf8 != 2`): all
+dirty words `~0`, `F |= 0x701`, `[H+0x3c] = ~0`, owner word = 2.  The 3-D
+hand-over `sub_2C070` leaves the owner word at 1 (`0x2c618`).
+
+**Validate `sub_C9AC0`**, atom order: raster `sub_C9250`
+(`[0x1328, 0x132c, 0x12fc, 0x12f8]`, `[0x12e8, 0x12e4, 0x12f0, 0x12ec]`),
+`+0xa8`, `+0xc0`, `+0x1d0`, `+0x9fc`, surface `sub_C98B0`
+(`[0x1220, 0x1224, 0x1230, 0x1234]`, `[0x1228, 0x122c]`,
+`[0x1238, 0x123c]`, `[0x1318, 0x1314]`, `[0x1324]`; dirty bit 7:
+`[DWGCTL = 0x307, 0x12bc = tag|1, 0x12bc = tag, 0x12b0 = MemLevels]`
+(`0xc9a37`) and then always `[DWGCTL = atom+4]`), then `+0x768`
+(`0x12f4`, WARP), each only for its dirty bits.
+
+**Surface fence `sub_9D6E0`**: `[DWGCTL = op|7, 0x12bc = tag|1,
+0x12bc = tag, DWGCTL = resume]` (`0x9d757..0x9d77e`).
+
+**Z-init load `sub_9F470` -> `sub_9D480`** (original family, `0x9f4a6`):
+`[0x12b4 = packed depth, DWGCTL = 0x008, DWGCTL = resume]`, or with `reset`
+`[DWGCTL = 0x108, DWGCTL = resume]`.  Linux `mtx2060` -> `mtx1447`
+(`0x107ad`: `0x21c0c0ad`, value, `8`; `0x10777`: `0x108`).
+
+`3D.EnableZinit` defaults to `(caps & 0x3c0) && (memconfig & 0x08000000)` in
+`MTXPARD.dll` (`0x109bff..0x109c34`) and to `caps & 0x3c0` in the Linux
+`mtx_drv.so` (`parhelia-p690-fast-depth-clear.md` section 1), so the
+vendor's 0528 runs its depth clears through Z-init by default (Linux
+unconditionally, Windows when the BIOS memory-config bit is set).
+
+### 12.3 One frame and the next
+
+**A. Arming** (`sub_A0490`, called from the per-draw state pass `0xb03f4`
+before the validate, `0x1400c0` -> `0x1400c7`), host only: block `+0xa0` =
+FAA word, slot 2 = `{fragbuf, 0x10000020}` (surface dirty 4), surfaces
+linked to the fragment context (`sub_9D330`), `sub_9AB30`: `F |= 0x100` if
+`0x12fc` bit 1 changed, MemLevels `(v & ~0x18000) | 0xe0000` and dirty bit 7
+when `[1:0]` became 3.  [PROVEN]
+
+**B. Every draw** (`sub_101010` then the primitive):
+
+1. Z tracking `sub_9DCC0`: `[DWGCTL = 0x20a | 0x00a, resume]` only on a
+   state change; on when the Z-init owner `pDev+0xa674` is the bound depth
+   surface.
+2. Retire/activate only if another context owns the unit (4.2).
+3. `sub_2EC10(blk, 0, 1)`: the 12.2 flush if `F & 0x700` (first FAA draw:
+   `[DWGCTL 0x106, resume]`); `sub_2D270`/`sub_2EB80` (texture-format
+   dependent, untextured: nothing); validate of the dirty atoms.  On the
+   first FAA draw this is `0x12fc` = FAA word, `0x12f8`, slots 0/2/1 and
+   `[DWGCTL 0x307, 0x12bc tag|1, tag, 0x12b0 = FAA MemLevels]`, DWGCTL.
+4. Primitive packets, section submit.
+5. `sub_9D1B0` (host): pending flag, snapshot of `0x12c8..0x12d0` and the
+   slots.
+
+Further draws of the frame carry only dirty state: no fence, no DWGCTL with
+bit 8-10 (11.11).  [PROVEN]
+
+**C. Resolve `sub_9E860`** (callers: surface access `sub_C2320` from
+`0x2c0bd`, `0xa338d`, `0xed6aa`; the Z-init clear `0x9fb16`; target or mode
+change in `sub_9FFE0`):
+
+1. (owner switch only) retire/activate; `sub_2DC20` -> nothing (12.1).
+2. `sub_2EC10(blk, 0, 1)`: dirty state only.
+3. `[0x1220, 0x1224, 0x1230, 0x1234]` = snapshot slots 0 and 2,
+   `[0x1228, 0x122c]` = snapshot slot 1.
+4. If `[H+0x30]` (`0x9e9b2`): `sub_2E360` = `[0x1324 = ~0, 0x12cc, 0x12d0]`,
+   `[DWGCTL = 0xc4, 0x132c = 0x0fff0fff, 0x1328 = 0, 0x12c8]`,
+   `[0x12fc = FAA word]`, the 34-dword setup-plane packet.
+5. `[DWGCTL = 9, DWGCTL = resume]`.
+6. `[DWGCTL 0x107, tag|1, tag, resume]`, `[DWGCTL 0x207, tag|1, tag, resume]`.
+7. Host: all dirty `~0`, current block `|= 0x2400000f`, pending = 0.
+
+`0x12fc` stays in FAA mode in the hardware after the resolve.  [PROVEN]
+
+**D. Frame boundary.**  Three vendor paths touch the engine between C and
+the next frame's first draw:
+
+* *D3D blit / present through the 3-D state* (`0x10d900`, `0x110160`):
+  ends with `[DWGCTL = 0x707, tag|1, tag, resume]` while `[blk+0xa0] & 3`
+  (`0x10e78d`), else `0x307`.  [PROVEN]
+* *Hand-over to 2-D* `sub_2C070` (callers `0x1b59c`, `0x3f7aa`, `0x4111e`,
+  `0x8b3e6`, `0x94c8d`, `0x94fa6`; `0x8b3e6` only when the owner word is not
+  1, i.e. after 3-D use; that a present takes this path is INFERRED): resolve pending FAA
+  surfaces (`0x2c0bd`); `F |= 0x701`; `sub_2EC10(default block, 0x7f, 0)` =
+  `[DWGCTL 0x307, resume]`, `[DWGCTL 4, DWGCTL 0x407, tag|1, tag, resume]`,
+  `[0x1378]`, null draw `sub_2E760` (`0x1324 = 0x12e8 = 0x12d4 = 0x12cc =
+  0x12c8 = 0x12d0 = 0`; `DWGCTL 0x1000f4`, `0x12fc = 0`, `0x12e4 = 1`, slot 0
+  format forced to `0x32`, tiny setup-plane triangle), `sub_2E960(1)`,
+  `[DWGCTL 0x207, tag|1, tag, resume]` (`F |= 0x201`, `[H+0x28] = 1`,
+  `0x2ebae`), validate of the default block; `sub_9DCC0(0)` =
+  `[DWGCTL 0x00a]` if tracking was on; then the engine initialisation words
+  (`0x2c185..0x2c5e9`) including `[0x1324, 0x1318, 0x1314, 0x12fc = 0]`
+  (`0x2c3c3..0x2c3d6`), `0x12f4 = 31.0`, `DWGCTL 0x2010cc`, the sync
+  `[DWGCTL 0x307, DWGCTL 0xc]`, `[DWGCTL 0x707, 0x1378 = 0, 0x12bc tag|1,
+  tag]` (`0x2c42f..0x2c461`), `0x12b8 = 0x70601`, the same sync again and
+  `0x12b0` = clock-derived MemLevels; owner word = 1.  So the vendor disarms
+  FAA (`0x12fc = 0`) and drains `0x307 / 0x407 / 0x207 / 0x307 / 0xc /
+  0x707` before any 2-D work.  [PROVEN sequence]
+* *Clear* (`sub_9FF30`): colour through `sub_9B0C0` -> `sub_A0970` (blit
+  clear, D3D blit fence as above); depth on the original family through
+  `sub_9F8E0` (`0x9fe08`; the `0x9f4b0` path is LX only).  With
+  `EnableZinit`, a full-surface rectangle and (Z and stencil cleared, or no
+  stencil content): `[DWGCTL 0x20a]` (`0x9fa94`, if not on), a conventional
+  clear of the rows beyond 3 MiB (`0x9faae..0x9faf9`), the resolve
+  (`0x9fb16`, no-op when C already ran), then `[0x12b4 = packed depth,
+  DWGCTL 0x008, DWGCTL resume]` (`0x9fb31`).  Otherwise
+  `[DWGCTL 0x00a]` if another surface owned Z-init, and a conventional
+  `sub_A0970` clear without resolve.  Linux `mtx237` (`0x10b80`):
+  `mtx1538(1)` `0x10d28`, budget `0x300000` `0x10d4d`, `mtx2954` `0x10d64`,
+  `mtx2060` `0x10da2`, same order.  [PROVEN]
+
+**E. Next frame, first draw.**  `sub_9DCC0` first (`[DWGCTL 0x20a]` if the
+Z-init owner is bound and tracking is off); then, after the hand-over (owner
+word 1), `sub_2D220` fires: dirty `~0`, `F = 0x701` -> `[DWGCTL 0x307,
+resume]`, `[DWGCTL 4, DWGCTL 0x407, tag|1, tag, resume]`, then the full
+validate: `0x12fc` = FAA word again, slot 2 = fragment buffer,
+`[DWGCTL 0x307, tag|1, tag, 0x12b0 = FAA MemLevels]`, DWGCTL.  Without a
+hand-over (blit-only present), the first validate after C still re-emits
+everything because C left all dirty words `~0`, including the tagged
+`0x307` arm.  Draws and the resolve follow as B and C.  [PROVEN]
+
+### 12.4 Vendor frame vs `--faa-probe` (Mesa `p0528-faa0528`, kernel -10)
+
+| step | vendor (0528) | probe |
+|---|---|---|
+| depth clear | Z-init: `0x20a` once, `0x12b4` + `DWGCTL 0x008` per frame, no pixel writes | 2-D solid fill (`p3d_emit_clear`, slots 0/1 = depth) in its own submit, `0x12fc` still FAA, slot 2 still bound |
+| Z tile tracking | explicit `0x20a`/`0x00a`, off before 2-D work | never written (power-on or previous client's state) |
+| between frames | `0x12fc = 0`, sync `0x307 / 4,0x407 / 0x207 / 0x307,0xc / 0x707` before 2-D work; D3D blits end `0x707` | FAA stays armed through host transfers and the depth fill; kernel drain `0x307` (`faa_boundary=8`) or `0x707` |
+| re-entry | `0x307` + `4, 0x407` + full validate with tagged `0x307` arm | full state batch, kernel opening fence |
+| arm flush | `DWGCTL 0x106` on the `0x12fc` bit-1 change | none |
+| ThresholdAA | `0x007fffff` (Windows) / `0x007fe000` (Linux param) | `0x007fe000` |
+| draw .. resolve | no fence between them | same (one submit) |
+| resolve, post fences | C.3-C.6 | same |
+
+### 12.5 Candidates for the carried-over state
+
+1. **FAA armed during foreign engine work.**  The vendor never lets 2-D work
+   or another client run with `0x12fc[1:0] = 3`: `sub_2C070` resolves,
+   flushes the fragment cache (`0x407`) and writes `0x12fc = 0` first.  The
+   probe leaves the resolve's FAA word live through the host transfers, the
+   2-D depth fill and anything else using the engine (X, fbcon) while it
+   sleeps, which fits the shorter runs with a 500 ms idle (b10) and the
+   boot-to-boot spread of the first resolve [INFERRED].  Probe: end every
+   FAA submit after the `0x107/0x207` fences with the vendor hand-over core
+   in the same stream, `[DWGCTL 0x307, resume]`, `[DWGCTL 4, DWGCTL 0x407,
+   tag|1, tag, resume]` (kernel-built), `[0x12fc = 0x0bb80024 (mode 0)]`,
+   `[DWGCTL 0x207, tag|1, tag, resume]`, and start the next FAA submit with
+   `[DWGCTL 0x307]`, `[4, 0x407 + tags]` before the state (12.3 E).  Run the
+   b8 loop with X stopped and fbcon unbound, then with them running.
+2. **Z tile-tracking state.**  FAA rewrites depth words of partly covered
+   pixels into `0x010000nn` fragment references (11.4) and per-tile state
+   survives a mode-0 redraw (run g3); the vendor clears depth by resetting
+   the Z unit's tile state (`0x20a` + `0x12b4`/`0x008`) every frame, the
+   probe by a 2-D fill of the memory only (on the P690 the tracked state is
+   on-chip and survives 2-D fills of other surfaces; whether a fill of the
+   tracked surface itself resets it is OPEN).  Probe: replace `faa_clear_depth` with
+   `parhelia_batch_depth_control(.., P3D_ZTRACK_ON, ..)` once per process and
+   `parhelia_batch_depth_control(.., P3D_ZINIT_LOAD_ORIGINAL, load, 0x00ffffff,
+   resume)` per frame, the latter at the head of the FAA submit (vendor
+   order: clear, validate, draws, resolve); on exit `P3D_ZINIT_RESET_ORIGINAL`
+   then `P3D_ZTRACK_OFF`.  [INFERRED]
+3. **No fragment-cache writeback between resolve and the next accumulation.**
+   With a present, the vendor always issues a DWGCTL with bit 10 between
+   frames (`0x707` blit end, or `4, 0x407`), the probe only with
+   `FAA_FRAMERETIRE=2`, which also redraws into the companion.  Probe:
+   `full_sync=1` on the module (every drain `0x307, 0x004, 0x707`) with the
+   b8 loop, or one in-stream `[4, 0x407]` kernel-built fence after the
+   `0x207` post fence.  [INFERRED]
+
+OPEN: the meaning of the memory-config bit 27 that gates Windows
+`EnableZinit`; which 2-D entry points a D3D present takes on Windows
+(`sub_2C070` vs the D3D blit), so whether a vendor frame pair contains the
+hand-over or only the `0x707` blit fence.
