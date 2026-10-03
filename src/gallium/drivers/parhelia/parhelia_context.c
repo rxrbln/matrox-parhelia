@@ -4409,6 +4409,14 @@ ph_warp_entry(const struct ph_context *ctx, bool textured, bool two_sets,
                      ctx->warp_passthrough;
 }
 
+/* A compiled program reading a generic varying routed into v0 needs the
+ * textured program that forwards the vertex colour, not REPLACE's. */
+static bool
+ph_fs_reads_routed_v0(const struct ph_fs *fs)
+{
+   return fs && fs->program.valid && fs->program.route[0] >= 0;
+}
+
 static void
 ph_submit_vertices(struct ph_context *ctx)
 {
@@ -4833,7 +4841,8 @@ ph_submit_vertices(struct ph_context *ctx)
       ph_pass_unit_state(ctx, 0, &tex);
       state.warp_entry =
          ph_warp_entry(ctx, true, texture1 || ctx->native_sampled_alpha,
-                       !ctx->fs->uses_color && !ctx->alpha_micro);
+                       !ctx->fs->uses_color && !ctx->alpha_micro &&
+                       !ph_fs_reads_routed_v0(ctx->fs));
       if (ctx->native_sampled_alpha) {
          tex1 = tex;
          tex1.reloc_offset = 0;
