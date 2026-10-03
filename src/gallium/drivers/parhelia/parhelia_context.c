@@ -5490,15 +5490,19 @@ ph_v_output(struct draw_context *draw, const struct ph_context *ctx, unsigned k)
 {
    const struct ph_fs *fs = ctx->fs;
 
-   if (fs && fs->program.valid && fs->program.route[k] == VARYING_SLOT_PNTC)
-      return draw_find_shader_output(draw, TGSI_SEMANTIC_PCOORD, 0);
-   if (fs && fs->program.valid && fs->program.route[k] >= (int)VARYING_SLOT_VAR0) {
-      const unsigned n = fs->program.route[k] - VARYING_SLOT_VAR0;
-      int out = draw_find_shader_output(draw, TGSI_SEMANTIC_GENERIC, n);
+   if (fs && fs->program.valid && fs->program.route[k] >= 0) {
+      unsigned name, index;
+      int out;
 
-      /* Without texcoord semantics the generics follow the eight sets. */
-      if (out < 0)
-         out = draw_find_shader_output(draw, TGSI_SEMANTIC_GENERIC, n + 9);
+      /* texcoord semantics first; without them the generics follow the
+       * eight texture coordinate sets */
+      tgsi_get_gl_varying_semantic(fs->program.route[k], true, &name, &index);
+      out = draw_find_shader_output(draw, name, index);
+      if (out < 0) {
+         tgsi_get_gl_varying_semantic(fs->program.route[k], false, &name,
+                                      &index);
+         out = draw_find_shader_output(draw, name, index);
+      }
       return out;
    }
    if (k == 0)

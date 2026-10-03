@@ -3700,6 +3700,16 @@ ph_fs_coordinate_only(nir_def *def, unsigned depth)
 /* Generic varyings the program reads as values, assigned to the colour
  * interpolators it does not read itself: v0 first, then v1.  Texture
  * coordinate varyings only feed the texture units and are not routed. */
+/* A varying the combiner reads as a value through a colour interpolator or
+ * a coordinate unit: generics, the point coordinate, and texture
+ * coordinates read as values (ARB_fragment_program's fragment.texcoord). */
+static bool
+ph_fs_value_varying(int location)
+{
+   return location >= VARYING_SLOT_VAR0 || location == VARYING_SLOT_PNTC ||
+          (location >= VARYING_SLOT_TEX0 && location <= VARYING_SLOT_TEX7);
+}
+
 static bool
 ph_fs_route_varyings(nir_shader *nir, int route[2],
                      const struct ph_fs_ramp *ramps, unsigned ramp_count)
@@ -3736,8 +3746,7 @@ ph_fs_route_varyings(nir_shader *nir, int route[2],
             else if (location == VARYING_SLOT_COL1 ||
                      location == VARYING_SLOT_FOGC)
                used_col1 = true;
-            else if (location >= VARYING_SLOT_VAR0 ||
-                     location == VARYING_SLOT_PNTC) {
+            else if (ph_fs_value_varying(location)) {
                bool seen = false;
 
                /* Carried by a coordinate unit. */
@@ -4236,8 +4245,7 @@ ph_fs_assign_pass_units(nir_shader *nir, unsigned used_units,
                read[loc] |= 1;
                continue;
             }
-            if (loc >= VARYING_SLOT_MAX ||
-                !(loc >= VARYING_SLOT_VAR0 || loc == VARYING_SLOT_PNTC))
+            if (loc >= VARYING_SLOT_MAX || !ph_fs_value_varying(loc))
                continue;
             for (i = 0; i < generics && location[i] != loc; i++)
                ;
