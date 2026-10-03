@@ -586,6 +586,24 @@ p3d_comb_opcode(const struct p3d_comb_half *h, int alpha_half)
 	return alpha_half ? word & ~0x124u : word;
 }
 
+/* MOV r0, r0 in both halves of an unused combiner slot.  The alpha half
+ * must be stated too: it keeps what the last client left, and after power-on
+ * that dropped an untextured RGBA draw's second triangle (vertex-count) until
+ * a compiled fragment program happened to rewrite it; X's conversion stream
+ * needed the same. */
+static void
+p3d_emit_comb_pad(struct p3d_cs *cs, uint32_t slot)
+{
+	struct p3d_rw rw[4] = {
+		{ P3D_R_COMB_RGB, 0x80u | slot },
+		{ P3D_R_COMB_ALPHA, 0x80u },
+		{ 0x126c, 0x00400400u },
+		{ 0x1268, 0x00400400u },
+	};
+
+	p3d_reglist(cs, rw, 4);
+}
+
 /* Emit a compiled fragment program starting at instruction index @first,
  * padding the slot walk out to the five-instruction quantum. */
 static void
@@ -624,12 +642,8 @@ p3d_emit_comb_program(struct p3d_cs *cs, const struct p3d_comb_program *prog,
 		p3d_reglist(cs, rw, 8);
 	}
 	/* MOV r0, r0 in every unused slot: the padding is the terminator. */
-	for (; emitted < P3D_COMB_QUANTUM; emitted++) {
-		rw[0].reg = P3D_R_COMB_RGB;
-		rw[0].val = 0x80u | p3d_comb_slot[emitted];
-		rw[1].reg = 0x126c; rw[1].val = 0x00400400u;
-		p3d_reglist(cs, rw, 2);
-	}
+	for (; emitted < P3D_COMB_QUANTUM; emitted++)
+		p3d_emit_comb_pad(cs, p3d_comb_slot[emitted]);
 }
 
 /* Emit one fixed-function texture-environment ALU stage.  The texture-address
@@ -1213,22 +1227,18 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 						st->comb_op);
 			}
 			/* one pad to reach the five-instruction quantum */
-			rw[0].reg = P3D_R_COMB_RGB; rw[0].val = 0x8a;
-			rw[1].reg = 0x126c;         rw[1].val = 0x00400400u;
-			p3d_reglist(cs, rw, 2);
+			p3d_emit_comb_pad(cs, 10);
 		} else {
-			static const uint32_t pad[] = { 0x84, 0x88, 0x8a };
+			static const uint32_t pad[] = { 4, 8, 10 };
 			size_t i;
-			for (i = 0; i < 3; i++) {
-				rw[0].reg = P3D_R_COMB_RGB; rw[0].val = pad[i];
-				rw[1].reg = 0x126c;         rw[1].val = 0x00400400u;
-				p3d_reglist(cs, rw, 2);
-			}
+
+			for (i = 0; i < 3; i++)
+				p3d_emit_comb_pad(cs, pad[i]);
 		}
 	} else if (st->comb) {
 		p3d_emit_comb_program(cs, st->comb, 0);
 	} else {
-		static const uint32_t pad[] = { 0x82, 0x84, 0x88, 0x8a };
+		static const uint32_t pad[] = { 2, 4, 8, 10 };
 		size_t i;
 
 		/* MOV_sat r0, v0 in slot 0 with identity pads in 2/4/8/10 */
@@ -1242,11 +1252,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 		rw[7].reg = 0x1284; rw[7].val = 0;
 		p3d_reglist(cs, rw, 8);
 
-		for (i = 0; i < 4; i++) {
-			rw[0].reg = P3D_R_COMB_RGB; rw[0].val = pad[i];
-			rw[1].reg = 0x126c;         rw[1].val = 0x00400400u;
-			p3d_reglist(cs, rw, 2);
-		}
+		for (i = 0; i < 4; i++)
+			p3d_emit_comb_pad(cs, pad[i]);
 	}
 }
 
