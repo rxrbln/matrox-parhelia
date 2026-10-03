@@ -1506,11 +1506,13 @@ ph_fs_assemble(struct ph_fs_ctx *ctx, nir_def *const defs[3],
       return ph_fs_fail(ctx, "RGB assembled from separate values");
    for (unsigned i = 0; i < 3; i++) {
       nir_def *def = defs[i];
-      nir_instr *instr = nir_def_instr(def);
+      nir_instr *instr = def ? nir_def_instr(def) : NULL;
       int sel = comps[i] == i ? -1 : comps[i];
       unsigned g;
 
       literal[i] = 0.0f;
+      if (!def)
+         continue;
       if (instr->type == nir_instr_type_load_const) {
          literal[i] = nir_const_value_as_float(
             nir_instr_as_load_const(instr)->value[comps[i]], 32);
@@ -1821,12 +1823,16 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
                             alu->src[sel].swizzle[0], out);
       }
       {
-         nir_def *defs[3] = { alu->src[0].src.ssa, alu->src[1].src.ssa,
-                              alu->src[2].src.ssa };
-         const uint8_t comps[3] = { alu->src[0].swizzle[0],
-                                    alu->src[1].swizzle[0],
-                                    alu->src[2].swizzle[0] };
+         /* A vec2 read naturally fills its third channel with zero, which
+          * nothing reads. */
+         const unsigned n = nir_op_infos[alu->op].num_inputs;
+         nir_def *defs[3] = { NULL, NULL, NULL };
+         uint8_t comps[3] = { 0, 0, 0 };
 
+         for (unsigned c = 0; c < MIN2(n, 3); c++) {
+            defs[c] = alu->src[c].src.ssa;
+            comps[c] = alu->src[c].swizzle[0];
+         }
          return ph_fs_assemble(ctx, defs, comps, lane, value, out);
       }
    }
