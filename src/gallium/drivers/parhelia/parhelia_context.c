@@ -8375,28 +8375,10 @@ ph_quant_domains(struct ph_quant_stage *q, const struct prim_header *prim,
 {
    static const uint8_t identity[4] = { 0, 1, 2, 3 };
 
-   /* The colour interpolators are affine: a routed varying across corners
-    * of different w would interpolate differently from GL. */
-   if (q->route_count && n > 1) {
-      const int pos = draw_current_shader_position_output(q->ctx->draw);
-      bool varies = false;
-
-      /* Equal values at every corner (a flat varying) interpolate to
-       * themselves either way. */
-      for (unsigned r = 0; r < q->route_count; r++)
-         for (unsigned v = 1; v < n; v++)
-            varies |= memcmp(prim->v[v]->data[q->route_slot[r]],
-                             prim->v[0]->data[q->route_slot[r]],
-                             4 * sizeof(float)) != 0;
-      for (unsigned v = 1; varies && v < n; v++)
-         if (prim->v[v]->data[pos][3] != prim->v[0]->data[pos][3]) {
-            ph_warn_once("a varying on a colour interpolator across corners "
-                         "of different w is not perspective-correct; the "
-                         "primitive is dropped\n");
-            return false;
-         }
-   }
-
+   /* The colour interpolators are affine, as for gl_Color on this
+    * hardware and in the vendor driver: a routed varying interpolates
+    * affinely rather than the primitive being dropped.  Varyings the
+    * compiler can give a coordinate unit are perspective-correct. */
    for (unsigned r = 0; r < q->route_count; r++)
       ph_quant_domain(q, prim, n, q->route_slot[r], q->route_carrier[r],
                       identity, 4);
