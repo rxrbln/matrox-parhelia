@@ -862,13 +862,19 @@ struct p3d_state {
 	unsigned	   comb_slot_base;
 	const struct p3d_texture *tex;	/* unit 0 */
 	const struct p3d_texture *tex1;	/* unit 1; NULL = single unit */	/* NULL = untextured */
-	/* Units 2 and 3 exist on the original Parhelia (0x0527/0x0528), which
-	 * has four texture units; the LX family has two and leaves these NULL.
+	/* Units 2 and 3: both families have four texture pipes (the LX
+	 * tables in PSER 0x1dbe58 / KRN mtx2422 assign one pipe per unit).
 	 * The units must be contiguous: a unit is active only if every lower
 	 * one is.  parhelia-multitexture.md section 1 has the register model -
 	 * 0x11c0..0x11e4 is one window that 0x1200 + unit*4 banks. */
-	const struct p3d_texture *tex2;	/* unit 2; original family only */
-	const struct p3d_texture *tex3;	/* unit 3; original family only */
+	const struct p3d_texture *tex2;	/* unit 2 */
+	const struct p3d_texture *tex3;	/* unit 3 */
+	/* 0x1118: nibble u is the WARP output (coordinate set + 3) unit u
+	 * samples with; 0 is the default one set per unit, 0x6543. */
+	uint32_t	   coord_map;
+	/* Coordinate sets the vertex carries when units share them through
+	 * @coord_map; 0 is one per unit. */
+	unsigned	   coord_sets;
 	/* P690 workaround proven by the RGB-companion cutout probe: preserve
 	 * unit-0 RGB and replicate unit-1 red into fragment alpha. */
 	int		   sampled_alpha_companion;
@@ -975,6 +981,39 @@ p3d_state_unit(const struct p3d_state *st, unsigned u)
 	}
 }
 
+/* The combiner register (t0..t3) holding unit @u's sample: the first pipe of
+ * the unit's mask.  P690 units sit alone on pipes [0], [0,2], [0,1,3] or
+ * [0,1,2,3] (PSER 0x177770); the ganged pairs of the original family merge
+ * into t0/t1. */
+static inline unsigned
+p3d_state_unit_treg(const struct p3d_state *st, unsigned nunit, unsigned u)
+{
+	static const uint8_t lx[5][4] = {
+		{ 0 }, { 0 }, { 0, 2 }, { 0, 1, 3 }, { 0, 1, 2, 3 },
+	};
+
+	if (!st->single_texture_pipe || st->sampled_alpha_companion ||
+	    nunit > 4)
+		return u;
+	return lx[nunit][u & 3];
+}
+
+/* Logical texture register t<i> -> physical: the units' pipes, then the free
+ * registers in order, so the rename is a permutation. */
+static inline void
+p3d_state_treg_map(const struct p3d_state *st, unsigned nunit, uint8_t map[4])
+{
+	unsigned i, used = 0, next = 0;
+
+	for (i = 0; i < nunit && i < 4; i++)
+		used |= 1u << (map[i] = p3d_state_unit_treg(st, nunit, i));
+	for (; i < 4; i++) {
+		while (used & (1u << next))
+			next++;
+		used |= 1u << (map[i] = next);
+	}
+}
+
 /* How many contiguous texture units this state drives, 0 when untextured. */
 static inline unsigned
 p3d_state_units(const struct p3d_state *st)
@@ -984,6 +1023,13 @@ p3d_state_units(const struct p3d_state *st)
 	while (u < P3D_MAX_TEXTURE_UNITS && p3d_state_unit(st, u))
 		u++;
 	return u;
+}
+
+/* How many coordinate sets the vertex of @st carries. */
+static inline unsigned
+p3d_state_coord_sets(const struct p3d_state *st)
+{
+	return st->coord_sets ? st->coord_sets : p3d_state_units(st);
 }
 uint32_t p3d_prim_class(enum p3d_prim prim);
 unsigned p3d_vertices_per_primitive(enum p3d_prim prim);

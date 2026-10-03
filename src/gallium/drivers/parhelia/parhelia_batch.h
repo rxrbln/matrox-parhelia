@@ -159,6 +159,13 @@ int parhelia_batch_state_multitextured(struct parhelia_batch *batch,
                                       uint32_t texture1_handle,
                                       const struct p3d_state *state,
                                       unsigned triangle_count);
+/* One local-VRAM texture per active unit of state (tex .. tex3), each handle
+ * relocated into its unit's surface base. */
+int parhelia_batch_state_units(struct parhelia_batch *batch,
+                               uint32_t colour_handle, uint32_t depth_handle,
+                               const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS],
+                               const struct p3d_state *state,
+                               unsigned triangle_count);
 /* Draw a run of @vertices vertices of state->prim, at most
  * state->vertices_per_packet of them per draw packet, with either texture
  * handle zero when that unit is unused.  Only the last packet may be short. */

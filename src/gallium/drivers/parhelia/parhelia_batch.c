@@ -280,8 +280,8 @@ compact_state_packets_enabled(void)
 
 static int batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
                         const struct p3d_reloc *calls, uint32_t colour_handle,
-                        uint32_t depth_handle, uint32_t texture0_handle,
-                        uint32_t texture1_handle,
+                        uint32_t depth_handle,
+                        const uint32_t *texture_handles,
                         const uint32_t *texture_offsets,
                         uint32_t source_handle,
                         unsigned triangle_count,
@@ -393,7 +393,7 @@ parhelia_batch_clear_rect_surface(struct parhelia_batch *batch,
    } else {
       p3d_emit_clear(&cs, &surface, value, write_mask, x, y, width, height);
    }
-   return batch_finish(batch, &cs, calls, handle, 0, 0, 0, NULL, 0, 0, 0,
+   return batch_finish(batch, &cs, calls, handle, 0, NULL, NULL, 0, 0, 0,
                        P3D_TRIANGLES, 0, 0, false);
 }
 
@@ -425,7 +425,7 @@ parhelia_batch_depth_control(struct parhelia_batch *batch,
    p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_depth_control(&cs, &surface, slot, control, load, value, resume);
-   return batch_finish(batch, &cs, calls, 0, depth_handle, 0, 0, NULL, 0, 0, 0,
+   return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
                        P3D_TRIANGLES, 0, 0, false);
 }
 
@@ -453,7 +453,7 @@ parhelia_batch_zclear(struct parhelia_batch *batch, uint32_t depth_handle,
                           P3D_DWGCTL_SOLID);
    p3d_emit_depth_control(&cs, &surface, 1, P3D_ZINIT_LOAD, true, value,
                           P3D_DWGCTL_SOLID);
-   return batch_finish(batch, &cs, calls, 0, depth_handle, 0, 0, NULL, 0, 0, 0,
+   return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
                        P3D_TRIANGLES, 0, 0, false);
 }
 
@@ -479,7 +479,7 @@ parhelia_batch_zclear_word(struct parhelia_batch *batch, uint32_t depth_handle,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_depth_control(&cs, &surface, 1, word, true, value,
                           P3D_DWGCTL_SOLID);
-   return batch_finish(batch, &cs, calls, 0, depth_handle, 0, 0, NULL, 0, 0, 0,
+   return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
                        P3D_TRIANGLES, 0, 0, false);
 }
 
@@ -504,7 +504,7 @@ parhelia_batch_zcontrol(struct parhelia_batch *batch, uint32_t depth_handle,
    for (unsigned i = 0; i < count; i++)
       p3d_emit_depth_control(&cs, &surface, 1, words[i], false, 0,
                              P3D_DWGCTL_SOLID);
-   return batch_finish(batch, &cs, calls, 0, depth_handle, 0, 0, NULL, 0, 0, 0,
+   return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
                        P3D_TRIANGLES, 0, 0, false);
 }
 
@@ -530,7 +530,7 @@ parhelia_batch_zdiscard(struct parhelia_batch *batch, uint32_t depth_handle,
                           P3D_DWGCTL_SOLID);
    p3d_emit_depth_control(&cs, &surface, 1, P3D_ZTRACK_OFF, false, 0,
                           P3D_DWGCTL_SOLID);
-   return batch_finish(batch, &cs, calls, 0, depth_handle, 0, 0, NULL, 0, 0, 0,
+   return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
                        P3D_TRIANGLES, 0, 0, false);
 }
 
@@ -585,7 +585,7 @@ parhelia_batch_blit_format(struct parhelia_batch *batch,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_blit(&cs, &dst, dst_type, dst_x, dst_y,
                  &src, src_type, src_x, src_y, width, height);
-   return batch_finish(batch, &cs, calls, dst_handle, 0, 0, 0, NULL,
+   return batch_finish(batch, &cs, calls, dst_handle, 0, NULL, NULL,
                        src_handle, 0, 0, P3D_TRIANGLES, 0, 0, false);
 }
 
@@ -709,11 +709,13 @@ packet_count(enum p3d_prim prim, unsigned per_packet, unsigned vertices)
  * zero means every packet carries a full state.vertices_per_packet. */
 static int
 batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
-            uint32_t depth_handle, uint32_t texture0_handle,
-            uint32_t texture1_handle,
+            uint32_t depth_handle,
+            const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS],
             const struct p3d_state *input, unsigned triangle_count,
             unsigned vertices)
 {
+   const unsigned units = input ? p3d_state_units(input) : 0;
+   bool units_ok = true;
    struct p3d_reloc calls[PH_BATCH_PACKETS];
    uint32_t ring[PH_BATCH_PACKETS * 5];
    struct p3d_cs cs;
@@ -721,7 +723,19 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
    unsigned per_packet;
    int ret;
 
-   if (!batch || !input || !colour_handle || !triangle_count ||
+   /* a handle exactly for every active unit, at relocatable base zero */
+   for (unsigned u = 0; input && u < P3D_MAX_TEXTURE_UNITS; u++)
+      units_ok &= !!texture_handles[u] == (u < units) &&
+                  (u < units || !p3d_state_unit(input, u)) &&
+                  (u >= units || !p3d_state_unit(input, u)->base);
+   /* shared sets: every unit's coordinate map nibble names a carried set */
+   if (input && input->coord_sets)
+      for (unsigned u = 0; u < units; u++) {
+         const unsigned o = (input->coord_map >> (4 * u)) & 0xfu;
+
+         units_ok &= o >= 3 && o < 3 + input->coord_sets;
+      }
+   if (!batch || !input || !colour_handle || !triangle_count || !units_ok ||
        triangle_count > PH_BATCH_MAX_DRAWS ||
        input->prim >= P3D_PRIM_COUNT ||
        ((input->prim != P3D_TRIANGLES && input->prim != P3D_LINES &&
@@ -736,18 +750,14 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
        input->screen_w > input->colour.pitch || (input->colour.pitch & 63) ||
        input->colour.pitch > 0x3fff || input->colour.base ||
        (input->colour.fmt != 0x32 && input->colour.fmt != 0x28) ||
-       (!!input->tex != !!texture0_handle) ||
-       (!!input->tex1 != !!texture1_handle) ||
-       (!input->tex && input->tex1) ||
-	       (input->tex && input->tex->base) ||
-	       (input->tex1 && input->tex1->base) ||
 	       (input->second_texcoord_probe &&
 	        (!input->tex || input->tex1 || input->has_depth ||
 	         input->vertex_alpha || input->transform)) ||
 	       (input->dw_per_vertex != 5u + !!p3d_position_has_z(input) +
 	        !!input->oow +
-	        2 * (!!input->tex + !!input->tex1 +
-	             !!input->second_texcoord_probe) + !!input->vertex_alpha +
+	        2 * (p3d_state_coord_sets(input) +
+	             !!input->second_texcoord_probe) +
+	        !!input->vertex_alpha +
 	        (input->vertex_colour1 ? 3u + !!(input->vertex_colour1 & 2) +
 	                                 !!(input->vertex_colour1 & 4) : 0u) +
 	        2u * (input->texcoord_q && !input->texcoord3)) ||
@@ -872,14 +882,14 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
       p3d_emit_bound_ranges(&cs, &state, triangle_count);
    else
       p3d_emit_draws(&cs, &state, triangle_count);
-   const uint32_t texture_offsets[2] = {
-      state.tex ? state.tex->reloc_offset : 0,
-      state.tex1 ? state.tex1->reloc_offset : 0,
-   };
+   uint32_t texture_offsets[P3D_MAX_TEXTURE_UNITS] = { 0 };
+
+   for (unsigned u = 0; u < units; u++)
+      texture_offsets[u] = p3d_state_unit(&state, u)->reloc_offset;
 
    ret = batch_finish(batch, &cs, calls, colour_handle,
                       state.has_depth ? depth_handle : 0,
-                      texture0_handle, texture1_handle, texture_offsets, 0,
+                      texture_handles, texture_offsets, 0,
                       triangle_count, state.dw_per_vertex, state.prim,
                       per_packet, vertices, !!state.bound_ranges);
    /* Q3 reaches this builder with already transformed window-space vertices.
@@ -895,7 +905,9 @@ parhelia_batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
                      uint32_t depth_handle, const struct p3d_state *state,
                      unsigned triangle_count)
 {
-   return batch_state(batch, colour_handle, depth_handle, 0, 0, state,
+   static const uint32_t none[P3D_MAX_TEXTURE_UNITS];
+
+   return batch_state(batch, colour_handle, depth_handle, none, state,
                       triangle_count, 0);
 }
 
@@ -913,9 +925,10 @@ parhelia_batch_state_run(struct parhelia_batch *batch, uint32_t colour_handle,
                 p3d_vertices_per_primitive(state->prim);
    if (!per_packet || !vertices)
       return -EINVAL;
-   return batch_state(batch, colour_handle, depth_handle, texture0_handle,
-                      texture1_handle, state,
-                      packet_count(state->prim, per_packet, vertices),
+   return batch_state(batch, colour_handle, depth_handle,
+                      (const uint32_t[P3D_MAX_TEXTURE_UNITS]){
+                         texture0_handle, texture1_handle },
+                      state, packet_count(state->prim, per_packet, vertices),
                       vertices);
 }
 
@@ -926,7 +939,8 @@ parhelia_batch_state_textured(struct parhelia_batch *batch,
                               const struct p3d_state *state,
                               unsigned triangle_count)
 {
-   return batch_state(batch, colour_handle, depth_handle, texture_handle, 0,
+   return batch_state(batch, colour_handle, depth_handle,
+                      (const uint32_t[P3D_MAX_TEXTURE_UNITS]){ texture_handle },
                       state, triangle_count, 0);
 }
 
@@ -939,15 +953,28 @@ parhelia_batch_state_multitextured(struct parhelia_batch *batch,
                                    const struct p3d_state *state,
                                    unsigned triangle_count)
 {
-   return batch_state(batch, colour_handle, depth_handle, texture0_handle,
-                      texture1_handle, state, triangle_count, 0);
+   return batch_state(batch, colour_handle, depth_handle,
+                      (const uint32_t[P3D_MAX_TEXTURE_UNITS]){
+                         texture0_handle, texture1_handle },
+                      state, triangle_count, 0);
+}
+
+int
+parhelia_batch_state_units(struct parhelia_batch *batch,
+                           uint32_t colour_handle, uint32_t depth_handle,
+                           const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS],
+                           const struct p3d_state *state,
+                           unsigned triangle_count)
+{
+   return batch_state(batch, colour_handle, depth_handle, texture_handles,
+                      state, triangle_count, 0);
 }
 
 static int
 batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
              const struct p3d_reloc *calls, uint32_t colour_handle,
-             uint32_t depth_handle, uint32_t texture0_handle,
-             uint32_t texture1_handle,
+             uint32_t depth_handle,
+             const uint32_t *texture_handles,
              const uint32_t *texture_offsets,
              uint32_t source_handle,
              unsigned triangle_count,
@@ -1041,8 +1068,6 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
                 */
                if (cmd[pos] || batch->reloc_count >= PH_BATCH_PACKETS + 4)
                   return -EINVAL;
-               if (index == 0x77 && selected_unit >= 2)
-                  return -EINVAL;
                const unsigned unit = selected_unit;
 
                if (index == 0x77)
@@ -1052,7 +1077,7 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
                   .delta = index == 0x77 && texture_offsets ?
                            texture_offsets[unit] : 0,
                   .handle = index == 0x77 ?
-                            (unit ? texture1_handle : texture0_handle) :
+                            (texture_handles ? texture_handles[unit] : 0) :
                             (index == 0x8a && depth_handle ? depth_handle :
                              index == 0x8c && source_handle ? source_handle :
                                                                     colour_handle),
@@ -1063,8 +1088,10 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
          }
       }
    }
-   if (texture_units != ((texture0_handle != 0) | (texture1_handle != 0) << 1))
-      return -EINVAL;
+   for (unsigned u = 0; u < P3D_MAX_TEXTURE_UNITS; u++)
+      if (!!(texture_units & (1u << u)) !=
+          !!(texture_handles && texture_handles[u]))
+         return -EINVAL;
    if (bound_ranges) {
       if (stream_packet == UINT32_MAX ||
           batch->reloc_count >= PH_BATCH_RELOCS)

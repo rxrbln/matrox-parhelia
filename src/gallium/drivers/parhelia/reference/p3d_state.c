@@ -667,24 +667,27 @@ p3d_emit_comb_program(struct p3d_cs *cs, const struct p3d_comb_program *prog,
 		p3d_emit_comb_pad(cs, p3d_comb_slot[emitted]);
 }
 
-/* Emit @prog with texture register t1 renamed to @t1, the physical pipe that
- * holds unit 1's sample. */
+/* Emit @prog with texture register t<u> renamed to the physical pipe that
+ * holds unit u's sample. */
 static void
-p3d_emit_comb_program_t1(struct p3d_cs *cs, const struct p3d_comb_program *prog,
-			 unsigned first, uint8_t t1)
+p3d_emit_comb_program_units(struct p3d_cs *cs, const struct p3d_state *st,
+			    unsigned nunit, unsigned first)
 {
-	struct p3d_comb_program p = *prog;
+	struct p3d_comb_program p = *st->comb;
+	uint8_t map[4];
 	unsigned i, h, k;
 
+	p3d_state_treg_map(st, nunit, map);
 	for (i = 0; i < p.count && i < P3D_COMB_MAX_INSTRUCTIONS; i++) {
 		struct p3d_comb_half *half[2] = { &p.inst[i].rgb, &p.inst[i].alpha };
 
 		for (h = 0; h < 2; h++) {
-			if (half[h]->dst == P3D_COMB_T1)
-				half[h]->dst = t1;
+			if (half[h]->dst <= P3D_COMB_T3)
+				half[h]->dst = map[half[h]->dst];
 			for (k = 0; k < 3; k++)
-				if (half[h]->src[k].reg == P3D_COMB_T1)
-					half[h]->src[k].reg = t1;
+				if (half[h]->src[k].reg <= P3D_COMB_T3)
+					half[h]->src[k].reg =
+						map[half[h]->src[k].reg];
 		}
 	}
 	p3d_emit_comb_program(cs, &p, first);
@@ -762,7 +765,7 @@ p3d_state_fetches_colour(const struct p3d_state *st)
 				    p3d_position_has_z(st), st->pos_desc,
 				    st->col_desc,
 				    st->tex && st->tex->env == P3D_TEXENV_REPLACE,
-				    p3d_state_units(st), !!st->vertex_alpha,
+				    p3d_state_coord_sets(st), !!st->vertex_alpha,
 				    !!st->texcoord3, !!st->vertex_colour1);
 
 	for (size_t i = 0; i < nd; i++)
@@ -994,7 +997,7 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			     st->pos_desc, st->col_desc,
 			     st->tex && st->tex->env == P3D_TEXENV_REPLACE,
 			     st->second_texcoord_probe && !st->tex1 ? 2u :
-			     p3d_state_units(st),
+			     p3d_state_coord_sets(st),
 			     st->vertex_alpha, st->texcoord3,
 			     st->vertex_colour1);
 	if (st->oow)
@@ -1008,7 +1011,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	rw[0].val = p3d_attr_present(desc, nd) | (st->fog ? 0x20u : 0u) |
 		    st->attr_present_extra;
 	rw[1].reg = P3D_R_ATTR_MAP0;    rw[1].val = 0x00287210u;
-	rw[2].reg = P3D_R_ATTR_MAP1;    rw[2].val = 0x00006543u;
+	rw[2].reg = P3D_R_ATTR_MAP1;
+	rw[2].val = st->coord_map ? st->coord_map : 0x00006543u;
 	p3d_reglist(cs, rw, 3);
 
 	/* -- the per-vertex WARP bind --------------------------------------
@@ -1075,7 +1079,10 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	 * vendor clamps this shadow one unit down on exactly that family
 	 * (KRN mtx2572, emitted by mtx2393). */
 	rw[0].reg = P3D_R_GUARDBAND;
+	/* 16.0f with three or more P690 units (KRN mtx958). */
 	rw[0].val = st->guard_band_bits ? st->guard_band_bits :
+		    st->single_texture_pipe && p3d_state_units(st) > 2 ?
+		    0x41800000u :
 		    st->lx_family ? 0x41f80000u : 0x42000000u;
 	p3d_reglist(cs, rw, 1);
 
@@ -1104,10 +1111,20 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	if (st->tex) {
 		const struct p3d_texture *t = st->tex;
 		unsigned nunit = p3d_state_units(st), u;
-		/* P690 two units sit alone on pipes 0 and 2: the vendor emits no
-		 * merges and the ALU reads t0 and t2 (an unowned pipe reads alpha 1). */
+		/* P690 units of a multi-unit draw sit alone on their pipes: the
+		 * vendor emits no merges and the ALU reads each unit's first pipe
+		 * (an unowned pipe reads alpha 1). */
 		const int pair = nunit > 1 && st->single_texture_pipe &&
 				 !st->sampled_alpha_companion;
+		/* PSER 0x1dbe58 / KRN mtx2422 LX masks for three and four units */
+		static const uint8_t lx_pipes[2][4] = {
+			{ 0x1, 0x2, 0x8 }, { 0x1, 0x2, 0x4, 0x8 },
+		};
+		/* 0x11e8 per unit bank (PSER 0x1d63f0, KRN mtx1783) */
+		static const uint32_t lx_cache[2][4] = {
+			{ 0x01600000u, 0x01600000u, 0x00400000u },
+			{ 0x01600000u, 0x01600000u, 0x01600000u, 0x01600000u },
+		};
 
 		rw[0].reg = 0x121c; rw[0].val = 0;
 		p3d_reglist(cs, rw, 1);
@@ -1135,7 +1152,9 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 
 			rw[0].reg = P3D_R_TEX_ENABLE + 4 * u;
 			rw[0].val = 0x00040100u | pipes;
-			if (st->single_texture_pipe && u == 0)
+			if (st->single_texture_pipe && nunit > 2)
+				rw[0].val = 0x00040100u | lx_pipes[nunit - 3][u];
+			else if (st->single_texture_pipe && u == 0)
 				/* A TEXCOORD unit is not ganged: both pipes would
 				 * pass the coordinate and the merge would add them. */
 				rw[0].val = lx && nunit == 1 && !tu->ta_op ? 0x00040105u :
@@ -1178,11 +1197,23 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 				    p3d_border_colour(tu->fmt,
 						      tu->border_colour) : 0;
 			/* the vendor LX table value for one or two stages */
-			rw[3].reg = P3D_R_TEX_CACHE; rw[3].val = 0x00500000u;
-			p3d_reglist(cs, rw, lx ? 4 : 3);
+			rw[3].reg = P3D_R_TEX_CACHE;
+			rw[3].val = st->single_texture_pipe && nunit > 2 ?
+				    lx_cache[nunit - 3][u] : 0x00500000u;
+			p3d_reglist(cs, rw, lx || (st->single_texture_pipe &&
+						    nunit > 2) ? 4 : 3);
 		}
 
-		if (lx) {
+		if (st->single_texture_pipe && nunit > 2) {
+			/* three units park the leftover pipe 2 on unit 3
+			 * (PSER 0xcbac8, KRN 0x3f878); four leave none */
+			if (nunit == 3) {
+				rw[0].reg = P3D_R_TEX_ENABLE + 12;
+				rw[0].val = 0x00010004u;
+				rw[1].reg = P3D_R_TEX_CACHE; rw[1].val = 0;
+				p3d_reglist(cs, rw, 2);
+			}
+		} else if (lx) {
 			/* park the pipes no stage owns on the first free unit */
 			for (u = nunit; u < 4; u++) {
 				rw[0].reg = P3D_R_TEX_ENABLE + 4 * u;
@@ -1271,8 +1302,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			p3d_reglist(cs, rw, 8);
 		}
 		if (st->comb && pair) {
-			p3d_emit_comb_program_t1(cs, st->comb,
-						 st->comb_slot_base, P3D_COMB_T2);
+			p3d_emit_comb_program_units(cs, st, nunit,
+						    st->comb_slot_base);
 			return;
 		}
 		if (st->comb && !st->sampled_alpha_companion) {
@@ -1285,12 +1316,16 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 		p3d_emit_texenv(cs, pair ? 0u : nunit > 1 ? 4u : 2u, 0, 1, t,
 				st->comb_op);
 		if (pair) {
-			static const uint32_t pad[] = { 4, 8, 10 };
+			/* one stage per unit in slots 0, 2, 4, 8, then pads */
+			static const uint32_t slot[] = { 0, 2, 4, 8, 10 };
 
-			p3d_emit_texenv(cs, 2, P3D_COMB_T2, 0, st->tex1,
-					st->comb_op);
-			for (u = 0; u < 3; u++)
-				p3d_emit_comb_pad(cs, pad[u]);
+			for (u = 1; u < nunit; u++)
+				p3d_emit_texenv(cs, slot[u],
+						p3d_state_unit_treg(st, nunit, u),
+						0, p3d_state_unit(st, u),
+						st->comb_op);
+			for (u = nunit; u < 5; u++)
+				p3d_emit_comb_pad(cs, slot[u]);
 			return;
 		}
 
@@ -1428,7 +1463,7 @@ p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 	nd = p3d_descriptors(desc, !!st->tex, p3d_position_has_z(st),
 			     st->pos_desc, st->col_desc,
 			     st->tex && st->tex->env == P3D_TEXENV_REPLACE,
-			     p3d_state_units(st),
+			     p3d_state_coord_sets(st),
 			     !!st->vertex_alpha, !!st->texcoord3,
 			     st->vertex_colour1);
 	if (st->oow)
