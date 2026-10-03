@@ -2954,6 +2954,35 @@ ph_fs_dump(const struct ph_fs_program *program, FILE *f)
               program->const_ref[r].mask);
 }
 
+/* A def every use of which ends in a texture coordinate, directly or through
+ * arithmetic that only feeds coordinates: the combiner never reads it as a
+ * value, so it needs no interpolator of its own. */
+static bool
+ph_fs_coordinate_only(nir_def *def, unsigned depth)
+{
+   if (depth > 8 || list_is_empty(&def->uses))
+      return false;
+   nir_foreach_use_including_if(src, def) {
+      nir_instr *user;
+
+      if (nir_src_is_if(src))
+         return false;
+      user = nir_src_use_instr(src);
+      if (user->type == nir_instr_type_tex) {
+         const nir_tex_instr *tex = nir_instr_as_tex(user);
+         const int c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+
+         if (c < 0 || &tex->src[c].src != src)
+            return false;
+         continue;
+      }
+      if (user->type != nir_instr_type_alu ||
+          !ph_fs_coordinate_only(&nir_instr_as_alu(user)->def, depth + 1))
+         return false;
+   }
+   return true;
+}
+
 /* Generic varyings the program reads as values, assigned to the colour
  * interpolators it does not read itself: v0 first, then v1.  Texture
  * coordinate varyings only feed the texture units and are not routed. */
@@ -2985,6 +3014,8 @@ ph_fs_route_varyings(nir_shader *nir, int route[2])
                        in->intrinsic == nir_intrinsic_load_interpolated_input) {
                location = nir_intrinsic_io_semantics(in).location;
             }
+            if (location >= 0 && ph_fs_coordinate_only(&in->def, 0))
+               continue;
             if (location == VARYING_SLOT_COL0)
                used_col0 = true;
             else if (location == VARYING_SLOT_COL1 ||
