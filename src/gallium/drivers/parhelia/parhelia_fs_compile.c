@@ -2088,6 +2088,31 @@ ph_fs_cond(struct ph_fs_ctx *ctx, nir_def *cond, int lane, int sel,
    if (instr->type != nir_instr_type_alu)
       return ph_fs_fail(ctx, "a select on a condition that is no boolean value");
    op = nir_instr_as_alu(instr);
+   /* any(v) / all(v) of a boolean vector against a constant false / true
+    * (ARB KIL of a vector): one select per channel, chained. */
+   if ((op->op == nir_op_bany_inequal2 || op->op == nir_op_bany_inequal3 ||
+        op->op == nir_op_bany_inequal4 || op->op == nir_op_ball_iequal2 ||
+        op->op == nir_op_ball_iequal3 || op->op == nir_op_ball_iequal4) &&
+       nir_src_is_const(op->src[1].src)) {
+      const bool any = op->op == nir_op_bany_inequal2 ||
+                       op->op == nir_op_bany_inequal3 ||
+                       op->op == nir_op_bany_inequal4;
+      const unsigned n = nir_op_infos[op->op].input_sizes[0];
+      struct ph_fs_src acc = any ? cc : bb;
+
+      for (unsigned i = 0; i < n; i++)
+         if (nir_src_comp_as_bool(op->src[1].src, op->src[1].swizzle[i]) == any)
+            return ph_fs_fail(ctx, "a vector compare against a varying constant");
+      for (unsigned i = n; i-- > 0;) {
+         const int ch = op->src[0].swizzle[i];
+
+         if (!(any ? ph_fs_cond(ctx, op->src[0].src.ssa, lane, ch, &bb, &acc, &acc) :
+                     ph_fs_cond(ctx, op->src[0].src.ssa, lane, ch, &acc, &cc, &acc)))
+            return false;
+      }
+      *out = acc;
+      return true;
+   }
    for (unsigned i = 0; i < 2 && i < nir_op_infos[op->op].num_inputs; i++)
       if (!ph_fs_translate(op, i, lane, sel, &req[i]))
          return ph_fs_fail(ctx, "a swizzle the replicates cannot express");

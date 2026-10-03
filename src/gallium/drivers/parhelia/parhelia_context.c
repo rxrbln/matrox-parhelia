@@ -10781,14 +10781,17 @@ ph_nir_def_uniform(nir_def *def, unsigned depth)
    }
 }
 
-/* The single terminate_if and the colour store of a straight-line shader. */
+/* The terminate_ifs and the colour store of a straight-line shader; *@kill
+ * is the first, *@kills counts them (several only with @many). */
 static bool
-ph_nir_find_kill(nir_shader *nir, nir_intrinsic_instr **kill,
-                 nir_intrinsic_instr **store, unsigned *value_src)
+ph_nir_find_kills(nir_shader *nir, bool many, nir_intrinsic_instr **kill,
+                  unsigned *kills, nir_intrinsic_instr **store,
+                  unsigned *value_src)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
 
    *kill = *store = NULL;
+   *kills = 0;
    if (!impl || exec_list_length(&impl->body) != 1)
       return false;
    nir_foreach_block(block, impl) {
@@ -10802,9 +10805,11 @@ ph_nir_find_kill(nir_shader *nir, nir_intrinsic_instr **kill,
          switch (in->intrinsic) {
          case nir_intrinsic_terminate_if:
          case nir_intrinsic_demote_if:
-            if (*kill)
+            if (*kill && !many)
                return false;
-            *kill = in;
+            if (!*kill)
+               *kill = in;
+            (*kills)++;
             break;
          case nir_intrinsic_terminate:
          case nir_intrinsic_demote:
@@ -10837,6 +10842,75 @@ ph_nir_find_kill(nir_shader *nir, nir_intrinsic_instr **kill,
       }
    }
    return *kill && *store;
+}
+
+static bool
+ph_nir_find_kill(nir_shader *nir, nir_intrinsic_instr **kill,
+                 nir_intrinsic_instr **store, unsigned *value_src)
+{
+   unsigned kills;
+
+   return ph_nir_find_kills(nir, false, kill, &kills, store, value_src);
+}
+
+/* Compile @src with every discard folded into a 0/1 alpha: 1 where no
+ * condition holds, so an alpha test GEQUAL 0.5 keeps exactly the fragments
+ * the shader keeps (ARB KIL of a vector, several KILs). */
+static bool
+ph_fs_compile_kill_bool(const nir_shader *src, unsigned budget,
+                        struct ph_fs_program *out)
+{
+   nir_shader *nir = nir_shader_clone(NULL, src);
+   nir_intrinsic_instr *kill, *store, *alpha_store;
+   unsigned kills, value_src = 0;
+   nir_def *cond = NULL;
+   bool ok = false;
+
+   if (!nir || !ph_nir_find_kills(nir, true, &kill, &kills, &store, &value_src))
+      goto done;
+   nir_builder b = nir_builder_at(nir_before_instr(&store->instr));
+
+   nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+      bool after_store = false;
+
+      nir_foreach_instr_safe(instr, block) {
+         nir_intrinsic_instr *in;
+
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         in = nir_instr_as_intrinsic(instr);
+         after_store |= in == store;
+         if (in->intrinsic != nir_intrinsic_terminate_if &&
+             in->intrinsic != nir_intrinsic_demote_if)
+            continue;
+         /* the alpha is computed at the store from every condition */
+         if (after_store)
+            goto done;
+         cond = cond ? nir_ior(&b, cond, in->src[0].ssa) : in->src[0].ssa;
+         nir_instr_remove(instr);
+      }
+   }
+   alpha_store = nir_instr_as_intrinsic(nir_instr_clone(nir, &store->instr));
+   nir_builder_instr_insert(&b, &alpha_store->instr);
+   nir_src_rewrite(&alpha_store->src[value_src],
+                   nir_replicate(&b, nir_b2f32(&b, nir_inot(&b, cond)), 4));
+   nir_intrinsic_set_write_mask(alpha_store, 0x8);
+   nir_intrinsic_set_write_mask(store, 0x7);
+   NIR_PASS(_, nir, nir_opt_algebraic);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_dce);
+   ok = ph_fs_compile(nir, budget, out);
+   /* The draw stages varyings for the shader's own program; a variant
+    * that routes generics would read interpolators nothing staged. */
+   if (ok && (out->route[0] >= 0 || out->route[1] >= 0)) {
+      ph_fs_program_fini(out);
+      memset(out, 0, sizeof(*out));
+      out->reject = "a discard variant that routes varyings";
+      ok = false;
+   }
+done:
+   ralloc_free(nir);
+   return ok;
 }
 
 enum ph_kill_variant { PH_KILL_V_X, PH_KILL_V_SUB, PH_KILL_V_COLOUR };
@@ -10875,9 +10949,40 @@ ph_fs_compile_kill_variant(const nir_shader *src, enum ph_kill_variant variant,
    nir_instr_remove(&kill->instr);
    NIR_PASS(_, nir, nir_opt_dce);
    ok = ph_fs_compile(nir, budget, out);
+   /* The draw stages varyings for the shader's own program; a variant
+    * that routes generics would read interpolators nothing staged. */
+   if (ok && (out->route[0] >= 0 || out->route[1] >= 0)) {
+      ph_fs_program_fini(out);
+      memset(out, 0, sizeof(*out));
+      out->reject = "a discard variant that routes varyings";
+      ok = false;
+   }
 done:
    ralloc_free(nir);
    return ok;
+}
+
+/* A discard of any other form, as the 0/1 keep alpha. */
+static struct ph_fs_kill *
+ph_fs_build_kill_bool(nir_shader *src, unsigned budget)
+{
+   struct ph_fs_kill *k = CALLOC_STRUCT(ph_fs_kill);
+
+   if (!k)
+      return NULL;
+   k->keep = PIPE_FUNC_GEQUAL;
+   k->ref = 128;
+   k->have_x = ph_fs_compile_kill_bool(src, budget, &k->alpha_x);
+   if (!k->have_x) {
+      if (ph_env("PARHELIA_TRACE"))
+         fprintf(stderr, "parhelia: discard has no keep-alpha form: %s\n",
+                 k->alpha_x.reject ? k->alpha_x.reject : "not a straight-line kill");
+      FREE(k);
+      return NULL;
+   }
+   if (ph_env("PARHELIA_TRACE"))
+      fprintf(stderr, "parhelia: discard as a 0/1 keep alpha, alpha test GEQUAL 128\n");
+   return k;
 }
 
 static struct ph_fs_kill *
@@ -10891,16 +10996,16 @@ ph_fs_build_kill(nir_shader *src, unsigned budget)
    unsigned xi;
 
    if (!ph_nir_find_kill(src, &kill, &store, &value_src))
-      return NULL;
+      return ph_fs_build_kill_bool(src, budget);
    cmp = nir_def_as_alu_or_null(kill->src[0].ssa);
    if (!cmp || nir_op_infos[cmp->op].num_inputs != 2 ||
        cmp->src[0].src.ssa->bit_size != 32 ||
        nir_src_is_const(cmp->src[0].src) == nir_src_is_const(cmp->src[1].src))
-      return NULL;
+      return ph_fs_build_kill_bool(src, budget);
    xi = nir_src_is_const(cmp->src[0].src) ? 1 : 0;
    c = nir_src_comp_as_float(cmp->src[xi ^ 1].src, cmp->src[xi ^ 1].swizzle[0]);
    if (c < 0.0f || c > 1.0f || c * 255.0f != floorf(c * 255.0f))
-      return NULL;
+      return ph_fs_build_kill_bool(src, budget);
    k = CALLOC_STRUCT(ph_fs_kill);
    if (!k)
       return NULL;
@@ -10913,7 +11018,7 @@ ph_fs_build_kill(nir_shader *src, unsigned budget)
    case nir_op_fge: k->keep = xi ? PIPE_FUNC_GREATER : PIPE_FUNC_LESS; break;
    default:
       FREE(k);
-      return NULL;
+      return ph_fs_build_kill_bool(src, budget);
    }
    k->ne_zero = cmp->op == nir_op_fneu && !k->ref;
    k->const_alpha =
@@ -11362,7 +11467,8 @@ static void *ph_create_fs(struct pipe_context *p,
                ph_fs_compile_uniform_depth(fs, s->ir.nir, compile_nir, budget);
             if (compile_nir != s->ir.nir)
                ralloc_free(compile_nir);
-            if (ph_fs_program_must_drop(s->ir.nir, &fs->program))
+            /* a discard the alpha test carries is decided per draw */
+            if (ph_fs_program_must_drop(s->ir.nir, &fs->program) && !fs->kill)
                fs->drop_reason = fs->program.reject ? fs->program.reject :
                                  "declared samplers";
             if (fs->program.valid)
