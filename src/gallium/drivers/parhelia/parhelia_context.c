@@ -162,6 +162,14 @@ struct ph_fs {
    /* Samples whose coordinate is a uniform (a constant glTexCoord), which
     * the vertex stage stages per vertex; see ph_fs_find_uniform_coords(). */
    struct ph_uniform_coord *ucoord;
+   /* Further taps of a texture at other coordinates: unit samples GL unit
+    * gl_unit at coord, an affine function of varyings that the vertex
+    * stage evaluates per vertex (in the shader's own NIR). */
+   struct ph_tap {
+      uint8_t unit, gl_unit;
+      nir_def *coord;
+   } taps[P3D_MAX_TEXTURE_UNITS];
+   unsigned tap_count;
    unsigned ucoord_count;
    /* glDrawPixels(GL_DEPTH_COMPONENT)'s shader: the depth output is channel
     * x of the sample of GL unit depth_unit, the colour the vertex colour. */
@@ -225,6 +233,11 @@ static int ph_prepare_alpha_companions(struct ph_context *ctx,
 static uint64_t ph_texture_base_hash(const struct parhelia_resource *texture,
                                      bool tiled, unsigned *alpha_zero,
                                      unsigned *alpha_nonzero);
+static int ph_nir_coord_location(nir_def *def);
+static bool ph_nir_eval_vertex(struct ph_context *ctx, nir_def *def,
+                               const struct vertex_header *v,
+                               nir_const_value out[NIR_MAX_VEC_COMPONENTS],
+                               unsigned depth);
 static const struct p3d_comb_program *ph_compiled_combiner(struct ph_context *ctx,
                                                           bool two_units);
 static bool ph_copy_texture_box(struct ph_context *ctx,
@@ -8090,6 +8103,9 @@ struct ph_quant_stage {
    unsigned ramp_count;
    int ramp_slot[P3D_MAX_TEXTURE_UNITS], ramp_src[P3D_MAX_TEXTURE_UNITS];
    struct ph_fs_ramp ramp[P3D_MAX_TEXTURE_UNITS];
+   /* Tap coordinates staged per vertex. */
+   unsigned tap_count;
+   int tap_slot[P3D_MAX_TEXTURE_UNITS];
 };
 
 static bool
@@ -8137,6 +8153,17 @@ ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
    for (unsigned i = 0; i < q->rect_count; i++) {
       out->data[q->rect_slot[i]][0] *= q->rect_scale[i][0];
       out->data[q->rect_slot[i]][1] *= q->rect_scale[i][1];
+   }
+   for (unsigned t = 0; t < q->tap_count; t++) {
+      nir_const_value c[NIR_MAX_VEC_COMPONENTS];
+      float *x = out->data[q->tap_slot[t]];
+      nir_def *coord = q->ctx->fs->taps[t].coord;
+
+      x[0] = x[1] = x[2] = 0.0f;
+      x[3] = 1.0f;
+      if (ph_nir_eval_vertex(q->ctx, coord, v, c, 0))
+         for (unsigned i = 0; i < MIN2(coord->num_components, 4); i++)
+            x[i] = c[i].f32;
    }
    for (unsigned i = 0; i < q->ramp_count; i++) {
       const struct ph_fs_ramp *r = &q->ramp[i];
@@ -8330,6 +8357,238 @@ ph_nir_eval_uniform(struct ph_context *ctx, nir_def *def,
    }
 }
 
+/* A value of constants, uniforms and varyings that is affine in the
+ * varyings, so its per-vertex values interpolate to its per-fragment ones. */
+static bool
+ph_nir_affine_in_varyings(nir_def *def, bool *varying, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   *varying = false;
+   if (depth > 16)
+      return false;
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+      return true;
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+
+      if (in->intrinsic == nir_intrinsic_load_ubo ||
+          in->intrinsic == nir_intrinsic_load_ubo_vec4)
+         return nir_src_is_const(in->src[0]) && nir_src_is_const(in->src[1]);
+      if (in->intrinsic == nir_intrinsic_load_interpolated_input ||
+          in->intrinsic == nir_intrinsic_load_input) {
+         *varying = true;
+         return nir_src_is_const(nir_get_io_offset_src(in)[0]);
+      }
+      if (in->intrinsic == nir_intrinsic_load_deref) {
+         nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+
+         *varying = d && d->deref_type == nir_deref_type_var &&
+                    (d->var->data.mode & nir_var_shader_in);
+         return *varying;
+      }
+      return false;
+   }
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      bool v[NIR_ALU_MAX_INPUTS] = { false };
+      const unsigned n = nir_op_infos[alu->op].num_inputs;
+      unsigned vary = 0;
+
+      for (unsigned i = 0; i < n; i++)
+         if (!ph_nir_affine_in_varyings(alu->src[i].src.ssa, &v[i], depth + 1))
+            return false;
+      for (unsigned i = 0; i < n; i++)
+         vary += v[i];
+      *varying = vary != 0;
+      switch (alu->op) {
+      case nir_op_mov: case nir_op_fneg: case nir_op_fadd: case nir_op_fsub:
+      case nir_op_vec2: case nir_op_vec3: case nir_op_vec4:
+      case nir_op_fcanonicalize:
+         return true;
+      case nir_op_fmul:
+         return vary <= 1;
+      case nir_op_ffma:
+         return !(v[0] && v[1]);
+      default:
+         return !vary;
+      }
+   }
+   default:
+      return false;
+   }
+}
+
+/* @def at vertex @v: varyings read from the draw's vertex outputs. */
+static bool
+ph_nir_eval_vertex(struct ph_context *ctx, nir_def *def,
+                   const struct vertex_header *v,
+                   nir_const_value out[NIR_MAX_VEC_COMPONENTS], unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+   int location = -1;
+   unsigned first = 0;
+
+   if (depth > 16)
+      return false;
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+
+      if (in->intrinsic == nir_intrinsic_load_interpolated_input ||
+          in->intrinsic == nir_intrinsic_load_input) {
+         location = nir_intrinsic_io_semantics(in).location;
+         first = nir_intrinsic_component(in);
+      } else if (in->intrinsic == nir_intrinsic_load_deref) {
+         nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+
+         if (d && d->deref_type == nir_deref_type_var &&
+             (d->var->data.mode & nir_var_shader_in)) {
+            location = d->var->data.location;
+            first = d->var->data.location_frac;
+         }
+      }
+   }
+   if (location >= 0) {
+      unsigned name, index;
+      int slot;
+
+      tgsi_get_gl_varying_semantic(location, true, &name, &index);
+      slot = draw_find_shader_output(ctx->draw, name, index);
+      if (slot < 0)
+         return false;
+      memset(out, 0, NIR_MAX_VEC_COMPONENTS * sizeof(*out));
+      for (unsigned c = 0; c < def->num_components && first + c < 4; c++)
+         out[c].f32 = v->data[slot][first + c];
+      return true;
+   }
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      const nir_op_info *info = &nir_op_infos[alu->op];
+      nir_const_value src[NIR_ALU_MAX_INPUTS][NIR_MAX_VEC_COMPONENTS];
+      nir_const_value *srcs[NIR_ALU_MAX_INPUTS];
+
+      for (unsigned i = 0; i < info->num_inputs; i++) {
+         nir_const_value val[NIR_MAX_VEC_COMPONENTS];
+
+         if (!ph_nir_eval_vertex(ctx, alu->src[i].src.ssa, v, val, depth + 1))
+            return false;
+         for (unsigned c = 0; c < nir_ssa_alu_instr_src_components(alu, i); c++)
+            src[i][c] = val[alu->src[i].swizzle[c]];
+         srcs[i] = src[i];
+      }
+      memset(out, 0, NIR_MAX_VEC_COMPONENTS * sizeof(*out));
+      nir_eval_const_opcode(alu->op, out, NULL, alu->def.num_components, 32,
+                            srcs, 0);
+      return true;
+   }
+   return ph_nir_eval_uniform(ctx, def, out, depth);
+}
+
+static void
+ph_nir_collect_tex(nir_shader *nir, nir_tex_instr **out, unsigned cap,
+                   unsigned *count)
+{
+   *count = 0;
+   nir_foreach_function_impl(impl, nir)
+      nir_foreach_block(block, impl)
+         nir_foreach_instr(instr, block)
+            if (instr->type == nir_instr_type_tex) {
+               if (*count < cap)
+                  out[*count] = nir_instr_as_tex(instr);
+               (*count)++;
+            }
+}
+
+static bool
+ph_tex_same_lookup(const nir_tex_instr *a, const nir_tex_instr *b)
+{
+   if (a->op != b->op || a->num_srcs != b->num_srcs ||
+       a->sampler_dim != b->sampler_dim ||
+       a->sampler_index != b->sampler_index)
+      return false;
+   for (unsigned i = 0; i < a->num_srcs; i++) {
+      const int j = nir_tex_instr_src_index(b, a->src[i].src_type);
+
+      if (j < 0 || b->src[j].src.ssa != a->src[i].src.ssa)
+         return false;
+   }
+   return true;
+}
+
+/* Further lookups of a unit at other coordinates (a filter's taps) move to
+ * free units that sample the same texture, their coordinate evaluated per
+ * vertex; the compile copy is renumbered in step.  A tap whose coordinate
+ * is not affine in the varyings, or one without a free unit, stays and the
+ * compile refuses it. */
+static void
+ph_fs_split_taps(struct ph_fs *fs, nir_shader *orig, nir_shader *copy,
+                 unsigned used, unsigned max_units)
+{
+   nir_tex_instr *a[32], *b[32];
+   nir_def *coord_of[32];
+   unsigned na, nb, unit = 0, moved_to[32];
+   int first[P3D_MAX_TEXTURE_UNITS];
+
+   fs->tap_count = 0;
+   ph_nir_collect_tex(orig, a, ARRAY_SIZE(a), &na);
+   ph_nir_collect_tex(copy, b, ARRAY_SIZE(b), &nb);
+   if (na != nb || nb > ARRAY_SIZE(b) || fs->unit_remap)
+      return;
+   for (unsigned u = 0; u < P3D_MAX_TEXTURE_UNITS; u++)
+      first[u] = -1;
+   for (unsigned i = 0; i < nb; i++) {
+      const unsigned s = b[i]->sampler_index;
+      const int c = nir_tex_instr_src_index(a[i], nir_tex_src_coord);
+      bool varying;
+
+      moved_to[i] = s;
+      coord_of[i] = c >= 0 ? a[i]->src[c].src.ssa : NULL;
+      if (s >= P3D_MAX_TEXTURE_UNITS)
+         continue;
+      if (first[s] < 0) {
+         first[s] = i;
+         continue;
+      }
+      if (ph_tex_same_lookup(b[first[s]], b[i]))
+         continue;
+      /* The same tap already moved shares that unit. */
+      for (unsigned j = 0; j < i && moved_to[i] == s; j++)
+         if (moved_to[j] != s && coord_of[j] == coord_of[i] &&
+             b[j]->op == b[i]->op)
+            moved_to[i] = moved_to[j];
+      if (moved_to[i] == s) {
+         if (c < 0 || a[i]->num_srcs != 1 || b[i]->op != nir_texop_tex ||
+             b[i]->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+             !ph_nir_affine_in_varyings(coord_of[i], &varying, 0))
+            continue;
+         while (unit < max_units && (used & (1u << unit)))
+            unit++;
+         if (unit >= max_units)
+            continue;
+         used |= 1u << unit;
+         fs->taps[fs->tap_count++] = (struct ph_tap){ unit, s, coord_of[i] };
+         moved_to[i] = unit;
+      }
+      b[i]->sampler_index = b[i]->texture_index = moved_to[i];
+   }
+   /* A unit whose own lookup is at an expression rather than a varying
+    * (the centre tap at an offset) stages that coordinate too. */
+   for (unsigned t = 0, n = fs->tap_count; t < n; t++) {
+      const unsigned s = fs->taps[t].gl_unit;
+      bool staged = false, varying;
+
+      for (unsigned k = 0; k < fs->tap_count; k++)
+         staged |= fs->taps[k].unit == s;
+      if (staged || first[s] < 0 || !coord_of[first[s]] ||
+          ph_nir_coord_location(coord_of[first[s]]) >= 0 ||
+          a[first[s]]->num_srcs != 1 ||
+          !ph_nir_affine_in_varyings(coord_of[first[s]], &varying, 0))
+         continue;
+      fs->taps[fs->tap_count++] = (struct ph_tap){ s, s, coord_of[first[s]] };
+   }
+}
+
 /* Sample coordinates that are uniforms: a constant glTexCoord reaches the
  * fragment shader as one, so the vertex stream carries no coordinate set
  * and the draw had nothing to give the texture unit. */
@@ -8498,6 +8757,18 @@ ph_fix_rects(struct ph_context *ctx, struct ph_quant_stage *q)
          1.0f / u_minify(v->texture->height0, v->u.tex.first_level);
       q->rect_count++;
    }
+}
+
+/* An extra attribute per tap for its per-vertex coordinate. */
+static void
+ph_fix_taps(struct ph_context *ctx, struct ph_quant_stage *q)
+{
+   q->tap_count = 0;
+   for (unsigned t = 0; ctx->fs && ctx->fs->program.valid &&
+                        t < ctx->fs->tap_count; t++)
+      q->tap_slot[q->tap_count++] =
+         draw_alloc_extra_vertex_attrib(ctx->draw, TGSI_SEMANTIC_TEXCOORD,
+                                        PH_RAMP_COORD_INDEX(ctx->fs->taps[t].unit));
 }
 
 /* Stage each floor ramp's coordinate into an extra attribute; false when
@@ -9247,10 +9518,11 @@ ph_draw_ramped(struct ph_context *ctx, const struct pipe_draw_info *info,
                const struct pipe_draw_start_count_bias *draws)
 {
    const struct ph_fs_program *prog = ctx->fs ? &ctx->fs->program : NULL;
-   struct pipe_sampler_view *old_view[P3D_MAX_TEXTURE_UNITS] = { NULL };
-   void *old_sampler[P3D_MAX_TEXTURE_UNITS];
+   struct pipe_sampler_view *old_view[2 * P3D_MAX_TEXTURE_UNITS] = { NULL };
+   void *old_sampler[2 * P3D_MAX_TEXTURE_UNITS];
 
-   if (ctx->ramping || !prog || !prog->valid || !prog->ramp_count)
+   if (ctx->ramping || !prog || !prog->valid ||
+       (!prog->ramp_count && !ctx->fs->tap_count))
       return false;
    if (!ctx->ramp_sampler) {
       const struct pipe_sampler_state templ = {
@@ -9295,7 +9567,30 @@ ph_draw_ramped(struct ph_context *ctx, const struct pipe_draw_info *info,
                                     prog->ramps[i].kind == PH_FS_RAMP_FLOOR ?
                                     &ctx->ramp_sampler : &ctx->lookup_sampler);
    }
+   /* A tap's unit samples its texture through the same view and sampler. */
+   for (unsigned t = 0; t < ctx->fs->tap_count; t++) {
+      const struct ph_tap *tap = &ctx->fs->taps[t];
+      struct pipe_sampler_view *view = ctx->bound_views[tap->gl_unit];
+      void *sampler = ctx->bound_samplers[tap->gl_unit];
+      const unsigned k = prog->ramp_count + t;
+
+      pipe_sampler_view_reference(&old_view[k], ctx->bound_views[tap->unit]);
+      old_sampler[k] = ctx->bound_samplers[tap->unit];
+      ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, tap->unit,
+                                  1, 0, &view);
+      ctx->base.bind_sampler_states(&ctx->base, MESA_SHADER_FRAGMENT,
+                                    tap->unit, 1, &sampler);
+   }
    ctx->base.draw_vbo(&ctx->base, info, drawid_offset, NULL, draws, 1);
+   for (unsigned t = 0; t < ctx->fs->tap_count; t++) {
+      const unsigned u = ctx->fs->taps[t].unit, k = prog->ramp_count + t;
+
+      ctx->base.bind_sampler_states(&ctx->base, MESA_SHADER_FRAGMENT, u, 1,
+                                    &old_sampler[k]);
+      ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, u, 1, 0,
+                                  &old_view[k]);
+      pipe_sampler_view_reference(&old_view[k], NULL);
+   }
    for (unsigned i = 0; i < prog->ramp_count; i++) {
       const unsigned u = prog->ramps[i].unit;
 
@@ -9417,7 +9712,7 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    const bool quantize = ph_logicop_quantize(ctx);
    const bool fix = (quantize || (ctx->fs && ctx->fs->ucoord_count) ||
                      (ctx->fs && ctx->fs->program.valid &&
-                      ctx->fs->program.ramp_count) ||
+                      (ctx->fs->program.ramp_count || ctx->fs->tap_count)) ||
                      ph_fs_samples_rect(ctx->fs) ||
                      (ctx->fs && ctx->fs->depth_uniform)) &&
                     (ctx->quant_stage ||
@@ -9442,6 +9737,7 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
          PH_REFUSE("a draw whose uniform texture coordinate cannot be evaluated is dropped\n");
          goto unbind;
       }
+      ph_fix_taps(ctx, (struct ph_quant_stage *)ctx->quant_stage);
       if (!ph_fix_ramps(ctx, (struct ph_quant_stage *)ctx->quant_stage)) {
          draw_remove_extra_vertex_attribs(ctx->draw);
          PH_REFUSE("a draw whose floored varying the vertex stage does not write is dropped\n");
@@ -10422,6 +10718,18 @@ static void *ph_create_fs(struct pipe_context *p,
                } while (progress);
             }
 
+            /* A texture sampled at several coordinates spreads its taps
+             * over free units. */
+            ph_fs_split_taps(fs, s->ir.nir, compile_nir,
+                             ph_nir_sampler_mask(compile_nir),
+                             MIN2(ph_screen(p->screen)->texture_units,
+                                  PH_TEXTURE_UNITS_DRIVEN));
+            for (unsigned t = 0; t < fs->tap_count; t++)
+               fs->sampler_mask |= 1u << fs->taps[t].unit;
+            if (fs->tap_count) {
+               units = util_bitcount(fs->sampler_mask);
+               budget = P3D_COMB_QUANTUM - (units > 0) - (units > 1);
+            }
             /* floor() of a varying samples a ramp texture on a free unit. */
             struct ph_fs_ramp ramps[P3D_MAX_TEXTURE_UNITS];
             const char *ramp_reject = NULL;
@@ -10525,6 +10833,13 @@ static void *ph_create_fs(struct pipe_context *p,
             for (unsigned r = 0; fs->program.valid &&
                                  r < fs->program.ramp_count; r++) {
                const unsigned u = fs->program.ramps[r].unit;
+
+               fs->coord_src_known[u] = true;
+               fs->coord_src_name[u] = TGSI_SEMANTIC_TEXCOORD;
+               fs->coord_src_index[u] = PH_RAMP_COORD_INDEX(u);
+            }
+            for (unsigned t = 0; fs->program.valid && t < fs->tap_count; t++) {
+               const unsigned u = fs->taps[t].unit;
 
                fs->coord_src_known[u] = true;
                fs->coord_src_name[u] = TGSI_SEMANTIC_TEXCOORD;
