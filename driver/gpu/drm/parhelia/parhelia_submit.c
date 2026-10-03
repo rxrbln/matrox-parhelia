@@ -3257,6 +3257,9 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 		drm_gem_object_put(&bo->bo.base);
 		return ret;
 	}
+	if ((args->flags & PARHELIA_CREATE_RENDER_NATIVE_COLOR) && cpp == 4)
+		parhelia_t2_prime_once(pdev, file, bo, args->width, args->height,
+				       pitch_pixels);
 	ret = parhelia_bo_clear(pdev, file, bo);
 	parhelia_vram_unpin(bo);
 	if (ret) {
@@ -3765,7 +3768,8 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 			       struct drm_parhelia_packet *packets,
 			       u32 *commands,
 			       struct drm_parhelia_reloc *relocs,
-			       struct drm_gem_object **kernel_objects)
+			       struct drm_gem_object **kernel_objects,
+			       const u32 *kernel_vertices)
 {
 	struct parhelia_submit_stats *stats = &pdev->submit_stats;
 	struct drm_gem_object **objects = NULL;
@@ -4035,9 +4039,12 @@ retry_slot:
 	ret = parhelia_engine_init(pdev);
 	if (ret)
 		goto out_unlock;
-	if (args->vertex_dwords &&
-	    copy_from_user(vertex_cpu, u64_to_user_ptr(args->vertices),
-			   args->vertex_dwords * sizeof(u32))) {
+	if (args->vertex_dwords && kernel_vertices)
+		memcpy(vertex_cpu, kernel_vertices,
+		       args->vertex_dwords * sizeof(u32));
+	else if (args->vertex_dwords &&
+		 copy_from_user(vertex_cpu, u64_to_user_ptr(args->vertices),
+				args->vertex_dwords * sizeof(u32))) {
 		ret = -EFAULT;
 		goto out_unlock;
 	}
@@ -4936,7 +4943,7 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 		}
 	}
 	return parhelia_submit_run(to_parhelia(drm), file, args, packets,
-				   commands, relocs, NULL);
+				   commands, relocs, NULL, NULL);
 }
 
 /* The largest power-of-two width up to @max_width pixels whose whole tile
@@ -5031,7 +5038,7 @@ int parhelia_bo_clear(struct parhelia_device *pdev, struct drm_file *file,
 	ret = parhelia_submit_check(&args);
 	if (!ret)
 		ret = parhelia_submit_run(pdev, file, &args, packets, commands,
-					  relocs, objects);
+					  relocs, objects, NULL);
 	else {
 		kvfree(packets);
 		kvfree(commands);
@@ -5047,6 +5054,142 @@ int parhelia_bo_clear(struct parhelia_device *pdev, struct drm_file *file,
 		return parhelia_vram_clear(pdev, gbo);
 	}
 	return parhelia_vram_clear_range(pdev, gbo, offset, size - offset);
+}
+
+/* Every P690 program that does not write WARP T2 - the RGBA, textured and
+ * transform programs - inherits it, and the setup unit rejects a vertex
+ * against it like a clip-space position (-w <= x,y,z <= w, w > 0).  The latch
+ * exists once per primitive slot of a draw packet, and after power-on the
+ * slots past the first held rejecting values: Mesa's two-triangle packets
+ * lost their second triangle until some client happened to draw a
+ * multi-primitive pass-through packet (docs/parhelia-raster-clip.md).  The
+ * pass-through writes T2 from the vertex colour, so one packet of
+ * PARHELIA_T2_PRIME_SLOTS black triangles (T2 = (0,0,0,1)) primes every slot
+ * a client can use (Mesa packs at most eight).  The words are the Mesa state
+ * emitter's own image for that draw into a 64x16 target (parhelia-drm-test
+ * --t2-prime-dump 8 64); the WARP entry, pitch and guard band are patched. */
+#define PARHELIA_T2_PRIME_SLOTS	8u
+
+static const u32 parhelia_t2_prime_words[] = {
+		0x00000023, 0xbebfcbca, 0x00000000, 0x00100040, 0x0bb80024, 0x007fe000,
+		0x2121210a, 0x0001ffff, 0x21b7b6b5, 0x00000000, 0x00000000, 0x00ffffff,
+		0xbbbcb9ba, 0x01800202, 0x0000000e, 0x00000000, 0x00000000, 0xb0b4b3b2,
+		0x001000e4, 0x000000ff, 0x000000ff, 0x80000000, 0x212121b1, 0x7fffffff,
+		0x21b7b6b5, 0x00000000, 0x00000000, 0x00ffffff, 0x4b4a4948, 0x45ffc5ff,
+		0xc5ff45ff, 0x00000000, 0x3f800000, 0x21464544, 0x00000003, 0x00287210,
+		0x00006543, 0x00000008, 0x212121dd, 0x00000000, 0x41403c3c, 0x20000002,
+		0x20000002, 0x7e57e000, 0x7e57e000, 0x2121213e, 0x00000002, 0x00000008,
+		0x3c3c3cdd, 0x00000000, 0x20000002, 0x20000002, 0x00000002, 0x2151474c,
+		0x0200200c, 0x00000fdb, 0x00000000, 0x00000003, 0x212d1819, 0x00000000,
+		0x000280cc, 0x00000000, 0x00000003, 0x212e2e2e, 0x20c00000, 0xa1c50020,
+		0x00000000, 0x00000004, 0x8d8c8988, 0x00000000, 0x32020040, 0x00000000,
+		0x32020000, 0x00000003, 0x21c9c5c6, 0x00000000, 0x00000000, 0xffffffff,
+		0x00000001, 0x212121ac, 0x3fff8842, 0x00000001, 0x212121c0, 0x00a60ec4,
+		0x00000001, 0x212121bd, 0x42000000, 0x00000006, 0x82818087, 0x00000000,
+		0x0001000f, 0x00000000, 0x00000000, 0x21212183, 0x00000000, 0x0000001d,
+		0x9a9b9899, 0x00000200, 0x00000200, 0x01400400, 0x01400400, 0xa1a09f9e,
+		0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x9a9b9899, 0x00000082,
+		0x00000080, 0x00400400, 0x00400400, 0x9a9b9899, 0x00000084, 0x00000080,
+		0x00400400, 0x00400400, 0x9a9b9899, 0x00000088, 0x00000080, 0x00400400,
+		0x00400400, 0x9a9b9899, 0x0000008a, 0x00000080, 0x00400400, 0x00400400,
+		0x00000001, 0x2121212c, 0x0006305c, 0x00000002, 0x21211000, 0x00000003,
+		0x00000004, 0x97080001, 0x00000000, 0x00000000,
+};
+
+static const struct { u16 offset, length; } parhelia_t2_prime_packets[] = {
+		{ 0, 37 }, { 37, 10 }, { 47, 10 }, { 57, 5 },
+		{ 62, 5 }, { 67, 6 }, { 73, 5 }, { 78, 3 },
+		{ 81, 3 }, { 84, 3 }, { 87, 8 }, { 95, 31 },
+		{ 126, 3 }, { 129, 4 }, { 133, 3 },
+};
+
+/* IEEE single bits of a small non-negative integer, without kernel FPU use */
+static u32 parhelia_f32_from_small(u32 n)
+{
+	u32 e = n ? fls(n) - 1 : 0;
+
+	return n ? ((127 + e) << 23) | ((n << (23 - e)) & 0x7fffff) : 0;
+}
+
+static int parhelia_t2_prime(struct parhelia_device *pdev, struct drm_file *file,
+			     struct drm_gem_vram_object *gbo, u32 pitch_pixels)
+{
+	const u32 npackets = ARRAY_SIZE(parhelia_t2_prime_packets);
+	const u32 ndwords = ARRAY_SIZE(parhelia_t2_prime_words);
+	struct drm_parhelia_submit args = { };
+	struct drm_parhelia_packet *packets;
+	struct drm_parhelia_reloc *relocs;
+	struct drm_gem_object *objects[3] = { };
+	u32 vertices[PARHELIA_T2_PRIME_SLOTS * 3 * 5] = { };
+	u32 *commands, v;
+	int ret;
+
+	packets = kvcalloc(npackets, sizeof(*packets), GFP_KERNEL);
+	commands = kvmemdup(parhelia_t2_prime_words, sizeof(parhelia_t2_prime_words),
+			    GFP_KERNEL);
+	relocs = kvcalloc(3, sizeof(*relocs), GFP_KERNEL);
+	if (!packets || !commands || !relocs) {
+		kvfree(packets);
+		kvfree(commands);
+		kvfree(relocs);
+		return -ENOMEM;
+	}
+	for (v = 0; v < npackets; v++) {
+		packets[v].offset = parhelia_t2_prime_packets[v].offset;
+		packets[v].length = parhelia_t2_prime_packets[v].length;
+	}
+	commands[43] = commands[44] =
+		parhelia_warp_entry(pdev, PARHELIA_WARP_PASSTHROUGH_ENTRY);
+	commands[70] = pitch_pixels | (2u << 16) | (0x32u << 24);
+	/* the vendor's LX guard band, KRN mtx2572 */
+	commands[86] = 0x41f80000;
+	/* x, y, r, g, b: distinct small triangles, colour black */
+	for (v = 0; v < PARHELIA_T2_PRIME_SLOTS * 3; v++) {
+		vertices[v * 5] = parhelia_f32_from_small(
+			(v / 3) * 4 % 60 + (v % 3 == 1) * 3);
+		vertices[v * 5 + 1] = parhelia_f32_from_small((v % 3 == 2) * 3);
+	}
+	relocs[0] = (struct drm_parhelia_reloc){
+		.packet = 5, .dword = 2, .type = PARHELIA_RELOC_VRAM };
+	relocs[1] = (struct drm_parhelia_reloc){
+		.packet = 5, .dword = 4, .type = PARHELIA_RELOC_VRAM };
+	relocs[2] = (struct drm_parhelia_reloc){
+		.packet = npackets - 1, .dword = 0, .delta = sizeof(vertices),
+		.type = PARHELIA_RELOC_DRAW };
+	objects[0] = objects[1] = &gbo->bo.base;
+	args.command_dwords = ndwords;
+	args.packet_count = npackets;
+	args.reloc_count = 3;
+	args.vertices = (uintptr_t)vertices;
+	args.vertex_dwords = ARRAY_SIZE(vertices);
+	args.flags = PARHELIA_SUBMIT_FENCE;
+	ret = parhelia_submit_check(&args);
+	if (!ret)
+		return parhelia_submit_run(pdev, file, &args, packets, commands,
+					   relocs, objects, vertices);
+	kvfree(packets);
+	kvfree(commands);
+	kvfree(relocs);
+	return ret;
+}
+
+/* Prime the T2 slots once per engine life, with the first native colour
+ * target large enough, before that target's clear makes it zero again. */
+void parhelia_t2_prime_once(struct parhelia_device *pdev, struct drm_file *file,
+			    struct drm_gem_vram_object *gbo, u32 width,
+			    u32 height, u32 pitch_pixels)
+{
+	int ret;
+
+	if (pdev->pdev->device != PARHELIA_P690 || pdev->t2_primed ||
+	    width < 64 || height < 16)
+		return;
+	ret = parhelia_t2_prime(pdev, file, gbo, pitch_pixels);
+	if (!ret)
+		pdev->t2_primed = true;
+	else if (ret != -EINTR && ret != -ERESTARTSYS)
+		dev_warn_ratelimited(&pdev->pdev->dev,
+				     "WARP T2 prime failed (%d)\n", ret);
 }
 
 static bool parhelia_fence_done_or_wedged(struct parhelia_device *pdev,
@@ -5177,7 +5320,7 @@ static int parhelia_engine_blit_submit(struct parhelia_device *pdev,
 	ret = parhelia_submit_check(&args);
 	if (!ret)
 		ret = parhelia_submit_run(pdev, file, &args, packets,
-					  commands, relocs, objects);
+					  commands, relocs, objects, NULL);
 	else {
 		kvfree(packets);
 		kvfree(commands);

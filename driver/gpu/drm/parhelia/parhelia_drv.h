@@ -659,6 +659,8 @@ struct parhelia_device {
 	bool engine_initialized;
 	bool raw_aperture_owned;
 	bool wedged;
+	/* every WARP T2 primitive slot holds an inside value */
+	bool t2_primed;
 	bool irq_installed;
 	u32 last_clock_khz;
 	/* Retain all batch references after a timeout until device teardown. */
@@ -827,6 +829,9 @@ int parhelia_vram_clear(struct parhelia_device *pdev,
 int parhelia_vram_clear_range(struct parhelia_device *pdev,
 			      struct drm_gem_vram_object *gbo, u64 offset,
 			      u64 len);
+void parhelia_t2_prime_once(struct parhelia_device *pdev, struct drm_file *file,
+			    struct drm_gem_vram_object *gbo, u32 width,
+			    u32 height, u32 pitch_pixels);
 int parhelia_bo_clear(struct parhelia_device *pdev, struct drm_file *file,
 		      struct drm_gem_vram_object *gbo);
 int parhelia_engine_transfer(struct parhelia_device *pdev,
