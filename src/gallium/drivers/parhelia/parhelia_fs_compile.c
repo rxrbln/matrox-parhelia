@@ -116,6 +116,7 @@ struct ph_fs_ctx {
    int route[2];           /* generic varying slot carried in v0/v1, or -1 */
    const struct ph_fs_uexp *uexp;
    unsigned uexp_count;
+   float tex_hi[4][4];     /* the largest value each unit channel samples */
    /* The fog factor read as v1.x: its root and its per-vertex expression. */
    nir_def *fog_root;
    struct ph_fs_fog_op *fog;
@@ -486,10 +487,19 @@ ph_fs_translate(const nir_alu_instr *alu, unsigned i, int lane, int sel,
 
    if (nir_op_infos[alu->op].input_sizes[i] == 3 ||
        (lane == PH_LANE_RGB && sel < 0)) {
-      if (sw[0] == sw[1] && sw[1] == sw[2])
-         *out = sw[0];
-      else if (sw[0] == 0 && sw[1] == 1 && sw[2] == 2)
+      /* Channels past a narrower result are never read. */
+      const unsigned n = nir_op_infos[alu->op].input_sizes[i] == 3 ? 3 :
+                         MIN2(alu->def.num_components, 3);
+      bool same = true, identity = true;
+
+      for (unsigned c = 0; c < n; c++) {
+         same &= sw[c] == sw[0];
+         identity &= sw[c] == c;
+      }
+      if (identity)
          *out = -1;
+      else if (same)
+         *out = sw[0];
       else
          return false;
       return true;
@@ -1869,30 +1879,38 @@ ph_fs_part_exp(const struct ph_fs_ctx *ctx, const struct ph_fs_part *p)
  * gave 0.875).  Each node therefore stores its value scaled by 2^-e, with
  * e picked from interval analysis; consumers align exponents, and the shift
  * folds the scale back in at the saturated colour write. */
+/* Per storage channel: RGB 0..2, alpha 3. */
 struct ph_fs_range {
-   float lo, hi;
+   float lo[4], hi[4];
    int e;
 };
 
 static struct ph_fs_range
 ph_fs_range_mod(struct ph_fs_range r, unsigned mod)
 {
-   const float a = ph_fs_modify(r.lo, mod), b = ph_fs_modify(r.hi, mod);
+   for (unsigned c = 0; c < 4; c++) {
+      const float a = ph_fs_modify(r.lo[c], mod), b = ph_fs_modify(r.hi[c], mod);
 
-   r.lo = MIN2(a, b);
-   r.hi = MAX2(a, b);
+      r.lo[c] = MIN2(a, b);
+      r.hi[c] = MAX2(a, b);
+   }
    return r;
 }
 
 static struct ph_fs_range
 ph_fs_range_mul(struct ph_fs_range a, struct ph_fs_range b)
 {
-   const float p[4] = { a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi };
-   struct ph_fs_range r = { p[0], p[0], a.e + b.e };
+   struct ph_fs_range r = { .e = a.e + b.e };
 
-   for (unsigned i = 1; i < 4; i++) {
-      r.lo = MIN2(r.lo, p[i]);
-      r.hi = MAX2(r.hi, p[i]);
+   for (unsigned c = 0; c < 4; c++) {
+      const float p[4] = { a.lo[c] * b.lo[c], a.lo[c] * b.hi[c],
+                           a.hi[c] * b.lo[c], a.hi[c] * b.hi[c] };
+
+      r.lo[c] = r.hi[c] = p[0];
+      for (unsigned i = 1; i < 4; i++) {
+         r.lo[c] = MIN2(r.lo[c], p[i]);
+         r.hi[c] = MAX2(r.hi[c], p[i]);
+      }
    }
    return r;
 }
@@ -1900,49 +1918,80 @@ ph_fs_range_mul(struct ph_fs_range a, struct ph_fs_range b)
 static struct ph_fs_range
 ph_fs_range_hull(struct ph_fs_range a, struct ph_fs_range b)
 {
-   a.lo = MIN2(a.lo, b.lo);
-   a.hi = MAX2(a.hi, b.hi);
+   for (unsigned c = 0; c < 4; c++) {
+      a.lo[c] = MIN2(a.lo[c], b.lo[c]);
+      a.hi[c] = MAX2(a.hi[c], b.hi[c]);
+   }
    return a;
 }
 
 static struct ph_fs_range
 ph_fs_range_add(struct ph_fs_range a, struct ph_fs_range b)
 {
-   a.lo += b.lo;
-   a.hi += b.hi;
+   for (unsigned c = 0; c < 4; c++) {
+      a.lo[c] += b.lo[c];
+      a.hi[c] += b.hi[c];
+   }
    return a;
+}
+
+static struct ph_fs_range
+ph_fs_range_scale(struct ph_fs_range r, float k)
+{
+   for (unsigned c = 0; c < 4; c++) {
+      r.lo[c] *= k;
+      r.hi[c] *= k;
+   }
+   return r;
+}
+
+static void
+ph_fs_range_fill(struct ph_fs_range *r, float lo, float hi)
+{
+   for (unsigned c = 0; c < 4; c++) {
+      r->lo[c] = lo;
+      r->hi[c] = hi;
+   }
 }
 
 static bool
 ph_fs_src_range(struct ph_fs_ctx *ctx, const struct ph_fs_range *nr,
                 const struct ph_fs_src *s, struct ph_fs_range *out)
 {
-   struct ph_fs_range r = { 0.0f, 1.0f, 0 };
+   struct ph_fs_range r = { .e = 0 };
 
+   ph_fs_range_fill(&r, 0.0f, 1.0f);
    switch (s->kind) {
    case PH_SRC_NONE:
-      r.hi = 0.0f;
+      ph_fs_range_fill(&r, 0.0f, 0.0f);
       break;
    case PH_SRC_NODE:
       r = nr[s->index];
+      break;
+   case PH_SRC_TEX:
+      for (unsigned c = 0; s->index < 4 && c < 4; c++)
+         r.hi[c] = ctx->tex_hi[s->index][c];
       break;
    case PH_SRC_CONST: {
       const struct ph_fs_part *p = &ctx->part[s->index];
 
       if (!p->literal) {
-         r.lo = -1.0f;
+         ph_fs_range_fill(&r, -1.0f, 1.0f);
          r.e = ph_fs_part_exp(ctx, p);
          break;
       }
-      r.lo = r.hi = p->value[0];
-      for (unsigned c = 1; c < ph_fs_lane_channels(p->lane); c++) {
-         r.lo = MIN2(r.lo, p->value[c]);
-         r.hi = MAX2(r.hi, p->value[c]);
-      }
+      for (unsigned c = 0; c < 4; c++)
+         r.lo[c] = r.hi[c] = p->value[p->lane == PH_LANE_A ? 0 : MIN2(c, 2)];
       break;
    }
    default:
       break;
+   }
+   /* A replicate reads one channel everywhere. */
+   if (s->channel >= 0 && s->channel < 4) {
+      const float lo = r.lo[s->channel], hi = r.hi[s->channel];
+
+      ph_fs_range_fill(&r, lo, hi);
    }
    if (r.e && s->mod != P3D_COMB_MOD_NONE && s->mod != P3D_COMB_MOD_NEG)
       return ph_fs_fail(ctx, "a modifier on an intermediate beyond the "
@@ -1987,15 +2036,29 @@ ph_fs_range_lower(struct ph_fs_ctx *ctx, struct ph_fs_rebuild *rb, int lane,
                   struct ph_fs_src *s, struct ph_fs_range *r, int d)
 {
    const float k = ldexpf(1.0f, -d);
-   struct ph_fs_range scaled = { r->lo * k, r->hi * k, r->e + d };
+   struct ph_fs_range scaled = ph_fs_range_scale(*r, k);
 
    if (d <= 0)
       return true;
+   scaled.e = r->e + d;
    if (d > 10)
       return ph_fs_fail(ctx, "an intermediate beyond the register range");
    if (s->kind == PH_SRC_NONE) {
       r->e += d;
       return true;
+   }
+   /* A producer only this operand reads stores itself further scaled down
+    * when its shift allows, which needs no instruction. */
+   if (s->kind == PH_SRC_NODE && s->mod == P3D_COMB_MOD_NONE) {
+      struct ph_fs_node *dep = &rb->node[s->index];
+      const int sh = dep->scale < 4 ? dep->scale : (int)dep->scale - 8;
+
+      if (dep->uses == 1 && !dep->sat && !dep->output && sh - d >= -2) {
+         dep->scale = sh - d >= 0 ? sh - d : 8 + sh - d;
+         rb->range[s->index] = scaled;
+         *r = scaled;
+         return true;
+      }
    }
    if (s->kind == PH_SRC_CONST && ctx->part[s->index].literal) {
       struct ph_fs_part part = ctx->part[s->index];
@@ -2074,11 +2137,18 @@ ph_fs_range_pass(struct ph_fs_ctx *ctx)
          f = ph_fs_range_mul(r[0], r[2]);
          break;
       case P3D_COMB_DP3:
-      case P3D_COMB_DP4:
-         f = ph_fs_range_mul(r[0], r[2]);
-         f.lo *= n.op == P3D_COMB_DP3 ? 3.0f : 4.0f;
-         f.hi *= n.op == P3D_COMB_DP3 ? 3.0f : 4.0f;
+      case P3D_COMB_DP4: {
+         const struct ph_fs_range p = ph_fs_range_mul(r[0], r[2]);
+         float lo = 0.0f, hi = 0.0f;
+
+         for (unsigned c = 0; c < (n.op == P3D_COMB_DP3 ? 3u : 4u); c++) {
+            lo += p.lo[c];
+            hi += p.hi[c];
+         }
+         f = p;
+         ph_fs_range_fill(&f, lo, hi);
          break;
+      }
       case P3D_COMB_MAD: {
          struct ph_fs_range p = ph_fs_range_mul(r[0], r[2]);
 
@@ -2136,31 +2206,40 @@ ph_fs_range_pass(struct ph_fs_ctx *ctx)
             ph_fs_fail(ctx, "an intermediate beyond the register range");
             goto out;
          }
-         f = (struct ph_fs_range){ -1.0f, 1.0f, 0 };
+         f.e = 0;
+         ph_fs_range_fill(&f, -1.0f, 1.0f);
          break;
       }
       /* The true value is f * 2^(f.e + so); store it * 2^-e. */
-      f.lo = ldexpf(f.lo, f.e + so);
-      f.hi = ldexpf(f.hi, f.e + so);
-      if (!n.sat) {
-         float m = MAX2(fabsf(f.lo), fabsf(f.hi));
+      {
+         const unsigned first = n.lane == PH_LANE_A ? 3 : 0;
+         const unsigned last = n.lane == PH_LANE_RGB ? 2 : 3;
+         float m = 0.0f;
 
+         f = ph_fs_range_scale(f, ldexpf(1.0f, f.e + so));
+         for (unsigned c = first; !n.sat && c <= last; c++)
+            m = MAX3(m, fabsf(f.lo[c]), fabsf(f.hi[c]));
          while (m > 1.0f + 1e-6f) {
             m *= 0.5f;
             e++;
          }
+         sh = f.e + so - e;
+         if (getenv("PARHELIA_TRACE_RANGE"))
+            fprintf(stderr, "range: node %u op %#x lane %u sat %u so %d fe %d "
+                    "-> e %d sh %d max %g\n", i, n.op, n.lane, n.sat, so, f.e,
+                    e, sh, ldexpf(m, e));
+         if (sh < -2 || sh > 3) {
+            ph_fs_fail(ctx, "a scale beyond the result shift");
+            goto out;
+         }
+         n.scale = sh >= 0 ? sh : 8 + sh;
+         f = ph_fs_range_scale(f, ldexpf(1.0f, -e));
+         for (unsigned c = 0; c < 4; c++) {
+            f.lo[c] = CLAMP(f.lo[c], n.sat ? 0.0f : -1.0f, 1.0f);
+            f.hi[c] = CLAMP(f.hi[c], n.sat ? 0.0f : -1.0f, 1.0f);
+         }
+         f.e = e;
       }
-      sh = f.e + so - e;
-      if (sh < -2 || sh > 3) {
-         ph_fs_fail(ctx, "a scale beyond the result shift");
-         goto out;
-      }
-      n.scale = sh >= 0 ? sh : 8 + sh;
-      f.lo = ldexpf(f.lo, -e);
-      f.hi = ldexpf(f.hi, -e);
-      f.lo = CLAMP(f.lo, n.sat ? 0.0f : -1.0f, 1.0f);
-      f.hi = CLAMP(f.hi, n.sat ? 0.0f : -1.0f, 1.0f);
-      f.e = e;
       if (!ph_fs_rebuild_push(ctx, &rb, &n, f))
          goto out;
       map[i] = rb.nodes - 1;
@@ -2857,6 +2936,9 @@ ph_fs_compile_key(nir_shader *nir, unsigned max_instructions,
    memset(out, 0, sizeof(*out));
    ctx.uexp = uexp;
    ctx.uexp_count = uexp_count;
+   for (unsigned u = 0; u < 4; u++)
+      for (unsigned c = 0; c < 4; c++)
+         ctx.tex_hi[u][c] = 1.0f;
    if (!ph_fs_route_varyings(nir, ctx.route)) {
       ph_fs_fail(&ctx, "more value varyings than free colour interpolators");
       goto done;
