@@ -112,6 +112,7 @@ struct ph_fs_ctx {
    bool tex_end_cross[4][2];
    unsigned sampler_mask;
    bool uses_color, uses_color1, uses_fogc, uses_col1;
+   int route[2];           /* generic varying slot carried in v0/v1, or -1 */
    /* The fog factor read as v1.x: its root and its per-vertex expression. */
    nir_def *fog_root;
    struct ph_fs_fog_op *fog;
@@ -1206,6 +1207,9 @@ ph_fs_varying(struct ph_fs_ctx *ctx, unsigned location, int sel,
       ctx->uses_col1 |= location == VARYING_SLOT_COL1;
       out->index = 1;
       ctx->uses_color1 = true;
+   } else if (ctx->route[0] == (int)location || ctx->route[1] == (int)location) {
+      out->index = ctx->route[0] == (int)location ? 0 : 1;
+      ctx->uses_color1 |= out->index == 1;
    } else {
       return ph_fs_fail(ctx, "a varying other than a colour");
    }
@@ -2423,6 +2427,69 @@ ph_fs_dump(const struct ph_fs_program *program, FILE *f)
               program->const_ref[r].mask);
 }
 
+/* Generic varyings the program reads as values, assigned to the colour
+ * interpolators it does not read itself: v0 first, then v1.  Texture
+ * coordinate varyings only feed the texture units and are not routed. */
+static bool
+ph_fs_route_varyings(nir_shader *nir, int route[2])
+{
+   bool used_col0 = false, used_col1 = false;
+   int generic[2];
+   unsigned generics = 0;
+   bool too_many = false;
+
+   route[0] = route[1] = -1;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_intrinsic_instr *in;
+            int location = -1;
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic == nir_intrinsic_load_deref) {
+               nir_deref_instr *deref = nir_src_as_deref(in->src[0]);
+
+               if (deref && deref->deref_type == nir_deref_type_var &&
+                   (deref->var->data.mode & nir_var_shader_in))
+                  location = deref->var->data.location;
+            } else if (in->intrinsic == nir_intrinsic_load_input ||
+                       in->intrinsic == nir_intrinsic_load_interpolated_input) {
+               location = nir_intrinsic_io_semantics(in).location;
+            }
+            if (location == VARYING_SLOT_COL0)
+               used_col0 = true;
+            else if (location == VARYING_SLOT_COL1 ||
+                     location == VARYING_SLOT_FOGC)
+               used_col1 = true;
+            else if (location >= VARYING_SLOT_VAR0 ||
+                     location == VARYING_SLOT_PNTC) {
+               bool seen = false;
+
+               for (unsigned i = 0; i < generics; i++)
+                  seen |= generic[i] == location;
+               if (!seen && generics < 2)
+                  generic[generics++] = location;
+               else if (!seen)
+                  too_many = true;
+            }
+         }
+      }
+   }
+   if (too_many)
+      return false;
+   for (unsigned i = 0; i < generics; i++) {
+      if (!used_col0 && route[0] < 0)
+         route[0] = generic[i];
+      else if (!used_col1 && route[1] < 0)
+         route[1] = generic[i];
+      else
+         return false;
+   }
+   return true;
+}
+
 bool
 ph_fs_compile(nir_shader *nir, unsigned max_instructions,
               struct ph_fs_program *out)
@@ -2437,6 +2504,10 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
 
    memset(&ctx, 0, sizeof(ctx));
    memset(out, 0, sizeof(*out));
+   if (!ph_fs_route_varyings(nir, ctx.route)) {
+      ph_fs_fail(&ctx, "more value varyings than free colour interpolators");
+      goto done;
+   }
    nir_foreach_function_impl(impl, nir) {
       if (exec_list_length(&impl->body) != 1) {
          ph_fs_fail(&ctx, "control flow");
@@ -2527,6 +2598,8 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
    out->uses_color = ctx.uses_color;
    out->uses_color1 = ctx.uses_color1;
    out->uses_fogc = ctx.uses_fogc || ctx.fog_root;
+   out->route[0] = ctx.route[0];
+   out->route[1] = ctx.route[1];
    if (ctx.fog_root) {
       out->fog = ctx.fog;
       out->fog_ops = ctx.fog_ops;

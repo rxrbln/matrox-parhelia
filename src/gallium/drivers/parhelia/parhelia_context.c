@@ -5334,12 +5334,72 @@ ph_split_fog_triangle(struct draw_stage *stage, struct prim_header *prim,
    return true;
 }
 
+/* The draw output feeding colour interpolator @k: a generic varying the
+ * compiled program routes there, else the colour (or fog) it carries. */
+static int
+ph_v_output(struct draw_context *draw, const struct ph_context *ctx, unsigned k)
+{
+   const struct ph_fs *fs = ctx->fs;
+
+   if (fs && fs->program.valid && fs->program.route[k] == VARYING_SLOT_PNTC)
+      return draw_find_shader_output(draw, TGSI_SEMANTIC_PCOORD, 0);
+   if (fs && fs->program.valid && fs->program.route[k] >= (int)VARYING_SLOT_VAR0) {
+      const unsigned n = fs->program.route[k] - VARYING_SLOT_VAR0;
+      int out = draw_find_shader_output(draw, TGSI_SEMANTIC_GENERIC, n);
+
+      /* Without texcoord semantics the generics follow the eight sets. */
+      if (out < 0)
+         out = draw_find_shader_output(draw, TGSI_SEMANTIC_GENERIC, n + 9);
+      return out;
+   }
+   if (k == 0)
+      return draw_find_shader_output(draw, TGSI_SEMANTIC_COLOR, 0);
+   return fs && fs->program.valid && fs->program.uses_fogc ?
+          draw_find_shader_output(draw, TGSI_SEMANTIC_FOG, 0) :
+          draw_find_shader_output(draw, TGSI_SEMANTIC_COLOR, 1);
+}
+
+/* A generic varying routed through a colour interpolator: MEASURED on the
+ * P690, the interpolators clamp to [0, 1] (-0.5, 1.5 and 2.0 read as 0, 1
+ * and 1).  A vertex outside that range would render a different value, so
+ * such a primitive is dropped rather than drawn wrong. */
+static bool
+ph_routed_in_range(struct draw_context *draw, const struct ph_context *ctx,
+                   const struct vertex_header *const *v, unsigned n)
+{
+   const struct ph_fs *fs = ctx->fs;
+
+   if (!fs || !fs->program.valid)
+      return true;
+   for (unsigned k = 0; k < 2; k++) {
+      int out;
+
+      if (fs->program.route[k] < 0)
+         continue;
+      out = ph_v_output(draw, ctx, k);
+      if (out < 0)
+         continue;
+      for (unsigned i = 0; i < n; i++)
+         for (unsigned c = 0; c < 4; c++)
+            if (!(v[i]->data[out][c] >= -1e-6f &&
+                  v[i]->data[out][c] <= 1.0f + 1e-6f)) {
+               ph_warn_once("a varying routed through a colour interpolator "
+                            "left [0, 1]; the primitive is dropped\n");
+               return false;
+            }
+   }
+   return true;
+}
+
 static void
 ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 {
    struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   if (!ph_routed_in_range(stage->draw, ctx,
+                           (const struct vertex_header *const *)prim->v, 3))
+      return;
    int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
-   int col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
+   int col = ph_v_output(stage->draw, ctx, 0);
    int texcoord = -1, texcoord1 = -1;
    bool textured = ph_samples_unit0(ctx);
 	bool multitextured = textured && ctx->fs &&
@@ -5365,7 +5425,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	bool colour_alpha;
    float *dst;
    const int fogc = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_FOG, 0);
-   const int col1 = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 1);
+   const int col1 = ph_v_output(stage->draw, ctx, 1);
 
    /* The hardware exposes only one-face cull selectors.  FRONT_AND_BACK has
     * no packet encoding and must reject the polygon before staging it. */
@@ -5777,7 +5837,7 @@ ph_stage_fan(struct draw_stage *stage, const struct vertex_header *const *src,
 {
    struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
    const int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
-   const int col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
+   const int col = ph_v_output(stage->draw, ctx, 0);
    struct prim_header tri = {0};
 
    for (unsigned i = 1; i + 1 < n; i++) {
@@ -5925,7 +5985,7 @@ ph_coverage_line(struct draw_stage *stage, struct prim_header *prim,
 {
    struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
    const int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
-   const int col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
+   const int col = ph_v_output(stage->draw, ctx, 0);
    const float *p0 = prim->v[0]->data[pos], *p1 = prim->v[1]->data[pos];
    const float dx = p1[0] - p0[0], dy = p1[1] - p0[1];
    const float len = sqrtf(dx * dx + dy * dy);
@@ -6062,6 +6122,9 @@ static void
 ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
 {
    struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   if (!ph_routed_in_range(stage->draw, ctx,
+                           (const struct vertex_header *const *)prim->v, 1))
+      return;
    const struct pipe_rasterizer_state *rast = ctx->rasterizer;
    float *dst, size = rast ? rast->point_size : 1.0f;
    int pos, col;
@@ -6074,7 +6137,7 @@ ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
       return;
 
    pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
-   col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
+   col = ph_v_output(stage->draw, ctx, 0);
    if (pos < 0)
       return;
    if (rast && rast->point_size_per_vertex) {
@@ -6227,6 +6290,9 @@ static void
 ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
 {
    struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   if (!ph_routed_in_range(stage->draw, ctx,
+                           (const struct vertex_header *const *)prim->v, 2))
+      return;
    const struct pipe_rasterizer_state *rast = ctx->rasterizer;
    float *dst;
    int pos, col;
@@ -6239,7 +6305,7 @@ ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
       return;
 
    pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
-   col = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_COLOR, 0);
+   col = ph_v_output(stage->draw, ctx, 0);
    if (pos < 0)
       return;
    struct prim_header extended;
@@ -7439,6 +7505,9 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
     * the window-space stream. */
    if (ctx->fs && ctx->fs->program.valid && ctx->fs->program.uses_color1)
       return ph_tcl_no(ctx, PH_TCL_NO_COLOUR1);
+   /* A generic varying routed into v0 is not what the program writes to o1. */
+   if (ctx->fs && ctx->fs->program.valid && ctx->fs->program.route[0] >= 0)
+      return ph_tcl_no(ctx, PH_TCL_NO_PROGRAM_IO);
    /* An untextured colour with a visible alpha needs the RGBA stream: its
     * transforming form drew right in --colour-alpha-probe but stopped the
     * engine on a 100000-vertex GL_POLYGON, so the draw module stages it
