@@ -564,3 +564,22 @@ buffer so that no surface tile is diverted) is still OPEN.
 * Two overlapping triangles accumulate without a stall in this placement
   (they stalled with the buffer inside the depth object); the resolve then
   stalls [MEASURED].
+
+### 11.6 Buffer use is fixed at about 24 KiB (runs d0-d3, e1, e2)
+
+* Shifting the buffer by 8/16 KiB moves the whole pattern with the base;
+  a +256 B base stalls the engine: the base must be 8 KiB aligned
+  [MEASURED].
+* With a 1 MiB, 1.18 MiB or 4 MiB buffer (object and `0x12fc[31:14]`
+  together) one draw always writes only the first three 8 KiB blocks:
+  the size field does not partition the buffer for the unit [MEASURED].
+* Relocated pixels keep the low 13 bits of their colour offset, so each
+  block is indexed like one 64x32 tile; pixels of different tiles that
+  share an in-tile offset overwrite each other [MEASURED, the per-pipe
+  reading INFERRED].
+* Linux `mtx2187` emits the same words as `sub_2E360` [C].
+
+The buffer therefore behaves like the write-back target of a per-pipe tile
+cache rather than a growing fragment heap in this setup; what the vendor
+binds or enables so that these lines go back to the colour target is the
+open item.
