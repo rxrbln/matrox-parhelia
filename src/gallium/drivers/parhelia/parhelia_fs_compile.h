@@ -20,7 +20,15 @@ struct ph_fs_const_ref {
    uint8_t instruction;
    uint8_t slot;
    uint8_t mask;
+   uint8_t e[4];           /* the register holds the value * 2^-e */
    uint16_t offset[4];
+};
+
+/* A runtime constant the program was compiled to read scaled by 2^-e: the
+ * combiner holds [-1, 1], so a uniform beyond it selects a variant. */
+struct ph_fs_uexp {
+   uint16_t offset;
+   uint8_t e;
 };
 
 /* One preshader scalar: @op over up to three sources, each a constant
@@ -104,6 +112,11 @@ struct ph_fs_program {
    nir_const_value *pre_value;
    unsigned pre_count;
    const char *reject;     /* why it did not compile */
+   /* What a recompile for larger runtime constants starts from. */
+   nir_shader *nir;
+   unsigned budget;
+   struct ph_fs_uexp *uexp;
+   unsigned uexp_count;
 };
 
 /* Compile @nir into at most @max_instructions combiner slots. */
@@ -114,8 +127,10 @@ bool ph_fs_compile(nir_shader *nir, unsigned max_instructions,
 void ph_fs_program_fini(struct ph_fs_program *program);
 
 /* Copy the runtime constants into the program's constant registers.
- * @constants is the mapped fragment constant buffer, @size its bytes. */
-void ph_fs_update_constants(struct ph_fs_program *program,
+ * @constants is the mapped fragment constant buffer, @size its bytes.  A
+ * constant beyond [-1, 1] recompiles the program for its magnitude; false
+ * when no variant can hold the constants. */
+bool ph_fs_update_constants(struct ph_fs_program *program,
                             const void *constants, unsigned size);
 
 /* Run @prog on one fragment: logical texture values @tex, colours @colour.

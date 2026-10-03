@@ -7208,8 +7208,9 @@ ph_fs_constant_colour(struct ph_context *ctx, float out[4])
    if (fs->program.const_ref_count) {
       if (!ctx->fs_const_snap_size)
          return false;
-      ph_fs_update_constants(&fs->program, ctx->fs_const_snap,
-                             ctx->fs_const_snap_size);
+      if (!ph_fs_update_constants(&fs->program, ctx->fs_const_snap,
+                                  ctx->fs_const_snap_size))
+         return false;
    }
    ph_fs_eval(&fs->program.comb, zero, (const float (*)[4])zero, 1.0f, out);
    return true;
@@ -8953,6 +8954,14 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       uint8_t kill_ref;
 
       ph_fs_snapshot_constants(ctx);
+      if (ctx->fs && ctx->fs->program.valid &&
+          ctx->fs->program.const_ref_count && ctx->fs_const_snap_size &&
+          !ph_fs_update_constants(&ctx->fs->program, ctx->fs_const_snap,
+                                  ctx->fs_const_snap_size)) {
+         PH_REFUSE("draws whose fragment uniforms no combiner variant can "
+                   "hold are dropped\n");
+         return;
+      }
       switch (ph_fs_kill_route(ctx, &kill_prog, &kill_func, &kill_ref)) {
       case PH_KILL_ALL:
          return;
@@ -9748,8 +9757,8 @@ ph_fs_program_constants(struct ph_context *ctx, struct ph_fs_program *prog)
       return true;
    if (!ctx->fs_const_snap_size)
       return false;
-   ph_fs_update_constants(prog, ctx->fs_const_snap, ctx->fs_const_snap_size);
-   return true;
+   return ph_fs_update_constants(prog, ctx->fs_const_snap,
+                                 ctx->fs_const_snap_size);
 }
 
 static bool

@@ -114,6 +114,8 @@ struct ph_fs_ctx {
    bool uses_color, uses_color1, uses_fogc, uses_col1, uses_color1_alpha;
    bool uses_color0_alpha;
    int route[2];           /* generic varying slot carried in v0/v1, or -1 */
+   const struct ph_fs_uexp *uexp;
+   unsigned uexp_count;
    /* The fog factor read as v1.x: its root and its per-vertex expression. */
    nir_def *fog_root;
    struct ph_fs_fog_op *fog;
@@ -1840,6 +1842,27 @@ ph_fs_result(struct ph_fs_ctx *ctx, int lane, struct ph_fs_src *src)
 
 /* ---- register range --------------------------------------------------- */
 
+static unsigned
+ph_fs_uexp_of(const struct ph_fs_uexp *uexp, unsigned count, unsigned offset)
+{
+   for (unsigned i = 0; i < count; i++)
+      if (uexp[i].offset == offset)
+         return uexp[i].e;
+   return 0;
+}
+
+/* The exponent a runtime constant part is read with: one per register
+ * half, the largest of its channels'. */
+static unsigned
+ph_fs_part_exp(const struct ph_fs_ctx *ctx, const struct ph_fs_part *p)
+{
+   unsigned e = 0;
+
+   for (unsigned c = 0; !p->literal && c < ph_fs_lane_channels(p->lane); c++)
+      e = MAX2(e, ph_fs_uexp_of(ctx->uexp, ctx->uexp_count, p->offset[c]));
+   return e;
+}
+
 /* MEASURED on the P690: every source reads, and every register write
  * clamps to, [-1, 1] - intermediates of 1.5, 2.5 and 7 read back as 1.0 -
  * while the ALU computes past 1 before the result shift ((1 + 0.75) * 0.5
@@ -1908,6 +1931,7 @@ ph_fs_src_range(struct ph_fs_ctx *ctx, const struct ph_fs_range *nr,
 
       if (!p->literal) {
          r.lo = -1.0f;
+         r.e = ph_fs_part_exp(ctx, p);
          break;
       }
       r.lo = r.hi = p->value[0];
@@ -2508,9 +2532,11 @@ ph_fs_emit_constants(struct ph_fs_ctx *ctx, const struct ph_fs_node *node,
          if (lane == PH_LANE_A) {
             ref->mask |= 1u << 3;
             ref->offset[3] = p->offset[0];
+            ref->e[3] = ph_fs_part_exp(ctx, p);
          } else {
             ref->mask |= 7u;
             memcpy(ref->offset, p->offset, 3 * sizeof(p->offset[0]));
+            ref->e[0] = ref->e[1] = ref->e[2] = ph_fs_part_exp(ctx, p);
          }
       }
    }
@@ -2814,9 +2840,10 @@ ph_fs_route_varyings(nir_shader *nir, int route[2])
    return true;
 }
 
-bool
-ph_fs_compile(nir_shader *nir, unsigned max_instructions,
-              struct ph_fs_program *out)
+static bool
+ph_fs_compile_key(nir_shader *nir, unsigned max_instructions,
+                  const struct ph_fs_uexp *uexp, unsigned uexp_count,
+                  struct ph_fs_program *out)
 {
    struct ph_fs_ctx ctx;
    nir_def *colour[4] = { NULL };
@@ -2828,6 +2855,8 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
 
    memset(&ctx, 0, sizeof(ctx));
    memset(out, 0, sizeof(*out));
+   ctx.uexp = uexp;
+   ctx.uexp_count = uexp_count;
    if (!ph_fs_route_varyings(nir, ctx.route)) {
       ph_fs_fail(&ctx, "more value varyings than free colour interpolators");
       goto done;
@@ -3014,9 +3043,28 @@ ph_fs_fog_eval(const struct ph_fs_program *program, float fogc,
       1.0f;
 }
 
+bool
+ph_fs_compile(nir_shader *nir, unsigned max_instructions,
+              struct ph_fs_program *out)
+{
+   if (!ph_fs_compile_key(nir, max_instructions, NULL, 0, out))
+      return false;
+   /* Only runtime constants can ask for a variant. */
+   if (out->const_ref_count) {
+      out->nir = nir_shader_clone(NULL, nir);
+      out->budget = max_instructions;
+   }
+   return true;
+}
+
 void
 ph_fs_program_fini(struct ph_fs_program *program)
 {
+   ralloc_free(program->nir);
+   program->nir = NULL;
+   free(program->uexp);
+   program->uexp = NULL;
+   program->uexp_count = 0;
    free(program->fog);
    program->fog = NULL;
    program->fog_ops = 0;
@@ -3062,29 +3110,109 @@ ph_fs_run_preshader(struct ph_fs_program *program, const float *values,
    }
 }
 
-void
+static float
+ph_fs_ref_value(const struct ph_fs_program *program,
+                const struct ph_fs_const_ref *ref, unsigned c,
+                const float *values, unsigned size)
+{
+   if (ref->offset[c] >= PH_FS_PRE_BASE)
+      return ref->offset[c] - PH_FS_PRE_BASE < program->pre_count ?
+             program->pre_value[ref->offset[c] - PH_FS_PRE_BASE].f32 : 0.0f;
+   return values && (ref->offset[c] + 1u) * sizeof(float) <= size ?
+          values[ref->offset[c]] : 0.0f;
+}
+
+/* Recompile for the exponents the current constants need, which only grow,
+ * so a program settles after a few variants rather than alternating.
+ * Returns 1 when it recompiled, 0 when nothing changed, -1 on failure. */
+static int
+ph_fs_rescale(struct ph_fs_program *program, const float *values,
+              unsigned size)
+{
+   struct ph_fs_uexp *uexp;
+   struct ph_fs_program variant;
+   unsigned count = program->uexp_count;
+   bool grown = false;
+
+   if (!program->nir)
+      return 0;
+   uexp = malloc((count + 4 * program->const_ref_count + 1) * sizeof(*uexp));
+   if (!uexp)
+      return -1;
+   memcpy(uexp, program->uexp, count * sizeof(*uexp));
+   for (unsigned i = 0; i < program->const_ref_count; i++) {
+      const struct ph_fs_const_ref *ref = &program->const_ref[i];
+
+      for (unsigned c = 0; c < 4; c++) {
+         float m;
+         unsigned e = 0, k;
+
+         if (!(ref->mask & (1u << c)))
+            continue;
+         m = fabsf(ph_fs_ref_value(program, ref, c, values, size));
+         while (m > 1.0f + 1e-6f && e < 16) {
+            m *= 0.5f;
+            e++;
+         }
+         if (e <= ref->e[c])
+            continue;
+         for (k = 0; k < count && uexp[k].offset != ref->offset[c]; k++)
+            ;
+         if (k == count)
+            uexp[count++] = (struct ph_fs_uexp){ ref->offset[c], 0 };
+         if (e > uexp[k].e) {
+            uexp[k].e = e;
+            grown = true;
+         }
+      }
+   }
+   if (!grown) {
+      free(uexp);
+      return 0;
+   }
+   if (!ph_fs_compile_key(program->nir, program->budget, uexp, count,
+                          &variant)) {
+      free(uexp);
+      program->valid = false;
+      program->reject = "a runtime constant beyond the combiner's range";
+      return -1;
+   }
+   variant.nir = program->nir;
+   variant.budget = program->budget;
+   variant.uexp = uexp;
+   variant.uexp_count = count;
+   program->nir = NULL;
+   ph_fs_program_fini(program);
+   *program = variant;
+   if (getenv("PARHELIA_TRACE_FS")) {
+      fprintf(stderr, "parhelia: fs recompiled for runtime constants beyond "
+                      "[-1, 1]\n");
+      ph_fs_dump(program, stderr);
+   }
+   return 1;
+}
+
+bool
 ph_fs_update_constants(struct ph_fs_program *program, const void *constants,
                        unsigned size)
 {
    const float *values = constants;
+   int rescaled;
 
    ph_fs_run_preshader(program, values, size);
+   rescaled = ph_fs_rescale(program, values, size);
+   if (rescaled > 0)
+      ph_fs_run_preshader(program, values, size);
    for (unsigned i = 0; i < program->const_ref_count; i++) {
       const struct ph_fs_const_ref *ref = &program->const_ref[i];
       float *target = program->comb.inst[ref->instruction].constant[ref->slot];
 
-      for (unsigned c = 0; c < 4; c++) {
-         if (!(ref->mask & (1u << c)))
-            continue;
-         if (ref->offset[c] >= PH_FS_PRE_BASE)
-            target[c] = ref->offset[c] - PH_FS_PRE_BASE < program->pre_count ?
-                        program->pre_value[ref->offset[c] - PH_FS_PRE_BASE].f32 :
-                        0.0f;
-         else
-            target[c] = values && (ref->offset[c] + 1u) * sizeof(float) <= size ?
-                        values[ref->offset[c]] : 0.0f;
-      }
+      for (unsigned c = 0; c < 4; c++)
+         if (ref->mask & (1u << c))
+            target[c] = ldexpf(ph_fs_ref_value(program, ref, c, values, size),
+                               -(int)ref->e[c]);
    }
+   return rescaled >= 0;
 }
 
 bool
