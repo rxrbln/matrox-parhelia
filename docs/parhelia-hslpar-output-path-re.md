@@ -1579,3 +1579,19 @@ for every pixel clock, which is why DVI ran at 154 MHz only after a VBE boot.
 Kernel: `parhelia_ch7301.c` (commit ae34aa5 on p0528-dvi0528) implements the
 probe and the vendor enable sequence with this board's lock check, called at
 the end of the original family's DVO mode set.
+
+### 15.1 Two ways the running DVI link was lost (2026-10-03)
+
+* **`0x1c4c` reads pin levels, not the latch.**  Bit 8 (the DDC/I2C channel
+  select, MISC-IO id 8) reads 0 in every capture although the VBIOS drives it
+  high before each transaction (`rom0528 0x4d6a`).  A read-modify-write that
+  writes back the read value therefore drives the select low and kills DDC on
+  both connectors.  Drive it per transaction, as the VBIOS and
+  `HSLPARI2COpenPort` do (kernel 3e2a5ef).
+* **Load sense borrows the DAC-index controller.**  `HSLPARSenseLoadOnInternalDAC`
+  (`mtx740 .text+0xc1130`/`+0xc1171`, `sel` = DAC index) writes `0x16459164` to
+  `0x188c + sel*0x200` and zeroes HDISPEND in `0x1910 + sel*0x200` for 10 ms.
+  Sensing DAC2 therefore blanks head 1, which drives DVI-I-1 on this board.  The
+  vendor only senses on explicit monitor detection; KMS probes on every xrandr
+  query, so the kernel must not sense through a controller that is scanning
+  out (kernel 78681ab).
