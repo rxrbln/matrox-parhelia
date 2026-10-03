@@ -6623,8 +6623,10 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
       util_format_get_blocksize(v->base.format) ==
       util_format_get_blocksize(r->base.format);
 
+   /* A 16-bit target copies into the 16-bit sampler storage of its format. */
    if ((!depth && util_format_get_blocksize(r->base.format) != 4 &&
-        !ph_format_widened(r->base.format)) || first > last)
+        !ph_format_widened(r->base.format) &&
+        !ph_sampler_format(r->base.format, NULL)) || first > last)
       return NULL;
    if (!v->shadow_view) {
       struct pipe_resource templ = r->base, *shadow;
@@ -6702,7 +6704,11 @@ ph_sampled_through_copy(const struct parhelia_resource *r)
       return r->base.target == PIPE_TEXTURE_2D ||
              r->base.target == PIPE_TEXTURE_RECT ||
              r->base.target == PIPE_TEXTURE_1D;
-   return r->transfer_shadow && !r->native_shared &&
+   /* A raw-mapped P690 16-bit target is copied from its mapping like a
+    * shadow (MEASURED on the P690 only). */
+   return (r->transfer_shadow ||
+           (r->map && ph_lx_family(ph_screen(r->base.screen)->chip_id))) &&
+          !r->native_shared &&
           !ph_resource_uses_sampler_layout(r) &&
           !(r->base.bind & PIPE_BIND_DEPTH_STENCIL) &&
           (r->base.target == PIPE_TEXTURE_2D ||
