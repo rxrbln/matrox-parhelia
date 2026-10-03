@@ -81,6 +81,19 @@ struct ph_fs_fog_op {
    float value;            /* PH_FOG_LITERAL */
 };
 
+/* A floor of a varying, evaluated by a nearest-sampled ramp texture on a
+ * free unit: texel j of dimension d holds code j * step, the floor is
+ * code * 255 / step + k * lo[d], and the unit reads the varying's
+ * components comp[] staged as (x - lo) / span. */
+struct ph_fs_ramp {
+   uint8_t unit;
+   uint8_t location;       /* VARYING_SLOT_* */
+   uint8_t dims;           /* floored components, 1..3 */
+   uint8_t comp[3];
+   uint16_t size[3];       /* texels per dimension */
+   float lo[3], span[3];   /* coordinate domain [lo, lo + span) */
+};
+
 struct ph_fs_program {
    struct p3d_comb_program comb;
    unsigned sampler_mask;
@@ -117,11 +130,28 @@ struct ph_fs_program {
    unsigned budget;
    struct ph_fs_uexp *uexp;
    unsigned uexp_count;
+   /* Units the program samples as floor ramps. */
+   struct ph_fs_ramp ramps[P3D_MAX_TEXTURE_UNITS];
+   unsigned ramp_count;
 };
+
+/* The code step of a ramp dimension of @size texels. */
+unsigned ph_fs_ramp_step(unsigned size);
+
+/* Replace floor(varying * k) by ramp samples on units outside @used_units;
+ * false with @reject when a floor has no ramp form. */
+bool ph_fs_lower_floor_ramps(nir_shader *nir, unsigned used_units,
+                             unsigned max_units, struct ph_fs_ramp *ramps,
+                             unsigned *count, const char **reject);
 
 /* Compile @nir into at most @max_instructions combiner slots. */
 bool ph_fs_compile(nir_shader *nir, unsigned max_instructions,
                    struct ph_fs_program *out);
+
+/* ph_fs_compile() for a program whose units @ramps hold floor ramps. */
+bool ph_fs_compile_ramps(nir_shader *nir, unsigned max_instructions,
+                         const struct ph_fs_ramp *ramps, unsigned ramp_count,
+                         struct ph_fs_program *out);
 
 /* Free what ph_fs_compile allocated for @program. */
 void ph_fs_program_fini(struct ph_fs_program *program);

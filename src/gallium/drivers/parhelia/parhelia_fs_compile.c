@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_constant_expressions.h"
 #include "parhelia_fs_compile.h"
 
@@ -2922,6 +2923,7 @@ ph_fs_route_varyings(nir_shader *nir, int route[2])
 static bool
 ph_fs_compile_key(nir_shader *nir, unsigned max_instructions,
                   const struct ph_fs_uexp *uexp, unsigned uexp_count,
+                  const struct ph_fs_ramp *ramps, unsigned ramp_count,
                   struct ph_fs_program *out)
 {
    struct ph_fs_ctx ctx;
@@ -2939,6 +2941,15 @@ ph_fs_compile_key(nir_shader *nir, unsigned max_instructions,
    for (unsigned u = 0; u < 4; u++)
       for (unsigned c = 0; c < 4; c++)
          ctx.tex_hi[u][c] = 1.0f;
+   /* A ramp texel holds only its own components; the rest are zero. */
+   for (unsigned r = 0; r < ramp_count; r++) {
+      if (ramps[r].unit >= 4)
+         continue;
+      for (unsigned c = 0; c < 4; c++)
+         ctx.tex_hi[ramps[r].unit][c] = 0.0f;
+      for (unsigned d = 0; d < ramps[r].dims; d++)
+         ctx.tex_hi[ramps[r].unit][ramps[r].comp[d]] = 1.0f;
+   }
    if (!ph_fs_route_varyings(nir, ctx.route)) {
       ph_fs_fail(&ctx, "more value varyings than free colour interpolators");
       goto done;
@@ -3082,6 +3093,334 @@ done:
    return ok;
 }
 
+/* ---- floor through a ramp texture -------------------------------------- */
+
+/* The varying a value reads, with its slot and the component each channel
+ * reads; false when it is anything else. */
+static bool
+ph_fs_ramp_varying(nir_def *def, unsigned *location, uint8_t comp[4])
+{
+   nir_instr *instr = nir_def_instr(def);
+   nir_intrinsic_instr *in;
+   unsigned first = 0;
+
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   in = nir_instr_as_intrinsic(instr);
+   switch (in->intrinsic) {
+   case nir_intrinsic_load_interpolated_input:
+   case nir_intrinsic_load_input:
+      *location = nir_intrinsic_io_semantics(in).location;
+      first = nir_intrinsic_component(in);
+      break;
+   case nir_intrinsic_load_deref: {
+      nir_variable *var =
+         nir_deref_instr_get_variable(nir_src_as_deref(in->src[0]));
+
+      if (!var || var->data.mode != nir_var_shader_in)
+         return false;
+      *location = var->data.location;
+      first = var->data.location_frac;
+      break;
+   }
+   default:
+      return false;
+   }
+   if (*location == VARYING_SLOT_COL0 || *location == VARYING_SLOT_COL1)
+      return false;
+   for (unsigned c = 0; c < 4; c++)
+      comp[c] = first + c;
+   return true;
+}
+
+/* floor(x * k) per channel of @floor: the varying component and k each
+ * channel takes; false for any other operand. */
+static bool
+ph_fs_ramp_match(nir_alu_instr *floor, unsigned *location,
+                 uint8_t comp[4], float k[4])
+{
+   nir_def *src = floor->src[0].src.ssa;
+   nir_alu_instr *mul;
+   uint8_t vc[4];
+   int xi;
+
+   if (ph_fs_ramp_varying(src, location, vc)) {
+      for (unsigned c = 0; c < floor->def.num_components; c++) {
+         comp[c] = vc[floor->src[0].swizzle[c]];
+         k[c] = 1.0f;
+      }
+      return true;
+   }
+   if (nir_def_instr(src)->type != nir_instr_type_alu)
+      return false;
+   mul = nir_def_as_alu(src);
+   if (mul->op != nir_op_fmul)
+      return false;
+   xi = nir_src_is_const(mul->src[1].src) ? 0 :
+        nir_src_is_const(mul->src[0].src) ? 1 : -1;
+   if (xi < 0 || !ph_fs_ramp_varying(mul->src[xi].src.ssa, location, vc))
+      return false;
+   for (unsigned c = 0; c < floor->def.num_components; c++) {
+      const unsigned m = floor->src[0].swizzle[c];
+
+      comp[c] = vc[mul->src[xi].swizzle[m]];
+      k[c] = nir_src_comp_as_float(mul->src[1 - xi].src,
+                                   mul->src[1 - xi].swizzle[m]);
+   }
+   return true;
+}
+
+/* Texels per dimension and coordinate span for scale @k: the texel count is
+ * one whose code step divides 255 exactly (2, 4, 16, 256), so the ramp's
+ * value times 255/step is the integer floor without rounding. */
+static bool
+ph_fs_ramp_size(float k, uint16_t *size, float *lo, float *span)
+{
+   static const unsigned sizes[] = { 16, 256, 4, 2 };
+   const int ik = (int)k;
+
+   if (k != (float)ik || ik < 1 || ik > 256 || (ik & (ik - 1)))
+      return false;
+   for (unsigned i = 0; i < ARRAY_SIZE(sizes); i++) {
+      if (sizes[i] < (unsigned)ik || sizes[i] % ik)
+         continue;
+      *size = sizes[i];
+      *span = (float)(sizes[i] / ik);
+      *lo = *span >= 2.0f ? -0.5f * *span : 0.0f;
+      return true;
+   }
+   return false;
+}
+
+static nir_def *
+ph_fs_ramp_sample(nir_builder *b, const struct ph_fs_ramp *ramp,
+                  nir_def *coord)
+{
+   nir_tex_instr *tex = nir_tex_instr_create(b->shader, 1);
+
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = ramp->dims == 3 ? GLSL_SAMPLER_DIM_3D :
+                                        GLSL_SAMPLER_DIM_2D;
+   tex->dest_type = nir_type_float32;
+   tex->texture_index = tex->sampler_index = ramp->unit;
+   tex->coord_components = ramp->dims == 3 ? 3 : 2;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord,
+                                     nir_trim_vector(b, coord,
+                                                     tex->coord_components));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(b, &tex->instr);
+   return &tex->def;
+}
+
+unsigned
+ph_fs_ramp_step(unsigned size)
+{
+   return size > 1 ? 255u / (size - 1u) : 255u;
+}
+
+bool
+ph_fs_lower_floor_ramps(nir_shader *nir, unsigned used_units,
+                        unsigned max_units, struct ph_fs_ramp *ramps,
+                        unsigned *count, const char **reject)
+{
+   /* The scale each varying component is floored at, 0 when it is not. */
+   float need[VARYING_SLOT_MAX][4];
+   unsigned free_units = 0, groups = 0, per = 2, n = 0;
+   bool any = false;
+
+   *count = 0;
+   memset(need, 0, sizeof(need));
+   /* Shaders without a floor of a varying stay untouched. */
+   nir_foreach_function_impl(impl, nir)
+      nir_foreach_block(block, impl)
+         nir_foreach_instr(instr, block) {
+            unsigned location;
+            uint8_t comp[4];
+            float k[4];
+
+            if (instr->type == nir_instr_type_alu &&
+                nir_instr_as_alu(instr)->op == nir_op_ffloor &&
+                ph_fs_ramp_match(nir_instr_as_alu(instr), &location, comp, k))
+               any = true;
+         }
+   if (!any)
+      return true;
+   any = false;
+   /* Only the channels something reads need a ramp. */
+   NIR_PASS(_, nir, nir_opt_shrink_vectors, true);
+   NIR_PASS(_, nir, nir_opt_dce);
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_alu_instr *alu;
+            unsigned location;
+            uint8_t comp[4];
+            float k[4];
+
+            if (instr->type != nir_instr_type_alu ||
+                (alu = nir_instr_as_alu(instr))->op != nir_op_ffloor)
+               continue;
+            if (!ph_fs_ramp_match(alu, &location, comp, k) ||
+                location >= VARYING_SLOT_MAX)
+               continue;
+            const nir_component_mask_t read = nir_def_components_read(&alu->def);
+
+            for (unsigned c = 0; c < alu->def.num_components; c++) {
+               uint16_t size;
+               float lo, span;
+
+               if (!(read & (1u << c)))
+                  continue;
+               if (comp[c] > 3 || !ph_fs_ramp_size(k[c], &size, &lo, &span)) {
+                  *reject = "a floor whose scale no ramp texture expresses";
+                  return false;
+               }
+               if (need[location][comp[c]] != 0.0f &&
+                   need[location][comp[c]] != k[c]) {
+                  *reject = "floors of one coordinate at different scales";
+                  return false;
+               }
+               need[location][comp[c]] = k[c];
+               any = true;
+            }
+         }
+      }
+   }
+   if (!any)
+      return true;
+   for (unsigned u = 0; u < max_units; u++)
+      free_units += !(used_units & (1u << u));
+   /* Two components per 2-D unit.  Three take one volume when it is the
+    * only unit: the draw stream carries a third coordinate for unit 0 alone
+    * (MEASURED on the P690: a volume ramp beside a 2-D texture read its third
+    * component as 0), and a volume of up to 16^3 texels. */
+   for (unsigned l = 0; l < VARYING_SLOT_MAX; l++) {
+      unsigned comps = 0;
+      bool small = true;
+
+      for (unsigned c = 0; c < 4; c++) {
+         uint16_t size = 0;
+         float lo, span;
+
+         if (need[l][c] == 0.0f)
+            continue;
+         comps++;
+         ph_fs_ramp_size(need[l][c], &size, &lo, &span);
+         small &= size <= 16;
+      }
+      groups += DIV_ROUND_UP(comps, 2);
+      if (comps == 3 && small && !used_units)
+         per = 3;
+   }
+   if (per == 3 && groups != 2)
+      per = 2;
+   else if (per == 3)
+      groups = 1;
+   if (groups > free_units) {
+      *reject = "a floor with no free texture unit for its ramp";
+      return false;
+   }
+   for (unsigned l = 0, u = 0; l < VARYING_SLOT_MAX; l++) {
+      struct ph_fs_ramp *ramp = NULL;
+
+      for (unsigned c = 0; c < 4; c++) {
+         if (need[l][c] == 0.0f)
+            continue;
+         if (!ramp || ramp->dims == per) {
+            while (used_units & (1u << u))
+               u++;
+            ramp = &ramps[n++];
+            memset(ramp, 0, sizeof(*ramp));
+            ramp->unit = u++;
+            ramp->location = l;
+         }
+         ramp->comp[ramp->dims] = c;
+         ph_fs_ramp_size(need[l][c], &ramp->size[ramp->dims],
+                         &ramp->lo[ramp->dims], &ramp->span[ramp->dims]);
+         ramp->dims++;
+      }
+   }
+   /* A two-dimensional unit with one component keeps a 1-texel second row. */
+   for (unsigned r = 0; r < n; r++)
+      for (unsigned d = ramps[r].dims; d < (ramps[r].dims == 3 ? 3u : 2u); d++) {
+         ramps[r].size[d] = 1;
+         ramps[r].span[d] = 1.0f;
+      }
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            nir_alu_instr *alu;
+            nir_def *value[4];
+            unsigned location;
+            uint8_t comp[4];
+            float k[4];
+
+            if (instr->type != nir_instr_type_alu ||
+                (alu = nir_instr_as_alu(instr))->op != nir_op_ffloor ||
+                !ph_fs_ramp_match(alu, &location, comp, k))
+               continue;
+            b.cursor = nir_before_instr(instr);
+            {
+               /* Texel channel c holds the floor of varying component c and
+                * every other channel is zero, so the ramps of one varying
+                * add up to the whole floored vector. */
+               nir_def *sum = NULL;
+               nir_def *coord = nir_pad_vector_imm_int(&b, alu->src[0].src.ssa,
+                                                       0, 4);
+
+               for (unsigned r = 0; r < n; r++) {
+                  nir_def *t;
+
+                  if (ramps[r].location != location)
+                     continue;
+                  /* The coordinate is only traced; the unit reads the
+                   * staged ramp coordinate. */
+                  t = ph_fs_ramp_sample(&b, &ramps[r], coord);
+                  sum = sum ? nir_fadd(&b, sum, t) : t;
+               }
+               {
+                  unsigned swz[4];
+                  float scale[4] = { 0 }, offset[4] = { 0 };
+
+                  for (unsigned c = 0; c < alu->def.num_components; c++) {
+                     swz[c] = comp[c] & 3;
+                     for (unsigned r = 0; r < n; r++)
+                        for (unsigned d = 0; d < ramps[r].dims; d++)
+                           if (ramps[r].location == location &&
+                               ramps[r].comp[d] == swz[c]) {
+                              scale[c] = 255.0f /
+                                 (float)ph_fs_ramp_step(ramps[r].size[d]);
+                              offset[c] = k[c] * ramps[r].lo[d];
+                           }
+                  }
+                  /* floor(k x) = texel index + k * lo, as one vector op */
+                  value[0] = nir_fadd(&b, nir_fmul(&b,
+                                nir_swizzle(&b, sum, swz, alu->def.num_components),
+                                nir_build_imm(&b, alu->def.num_components, 32,
+                                   (nir_const_value[4]){
+                                      nir_const_value_for_float(scale[0], 32),
+                                      nir_const_value_for_float(scale[1], 32),
+                                      nir_const_value_for_float(scale[2], 32),
+                                      nir_const_value_for_float(scale[3], 32) })),
+                                nir_build_imm(&b, alu->def.num_components, 32,
+                                   (nir_const_value[4]){
+                                      nir_const_value_for_float(offset[0], 32),
+                                      nir_const_value_for_float(offset[1], 32),
+                                      nir_const_value_for_float(offset[2], 32),
+                                      nir_const_value_for_float(offset[3], 32) }));
+               }
+            }
+            nir_def_replace(&alu->def, value[0]);
+         }
+      }
+      nir_progress(true, impl, nir_metadata_none);
+   }
+   *count = n;
+   return true;
+}
+
 float
 ph_fs_fog_eval_step(const struct ph_fs_program *program, unsigned step,
                     float fogc, const void *constants, unsigned size)
@@ -3129,8 +3468,21 @@ bool
 ph_fs_compile(nir_shader *nir, unsigned max_instructions,
               struct ph_fs_program *out)
 {
-   if (!ph_fs_compile_key(nir, max_instructions, NULL, 0, out))
+   return ph_fs_compile_ramps(nir, max_instructions, NULL, 0, out);
+}
+
+bool
+ph_fs_compile_ramps(nir_shader *nir, unsigned max_instructions,
+                    const struct ph_fs_ramp *ramps, unsigned ramp_count,
+                    struct ph_fs_program *out)
+{
+   if (ramp_count > ARRAY_SIZE(out->ramps))
       return false;
+   if (!ph_fs_compile_key(nir, max_instructions, NULL, 0, ramps, ramp_count,
+                          out))
+      return false;
+   memcpy(out->ramps, ramps, ramp_count * sizeof(*ramps));
+   out->ramp_count = ramp_count;
    /* Only runtime constants can ask for a variant. */
    if (out->const_ref_count) {
       out->nir = nir_shader_clone(NULL, nir);
@@ -3253,12 +3605,14 @@ ph_fs_rescale(struct ph_fs_program *program, const float *values,
       return 0;
    }
    if (!ph_fs_compile_key(program->nir, program->budget, uexp, count,
-                          &variant)) {
+                          program->ramps, program->ramp_count, &variant)) {
       free(uexp);
       program->valid = false;
       program->reject = "a runtime constant beyond the combiner's range";
       return -1;
    }
+   memcpy(variant.ramps, program->ramps, sizeof(variant.ramps));
+   variant.ramp_count = program->ramp_count;
    variant.nir = program->nir;
    variant.budget = program->budget;
    variant.uexp = uexp;

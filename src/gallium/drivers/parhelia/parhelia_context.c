@@ -182,6 +182,8 @@ struct ph_fs {
 /* Semantic index of the extra attribute carrying unit k's uniform coordinate,
  * above every TEXCOORD a vertex shader exports. */
 #define PH_UNIFORM_COORD_INDEX(k) (32u + (k))
+/* ... and of the staged coordinate of a floor ramp on unit k. */
+#define PH_RAMP_COORD_INDEX(k) (40u + (k))
 
 struct ph_uniform_coord {
    nir_def *coord, *projector;
@@ -332,6 +334,15 @@ struct ph_context {
    struct pipe_resource *stipple_tex;
    struct pipe_sampler_view *stipple_view;
    void *stipple_sampler;
+   /* The floor ramps fragment programs sample, built on first use. */
+   struct ph_ramp_tex {
+      struct ph_fs_ramp key;
+      struct pipe_resource *tex;
+      struct pipe_sampler_view *view;
+   } *ramp_tex;
+   unsigned ramp_tex_count, ramp_tex_cap;
+   void *ramp_sampler;
+   bool ramping;
    /* The framebuffer as the state tracker set it, and the stand-in render
     * resources for surfaces the engine cannot address in place (a mip level
     * above 0 or a slice): ctx->fb binds the stand-ins. */
@@ -8000,6 +8011,10 @@ struct ph_quant_stage {
    unsigned rect_count;
    int rect_slot[P3D_MAX_TEXTURE_UNITS];
    float rect_scale[P3D_MAX_TEXTURE_UNITS][2];
+   /* Floor ramp coordinates: (x - lo) / span of the varying's components. */
+   unsigned ramp_count;
+   int ramp_slot[P3D_MAX_TEXTURE_UNITS], ramp_src[P3D_MAX_TEXTURE_UNITS];
+   struct ph_fs_ramp ramp[P3D_MAX_TEXTURE_UNITS];
 };
 
 static bool
@@ -8048,6 +8063,16 @@ ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
       out->data[q->rect_slot[i]][0] *= q->rect_scale[i][0];
       out->data[q->rect_slot[i]][1] *= q->rect_scale[i][1];
    }
+   for (unsigned i = 0; i < q->ramp_count; i++) {
+      const struct ph_fs_ramp *r = &q->ramp[i];
+      const float *src = v->data[q->ramp_src[i]];
+      float *c = out->data[q->ramp_slot[i]];
+
+      c[0] = c[1] = c[2] = 0.5f;
+      c[3] = 1.0f;
+      for (unsigned d = 0; d < r->dims; d++)
+         c[d] = (src[r->comp[d]] - r->lo[d]) / r->span[d];
+   }
    for (unsigned i = 0; q->quantize && i < 2; i++) {
       if (q->slot[i] < 0)
          continue;
@@ -8060,11 +8085,34 @@ ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
    return out;
 }
 
+/* A ramp is exact on [lo, lo + span) only: a primitive whose coordinate
+ * leaves it would sample a different floor, so it is dropped. */
+static bool
+ph_quant_ramps_in_range(const struct ph_quant_stage *q,
+                        const struct prim_header *prim, unsigned n)
+{
+   for (unsigned i = 0; i < q->ramp_count; i++)
+      for (unsigned v = 0; v < n; v++)
+         for (unsigned d = 0; d < q->ramp[i].dims; d++) {
+            const float x = prim->v[v]->data[q->ramp_src[i]][q->ramp[i].comp[d]];
+
+            if (!(x >= q->ramp[i].lo[d] &&
+                  x < q->ramp[i].lo[d] + q->ramp[i].span[d])) {
+               ph_warn_once("a floored coordinate left its ramp's exact "
+                            "range; the primitive is dropped\n");
+               return false;
+            }
+         }
+   return true;
+}
+
 static void
 ph_quant_tri(struct draw_stage *stage, struct prim_header *prim)
 {
    struct prim_header tmp = *prim;
 
+   if (!ph_quant_ramps_in_range((struct ph_quant_stage *)stage, prim, 3))
+      return;
    for (unsigned i = 0; i < 3; i++)
       tmp.v[i] = ph_quant_vertex(stage, prim->v[i], i);
    stage->next->tri(stage->next, &tmp);
@@ -8075,6 +8123,8 @@ ph_quant_line(struct draw_stage *stage, struct prim_header *prim)
 {
    struct prim_header tmp = *prim;
 
+   if (!ph_quant_ramps_in_range((struct ph_quant_stage *)stage, prim, 2))
+      return;
    for (unsigned i = 0; i < 2; i++)
       tmp.v[i] = ph_quant_vertex(stage, prim->v[i], i);
    stage->next->line(stage->next, &tmp);
@@ -8085,6 +8135,8 @@ ph_quant_point(struct draw_stage *stage, struct prim_header *prim)
 {
    struct prim_header tmp = *prim;
 
+   if (!ph_quant_ramps_in_range((struct ph_quant_stage *)stage, prim, 1))
+      return;
    tmp.v[0] = ph_quant_vertex(stage, prim->v[0], 0);
    stage->next->point(stage->next, &tmp);
 }
@@ -8367,6 +8419,32 @@ ph_fix_rects(struct ph_context *ctx, struct ph_quant_stage *q)
          1.0f / u_minify(v->texture->height0, v->u.tex.first_level);
       q->rect_count++;
    }
+}
+
+/* Stage each floor ramp's coordinate into an extra attribute; false when
+ * the varying it floors is not in the vertex output. */
+static bool
+ph_fix_ramps(struct ph_context *ctx, struct ph_quant_stage *q)
+{
+   const struct ph_fs_program *prog = ctx->fs ? &ctx->fs->program : NULL;
+
+   q->ramp_count = 0;
+   for (unsigned i = 0; prog && prog->valid && i < prog->ramp_count; i++) {
+      const struct ph_fs_ramp *r = &prog->ramps[i];
+      unsigned name, index;
+      int src;
+
+      tgsi_get_gl_varying_semantic(r->location, true, &name, &index);
+      src = draw_find_shader_output(ctx->draw, name, index);
+      if (src < 0)
+         return false;
+      q->ramp[q->ramp_count] = *r;
+      q->ramp_src[q->ramp_count] = src;
+      q->ramp_slot[q->ramp_count++] =
+         draw_alloc_extra_vertex_attrib(ctx->draw, TGSI_SEMANTIC_TEXCOORD,
+                                        PH_RAMP_COORD_INDEX(r->unit));
+   }
+   return true;
 }
 
 static bool
@@ -8918,6 +8996,131 @@ ph_draw_stippled(struct ph_context *ctx, const struct pipe_draw_info *info,
    return true;
 }
 
+/* The ramp texture of @r: texel (x, y, z) holds code index * step in the
+ * channel of each floored component, zero elsewhere. */
+static struct pipe_sampler_view *
+ph_ramp_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
+{
+   static const unsigned byte_of[4] = { 2, 1, 0, 3 };   /* B8G8R8A8 */
+   struct pipe_resource templ = {
+      .target = r->dims == 3 ? PIPE_TEXTURE_3D : PIPE_TEXTURE_2D,
+      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      .width0 = r->size[0], .height0 = r->size[1],
+      .depth0 = r->dims == 3 ? r->size[2] : 1, .array_size = 1,
+      .bind = PIPE_BIND_SAMPLER_VIEW,
+   };
+   struct ph_ramp_tex *t;
+   struct pipe_sampler_view vt;
+   struct pipe_box box;
+   uint8_t *data;
+
+   for (unsigned i = 0; i < ctx->ramp_tex_count; i++) {
+      const struct ph_fs_ramp *k = &ctx->ramp_tex[i].key;
+
+      if (k->dims == r->dims && !memcmp(k->size, r->size, sizeof(k->size)) &&
+          !memcmp(k->comp, r->comp, sizeof(k->comp)))
+         return ctx->ramp_tex[i].view;
+   }
+   if (ctx->ramp_tex_count == ctx->ramp_tex_cap) {
+      const unsigned cap = ctx->ramp_tex_cap ? ctx->ramp_tex_cap * 2 : 4;
+      struct ph_ramp_tex *grown = realloc(ctx->ramp_tex, cap * sizeof(*grown));
+
+      if (!grown)
+         return NULL;
+      ctx->ramp_tex = grown;
+      ctx->ramp_tex_cap = cap;
+   }
+   data = calloc((size_t)templ.width0 * templ.height0 * templ.depth0, 4);
+   if (!data)
+      return NULL;
+   for (unsigned z = 0; z < templ.depth0; z++)
+      for (unsigned y = 0; y < templ.height0; y++)
+         for (unsigned x = 0; x < templ.width0; x++) {
+            const unsigned idx[3] = { x, y, z };
+            uint8_t *texel = data + 4 * ((z * templ.height0 + y) *
+                                         templ.width0 + x);
+
+            for (unsigned d = 0; d < r->dims; d++)
+               texel[byte_of[r->comp[d] & 3]] =
+                  idx[d] * ph_fs_ramp_step(r->size[d]);
+         }
+   t = &ctx->ramp_tex[ctx->ramp_tex_count];
+   memset(t, 0, sizeof(*t));
+   t->key = *r;
+   t->tex = ctx->base.screen->resource_create(ctx->base.screen, &templ);
+   if (t->tex) {
+      u_box_3d(0, 0, 0, templ.width0, templ.height0, templ.depth0, &box);
+      ctx->base.texture_subdata(&ctx->base, t->tex, 0, PIPE_MAP_WRITE, &box,
+                                data, templ.width0 * 4,
+                                templ.width0 * templ.height0 * 4);
+      u_sampler_view_default_template(&vt, t->tex, t->tex->format);
+      t->view = ctx->base.create_sampler_view(&ctx->base, t->tex, &vt);
+   }
+   free(data);
+   if (!t->view) {
+      pipe_resource_reference(&t->tex, NULL);
+      return NULL;
+   }
+   ctx->ramp_tex_count++;
+   return t->view;
+}
+
+/* Replay the draw with each floor ramp bound on its unit, as the polygon
+ * stipple binds its pattern. */
+static bool
+ph_draw_ramped(struct ph_context *ctx, const struct pipe_draw_info *info,
+               unsigned drawid_offset,
+               const struct pipe_draw_start_count_bias *draws)
+{
+   const struct ph_fs_program *prog = ctx->fs ? &ctx->fs->program : NULL;
+   struct pipe_sampler_view *old_view[P3D_MAX_TEXTURE_UNITS] = { NULL };
+   void *old_sampler[P3D_MAX_TEXTURE_UNITS];
+
+   if (ctx->ramping || !prog || !prog->valid || !prog->ramp_count)
+      return false;
+   if (!ctx->ramp_sampler) {
+      const struct pipe_sampler_state templ = {
+         .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .min_img_filter = PIPE_TEX_FILTER_NEAREST,
+         .mag_img_filter = PIPE_TEX_FILTER_NEAREST,
+         .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
+      };
+
+      ctx->ramp_sampler = ctx->base.create_sampler_state(&ctx->base, &templ);
+   }
+   for (unsigned i = 0; i < prog->ramp_count; i++)
+      if (!ctx->ramp_sampler || !ph_ramp_view(ctx, &prog->ramps[i])) {
+         PH_REFUSE("a draw whose floor ramp texture cannot be built is dropped\n");
+         return true;
+      }
+   ctx->ramping = true;
+   for (unsigned i = 0; i < prog->ramp_count; i++) {
+      const unsigned u = prog->ramps[i].unit;
+      struct pipe_sampler_view *view = ph_ramp_view(ctx, &prog->ramps[i]);
+
+      pipe_sampler_view_reference(&old_view[i], ctx->bound_views[u]);
+      old_sampler[i] = ctx->bound_samplers[u];
+      ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, u, 1, 0,
+                                  &view);
+      ctx->base.bind_sampler_states(&ctx->base, MESA_SHADER_FRAGMENT, u, 1,
+                                    &ctx->ramp_sampler);
+   }
+   ctx->base.draw_vbo(&ctx->base, info, drawid_offset, NULL, draws, 1);
+   for (unsigned i = 0; i < prog->ramp_count; i++) {
+      const unsigned u = prog->ramps[i].unit;
+
+      ctx->base.bind_sampler_states(&ctx->base, MESA_SHADER_FRAGMENT, u, 1,
+                                    &old_sampler[i]);
+      ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, u, 1, 0,
+                                  &old_view[i]);
+      pipe_sampler_view_reference(&old_view[i], NULL);
+   }
+   ctx->ramping = false;
+   return true;
+}
+
 static void
 ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
             unsigned drawid_offset, const struct pipe_draw_indirect_info *indirect,
@@ -8934,6 +9137,8 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    if (!num_draws || indirect || ctx->submit_error)
       return;
    if (ph_draw_stippled(ctx, info, drawid_offset, draws))
+      return;
+   if (ph_draw_ramped(ctx, info, drawid_offset, draws))
       return;
    if (ph_draw_broadcast(ctx, info, drawid_offset, draws))
       return;
@@ -9016,6 +9221,8 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    const bool quantize = ph_logicop_quantize(ctx);
    const bool fix = (quantize || (ctx->fs && ctx->fs->ucoord_count) ||
+                     (ctx->fs && ctx->fs->program.valid &&
+                      ctx->fs->program.ramp_count) ||
                      ph_fs_samples_rect(ctx->fs) ||
                      (ctx->fs && ctx->fs->depth_uniform)) &&
                     (ctx->quant_stage ||
@@ -9038,6 +9245,11 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       if (!ph_fix_coords(ctx, (struct ph_quant_stage *)ctx->quant_stage)) {
          draw_remove_extra_vertex_attribs(ctx->draw);
          PH_REFUSE("a draw whose uniform texture coordinate cannot be evaluated is dropped\n");
+         goto unbind;
+      }
+      if (!ph_fix_ramps(ctx, (struct ph_quant_stage *)ctx->quant_stage)) {
+         draw_remove_extra_vertex_attribs(ctx->draw);
+         PH_REFUSE("a draw whose floored varying the vertex stage does not write is dropped\n");
          goto unbind;
       }
       draw_set_rasterize_stage(ctx->draw, ctx->quant_stage);
@@ -10015,13 +10227,58 @@ static void *ph_create_fs(struct pipe_context *p,
                } while (progress);
             }
 
-            if (ph_fs_compile(compile_nir, budget, &fs->program) &&
-                (fs->program.sampler_mask & ~fs->sampler_mask))
+            /* floor() of a varying samples a ramp texture on a free unit. */
+            struct ph_fs_ramp ramps[P3D_MAX_TEXTURE_UNITS];
+            const char *ramp_reject = NULL;
+            unsigned ramp_count = 0, ramp_mask = 0;
+            bool ramped = ph_fs_lower_floor_ramps(compile_nir,
+               ph_nir_sampler_mask(compile_nir),
+               MIN2(ph_screen(p->screen)->texture_units, PH_TEXTURE_UNITS_DRIVEN),
+               ramps, &ramp_count, &ramp_reject);
+
+            for (unsigned r = 0; r < ramp_count; r++)
+               ramp_mask |= 1u << ramps[r].unit;
+            if (ramped && ramp_count && fs->unit_remap) {
+               ramped = false;
+               ramp_reject = "a floor ramp next to remapped texture units";
+            }
+            if (ramped && ramp_count) {
+               bool progress;
+
+               do {
+                  progress = false;
+                  NIR_PASS(progress, compile_nir, nir_opt_copy_prop);
+                  NIR_PASS(progress, compile_nir, nir_opt_algebraic);
+                  NIR_PASS(progress, compile_nir, nir_opt_constant_folding);
+                  NIR_PASS(progress, compile_nir, nir_opt_cse);
+                  NIR_PASS(progress, compile_nir, nir_opt_dce);
+               } while (progress);
+               units = util_bitcount(fs->sampler_mask | ramp_mask);
+               budget = P3D_COMB_QUANTUM - (units > 0) - (units > 1);
+               fs->sampler_mask |= ramp_mask;
+               fs->uses_texture = true;
+            }
+            if (!ramped) {
+               memset(&fs->program, 0, sizeof(fs->program));
+               fs->program.reject = ramp_reject;
+            } else if (ph_fs_compile_ramps(compile_nir, budget, ramps,
+                                           ramp_count, &fs->program) &&
+                       (fs->program.sampler_mask & ~fs->sampler_mask)) {
                ph_fs_program_fini(&fs->program), fs->program.valid = false;
+            }
             if (compile_nir->info.fs.uses_discard)
                fs->kill = ph_fs_build_kill(compile_nir, budget);
             ph_fs_find_uniform_coords(fs, s->ir.nir);
             ph_fs_find_coord_sources(fs, s->ir.nir);
+            /* A ramp unit reads its staged coordinate attribute. */
+            for (unsigned r = 0; fs->program.valid &&
+                                 r < fs->program.ramp_count; r++) {
+               const unsigned u = fs->program.ramps[r].unit;
+
+               fs->coord_src_known[u] = true;
+               fs->coord_src_name[u] = TGSI_SEMANTIC_TEXCOORD;
+               fs->coord_src_index[u] = PH_RAMP_COORD_INDEX(u);
+            }
             if (s->ir.nir->info.outputs_written &
                 BITFIELD64_BIT(FRAG_RESULT_DEPTH))
                fs->depth_from_texture =
@@ -12394,6 +12651,13 @@ ph_destroy_context(struct pipe_context *p)
    pipe_resource_reference(&ctx->stipple_tex, NULL);
    if (ctx->stipple_sampler)
       p->delete_sampler_state(p, ctx->stipple_sampler);
+   for (unsigned i = 0; i < ctx->ramp_tex_count; i++) {
+      pipe_sampler_view_reference(&ctx->ramp_tex[i].view, NULL);
+      pipe_resource_reference(&ctx->ramp_tex[i].tex, NULL);
+   }
+   free(ctx->ramp_tex);
+   if (ctx->ramp_sampler)
+      p->delete_sampler_state(p, ctx->ramp_sampler);
    util_unreference_framebuffer_state(&ctx->fb_api);
    util_unreference_framebuffer_state(&ctx->fb);
    if (p->stream_uploader)
