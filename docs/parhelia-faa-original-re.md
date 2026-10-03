@@ -595,3 +595,81 @@ background to triangle colour, matching the analytic pixel coverage to
 therefore the vendor's `sub_9E860` sequence; what still fails are pixels in
 tiles whose data was already relocated or overwritten during accumulation,
 and any draw with several fragments per pixel stalls (runs g4, o2).
+
+### 11.8 Fences between draw and resolve (runs w1-w1d, modules faa0528-7/-8)
+
+All runs issue the draw, one in-stream tagged fence
+`[4, 0xc0afafc0, op, tag|1, tag, resume]` and the resolve in one submit.
+
+| op | result |
+|----|--------|
+| `0x307`, `0x207`, `0x107` | lockup in the resolve (completed tag = the in-stream fence) [MEASURED] |
+| `0xc07` | no lockup, but the resolve no longer merges: 161 of 750 edge pixels intermediate, mean error 0.336 (no fence: 0.07) [MEASURED] |
+| retire pass (`sub_9E000`, fence `0x207`) then resolve | lockup in the resolve [MEASURED, w2] |
+| retire pass only | no lockup [MEASURED, w3, w3b, w11] |
+
+### 11.9 What the retire pass reads (runs w5b, w6, w3b, w11; module faa0528-9)
+
+With the 256-byte companion pre-filled with markers `0xc0d000nn`:
+
+* The setup-plane triangle of `sub_9E000` writes S8Z24 values into dwords
+  0..2 only: stencil `0xc0 -> 0xc1` (increment) and Z24 = one 18-bit
+  word of the fragment unit.  Dword 3 and dwords 32..35 (row 1 at the
+  32-pixel companion pitch) are never written; the vendor reads them
+  anyway and zeroes its copy afterwards, so its saved words 3..7 are
+  0 [MEASURED].
+* Loading `0x110, 0x220, 0x330, ...` into `0x1340..` and retiring reads
+  back `0x110 0x220 0x330`: dwords 0..2 are `0x1340`, `0x1344`, `0x1348`,
+  the live registers [MEASURED].
+* After power-on the three words are `1, 1, 1`, not 0; after a
+  multi-fragment draw about `0x51, 0x7d, 0x4f` (`0x53, 0x7d, 0x51` on
+  another boot) [MEASURED].  Three counters match the three 8 KiB buffer
+  blocks the tiles spill into (11.6) [INFERRED].
+
+### 11.10 The control run regressed on faa0528-9
+
+Loading `1,1,1` (w8), `0x51,0x7d,0x4f,0,...` (w4), or the 0xc00 flush
+alone (w9c) ahead of a multi-fragment draw plus resolve all lock up, but
+so does the same draw plus resolve with nothing added (w10, twice), which
+passed on faa0528-3/-4 (o4, x2).  These runs therefore do not show that the
+pointer load is at fault.  Multi-fragment draw plus retire without the
+resolve never locked up [MEASURED].
+
+### 11.11 How the vendor keeps FAA alive between draws [PROVEN, static]
+
+The contradiction "the vendor arms `0x307` per validate, yet `0x307`
+before the resolve locks it up" does not hold:
+
+* The `ValidateState` arm at `0xc9a37` (`[4, 0xacafafc0]`: `DWGCTL = 0x307`,
+  `0x12bc = tag|1`, `0x12bc = tag`, `0x12b0 = MemLevels`) only runs when
+  the surface atom's dirty word has bit 7 set (`0xc9a05: cmp byte [dirty],0;
+  jns 0xc9a65`).  That bit is set when a surface slot or `MemLevels`
+  (`0x12b0`) changes (`0x10ddc6`, `0x10e757`, and the surface binders), not
+  per draw.  Enabling FAA changes `0x12b0` (`|0xe0000`), so the vendor arms
+  once when the FAA target is bound, then streams FAA draws without any
+  fence until the resolve.
+* The tagged end fences of the 2D-on-3D paths (BITBLT `0x10d900`, the
+  `0x110160` path) pick `0x707` instead of `0x307` when the raster atom has
+  FAA mode bits set: `0x10e78d test byte [blk+0xa0],3` / `0x10e797`,
+  `0x110244` / `0x11024e`.  `0x707` is also the second op of the kernel's
+  `full_sync` drain and appears in engine init (`0x2c44d`).
+* Further FAA-dependent state: with FAA on, `0x2cfa1` lowers
+  `[blk+0x780]` from 32.0 to 31.0 (16.0 to 15.0) and sets dirty bit 28;
+  `0x2d2b6` sets bit 4 in `[ctx+0x3c]` [PROVEN, meaning OPEN].
+* `0x1340..0x134c`/`0x13c0..0x13cc` are written only by the activate
+  path (`sub_9D790`) on a context switch: saved words, or zeros for a
+  never-used context; the first owner never loads (4.2).
+
+A vendor FAA frame is therefore:
+activate (only on a context switch) -> validate with dirty bit 7 (surfaces
+incl. slot 2, `0x307` arm with the FAA `MemLevels`) -> FAA draws with
+only state/vertex packets between them (blits inside use `0x707`) ->
+`sub_9E860` resolve before a clear, target change or present -> the next
+validate re-arms `0x307` with the restored `MemLevels`.
+
+Consequence for the Linux kernel: the per-batch `0x307` drain is what ends
+the FAA session between our batches.  Module faa0528-10 (`3263d41`) emits
+`0x707` for the drain of batches that leave FAA armed (`faa_boundary`
+bit 3 keeps `0x307`) and admits `0x707` as an in-stream fence; the next
+hardware tests are the in-stream `0x707` fence between draw and resolve,
+then draw and resolve in separate batches.
