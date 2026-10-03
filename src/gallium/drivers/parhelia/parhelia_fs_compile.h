@@ -83,7 +83,10 @@ struct ph_fs_fog_op {
 
 enum ph_fs_ramp_kind {
    PH_FS_RAMP_FLOOR = 0,
-   PH_FS_RAMP_DIRECTION,   /* a function lookup, see parhelia_fs_lookup.h */
+   /* function lookups, see parhelia_fs_lookup.h */
+   PH_FS_RAMP_DIRECTION,
+   PH_FS_RAMP_SCALAR,
+   PH_FS_RAMP_PLANE,
 };
 
 struct ph_fs_lookup;

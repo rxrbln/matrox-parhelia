@@ -9126,7 +9126,7 @@ ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
    data = malloc((size_t)n * n * 6 * 4);
    if (!data)
       return NULL;
-   if (!ph_fs_lookup_fill(r->fn, n, ctx->fs_const_snap,
+   if (!ph_fs_lookup_fill(r->fn, r, ctx->fs_const_snap,
                           ctx->fs_const_snap_size, data)) {
       free(data);
       return NULL;
@@ -10445,7 +10445,7 @@ static void *ph_create_fs(struct pipe_context *p,
                       ph_nir_sampler_mask(compile_nir),
                       MIN2(ph_screen(p->screen)->texture_units,
                            PH_TEXTURE_UNITS_DRIVEN),
-                      &lookup_ramp, &fs->lookup, &lookup_reject)) {
+                      1u << PH_FS_RAMP_DIRECTION, &lookup_ramp, &fs->lookup, &lookup_reject)) {
                   if (ph_fs_compile_ramps(compile_nir, P3D_COMB_QUANTUM - 1,
                                           &lookup_ramp, 1, &lookup_prog)) {
                      ph_fs_program_fini(&fs->program);

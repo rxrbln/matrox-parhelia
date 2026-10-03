@@ -30,18 +30,27 @@
 
 static uint32_t ph_fs_lookup_uid;
 
-unsigned
-ph_fs_lookup_cube_size(void)
+static unsigned
+ph_fs_lookup_env_size(const char *name, unsigned def, unsigned max)
 {
-   static int size;
+   const char *e = getenv(name);
+   const int v = e ? atoi(e) : 0;
 
-   if (!size) {
-      const char *e = getenv("PARHELIA_LOOKUP_CUBE");
-      const int v = e ? atoi(e) : 0;
+   return v >= 8 && v <= (int)max && util_is_power_of_two_nonzero(v) ? v : def;
+}
 
-      size = v >= 8 && v <= 256 && util_is_power_of_two_nonzero(v) ? v : 128;
+unsigned
+ph_fs_lookup_size(unsigned kind)
+{
+   static unsigned size[3];
+
+   if (!size[0]) {
+      size[0] = ph_fs_lookup_env_size("PARHELIA_LOOKUP_CUBE", 128, 256);
+      size[1] = ph_fs_lookup_env_size("PARHELIA_LOOKUP_LINE", 1024, 2048);
+      size[2] = ph_fs_lookup_env_size("PARHELIA_LOOKUP_PLANE", 128, 512);
    }
-   return size;
+   return kind == PH_FS_RAMP_DIRECTION ? size[0] :
+          kind == PH_FS_RAMP_SCALAR ? size[1] : size[2];
 }
 
 /* The varying load @instr reads: its slot and first component. */
@@ -227,7 +236,7 @@ ph_fs_lookup_free(struct ph_fs_lookup *fn)
 
 bool
 ph_fs_lower_lookup(nir_shader *nir, unsigned used_units, unsigned max_units,
-                   struct ph_fs_ramp *ramp, struct ph_fs_lookup **fn_out,
+                   unsigned kinds, struct ph_fs_ramp *ramp, struct ph_fs_lookup **fn_out,
                    const char **reject)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -235,8 +244,9 @@ ph_fs_lower_lookup(nir_shader *nir, unsigned used_units, unsigned max_units,
    unsigned store_count = 0, location = ~0u, out_mask = 0;
    uint8_t comp_read = 0;
    int8_t (*deg)[16] = NULL;
-   bool *varies = NULL;
+   bool *varies = NULL, homogeneous = true;
    struct ph_fs_lookup *fn = NULL;
+   unsigned kind, comps;
    bool ok = false;
 
    *fn_out = NULL;
@@ -307,10 +317,8 @@ ph_fs_lower_lookup(nir_shader *nir, unsigned used_units, unsigned max_units,
             nir_intrinsic_instr **grown;
 
             for (unsigned c = 0; c < n; c++)
-               if (((mask >> first) & (1u << c)) && deg[value->index][c] != 0) {
-                  *reject = "a colour that is no function of a direction";
-                  goto done;
-               }
+               if (((mask >> first) & (1u << c)) && deg[value->index][c] != 0)
+                  homogeneous = false;
             grown = realloc(stores, (store_count + 1) * sizeof(*stores));
             if (!grown) {
                *reject = "out of memory";
@@ -331,9 +339,19 @@ ph_fs_lower_lookup(nir_shader *nir, unsigned used_units, unsigned max_units,
       *reject = "a lookup of no varying";
       goto done;
    }
+   /* One or two components tabulate over the draw's range of them; three
+    * only through their direction. */
+   comps = util_bitcount(comp_read);
+   kind = comps == 1 ? PH_FS_RAMP_SCALAR : comps == 2 ? PH_FS_RAMP_PLANE :
+          comps == 3 && homogeneous ? PH_FS_RAMP_DIRECTION : ~0u;
+   if (kind != ~0u && !(kinds & (1u << kind))) {
+      *reject = "a colour of one or two components needs the draw's range";
+      goto done;
+   }
    if (location == VARYING_SLOT_COL0 || location == VARYING_SLOT_COL1 ||
-       util_bitcount(comp_read) != 3 || (comp_read & 8)) {
-      *reject = "a direction lookup of other than three components";
+       kind == ~0u) {
+      *reject = comps == 3 ? "a colour of three components beyond their direction" :
+                "a colour of more than three components";
       goto done;
    }
    fn = calloc(1, sizeof(*fn));
@@ -342,7 +360,7 @@ ph_fs_lower_lookup(nir_shader *nir, unsigned used_units, unsigned max_units,
       goto done;
    }
    fn->uid = p_atomic_inc_return(&ph_fs_lookup_uid);
-   fn->kind = PH_FS_RAMP_DIRECTION;
+   fn->kind = kind;
    fn->location = location;
    fn->out_mask = out_mask;
    for (unsigned c = 0; c < 4; c++)
@@ -363,14 +381,15 @@ ph_fs_lower_lookup(nir_shader *nir, unsigned used_units, unsigned max_units,
       b.cursor = nir_before_instr(&stores[0]->instr);
       tex = nir_tex_instr_create(nir, 1);
       tex->op = nir_texop_tex;
-      tex->sampler_dim = GLSL_SAMPLER_DIM_CUBE;
+      tex->sampler_dim = kind == PH_FS_RAMP_DIRECTION ? GLSL_SAMPLER_DIM_CUBE :
+                                                        GLSL_SAMPLER_DIM_2D;
       tex->dest_type = nir_type_float32;
       tex->texture_index = tex->sampler_index = 0;
-      tex->coord_components = 3;
+      tex->coord_components = kind == PH_FS_RAMP_DIRECTION ? 3 : 2;
       /* The unit reads the staged varying (ph_fs_lookup_stage), so the
        * program keeps no load that would route the varying as a value. */
       tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord,
-                                        nir_imm_vec3(&b, 0.0f, 0.0f, 0.0f));
+                                        nir_imm_zero(&b, tex->coord_components, 32));
       nir_def_init(&tex->instr, &tex->def, 4, 32);
       nir_builder_instr_insert(&b, &tex->instr);
       for (unsigned i = 0; i < store_count; i++) {
@@ -393,11 +412,14 @@ ph_fs_lower_lookup(nir_shader *nir, unsigned used_units, unsigned max_units,
    ramp->fn = fn;
    ramp->unit = 0;
    ramp->location = location;
-   ramp->dims = 3;
-   for (unsigned i = 0; i < 3; i++) {
+   ramp->dims = comps;
+   for (unsigned i = 0; i < comps; i++) {
       ramp->comp[i] = fn->comp[i];
-      ramp->size[i] = ph_fs_lookup_cube_size();
+      ramp->size[i] = ph_fs_lookup_size(kind);
+      ramp->span[i] = 1.0f;
    }
+   if (kind == PH_FS_RAMP_SCALAR)
+      ramp->size[1] = 1;
    *fn_out = fn;
    fn = NULL;
    ok = true;
@@ -589,25 +611,33 @@ ph_fs_lookup_cube_dir(unsigned face, float sc, float tc, float d[3])
 }
 
 bool
-ph_fs_lookup_fill(const struct ph_fs_lookup *fn, unsigned size_px,
+ph_fs_lookup_fill(const struct ph_fs_lookup *fn, const struct ph_fs_ramp *r,
                   const void *constants, unsigned size, uint8_t *texels)
 {
    static const unsigned byte_of[4] = { 2, 1, 0, 3 };   /* B8G8R8A8 */
+   const unsigned w = r->size[0], h = r->size[1];
+   const unsigned faces = fn->kind == PH_FS_RAMP_DIRECTION ? 6 : 1;
    struct ph_fs_lookup_eval e;
 
    if (!ph_fs_lookup_begin(&e, fn, constants, size))
       return false;
-   for (unsigned face = 0; face < 6; face++)
-      for (unsigned y = 0; y < size_px; y++)
-         for (unsigned x = 0; x < size_px; x++) {
-            uint8_t *texel = texels + 4 * ((face * size_px + y) * size_px + x);
+   for (unsigned face = 0; face < faces; face++)
+      for (unsigned y = 0; y < h; y++)
+         for (unsigned x = 0; x < w; x++) {
+            uint8_t *texel = texels + 4 * ((face * h + y) * w + x);
             float d[3], len;
 
-            ph_fs_lookup_cube_dir(face, 2.0f * (x + 0.5f) / size_px - 1.0f,
-                                  2.0f * (y + 0.5f) / size_px - 1.0f, d);
-            len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-            for (unsigned c = 0; c < 3; c++)
-               d[c] /= len;
+            if (fn->kind == PH_FS_RAMP_DIRECTION) {
+               ph_fs_lookup_cube_dir(face, 2.0f * (x + 0.5f) / w - 1.0f,
+                                     2.0f * (y + 0.5f) / h - 1.0f, d);
+               len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+               for (unsigned c = 0; c < 3; c++)
+                  d[c] /= len;
+            } else {
+               /* texel centres span the domain end to end */
+               d[0] = r->lo[0] + r->span[0] * (w > 1 ? (float)x / (w - 1) : 0.0f);
+               d[1] = r->lo[1] + r->span[1] * (h > 1 ? (float)y / (h - 1) : 0.0f);
+            }
             memset(e.out, 0, sizeof(e.out));
             if (!ph_fs_lookup_run(&e, d, true)) {
                free(e.val);
@@ -623,7 +653,15 @@ ph_fs_lookup_fill(const struct ph_fs_lookup *fn, unsigned size_px,
 void
 ph_fs_lookup_stage(const struct ph_fs_ramp *r, const float *src, float c[4])
 {
-   for (unsigned i = 0; i < 3; i++)
-      c[i] = src[r->comp[i]];
+   c[0] = c[1] = c[2] = 0.5f;
    c[3] = 1.0f;
+   if (r->kind == PH_FS_RAMP_DIRECTION) {
+      for (unsigned i = 0; i < 3; i++)
+         c[i] = src[r->comp[i]];
+      return;
+   }
+   /* the domain's ends on the first and last texel centre */
+   for (unsigned d = 0; d < r->dims; d++)
+      c[d] = (0.5f + (src[r->comp[d]] - r->lo[d]) / r->span[d] *
+                     (r->size[d] - 1)) / r->size[d];
 }
