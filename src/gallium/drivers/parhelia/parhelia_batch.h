@@ -99,9 +99,17 @@ int parhelia_batch_depth_control(struct parhelia_batch *batch,
  * first access; parhelia_batch_zdiscard() drops what is left. */
 int parhelia_batch_zclear(struct parhelia_batch *batch, uint32_t depth_handle,
                           unsigned pitch, unsigned format, uint32_t value);
+int parhelia_batch_zclear_original(struct parhelia_batch *batch,
+                                 uint32_t colour_handle, unsigned colour_pitch,
+                                 unsigned colour_format, uint32_t depth_handle,
+                                 unsigned pitch, unsigned format,
+                                 uint32_t value);
 int parhelia_batch_zdiscard(struct parhelia_batch *batch,
                             uint32_t depth_handle, unsigned pitch,
                             unsigned format);
+int parhelia_batch_zdiscard_original(struct parhelia_batch *batch,
+                                     uint32_t depth_handle, unsigned pitch,
+                                     unsigned format);
 int parhelia_batch_zclear_word(struct parhelia_batch *batch,
                                uint32_t depth_handle, unsigned pitch,
                                unsigned format, uint32_t value, uint32_t word);

@@ -946,6 +946,10 @@ void	 p3d_emit_clear_frame(struct p3d_cs *cs, const struct p3d_state *st,
 #define P3D_ZTRACK_ON	0x0000020au
 #define P3D_ZINIT_LOAD	0x00000208u	/* set every tracked tile to 0x12b4 */
 #define P3D_ZINIT_RESET	0x00000308u	/* discard the tracked tile state */
+/* The original family's load and reset words (mtxpserd.dll 0x9ea30,
+ * MTXPARD.dll 0x9d539 / 0x9d4cd); the LX ones above are 0x9eff0's. */
+#define P3D_ZINIT_LOAD_ORIGINAL		0x00000008u
+#define P3D_ZINIT_RESET_ORIGINAL	0x00000108u
 /* Bind @s as the depth surface in slot @slot and issue one Z control word,
  * optionally preceded by the Z-init value.  @resume is the draw word the
  * hardware returns to. */

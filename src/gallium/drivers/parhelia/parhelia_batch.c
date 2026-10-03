@@ -413,7 +413,9 @@ parhelia_batch_depth_control(struct parhelia_batch *batch,
        pitch > 0x3fff || !p3d_surface_format_bytes(format))
       return -EINVAL;
    if (control != P3D_ZTRACK_OFF && control != P3D_ZTRACK_ON &&
-       control != P3D_ZINIT_LOAD && control != P3D_ZINIT_RESET)
+       control != P3D_ZINIT_LOAD && control != P3D_ZINIT_RESET &&
+       control != P3D_ZINIT_LOAD_ORIGINAL &&
+       control != P3D_ZINIT_RESET_ORIGINAL)
       return -EINVAL;
    /* The kernel's drain replays the last DWGCTL of a batch, so the word the
     * command returns to must not be a Z command itself. */
@@ -432,9 +434,10 @@ parhelia_batch_depth_control(struct parhelia_batch *batch,
 /* The complete hardware clear: arm the surface, then load the value.  Both
  * commands travel in one batch so nothing can bind another depth surface in
  * between. */
-int
-parhelia_batch_zclear(struct parhelia_batch *batch, uint32_t depth_handle,
-                      unsigned pitch, unsigned format, uint32_t value)
+static int
+batch_zclear(struct parhelia_batch *batch, uint32_t colour_handle,
+             const struct p3d_surface *colour, uint32_t depth_handle,
+             unsigned pitch, unsigned format, uint32_t value, uint32_t load)
 {
    struct p3d_reloc calls[PH_BATCH_PACKETS];
    uint32_t ring[PH_BATCH_PACKETS * 5];
@@ -449,12 +452,47 @@ parhelia_batch_zclear(struct parhelia_batch *batch, uint32_t depth_handle,
    batch->reloc_count = 0;
    p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
+   if (colour) {
+      const struct p3d_rw rw[2] = {
+         {P3D_R_SURF0_BASE, 0}, {P3D_R_SURF0_BASE + 4, p3d_surface_cfg(colour)},
+      };
+
+      p3d_reglist(&cs, rw, 2);
+   }
    p3d_emit_depth_control(&cs, &surface, 1, P3D_ZTRACK_ON, false, 0,
                           P3D_DWGCTL_SOLID);
-   p3d_emit_depth_control(&cs, &surface, 1, P3D_ZINIT_LOAD, true, value,
+   p3d_emit_depth_control(&cs, &surface, 1, load, true, value,
                           P3D_DWGCTL_SOLID);
-   return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
-                       P3D_TRIANGLES, 0, 0, false);
+   return batch_finish(batch, &cs, calls, colour_handle, depth_handle, NULL,
+                       NULL, 0, 0, 0, P3D_TRIANGLES, 0, 0, false);
+}
+
+int
+parhelia_batch_zclear(struct parhelia_batch *batch, uint32_t depth_handle,
+                      unsigned pitch, unsigned format, uint32_t value)
+{
+   return batch_zclear(batch, 0, NULL, depth_handle, pitch, format, value,
+                       P3D_ZINIT_LOAD);
+}
+
+/* The original family's form: its own load word, and the colour target
+ * bound in slot 0 first as the vendor rebinds both slots before the load -
+ * its Z unit addresses depth relative to the colour target, and the kernel
+ * pins a depth surface into that window only for such a pair. */
+int
+parhelia_batch_zclear_original(struct parhelia_batch *batch,
+                             uint32_t colour_handle, unsigned colour_pitch,
+                             unsigned colour_format, uint32_t depth_handle,
+                             unsigned pitch, unsigned format, uint32_t value)
+{
+   const struct p3d_surface colour = {.pitch = colour_pitch,
+                                      .fmt = colour_format};
+
+   if (!colour_handle || !colour_pitch ||
+       !p3d_surface_format_bytes(colour_format))
+      return -EINVAL;
+   return batch_zclear(batch, colour_handle, &colour, depth_handle, pitch,
+                       format, value, P3D_ZINIT_LOAD_ORIGINAL);
 }
 
 /* The Z-init load with an explicit DWGCTL word: 0x208 uncompressed, 0x008
@@ -509,9 +547,9 @@ parhelia_batch_zcontrol(struct parhelia_batch *batch, uint32_t depth_handle,
 }
 
 /* Drop the tracked tile state after it has been written out. */
-int
-parhelia_batch_zdiscard(struct parhelia_batch *batch, uint32_t depth_handle,
-                        unsigned pitch, unsigned format)
+static int
+batch_zdiscard(struct parhelia_batch *batch, uint32_t depth_handle,
+               unsigned pitch, unsigned format, uint32_t reset)
 {
    struct p3d_reloc calls[PH_BATCH_PACKETS];
    uint32_t ring[PH_BATCH_PACKETS * 5];
@@ -526,12 +564,28 @@ parhelia_batch_zdiscard(struct parhelia_batch *batch, uint32_t depth_handle,
    batch->reloc_count = 0;
    p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
-   p3d_emit_depth_control(&cs, &surface, 1, P3D_ZINIT_RESET, false, 0,
+   p3d_emit_depth_control(&cs, &surface, 1, reset, false, 0,
                           P3D_DWGCTL_SOLID);
    p3d_emit_depth_control(&cs, &surface, 1, P3D_ZTRACK_OFF, false, 0,
                           P3D_DWGCTL_SOLID);
    return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
                        P3D_TRIANGLES, 0, 0, false);
+}
+
+int
+parhelia_batch_zdiscard(struct parhelia_batch *batch, uint32_t depth_handle,
+                        unsigned pitch, unsigned format)
+{
+   return batch_zdiscard(batch, depth_handle, pitch, format, P3D_ZINIT_RESET);
+}
+
+int
+parhelia_batch_zdiscard_original(struct parhelia_batch *batch,
+                                 uint32_t depth_handle, unsigned pitch,
+                                 unsigned format)
+{
+   return batch_zdiscard(batch, depth_handle, pitch, format,
+                         P3D_ZINIT_RESET_ORIGINAL);
 }
 
 int

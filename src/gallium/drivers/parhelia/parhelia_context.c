@@ -12049,11 +12049,26 @@ ph_colour_write_mask(enum pipe_format format, unsigned colormask)
  * The tracked state is one global hardware resource.  A 3-D draw against a
  * different depth surface destroys it, which is why only one surface is ever
  * armed and why it is resolved before the framebuffer moves away.  Measured
- * coverage on this chip is 640 tiles of 4096 bytes from the surface origin;
- * a larger depth buffer keeps the 2-D fill.
+ * coverage from the surface origin: 640 tiles of 4096 bytes on the P690, and
+ * 0x300000 bytes on the 0528 (the vendor's Parhelia-512 budget, MTXPARD
+ * 0x9faae); rows past it keep the 2-D fill.
  */
-#define PH_ZINIT_TILE_BYTES 4096u
-#define PH_ZINIT_TILES 640u
+static uint64_t
+ph_zinit_coverage(const struct parhelia_screen *screen)
+{
+   if (ph_lx_family(screen->chip_id))
+      return 640u * 4096u;
+   if (ph_original_family(screen->chip_id))
+      return 0x300000u;
+   return 0;
+}
+
+/* The Z tile height: 16 rows in the LX 4 KiB tile, 32 in the 64x32 one. */
+static unsigned
+ph_zinit_tile_rows(const struct parhelia_resource *r)
+{
+   return r->tile_layout == PARHELIA_TILE_64X16_4K ? 16 : 32;
+}
 
 static bool
 ph_zinit_enabled(void)
@@ -12076,31 +12091,29 @@ ph_zinit_enabled(void)
 static unsigned
 ph_zinit_alloc_height(const struct parhelia_resource *r)
 {
-   return ALIGN_POT(r->base.height0,
-                    r->tile_layout == PARHELIA_TILE_64X16_4K ? 16 : 32);
+   return ALIGN_POT(r->base.height0, ph_zinit_tile_rows(r));
 }
 
 static bool
-ph_zinit_fits(const struct parhelia_resource *r)
+ph_zinit_fits(const struct parhelia_resource *r, uint64_t coverage)
 {
    const uint64_t bytes = (uint64_t)r->stride * r->cpp *
                           ph_zinit_alloc_height(r);
 
-   return bytes && bytes <= (uint64_t)PH_ZINIT_TILES * PH_ZINIT_TILE_BYTES;
+   return bytes && bytes <= coverage;
 }
 
 /* Rows of whole tile rows inside the coverage, counted in address order from
- * the origin (the vendor's own split, mtxpserd.dll 0xa0d95, with the measured
- * 640 tiles).  The P690 4 KiB tile is 16 rows high. */
+ * the origin (the vendor's own split, mtxpserd.dll 0xa0d95 / 0xa104f). */
 static unsigned
-ph_zinit_covered_rows(const struct parhelia_resource *r)
+ph_zinit_covered_rows(const struct parhelia_resource *r, uint64_t coverage)
 {
-   const uint64_t row_bytes = (uint64_t)r->stride * r->cpp * 16;
+   const unsigned tile_rows = ph_zinit_tile_rows(r);
+   const uint64_t row_bytes = (uint64_t)r->stride * r->cpp * tile_rows;
 
-   if (r->tile_layout != PARHELIA_TILE_64X16_4K || !row_bytes)
+   if (!row_bytes)
       return 0;
-   return (unsigned)((uint64_t)PH_ZINIT_TILES * PH_ZINIT_TILE_BYTES /
-                     row_bytes) * 16;
+   return (unsigned)(coverage / row_bytes) * tile_rows;
 }
 
 /* The vertex depth that stores exactly @value.  Both quotients are exact in
@@ -12163,7 +12176,10 @@ ph_zinit_resolve(struct ph_context *ctx, struct parhelia_resource *r)
    if (!ret)
       ret = ph_submit_batch(ctx, batch, quad, 36, r, colour, NULL, NULL);
    if (!ret)
-      ret = parhelia_batch_zdiscard(batch, r->handle, r->stride, r->surf_fmt);
+      ret = ph_original_family(ph_screen(ctx->base.screen)->chip_id) ?
+            parhelia_batch_zdiscard_original(batch, r->handle, r->stride,
+                                             r->surf_fmt) :
+            parhelia_batch_zdiscard(batch, r->handle, r->stride, r->surf_fmt);
    if (!ret)
       ret = ph_submit_batch(ctx, batch, NULL, 0, r, NULL, NULL, NULL);
    if (ph_env("PARHELIA_TRACE"))
@@ -12200,19 +12216,20 @@ ph_zinit_clear(struct ph_context *ctx, struct parhelia_resource *r,
                unsigned width, unsigned height)
 {
    struct parhelia_batch *batch = &ctx->build_batch;
+   struct parhelia_screen *screen = ph_screen(ctx->base.screen);
+   const uint64_t coverage = ph_zinit_coverage(screen);
    struct parhelia_resource *colour;
    unsigned tail;
    int ret;
 
-   /* The 640-tile coverage is measured on the LX tile layout only; on the
-    * original family an armed clear mixes depth into the colour target. */
-   if (!ph_zinit_enabled() || !ph_lx_family(ph_screen(ctx->base.screen)->chip_id) ||
-       !r || !r->handle || ctx->submit_error)
+   if (!ph_zinit_enabled() || !coverage || !r || !r->handle ||
+       ctx->submit_error)
       return false;
    if (x || y || width != r->base.width0 || height != r->base.height0 ||
        write_mask != 0xffffffffu || r->upload_texture)
       return false;
-   tail = ph_zinit_fits(r) ? r->base.height0 : ph_zinit_covered_rows(r);
+   tail = ph_zinit_fits(r, coverage) ? r->base.height0 :
+                                       ph_zinit_covered_rows(r, coverage);
    if (!tail)
       return false;
    if (!ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture)
@@ -12225,7 +12242,13 @@ ph_zinit_clear(struct ph_context *ctx, struct parhelia_resource *r,
       return false;
    if (ctx->zinit_res && ctx->zinit_res != r)
       ph_zinit_resolve(ctx, ctx->zinit_res);
-   if (parhelia_batch_zclear(batch, r->handle, r->stride, r->surf_fmt, value))
+   /* The original family's vendor form, its colour target bound: the depth
+    * surface is placed in the window above it before the state exists. */
+   if (ph_original_family(screen->chip_id) ?
+       parhelia_batch_zclear_original(batch, colour->handle, colour->stride,
+                                    colour->surf_fmt, r->handle, r->stride,
+                                    r->surf_fmt, value) :
+       parhelia_batch_zclear(batch, r->handle, r->stride, r->surf_fmt, value))
       return false;
    ctx->stat.clears++;
    ctx->stat_kind = PH_STAT_CLEAR;
