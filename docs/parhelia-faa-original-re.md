@@ -254,10 +254,12 @@ count 7, c0 cb ca b2 20 bf:    0x1300 = 0x000000c4
                                0x132c = 0x0fff0fff    0x1328 = 0
                                0x12c8 = saved +0x100  (pad 0)
                                0x12fc = saved +0x0fc  (FAA mode bits set)
-count 0x22, WARP setup planes: 7 groups of {0x116c|0x1164|0x1168, 0x1174,
-                               0x1178|0x117c, 0x1180..0x1198} = 0, except
-                               0x1180 = 0x3d800000 and 0x1178 = 0x3d800000
-                               (1/16) in the third group (0x2e4bc..0x2e4e3)
+count 0x22, WARP setup planes, 28 writes in this order (0x2e481..0x2e534):
+  0x116c 0x1174 0x1178 0x1180 | 0x116c 0x1178 0x1180 0x1164 |
+  0x1180=1/16 0x1168 0x1178=1/16 0x1180 | 0x116c 0x1174 0x1178 0x118c |
+  0x116c 0x1174 0x1178 0x1190 | 0x116c 0x1174 0x1178 0x1194 |
+  0x116c 0x1174 0x117c 0x1198, all others 0 - every register ends at 0,
+  the two 1/16 (0x3d800000) writes are overwritten in the same packet
 dirty |= 0x6400000f
 ```
 
@@ -373,8 +375,9 @@ it].
   (`pDev+0xa9e0`), not the fragment buffer; retire binds that surface as
   slot 1 and keeps the fragment buffer in slot 2.
 * Antialiasing doc 9a.5: `sub_9E860` is the **resolve**, not a plain restore;
-  it re-emits the FAA `0x12fc` word and ends with `DWGCTL = 9`.  The 1/16
-  values in the WARP packet land in `0x1180` and `0x1178`.
+  it re-emits the FAA `0x12fc` word and ends with `DWGCTL = 9`.  The two
+  1/16 writes of the WARP packet go to `0x1180` and `0x1178` and are
+  overwritten by later writes of the same packet; the order is kept.
 * The 6 MiB figure is a retry floor, not a minimum allocation.
 * The guard-band reduction to 31.0/15.0 applies to the LX class only.
 
@@ -392,7 +395,7 @@ bind   0x1230 = base(fb), 0x1234 = 0x10000020  (with 0x1220/0x1224, 4-reg group)
 draw   unchanged primitives                                                  DERIVED
 resolve 0x1324 = ~0; 0x12cc/0x12d0 = stencil; 0x1300 = 0xc4;
        0x132c = 0x0fff0fff; 0x1328 = 0; 0x12c8 = depth ctl; 0x12fc = FAA word;
-       WARP 0x1164..0x1198 = 0 except 0x1178 = 0x1180 = 1/16;
+       WARP 0x1164..0x1198 packet replayed in vendor order (4.1);
        0x1300 = 9; 0x1300 = normal DWGCTL; fences 0x107/0x207             PROVEN sequence, INFERRED effect
 off    0x12fc[1:0] = 0 (bit-1 flush again), 0x12b0 = MemLevels,
        slot 2 = {0, 0x32020000}                                              DERIVED
@@ -433,6 +436,10 @@ covers the whole target plus partial-coverage edges at every subpixel phase.
    depth orders (sort independence), then with depth test on.
 5. Only then: target change and clear interplay, and a 1920x1200 buffer near
    the 16 MiB cap to test placement relative to the colour target's window.
+
+Implementation: `parhelia-drm-test --faa-probe` (`PROBE_STEP=1..5`) in the
+Mesa branch `p0528-faa0528`; each step compares against an FAA-off
+reference draw and dumps colour and fragment-buffer head/tail files.
 
 A stall in step 1 or 2 indicates base/window placement (try the buffer
 directly above the colour target inside its 16 MiB window, as for depth).
