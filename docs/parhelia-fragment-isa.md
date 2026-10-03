@@ -1097,6 +1097,30 @@ block-copied, never as `(register, value)` pairs — which is exactly why the
 earlier passes could not find a register: it is applied outside the code the
 binary contains.
 
+**Update 2026-10-03: lead 1 is PROVEN (binary) and MEASURED for TEXCOORD.**
+`mtxpserd.dll` 0x17bfe4-0x17c0de builds the unit word from the program's TA
+record as `w = (w & 0xe700ffff) | (op & 0x1f) << 19 | (mode & 7) << 16 |
+([desc+0xc0] & 1) << 27 | ([desc+0xbc] & 1) << 28`, with `op = [desc+0x74]`
+taken from the ps.1.x table at `0x1d6388` (data `0x1d6488`, byte-identical in
+PARD), and stores it in the TA record that the emitter at `0x171e10` writes to
+`0x1200+unit*4`. The Linux kernel does the same in `KRN mtx1723`
+(0x72390-0x72490): `byte[+6] = (opcode << 3) | (mtx484[..+4] & 7)`. The
+[18:16] mode comes from a per-opcode table, identical in PSER `0x1ddd30`, PARD
+`0x1dbd30` and KRN `mtx484`: TEXCOORD (op 2) and TEXKILL (op 3) use mode 3, a
+plain sample (op 0) 4/5 (2-D, odd = projective) or 6/7 (cube/volume), a
+disabled unit 1, the TEXDEP ops 0x10-0x13 mode 0 (INFERRED: coordinate from a
+register). The D3D TEXCOORD handler (`0x189420`) creates no texture.
+**MEASURED on the P690** with `parhelia-drm-test --texcoord-pass-probe`
+(op 2, mode 3, a constant-marker texture bound): the marker appears in 0 of
+16384 pixels; t0.R = s, G = t, B = r, each clamped to [0, 1], max error 0.0029;
+A = 1.0 (not q); with the 1/w stream (PROBE_W=4) R follows the
+perspective-correct s within 0.0032. In the driver such a unit must not be
+ganged over pipes 0+2 (single-unit LX path): both pipes pass the coordinate and
+the slot-0 merge adds them, doubling it (MEASURED, coordinate units in the
+parhelia Mesa driver). Lead 2 (the bump matrix) is still open.
+
+The original text of the two leads follows.
+
 Two independent leads, mutually compatible, both **INFERRED — do not implement
 against either**:
 
@@ -1319,10 +1343,11 @@ than incidental; and the disabled test is literally
 | [3:0] | one-hot texture-pipe select (1, 2, 4, 8) — `0x1052e7` `1 << tbl0x1d3ac0[cnt*4+unit]`; idle defaults `0x00010001/2/4/8` for units 0-3 at `0x15a2d5` |
 | [11:8] | constant `0x1` on every path (`or ...,0x40100`) |
 | [18:16] | texture type / enable: `1` = disabled, `4`-`7` = enabled; bit16 is a projective ("divide by q") sub-flag that an errata path rewrites 5→4 and 7→6 (`0x2c900`) |
-| [23:19] | 5-bit code, called a "filter code" here because that is where MTXPARD's DDraw-side texture object keeps it (`0xa2915`: `obj[+4] << 0x13`, mask `0xf80000`; `0xa293e` forces `0x480000` = 9). Codes 2, 3, 9, 0xa, 0xe trigger a hardware-errata workaround (`0x2cea0`). **See §9.5.7: those five codes are exactly the hardware TA opcodes of `TEX_COORD`, `TEXKILL`, `TEXDOT3`, `TEXM3X3_COORD` and `TEXM3X2_DEPTH`, so this field is the leading candidate for the texture-address opcode. Unresolved.** |
+| [23:19] | **texture-address opcode** (PROVEN 2026-10-03, §9.5.7: `mtxpserd 0x17bfe4`, `KRN mtx1723`): 0 = sample, 2 = TEXCOORD (with mode 3: the interpolated s, t, r reach the combiner as t, clamped to [0, 1], alpha 1; MEASURED on the P690), 3 = TEXKILL, 9/0xa = TEXDOT3/TEXM3x3, 0x10-0x13 = dependent reads. MTXPARD's DDraw-side texture object keeps a code here too (`0xa2915`, `0xa293e` forces 9); codes 2, 3, 9, 0xa, 0xe trigger the errata path at `0x2cea0`. |
 | [24], [28:27] | writable (mask `0xe404f1f1`), purpose unknown |
 
-Known-good values: active `0x00040101`, idle `0x00010000`.
+Known-good values: active `0x00040101`, idle `0x00010000`, TEXCOORD pass
+`0x00130101` (MEASURED on the P690, not ganged).
 
 Related: `engine[+4] = tbl0x1d3b10[count] = {0, 0x1000, 0x5000, 0xb000,
 0xf000}` — the one-hot pipe-enable mask shifted left 12.
