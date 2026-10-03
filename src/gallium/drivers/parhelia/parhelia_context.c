@@ -359,8 +359,8 @@ static const char *const ph_stat_kind_names[PH_STAT_KINDS] = {
 struct ph_context {
    struct pipe_context base;
    struct draw_context *draw;
-   /* Behaviour measured on the P690 only (chip 0x2539): the Z unit's
-    * trunc(d * 2^n) grid, the raster op's wide source colour, and the
+   /* The Z unit's trunc(d * 2^n) grid (P690 and 0528), and, measured on
+    * the P690 only (chip 0x2539): the raster op's wide source colour, and the
     * combiner alpha that carries a discard into the alpha test.  The
     * original family keeps its previous paths until measured there. */
    bool z_grid, logicop_grid, kill_alpha;
@@ -14250,8 +14250,11 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       goto fail;
    draw_set_rasterize_stage(ctx->draw, stage);
    ctx->hw_stage = stage;
-   ctx->z_grid = ctx->logicop_grid = ctx->kill_alpha =
+   ctx->logicop_grid = ctx->kill_alpha =
       ph_screen(screen)->chip_id == 0x2539;
+   /* trunc(d * 2^n), measured on the P690 and the 0528 (--zcode-probe) */
+   ctx->z_grid = ph_screen(screen)->chip_id == 0x2539 ||
+                 ph_original_family(ph_screen(screen)->chip_id);
    ctx->colour_fs.uses_color = true;
    ctx->colour_fs.texenv = P3D_TEXENV_MODULATE;
    ctx->colour_fs.serial_op = PH_SERIAL_UNSUPPORTED;
