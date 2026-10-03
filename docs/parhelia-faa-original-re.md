@@ -706,10 +706,10 @@ first post-resolve fence completes.
 
 ### 11.13 Repeatability (module faa0528-10, `faa_boundary=8`)
 
-Over six boots with one placement throughout (colour `0x1986000`,
+Over these boots, with one placement throughout (colour `0x1986000`,
 fragment buffer `0x19c6000`, depth `0x2000000`), the draw alone never
 locked up (6 runs), while a submit with draw and resolve locked up on
-the first resolve of a boot in 3 of 8 cases and on a later resolve in 6
+the first resolve of a boot in 3 of 10 cases and on a later resolve in 6
 of 8 [MEASURED].  Placement is not the cause; the lockup is inside the
 draw-plus-resolve span.  What carries over from one resolve to the next
 is OPEN.
