@@ -86,6 +86,16 @@ static bool parhelia_output_load_sense(struct parhelia_output *output)
 	return (sense & channels) != channels;
 }
 
+static bool parhelia_output_sense_head_busy(struct parhelia_output *output)
+{
+	struct parhelia_device *pdev = output->pdev;
+	unsigned int head = output->desc->analog_route == PARHELIA_ROUTE_DAC2;
+
+	if (pdev->chip->output_family != PARHELIA_OUTPUT_ORIGINAL)
+		return false;
+	return parhelia_read(pdev, PARHELIA_DC(head) + PARHELIA_DC_CTRL) & 1;
+}
+
 static int
 parhelia_connector_detect(struct drm_connector *connector,
 			  struct drm_modeset_acquire_ctx *ctx, bool force)
@@ -98,6 +108,11 @@ parhelia_connector_detect(struct drm_connector *connector,
 		output->analog_sensed = false;
 		return status;
 	}
+	/* The sense borrows the DAC's controller (0x188c/0x1910 + sel*0x200)
+	 * and zeroes its HDISPEND for 10 ms; never do that to the scanning head,
+	 * it drops the DVI link of the output it drives. */
+	if (parhelia_output_sense_head_busy(output))
+		return status;
 
 	output->analog_sensed = parhelia_output_load_sense(output);
 	return output->analog_sensed ? connector_status_connected : status;
