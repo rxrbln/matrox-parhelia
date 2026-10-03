@@ -11337,6 +11337,14 @@ ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *
    if (util_framebuffer_state_equal(&ctx->fb_api, fb))
       return;
    ph_submit_vertices(ctx);
+   /* Only one depth surface may own the Z unit's tracked state.  A draw that
+    * binds no depth surface at all leaves it alone (measured), so a
+    * framebuffer without one is not a handover.  Creating a depth stand-in
+    * loses an armed clear too (measured), so resolve before the stand-ins. */
+   if (ctx->zinit_res && fb && fb->zsbuf.texture &&
+       (ctx->zinit_res != ph_resource(fb->zsbuf.texture) ||
+        fb->zsbuf.level || fb->zsbuf.first_layer))
+      ph_zinit_resolve(ctx, ctx->zinit_res);
    ph_proxy_release(ctx);
    util_copy_framebuffer_state(&ctx->fb_api, fb);
    struct pipe_framebuffer_state bound;
@@ -11354,9 +11362,6 @@ ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *
       ctx->colour_stub_bound = false;
    }
    ph_update_blend(ctx);
-   /* Only one depth surface may own the Z unit's tracked state.  A draw that
-    * binds no depth surface at all leaves it alone (measured), so a
-    * framebuffer without one is not a handover. */
    if (ctx->zinit_res && fb && fb->zsbuf.texture &&
        ctx->zinit_res != ph_resource(fb->zsbuf.texture))
       ph_zinit_resolve(ctx, ctx->zinit_res);
