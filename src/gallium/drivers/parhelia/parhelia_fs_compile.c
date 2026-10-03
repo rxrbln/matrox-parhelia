@@ -110,6 +110,7 @@ struct ph_fs_ctx {
    struct ph_fs_pre_memo *pre_memo;
    unsigned pre_memos, pre_memo_cap;
    int tex_end[4][2];
+   const nir_tex_instr *tex_first[4];  /* the lookup each unit returns */
    bool tex_end_cross[4][2];
    unsigned sampler_mask;
    bool uses_color, uses_color1, uses_fogc, uses_col1, uses_color1_alpha;
@@ -1303,6 +1304,24 @@ ph_fs_intrinsic(struct ph_fs_ctx *ctx, const nir_intrinsic_instr *load,
    return ph_fs_fail(ctx, nir_intrinsic_infos[load->intrinsic].name);
 }
 
+/* Two lookups that fetch the same texel: one op over the same sources. */
+static bool
+ph_fs_same_lookup(const nir_tex_instr *a, const nir_tex_instr *b)
+{
+   if (a == b)
+      return true;
+   if (a->op != b->op || a->num_srcs != b->num_srcs ||
+       a->sampler_dim != b->sampler_dim)
+      return false;
+   for (unsigned i = 0; i < a->num_srcs; i++) {
+      const int j = nir_tex_instr_src_index(b, a->src[i].src_type);
+
+      if (j < 0 || b->src[j].src.ssa != a->src[i].src.ssa)
+         return false;
+   }
+   return true;
+}
+
 static bool
 ph_fs_texture(struct ph_fs_ctx *ctx, const nir_tex_instr *tex, int sel,
               struct ph_fs_src *out)
@@ -1323,6 +1342,13 @@ ph_fs_texture(struct ph_fs_ctx *ctx, const nir_tex_instr *tex, int sel,
       return ph_fs_fail(ctx, "a texel offset");
    if (tex->sampler_index > 3)
       return ph_fs_fail(ctx, "a sampler beyond the four pipes");
+   /* A unit returns one texel per fragment: a second lookup of it at
+    * another coordinate (a filter's taps) is not the same t register. */
+   if (ctx->tex_first[tex->sampler_index] &&
+       !ph_fs_same_lookup(ctx->tex_first[tex->sampler_index], tex))
+      return ph_fs_fail(ctx, "two lookups of one texture unit at different "
+                             "coordinates");
+   ctx->tex_first[tex->sampler_index] = tex;
    ctx->sampler_mask |= 1u << tex->sampler_index;
    *out = (struct ph_fs_src){ .kind = PH_SRC_TEX, .channel = sel,
                               .index = tex->sampler_index };
