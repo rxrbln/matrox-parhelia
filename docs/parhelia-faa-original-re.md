@@ -507,3 +507,19 @@ before clears and target changes (section 4.1) [C, negative search].
   so reads are not resolved lazily either [MEASURED].
 
 The operation that turns spilled tiles back into pixels is still OPEN.
+
+### 11.3 Record fields (decoded from the f2 dumps, LINCOL runs pending)
+
+| word | content | evidence |
+|---|---|---|
+| w0 | `00RRGGBB` fragment colour, alpha dropped | equals the FAA-off colour of the pixel [MEASURED] |
+| w1 | `[31:24]` 8-bit sample mask, `[23:0]` `0xff8000` (three records `0x800000`, the depth 0.5 of the triangle) | [MEASURED values, meaning INFERRED] |
+| w2 | `0xff`, `[23:12]` pixel x, `[11:0]` about y/2 | x exact against colour-matched pixels, y ambiguous by one [MEASURED/INFERRED] |
+| w3 | `0x4020ffff` | constant in every record [MEASURED] |
+
+In the depth surface the depth of each partially covered pixel is replaced
+by `0x010000nn` (bit 24 set, small n) [MEASURED]. No vendor 2-D or 3-D
+operation that reads the fragment buffer outside the fragment-context class
+was found [C, negative search]; the merge semantics are being established
+by decoding the records against position-encoded colours (`FAA_LINCOL`)
+and a software blend of the records over the target.
