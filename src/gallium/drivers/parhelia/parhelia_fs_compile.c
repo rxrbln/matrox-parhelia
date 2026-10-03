@@ -117,6 +117,9 @@ struct ph_fs_ctx {
    bool uses_color, uses_color1, uses_fogc, uses_col1, uses_color1_alpha;
    bool uses_color0_alpha;
    int route[2];           /* generic varying slot carried in v0/v1, or -1 */
+   unsigned scaled_key, carriers;
+   const struct ph_fs_ramp *ramps;
+   unsigned ramp_count;
    const struct ph_fs_uexp *uexp;
    unsigned uexp_count;
    float tex_hi[4][4];     /* the largest value each unit channel samples */
@@ -990,6 +993,14 @@ ph_fs_uniform_offset(const nir_intrinsic_instr *load, unsigned *offset)
 {
    switch (load->intrinsic) {
    case nir_intrinsic_load_ubo_vec4:
+      /* Constant buffer 1: the driver constants. */
+      if (nir_src_is_const(load->src[0]) && nir_src_is_const(load->src[1]) &&
+          nir_src_as_uint(load->src[0]) == PH_FS_DRV_UBO) {
+         *offset = PH_FS_DRV_BASE +
+                   (nir_intrinsic_base(load) + ph_fs_index(load->src[1])) * 4u +
+                   nir_intrinsic_component(load);
+         return true;
+      }
       if (!nir_src_is_const(load->src[0]) || ph_fs_index(load->src[0]) ||
           !nir_src_is_const(load->src[1]))
          return false;
@@ -1231,9 +1242,79 @@ ph_fs_preshade(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
    return ph_fs_part(ctx, &part, out);
 }
 
+/* The unit and channel carrying component @comp of varying @location. */
 static bool
-ph_fs_varying(struct ph_fs_ctx *ctx, unsigned location, int lane, int sel,
-              struct ph_fs_src *out)
+ph_fs_pass_slot(const struct ph_fs_ctx *ctx, unsigned location, unsigned comp,
+                unsigned *unit, unsigned *channel)
+{
+   for (unsigned r = 0; r < ctx->ramp_count; r++) {
+      const struct ph_fs_ramp *rp = &ctx->ramps[r];
+
+      if (rp->kind != PH_FS_RAMP_PASS || rp->location != location)
+         continue;
+      for (unsigned d = 0; d < rp->dims; d++)
+         if (rp->comp[d] == comp) {
+            *unit = rp->unit;
+            *channel = d;
+            return true;
+         }
+   }
+   return false;
+}
+
+/* A varying on a coordinate unit: the unit's t register, channel d holding
+ * component comp[d], scaled back from the carrier's domain. */
+static bool
+ph_fs_pass_varying(struct ph_fs_ctx *ctx, unsigned location, unsigned first,
+                   unsigned width, int lane, int sel, struct ph_fs_src *out)
+{
+   unsigned unit = 0, channel[3], k;
+   const unsigned n = ph_fs_lane_channels(lane);
+   struct ph_fs_src t;
+
+   for (unsigned c = 0; c < n; c++) {
+      const unsigned comp = first + (sel >= 0 ? (unsigned)sel :
+                                     lane == PH_LANE_A ? 3 : c);
+      unsigned u;
+
+      if (!ph_fs_pass_slot(ctx, location, comp, &u, &channel[c])) {
+         /* A narrower load read naturally in the RGB lane: the channels
+          * past its width are never used. */
+         if (sel < 0 && lane == PH_LANE_RGB && c >= width && c) {
+            channel[c] = c;
+            continue;
+         }
+         return ph_fs_fail(ctx, "a varying other than a colour");
+      }
+      if (c && u != unit)
+         return ph_fs_fail(ctx, "a varying split over coordinate units");
+      unit = u;
+   }
+   /* Natural channels map to themselves, or one channel replicates. */
+   if (n == 3 && !(channel[0] == 0 && channel[1] == 1 && channel[2] == 2) &&
+       !(channel[0] == channel[1] && channel[1] == channel[2]))
+      return ph_fs_fail(ctx, "a varying swizzle a coordinate unit cannot express");
+   {
+      static const uint8_t identity[4] = { 0, 1, 2, 3 };
+      const int usel = n == 3 && channel[0] == 0 && channel[1] == 1 ? -1 :
+                       (int)channel[0];
+
+      t = (struct ph_fs_src){ .kind = PH_SRC_TEX, .index = unit,
+                              .channel = usel };
+      ctx->sampler_mask |= 1u << unit;
+      k = 2 + unit;
+      ctx->carriers |= 1u << k;
+      (void)identity;
+      *out = t;
+      return true;
+   }
+}
+
+/* Varying @location read from its component @first on (the load of a
+ * packed varying starts there). */
+static bool
+ph_fs_varying(struct ph_fs_ctx *ctx, unsigned location, unsigned first,
+              unsigned width, int lane, int sel, struct ph_fs_src *out)
 {
    if (location == VARYING_SLOT_COL0) {
       out->index = 0;
@@ -1251,9 +1332,16 @@ ph_fs_varying(struct ph_fs_ctx *ctx, unsigned location, int lane, int sel,
    } else if (ctx->route[0] == (int)location || ctx->route[1] == (int)location) {
       out->index = ctx->route[0] == (int)location ? 0 : 1;
       ctx->uses_color1 |= out->index == 1;
+      ctx->carriers |= 1u << out->index;
    } else {
-      return ph_fs_fail(ctx, "a varying other than a colour");
+      return ph_fs_pass_varying(ctx, location, first, width, lane, sel, out);
    }
+   /* A colour interpolator carries the whole slot: a packed load's natural
+    * read has to start at component 0. */
+   if (first && sel < 0)
+      return ph_fs_fail(ctx, "a packed varying read across its slot");
+   if (first)
+      sel += first;
    out->kind = PH_SRC_COLOUR;
    out->channel = sel;
    ctx->uses_color = true;
@@ -1278,21 +1366,24 @@ ph_fs_intrinsic(struct ph_fs_ctx *ctx, const nir_intrinsic_instr *load,
       if (!deref || deref->deref_type != nir_deref_type_var ||
           !(deref->var->data.mode & nir_var_shader_in))
          return ph_fs_fail(ctx, "a dereference that is no input variable");
-      return ph_fs_varying(ctx, deref->var->data.location, lane, sel, out);
+      return ph_fs_varying(ctx, deref->var->data.location,
+                           deref->var->data.location_frac,
+                           load->def.num_components, lane, sel, out);
    }
    case nir_intrinsic_load_input:
    case nir_intrinsic_load_interpolated_input:
       return ph_fs_varying(ctx, nir_intrinsic_io_semantics(load).location,
-                           lane, sel, out);
-   case nir_intrinsic_load_ubo_vec4:
-      /* The starting channel is the intrinsic's component index. */
-      if (!nir_src_is_const(load->src[0]) || ph_fs_index(load->src[0]) ||
-          !nir_src_is_const(load->src[1]))
+                           nir_intrinsic_component(load),
+                           load->def.num_components, lane, sel, out);
+   case nir_intrinsic_load_ubo_vec4: {
+      /* The starting channel is the intrinsic's component index; buffer 1
+       * holds the driver constants. */
+      unsigned offset;
+
+      if (!ph_fs_uniform_offset(load, &offset))
          break;
-      return ph_fs_uniform(ctx, (nir_intrinsic_base(load) +
-                                 ph_fs_index(load->src[1])) * 4u +
-                                nir_intrinsic_component(load),
-                           lane, sel, out);
+      return ph_fs_uniform(ctx, offset, lane, sel, out);
+   }
    case nir_intrinsic_load_ubo:
       if (!nir_src_is_const(load->src[0]) || ph_fs_index(load->src[0]) ||
           !nir_src_is_const(load->src[1]) ||
@@ -3202,7 +3293,8 @@ ph_fs_coordinate_only(nir_def *def, unsigned depth)
  * interpolators it does not read itself: v0 first, then v1.  Texture
  * coordinate varyings only feed the texture units and are not routed. */
 static bool
-ph_fs_route_varyings(nir_shader *nir, int route[2])
+ph_fs_route_varyings(nir_shader *nir, int route[2],
+                     const struct ph_fs_ramp *ramps, unsigned ramp_count)
 {
    bool used_col0 = false, used_col1 = false;
    int generic[2];
@@ -3240,6 +3332,9 @@ ph_fs_route_varyings(nir_shader *nir, int route[2])
                      location == VARYING_SLOT_PNTC) {
                bool seen = false;
 
+               /* Carried by a coordinate unit. */
+               for (unsigned r = 0; r < ramp_count; r++)
+                  seen |= ramps[r].kind == PH_FS_RAMP_PASS && ramps[r].location == location;
                for (unsigned i = 0; i < generics; i++)
                   seen |= generic[i] == location;
                if (!seen && generics < 2)
@@ -3263,13 +3358,123 @@ ph_fs_route_varyings(nir_shader *nir, int route[2])
    return true;
 }
 
+/* The carrier and channel of component @comp of varying @location, or
+ * false when the colour route and coordinate units do not carry it. */
+static bool
+ph_fs_carrier_of(const int route[2], const struct ph_fs_ramp *ramps,
+                 unsigned ramp_count, unsigned location, unsigned comp,
+                 unsigned *carrier, unsigned *channel)
+{
+   for (unsigned k = 0; k < 2; k++)
+      if (route[k] == (int)location) {
+         *carrier = k;
+         *channel = comp;
+         return true;
+      }
+   for (unsigned r = 0; r < ramp_count; r++)
+      for (unsigned d = 0; ramps[r].kind == PH_FS_RAMP_PASS && d < ramps[r].dims; d++)
+         if (ramps[r].location == location && ramps[r].comp[d] == comp) {
+            *carrier = 2 + ramps[r].unit;
+            *channel = d;
+            return true;
+         }
+   return false;
+}
+
+/* A carrier off the identity domain stores (x - lo) / span: every read of
+ * its varyings becomes x * span + lo with span and lo the driver constants
+ * of constant buffer 1, so the ordinary algebra and preshader fold them
+ * into what the program does with the value. */
+static void
+ph_fs_scale_carriers(nir_shader *nir, const int route[2],
+                     const struct ph_fs_ramp *ramps, unsigned ramp_count,
+                     unsigned scaled_key)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            nir_intrinsic_instr *in;
+            unsigned location, first;
+            nir_def *comp[4];
+            bool any = false;
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic == nir_intrinsic_load_deref) {
+               nir_deref_instr *deref = nir_src_as_deref(in->src[0]);
+
+               if (!deref || deref->deref_type != nir_deref_type_var ||
+                   !(deref->var->data.mode & nir_var_shader_in))
+                  continue;
+               location = deref->var->data.location;
+               first = deref->var->data.location_frac;
+            } else if (in->intrinsic == nir_intrinsic_load_input ||
+                       in->intrinsic == nir_intrinsic_load_interpolated_input) {
+               location = nir_intrinsic_io_semantics(in).location;
+               first = nir_intrinsic_component(in);
+            } else {
+               continue;
+            }
+            b.cursor = nir_after_instr(instr);
+            {
+               const unsigned n = MIN2(in->def.num_components, 4);
+               unsigned k[4], ch[4], swz[4];
+               bool scaled[4], one = true;
+               nir_def *v;
+
+               for (unsigned c = 0; c < n; c++) {
+                  scaled[c] = ph_fs_carrier_of(route, ramps, ramp_count,
+                                               location, first + c, &k[c],
+                                               &ch[c]) &&
+                              (scaled_key & (1u << k[c]));
+                  any |= scaled[c];
+                  swz[c] = scaled[c] ? ch[c] : 0;
+                  one &= scaled[c] && k[c] == k[0];
+               }
+               if (!any)
+                  continue;
+               if (one) {
+                  /* One carrier: a single vector multiply-add, which the
+                   * algebra folds into what the program does next. */
+                  nir_def *span = nir_load_ubo_vec4(&b, 4, 32,
+                     nir_imm_int(&b, PH_FS_DRV_UBO), nir_imm_int(&b, k[0] * 2));
+                  nir_def *lo = nir_load_ubo_vec4(&b, 4, 32,
+                     nir_imm_int(&b, PH_FS_DRV_UBO), nir_imm_int(&b, k[0] * 2 + 1));
+
+                  v = nir_ffma(&b, &in->def, nir_swizzle(&b, span, swz, n),
+                               nir_swizzle(&b, lo, swz, n));
+               } else {
+                  for (unsigned c = 0; c < n; c++) {
+                     comp[c] = nir_channel(&b, &in->def, c);
+                     if (!scaled[c])
+                        continue;
+                     comp[c] = nir_ffma(&b, comp[c],
+                        nir_channel(&b, nir_load_ubo_vec4(&b, 4, 32,
+                           nir_imm_int(&b, PH_FS_DRV_UBO), nir_imm_int(&b, k[c] * 2)), ch[c]),
+                        nir_channel(&b, nir_load_ubo_vec4(&b, 4, 32,
+                           nir_imm_int(&b, PH_FS_DRV_UBO), nir_imm_int(&b, k[c] * 2 + 1)), ch[c]));
+                  }
+                  v = nir_vec(&b, comp, n);
+               }
+               nir_def_rewrite_uses_after(&in->def, v);
+            }
+         }
+      }
+      nir_progress(true, impl, nir_metadata_none);
+   }
+}
+
 static bool
 ph_fs_compile_key(nir_shader *nir, unsigned max_instructions,
                   const struct ph_fs_uexp *uexp, unsigned uexp_count,
                   const struct ph_fs_ramp *ramps, unsigned ramp_count,
-                  struct ph_fs_program *out)
+                  unsigned scaled_key, struct ph_fs_program *out)
 {
    struct ph_fs_ctx ctx;
+   nir_shader *scaled_nir = NULL;
    nir_def *colour[4] = { NULL };
    uint8_t channel[4] = { 0 };
    struct ph_fs_src rgb, alpha;
@@ -3281,6 +3486,7 @@ ph_fs_compile_key(nir_shader *nir, unsigned max_instructions,
    memset(out, 0, sizeof(*out));
    ctx.uexp = uexp;
    ctx.uexp_count = uexp_count;
+   ctx.scaled_key = scaled_key;
    if (getenv("PARHELIA_TRACE_FS_NIR"))
       nir_print_shader(nir, stderr);
    for (unsigned u = 0; u < 4; u++)
@@ -3295,9 +3501,22 @@ ph_fs_compile_key(nir_shader *nir, unsigned max_instructions,
       for (unsigned d = 0; d < ramps[r].dims; d++)
          ctx.tex_hi[ramps[r].unit][ramps[r].comp[d]] = 1.0f;
    }
-   if (!ph_fs_route_varyings(nir, ctx.route)) {
+   ctx.ramps = ramps;
+   ctx.ramp_count = ramp_count;
+   if (!ph_fs_route_varyings(nir, ctx.route, ramps, ramp_count)) {
       ph_fs_fail(&ctx, "more value varyings than free colour interpolators");
       goto done;
+   }
+   if (scaled_key) {
+      scaled_nir = nir_shader_clone(NULL, nir);
+      ph_fs_scale_carriers(scaled_nir, ctx.route, ramps, ramp_count,
+                           scaled_key);
+      NIR_PASS(_, scaled_nir, nir_opt_copy_prop);
+      NIR_PASS(_, scaled_nir, nir_opt_algebraic);
+      NIR_PASS(_, scaled_nir, nir_opt_constant_folding);
+      NIR_PASS(_, scaled_nir, nir_opt_cse);
+      NIR_PASS(_, scaled_nir, nir_opt_dce);
+      nir = scaled_nir;
    }
    nir_foreach_function_impl(impl, nir) {
       if (exec_list_length(&impl->body) != 1) {
@@ -3392,6 +3611,11 @@ ph_fs_compile_key(nir_shader *nir, unsigned max_instructions,
    out->uses_fogc = ctx.uses_fogc || ctx.fog_root;
    out->uses_color1_alpha = ctx.uses_color1_alpha;
    out->uses_color0_alpha = ctx.uses_color0_alpha;
+   out->scaled_key = scaled_key;
+   out->carriers = ctx.carriers;
+   for (unsigned k = 0; k < PH_FS_CARRIERS; k++)
+      for (unsigned c = 0; c < 4; c++)
+         out->drv[PH_FS_DRV_SPAN(k, c)] = 1.0f;
    out->route[0] = ctx.route[0];
    out->route[1] = ctx.route[1];
    if (ctx.fog_root) {
@@ -3435,6 +3659,7 @@ done:
    free(ctx.pre);
    free(ctx.pre_memo);
    free(ctx.fog);
+   ralloc_free(scaled_nir);
    return ok;
 }
 
@@ -3561,6 +3786,119 @@ unsigned
 ph_fs_ramp_step(unsigned size)
 {
    return size > 1 ? 255u / (size - 1u) : 255u;
+}
+
+bool
+ph_fs_assign_pass_units(nir_shader *nir, unsigned used_units,
+                        unsigned max_units, struct ph_fs_ramp *ramps,
+                        unsigned *count, const char **reject)
+{
+   unsigned location[VARYING_SLOT_MAX], read[VARYING_SLOT_MAX];
+   unsigned generics = 0, colours = 2, u = 0;
+
+   memset(read, 0, sizeof(read));
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nir_intrinsic_instr *in;
+            unsigned loc = ~0u, first = 0, i;
+
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic == nir_intrinsic_load_deref) {
+               nir_deref_instr *deref = nir_src_as_deref(in->src[0]);
+
+               if (!deref || deref->deref_type != nir_deref_type_var ||
+                   !(deref->var->data.mode & nir_var_shader_in))
+                  continue;
+               loc = deref->var->data.location;
+               first = deref->var->data.location_frac;
+            } else if (in->intrinsic == nir_intrinsic_load_input ||
+                       in->intrinsic == nir_intrinsic_load_interpolated_input) {
+               loc = nir_intrinsic_io_semantics(in).location;
+               first = nir_intrinsic_component(in);
+            } else {
+               continue;
+            }
+            if (ph_fs_coordinate_only(&in->def, 0))
+               continue;
+            if (loc == VARYING_SLOT_COL0 || loc == VARYING_SLOT_COL1 ||
+                loc == VARYING_SLOT_FOGC) {
+               read[loc] |= 1;
+               continue;
+            }
+            if (loc >= VARYING_SLOT_MAX ||
+                !(loc >= VARYING_SLOT_VAR0 || loc == VARYING_SLOT_PNTC))
+               continue;
+            for (i = 0; i < generics && location[i] != loc; i++)
+               ;
+            if (i == generics)
+               location[generics++] = loc;
+            read[loc] |= nir_def_components_read(&in->def) << first;
+         }
+      }
+   }
+   colours = !read[VARYING_SLOT_COL0] +
+             !(read[VARYING_SLOT_COL1] || read[VARYING_SLOT_FOGC]);
+   /* Coordinate units interpolate perspective-correctly, the colour
+    * interpolators affinely (MEASURED on the P690: a routed varying read
+    * the same with w = 1 and w = 2 on one edge), so a varying of up to two
+    * read components takes a unit while units last; the colours take the
+    * rest, wider ones first. */
+   bool on_unit[VARYING_SLOT_MAX] = { false };
+   unsigned left = generics, free_units = 0;
+
+   for (unsigned v = 0; v < max_units; v++)
+      free_units += !(used_units & (1u << v));
+   for (unsigned g = 0; g < generics && free_units; g++)
+      if (util_bitcount(read[location[g]]) <= 2) {
+         on_unit[location[g]] = true;
+         free_units--;
+         left--;
+      }
+   for (unsigned g = 0; g < generics && left > colours; g++)
+      if (!on_unit[location[g]] && util_bitcount(read[location[g]]) <= 4 &&
+          free_units >= DIV_ROUND_UP(util_bitcount(read[location[g]]), 2)) {
+         on_unit[location[g]] = true;
+         free_units -= DIV_ROUND_UP(util_bitcount(read[location[g]]), 2);
+         left--;
+      }
+   if (left > colours) {
+      *reject = "more value varyings than colour interpolators and "
+                "coordinate units";
+      return false;
+   }
+   for (unsigned g = 0; g < generics; g++) {
+      struct ph_fs_ramp *ramp = NULL;
+
+      if (!on_unit[location[g]])
+         continue;
+
+      for (unsigned c = 0; c < 4; c++) {
+         if (!(read[location[g]] & (1u << c)))
+            continue;
+         if (!ramp || ramp->dims == 2) {
+            while (u < max_units && (used_units & (1u << u)))
+               u++;
+            if (u >= max_units) {
+               *reject = "more value varyings than colour interpolators "
+                         "and coordinate units";
+               return false;
+            }
+            ramp = &ramps[(*count)++];
+            memset(ramp, 0, sizeof(*ramp));
+            ramp->unit = u++;
+            ramp->location = location[g];
+            ramp->kind = PH_FS_RAMP_PASS;
+         }
+         ramp->comp[ramp->dims] = c;
+         ramp->size[ramp->dims] = 1;
+         ramp->span[ramp->dims] = 1.0f;
+         ramp->dims++;
+      }
+   }
+   return true;
 }
 
 bool
@@ -3824,12 +4162,12 @@ ph_fs_compile_ramps(nir_shader *nir, unsigned max_instructions,
    if (ramp_count > ARRAY_SIZE(out->ramps))
       return false;
    if (!ph_fs_compile_key(nir, max_instructions, NULL, 0, ramps, ramp_count,
-                          out))
+                          0, out))
       return false;
    memcpy(out->ramps, ramps, ramp_count * sizeof(*ramps));
    out->ramp_count = ramp_count;
-   /* Only runtime constants can ask for a variant. */
-   if (out->const_ref_count) {
+   /* Only runtime constants and scaled carriers can ask for a variant. */
+   if (out->const_ref_count || out->carriers) {
       out->nir = nir_shader_clone(NULL, nir);
       out->budget = max_instructions;
    }
@@ -3870,7 +4208,10 @@ ph_fs_run_preshader(struct ph_fs_program *program, const float *values,
          for (unsigned c = 0; c < node->ncomp[s]; c++) {
             const struct ph_fs_pre_src *in = &node->src[s][c];
 
-            if (in->kind == PH_FS_PRE_BUFFER)
+            if (in->kind == PH_FS_PRE_BUFFER && in->index >= PH_FS_DRV_BASE)
+               src[s][c].f32 = in->index - PH_FS_DRV_BASE < PH_FS_DRV_COUNT ?
+                               program->drv[in->index - PH_FS_DRV_BASE] : 0.0f;
+            else if (in->kind == PH_FS_PRE_BUFFER)
                src[s][c].f32 = values && (in->index + 1u) * sizeof(float) <= size ?
                                values[in->index] : 0.0f;
             else if (in->kind == PH_FS_PRE_RESULT)
@@ -3902,6 +4243,9 @@ ph_fs_ref_value(const struct ph_fs_program *program,
                 const struct ph_fs_const_ref *ref, unsigned c,
                 const float *values, unsigned size)
 {
+   if (ref->offset[c] >= PH_FS_DRV_BASE)
+      return ref->offset[c] - PH_FS_DRV_BASE < PH_FS_DRV_COUNT ?
+             program->drv[ref->offset[c] - PH_FS_DRV_BASE] : 0.0f;
    if (ref->offset[c] >= PH_FS_PRE_BASE)
       return ref->offset[c] - PH_FS_PRE_BASE < program->pre_count ?
              program->pre_value[ref->offset[c] - PH_FS_PRE_BASE].f32 : 0.0f;
@@ -3932,11 +4276,19 @@ ph_fs_rescale(struct ph_fs_program *program, const float *values,
 {
    struct ph_fs_uexp *uexp;
    struct ph_fs_program variant;
-   unsigned count = program->uexp_count;
+   unsigned count = program->uexp_count, scaled = program->scaled_key;
    bool grown = false;
 
    if (!program->nir)
       return 0;
+   /* A carrier off the identity domain needs the scaling variant. */
+   for (unsigned k = 0; k < PH_FS_CARRIERS; k++)
+      for (unsigned c = 0; c < 4; c++)
+         if ((program->carriers & (1u << k)) &&
+             (program->drv[PH_FS_DRV_SPAN(k, c)] != 1.0f ||
+              program->drv[PH_FS_DRV_LO(k, c)] != 0.0f))
+            scaled |= 1u << k;
+   grown = scaled != program->scaled_key;
    uexp = malloc((count + 4 * program->const_ref_count + 1) * sizeof(*uexp));
    if (!uexp)
       return -1;
@@ -3972,13 +4324,15 @@ ph_fs_rescale(struct ph_fs_program *program, const float *values,
       return 0;
    }
    if (!ph_fs_compile_key(program->nir, program->budget, uexp, count,
-                          program->ramps, program->ramp_count, &variant)) {
+                          program->ramps, program->ramp_count, scaled,
+                          &variant)) {
       /* The program stays as it was: only this draw is refused. */
       free(uexp);
       return -1;
    }
    memcpy(variant.ramps, program->ramps, sizeof(variant.ramps));
    variant.ramp_count = program->ramp_count;
+   memcpy(variant.drv, program->drv, sizeof(variant.drv));
    variant.nir = program->nir;
    variant.budget = program->budget;
    variant.uexp = uexp;
@@ -3994,17 +4348,38 @@ ph_fs_rescale(struct ph_fs_program *program, const float *values,
    return 1;
 }
 
+void
+ph_fs_set_domain(struct ph_fs_program *program, unsigned carrier,
+                 const float lo[4], const float span[4])
+{
+   if (carrier >= PH_FS_CARRIERS)
+      return;
+   for (unsigned c = 0; c < 4; c++) {
+      program->drv[PH_FS_DRV_SPAN(carrier, c)] = span[c];
+      program->drv[PH_FS_DRV_LO(carrier, c)] = lo[c];
+   }
+}
+
 bool
 ph_fs_update_constants(struct ph_fs_program *program, const void *constants,
                        unsigned size)
 {
    const float *values = constants;
-   int rescaled;
+   int rescaled = 0;
 
    ph_fs_run_preshader(program, values, size);
-   rescaled = ph_fs_rescale(program, values, size);
-   if (rescaled > 0)
+   /* A scaling variant brings new constants whose exponents the next pass
+    * sees; exponents only grow, so this settles. */
+   for (unsigned pass = 0; pass < 4; pass++) {
+      int r = ph_fs_rescale(program, values, size);
+
+      if (r <= 0) {
+         rescaled = r < 0 ? -1 : pass ? 1 : 0;
+         break;
+      }
+      rescaled = 1;
       ph_fs_run_preshader(program, values, size);
+   }
    for (unsigned i = 0; i < program->const_ref_count; i++) {
       const struct ph_fs_const_ref *ref = &program->const_ref[i];
       float *target = program->comb.inst[ref->instruction].constant[ref->slot];

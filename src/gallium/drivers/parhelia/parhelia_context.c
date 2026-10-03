@@ -243,6 +243,8 @@ static bool ph_nir_eval_vertex(struct ph_context *ctx, nir_def *def,
                                const struct vertex_header *v,
                                nir_const_value out[NIR_MAX_VEC_COMPONENTS],
                                unsigned depth);
+static void ph_pass_unit_state(const struct ph_context *ctx, unsigned unit,
+                               struct p3d_texture *t);
 static const struct p3d_comb_program *ph_compiled_combiner(struct ph_context *ctx,
                                                           bool two_units);
 static bool ph_copy_texture_box(struct ph_context *ctx,
@@ -380,6 +382,10 @@ struct ph_context {
    size_t lookup_bytes;
    uint64_t lookup_clock;
    void *lookup_sampler;
+   /* The domain each varying carrier is staged in, (x - lo) / span, and
+    * a compiled combiner refusing the batch it was asked for. */
+   float dom_lo[PH_FS_CARRIERS][4], dom_span[PH_FS_CARRIERS][4];
+   bool comb_refused;
    /* The framebuffer as the state tracker set it, and the stand-in render
     * resources for surfaces the engine cannot address in place (a mip level
     * above 0 or a slice): ctx->fb binds the stand-ins. */
@@ -4199,8 +4205,13 @@ ph_submit_simple_primitives(struct ph_context *ctx, enum p3d_prim prim)
    ph_apply_fragment_state(ctx, &state, depth != NULL);
    /* The fragment program applies to lines and points as to triangles: a
     * constant glColor reaches it as a uniform, not as the vertex colour. */
+   ctx->comb_refused = false;
    state.comb = ph_fs_untextured_program(ctx) ?
                 ph_compiled_combiner(ctx, false) : NULL;
+   if (ctx->comb_refused) {
+      PH_REFUSE("a batch whose fragment constants no combiner variant can hold is dropped\n");
+      goto out;
+   }
 
    ret = ph_batch_primitives(ctx, batch, &state, color->handle,
                              depth ? depth->handle : 0, 0, 0, count);
@@ -4660,8 +4671,13 @@ ph_submit_vertices(struct ph_context *ctx)
     * function fog is a mix between the fragment colour and a constant - as
     * long as that program samples nothing.  A smooth line's triangles carry
     * their final colour and take the plain colour combiner. */
+   ctx->comb_refused = false;
    state.comb = ph_fs_untextured_program(ctx) && !ctx->line_coverage ?
                 ph_compiled_combiner(ctx, false) : NULL;
+   if (ctx->comb_refused) {
+      PH_REFUSE("a batch whose fragment constants no combiner variant can hold is dropped\n");
+      goto out;
+   }
    state.dither = !ctx->blend || ctx->blend->dither;
    state.flat = ctx->rasterizer && ctx->rasterizer->flatshade;
    state.cull = ctx->derived_triangles ? 0 :
@@ -4805,10 +4821,16 @@ ph_submit_vertices(struct ph_context *ctx)
       tex.filter = ph_sampler_filter_word(&tex, sampler, ph_max_lod_bias(ctx));
       tex.wrap = ph_sampler_wrap_word(&tex, sampler);
       tex.env = ctx->fs->texenv;
+      ctx->comb_refused = false;
       state.comb = ph_compiled_combiner(ctx, texture1 != NULL);
+      if (ctx->comb_refused) {
+         PH_REFUSE("a batch whose fragment constants no combiner variant can hold is dropped\n");
+         goto out;
+      }
       state.comb_slot_base = ph_env("PARHELIA_COMB_SLOT_BASE") ?
          (unsigned)atoi(getenv("PARHELIA_COMB_SLOT_BASE")) : 0;
       state.tex = &tex;
+      ph_pass_unit_state(ctx, 0, &tex);
       state.warp_entry =
          ph_warp_entry(ctx, true, texture1 || ctx->native_sampled_alpha,
                        !ctx->fs->uses_color && !ctx->alpha_micro);
@@ -4854,6 +4876,7 @@ ph_submit_vertices(struct ph_context *ctx)
          /* Quake's base world pass is diffuse times lightmap. */
          tex1.env = P3D_TEXENV_MODULATE;
          state.tex1 = &tex1;
+         ph_pass_unit_state(ctx, 1, &tex1);
       }
    }
    if (depth) {
@@ -8217,6 +8240,10 @@ struct ph_quant_stage {
    /* Tap coordinates staged per vertex. */
    unsigned tap_count;
    int tap_slot[P3D_MAX_TEXTURE_UNITS];
+   /* Generic varyings routed through the colour interpolators, staged in
+    * their carrier's domain. */
+   unsigned route_count;
+   int route_slot[2], route_carrier[2];
 };
 
 static bool
@@ -8241,6 +8268,129 @@ ph_logicop_grid(const struct ph_context *ctx, float scale[4])
                  desc->channel[s].size ?
                  (float)((1u << desc->channel[s].size) - 1) : 0.0f;
    }
+}
+
+/* A coordinate unit: texture-address opcode 2 with mode 3 passes the
+ * staged coordinate instead of a texel (vendor TEXCOORD, MEASURED by
+ * parhelia-drm-test --texcoord-pass-probe). */
+static void
+ph_pass_unit_state(const struct ph_context *ctx, unsigned unit,
+                   struct p3d_texture *t)
+{
+   const struct ph_fs_program *prog = ctx->fs ? &ctx->fs->program : NULL;
+
+   for (unsigned r = 0; prog && prog->valid && r < prog->ramp_count; r++)
+      if (prog->ramps[r].kind == PH_FS_RAMP_PASS && prog->ramps[r].unit == unit) {
+         t->ta_op = 2;
+         t->coord_mode = 3;
+      }
+}
+
+static void
+ph_domain_reset(struct ph_context *ctx)
+{
+   for (unsigned k = 0; k < PH_FS_CARRIERS; k++)
+      for (unsigned c = 0; c < 4; c++) {
+         ctx->dom_lo[k][c] = 0.0f;
+         ctx->dom_span[k][c] = 1.0f;
+      }
+}
+
+/* [lo, lo + span) with a power-of-two span covering [lo, hi]; [0, 1] when
+ * that already does.  The power of two keeps the scale an exact shift. */
+static void
+ph_domain_cover(float lo, float hi, float *out_lo, float *out_span)
+{
+   float span = 1.0f;
+
+   if (lo >= 0.0f && hi <= 1.0f) {
+      *out_lo = 0.0f;
+      *out_span = 1.0f;
+      return;
+   }
+   while (span < hi - lo && span < 65536.0f)
+      span *= 2.0f;
+   *out_lo = lo;
+   *out_span = span;
+}
+
+/* Keep every routed value of @prim inside its carrier's domain: a value
+ * outside submits what is staged and widens the domain, so each batch
+ * interpolates one domain (the colour interpolators clamp to [0, 1]). */
+static void
+ph_quant_domain(struct ph_quant_stage *q, const struct prim_header *prim,
+                unsigned n, int slot, unsigned k, const uint8_t *comp,
+                unsigned channels)
+{
+   struct ph_context *ctx = q->ctx;
+   float lo[4], hi[4];
+   bool fits = true;
+
+   for (unsigned c = 0; c < channels; c++) {
+      lo[c] = hi[c] = prim->v[0]->data[slot][comp[c]];
+      for (unsigned v = 1; v < n; v++) {
+         const float x = prim->v[v]->data[slot][comp[c]];
+
+         lo[c] = MIN2(lo[c], x);
+         hi[c] = MAX2(hi[c], x);
+      }
+      fits &= lo[c] >= ctx->dom_lo[k][c] &&
+              hi[c] <= ctx->dom_lo[k][c] + ctx->dom_span[k][c];
+   }
+   if (fits)
+      return;
+   if (ctx->triangles || ctx->points || ctx->lines)
+      ph_submit_vertices(ctx);
+   for (unsigned c = 0; c < channels; c++) {
+      /* Grow over the previous domain: the next batch likely needs it. */
+      const float l = MIN2(lo[c], ctx->dom_lo[k][c]);
+      const float h = MAX2(hi[c], ctx->dom_lo[k][c] + ctx->dom_span[k][c]);
+
+      if (!(l >= -1e30f && h <= 1e30f))
+         continue;
+      ph_domain_cover(l, h, &ctx->dom_lo[k][c], &ctx->dom_span[k][c]);
+   }
+}
+
+/* Keep every carried value of @prim inside its carrier's domain: a value
+ * outside submits what is staged and widens the domain, so each batch
+ * interpolates one domain (both carriers clamp to [0, 1]). */
+static bool
+ph_quant_domains(struct ph_quant_stage *q, const struct prim_header *prim,
+                 unsigned n)
+{
+   static const uint8_t identity[4] = { 0, 1, 2, 3 };
+
+   /* The colour interpolators are affine: a routed varying across corners
+    * of different w would interpolate differently from GL. */
+   if (q->route_count && n > 1) {
+      const int pos = draw_current_shader_position_output(q->ctx->draw);
+      bool varies = false;
+
+      /* Equal values at every corner (a flat varying) interpolate to
+       * themselves either way. */
+      for (unsigned r = 0; r < q->route_count; r++)
+         for (unsigned v = 1; v < n; v++)
+            varies |= memcmp(prim->v[v]->data[q->route_slot[r]],
+                             prim->v[0]->data[q->route_slot[r]],
+                             4 * sizeof(float)) != 0;
+      for (unsigned v = 1; varies && v < n; v++)
+         if (prim->v[v]->data[pos][3] != prim->v[0]->data[pos][3]) {
+            ph_warn_once("a varying on a colour interpolator across corners "
+                         "of different w is not perspective-correct; the "
+                         "primitive is dropped\n");
+            return false;
+         }
+   }
+
+   for (unsigned r = 0; r < q->route_count; r++)
+      ph_quant_domain(q, prim, n, q->route_slot[r], q->route_carrier[r],
+                      identity, 4);
+   for (unsigned i = 0; i < q->ramp_count; i++)
+      if (q->ramp[i].kind == PH_FS_RAMP_PASS)
+         ph_quant_domain(q, prim, n, q->ramp_src[i], 2 + q->ramp[i].unit,
+                         q->ramp[i].comp, q->ramp[i].dims);
+   return true;
 }
 
 static struct vertex_header *
@@ -8276,19 +8426,29 @@ ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
          for (unsigned i = 0; i < MIN2(coord->num_components, 4); i++)
             x[i] = c[i].f32;
    }
+   for (unsigned r = 0; r < q->route_count; r++) {
+      const unsigned k = q->route_carrier[r];
+      float *x = out->data[q->route_slot[r]];
+
+      for (unsigned c = 0; c < 4; c++)
+         x[c] = (x[c] - q->ctx->dom_lo[k][c]) / q->ctx->dom_span[k][c];
+   }
    for (unsigned i = 0; i < q->ramp_count; i++) {
       const struct ph_fs_ramp *r = &q->ramp[i];
       const float *src = v->data[q->ramp_src[i]];
       float *c = out->data[q->ramp_slot[i]];
 
-      if (r->kind != PH_FS_RAMP_FLOOR) {
+      if (r->kind != PH_FS_RAMP_FLOOR && r->kind != PH_FS_RAMP_PASS) {
          ph_fs_lookup_stage(r, src, c);
          continue;
       }
       c[0] = c[1] = c[2] = 0.5f;
       c[3] = 1.0f;
       for (unsigned d = 0; d < r->dims; d++)
-         c[d] = (src[r->comp[d]] - r->lo[d]) / r->span[d];
+         c[d] = r->kind == PH_FS_RAMP_PASS ?
+            (src[r->comp[d]] - q->ctx->dom_lo[2 + r->unit][d]) /
+            q->ctx->dom_span[2 + r->unit][d] :
+            (src[r->comp[d]] - r->lo[d]) / r->span[d];
    }
    for (unsigned i = 0; q->quantize && i < 2; i++) {
       if (q->slot[i] < 0)
@@ -8330,6 +8490,8 @@ ph_quant_tri(struct draw_stage *stage, struct prim_header *prim)
 
    if (!ph_quant_ramps_in_range((struct ph_quant_stage *)stage, prim, 3))
       return;
+   if (!ph_quant_domains((struct ph_quant_stage *)stage, prim, 3))
+      return;
    for (unsigned i = 0; i < 3; i++)
       tmp.v[i] = ph_quant_vertex(stage, prim->v[i], i);
    stage->next->tri(stage->next, &tmp);
@@ -8342,6 +8504,8 @@ ph_quant_line(struct draw_stage *stage, struct prim_header *prim)
 
    if (!ph_quant_ramps_in_range((struct ph_quant_stage *)stage, prim, 2))
       return;
+   if (!ph_quant_domains((struct ph_quant_stage *)stage, prim, 2))
+      return;
    for (unsigned i = 0; i < 2; i++)
       tmp.v[i] = ph_quant_vertex(stage, prim->v[i], i);
    stage->next->line(stage->next, &tmp);
@@ -8353,6 +8517,8 @@ ph_quant_point(struct draw_stage *stage, struct prim_header *prim)
    struct prim_header tmp = *prim;
 
    if (!ph_quant_ramps_in_range((struct ph_quant_stage *)stage, prim, 1))
+      return;
+   if (!ph_quant_domains((struct ph_quant_stage *)stage, prim, 1))
       return;
    tmp.v[0] = ph_quant_vertex(stage, prim->v[0], 0);
    stage->next->point(stage->next, &tmp);
@@ -8906,6 +9072,23 @@ ph_fix_ramps(struct ph_context *ctx, struct ph_quant_stage *q)
                                         PH_RAMP_COORD_INDEX(r->unit));
    }
    return true;
+}
+
+/* The routed generic varyings' vertex outputs, staged in their domains. */
+static void
+ph_fix_routes(struct ph_context *ctx, struct ph_quant_stage *q)
+{
+   const struct ph_fs_program *prog = ctx->fs ? &ctx->fs->program : NULL;
+
+   q->route_count = 0;
+   for (unsigned k = 0; prog && prog->valid && k < 2; k++) {
+      const int slot = prog->route[k] >= 0 ? ph_v_output(ctx->draw, ctx, k) : -1;
+
+      if (slot < 0)
+         continue;
+      q->route_slot[q->route_count] = slot;
+      q->route_carrier[q->route_count++] = k;
+   }
 }
 
 static bool
@@ -9595,11 +9778,16 @@ static struct pipe_sampler_view *
 ph_ramp_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
 {
    static const unsigned byte_of[4] = { 2, 1, 0, 3 };   /* B8G8R8A8 */
+   /* A coordinate unit fetches nothing; any small surface satisfies the
+    * descriptor. */
    struct pipe_resource templ = {
-      .target = r->dims == 3 ? PIPE_TEXTURE_3D : PIPE_TEXTURE_2D,
+      .target = r->dims == 3 && r->kind != PH_FS_RAMP_PASS ? PIPE_TEXTURE_3D :
+                                                           PIPE_TEXTURE_2D,
       .format = PIPE_FORMAT_B8G8R8A8_UNORM,
-      .width0 = r->size[0], .height0 = r->size[1],
-      .depth0 = r->dims == 3 ? r->size[2] : 1, .array_size = 1,
+      .width0 = r->kind == PH_FS_RAMP_PASS ? 2 : r->size[0],
+      .height0 = r->kind == PH_FS_RAMP_PASS ? 2 : r->size[1],
+      .depth0 = r->dims == 3 && r->kind != PH_FS_RAMP_PASS ? r->size[2] : 1,
+      .array_size = 1,
       .bind = PIPE_BIND_SAMPLER_VIEW,
    };
    struct ph_ramp_tex *t;
@@ -9607,15 +9795,17 @@ ph_ramp_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
    struct pipe_box box;
    uint8_t *data;
 
-   if (r->kind != PH_FS_RAMP_FLOOR)
+   if (r->kind != PH_FS_RAMP_FLOOR && r->kind != PH_FS_RAMP_PASS)
       return ph_lookup_view(ctx, r);
    for (unsigned i = 0; i < ctx->ramp_tex_count; i++) {
       const struct ph_fs_ramp *k = &ctx->ramp_tex[i].key;
 
-      if (k->kind != PH_FS_RAMP_FLOOR)
+      if (k->kind != r->kind)
          continue;
-      if (k->dims == r->dims && !memcmp(k->size, r->size, sizeof(k->size)) &&
-          !memcmp(k->comp, r->comp, sizeof(k->comp)))
+      /* Every coordinate unit shares one small surface it never fetches. */
+      if (r->kind == PH_FS_RAMP_PASS ||
+          (k->dims == r->dims && !memcmp(k->size, r->size, sizeof(k->size)) &&
+           !memcmp(k->comp, r->comp, sizeof(k->comp))))
          return ctx->ramp_tex[i].view;
    }
    if (ctx->ramp_tex_count == ctx->ramp_tex_cap) {
@@ -9637,7 +9827,7 @@ ph_ramp_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
             uint8_t *texel = data + 4 * ((z * templ.height0 + y) *
                                          templ.width0 + x);
 
-            for (unsigned d = 0; d < r->dims; d++)
+            for (unsigned d = 0; d < r->dims && r->kind != PH_FS_RAMP_PASS; d++)
                texel[byte_of[r->comp[d] & 3]] =
                   idx[d] * ph_fs_ramp_step(r->size[d]);
          }
@@ -9802,7 +9992,8 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
 
       ph_fs_snapshot_constants(ctx);
       if (ctx->fs && ctx->fs->program.valid &&
-          ctx->fs->program.const_ref_count && ctx->fs_const_snap_size &&
+          ((ctx->fs->program.const_ref_count && ctx->fs_const_snap_size) ||
+           ctx->fs->program.carriers) &&
           !ph_fs_update_constants(&ctx->fs->program, ctx->fs_const_snap,
                                   ctx->fs_const_snap_size)) {
          PH_REFUSE("draws whose fragment uniforms no combiner variant can "
@@ -9864,7 +10055,9 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    const bool quantize = ph_logicop_quantize(ctx);
    const bool fix = (quantize || (ctx->fs && ctx->fs->ucoord_count) ||
                      (ctx->fs && ctx->fs->program.valid &&
-                      (ctx->fs->program.ramp_count || ctx->fs->tap_count)) ||
+                      (ctx->fs->program.ramp_count || ctx->fs->tap_count ||
+                       ctx->fs->program.route[0] >= 0 ||
+                       ctx->fs->program.route[1] >= 0)) ||
                      ph_fs_samples_rect(ctx->fs) ||
                      (ctx->fs && ctx->fs->depth_uniform)) &&
                     (ctx->quant_stage ||
@@ -9890,6 +10083,7 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
          goto unbind;
       }
       ph_fix_taps(ctx, (struct ph_quant_stage *)ctx->quant_stage);
+      ph_fix_routes(ctx, (struct ph_quant_stage *)ctx->quant_stage);
       if (!ph_fix_ramps(ctx, (struct ph_quant_stage *)ctx->quant_stage)) {
          draw_remove_extra_vertex_attribs(ctx->draw);
          PH_REFUSE("a draw whose floored varying the vertex stage does not write is dropped\n");
@@ -10357,7 +10551,11 @@ ph_compiled_combiner(struct ph_context *ctx, bool two_units)
        ctx->alpha_micro_cutout || ctx->cpu_alpha_cutout ||
        ctx->rgb_alpha_two_pass)
       return NULL;
-   if (fs->program.const_ref_count) {
+   /* The domains the staged carriers of this batch interpolate. */
+   for (unsigned k = 0; k < PH_FS_CARRIERS; k++)
+      if (fs->program.carriers & (1u << k))
+         ph_fs_set_domain(&fs->program, k, ctx->dom_lo[k], ctx->dom_span[k]);
+   if (fs->program.const_ref_count || fs->program.carriers) {
       const uint8_t *live = NULL;
 
       if (ctx->user_constants[MESA_SHADER_FRAGMENT])
@@ -10382,10 +10580,15 @@ ph_compiled_combiner(struct ph_context *ctx, bool two_units)
                                 ctx->constant_size[MESA_SHADER_FRAGMENT]);
          return &fs->program.comb;
       }
-      if (!ctx->fs_const_snap_size)
+      if (!ctx->fs_const_snap_size && fs->program.const_ref_count)
          return NULL;
-      ph_fs_update_constants(&fs->program, ctx->fs_const_snap,
-                             ctx->fs_const_snap_size);
+      if (!ph_fs_update_constants(&fs->program, ctx->fs_const_snap,
+                                  ctx->fs_const_snap_size)) {
+         /* No variant holds this batch's constants or domains: the batch
+          * is dropped, never drawn with another program. */
+         ctx->comb_refused = true;
+         return NULL;
+      }
    }
    /* A program that only moves a constant (glColor's current colour) has
     * that constant as its colour: put it on the logic op's target grid. */
@@ -10909,6 +11112,19 @@ static void *ph_create_fs(struct pipe_context *p,
                MIN2(ph_screen(p->screen)->texture_units, PH_TEXTURE_UNITS_DRIVEN),
                ramps, &ramp_count, &ramp_reject);
 
+            const unsigned floor_ramps = ramp_count;
+
+            /* Generic varyings beyond the colour interpolators ride on
+             * coordinate units. */
+            if (ramped) {
+               for (unsigned r = 0; r < ramp_count; r++)
+                  ramp_mask |= 1u << ramps[r].unit;
+               ramped = ph_fs_assign_pass_units(compile_nir,
+                  ph_nir_sampler_mask(compile_nir) | ramp_mask,
+                  MIN2(ph_screen(p->screen)->texture_units, PH_TEXTURE_UNITS_DRIVEN),
+                  ramps, &ramp_count, &ramp_reject);
+            }
+            ramp_mask = 0;
             for (unsigned r = 0; r < ramp_count; r++)
                ramp_mask |= 1u << ramps[r].unit;
             if (ramped && ramp_count && fs->unit_remap) {
@@ -10916,16 +11132,16 @@ static void *ph_create_fs(struct pipe_context *p,
                ramp_reject = "a floor ramp next to remapped texture units";
             }
             if (ramped && ramp_count) {
-               bool progress;
+               bool progress = floor_ramps != 0;
 
-               do {
+               while (progress) {
                   progress = false;
                   NIR_PASS(progress, compile_nir, nir_opt_copy_prop);
                   NIR_PASS(progress, compile_nir, nir_opt_algebraic);
                   NIR_PASS(progress, compile_nir, nir_opt_constant_folding);
                   NIR_PASS(progress, compile_nir, nir_opt_cse);
                   NIR_PASS(progress, compile_nir, nir_opt_dce);
-               } while (progress);
+               }
                units = util_bitcount(fs->sampler_mask | ramp_mask);
                budget = P3D_COMB_QUANTUM - (units > 0) - (units > 1);
                fs->sampler_mask |= ramp_mask;
@@ -11088,6 +11304,7 @@ static void ph_bind_fs(struct pipe_context *p, void *s)
       return;
    ph_submit_vertices(ctx);
    ctx->fs = fs;
+   ph_domain_reset(ctx);
    draw_bind_fragment_shader(ctx->draw, fs ? fs->draw : NULL);
 }
 static void ph_delete_fs(struct pipe_context *p, void *s)
@@ -13729,6 +13946,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    draw_wide_line_threshold(ctx->draw, 2048.0f);
 
    ctx->base.destroy = ph_destroy_context;
+   ph_domain_reset(ctx);
    ctx->base.draw_vbo = ph_draw_vbo;
    ctx->base.flush = ph_flush;
    ctx->base.flush_resource = ph_flush_resource;

@@ -35,6 +35,18 @@ struct ph_fs_uexp {
  * buffer scalar, an earlier result or a literal. */
 #define PH_FS_PRE_BASE 0x8000u
 
+/* Driver constants: the domain a scaled varying carrier interpolates,
+ * value = stored * span + lo.  Carrier 0/1 are the colour interpolators,
+ * 2 + u the coordinate of unit u; per channel span then lo. */
+#define PH_FS_DRV_BASE 0xa000u
+#define PH_FS_CARRIERS 6u
+#define PH_FS_DRV_COUNT (PH_FS_CARRIERS * 8u)
+#define PH_FS_DRV_SPAN(carrier, c) ((carrier) * 8u + (c))
+#define PH_FS_DRV_LO(carrier, c) ((carrier) * 8u + 4u + (c))
+/* In NIR the driver constants are constant buffer 1, one vec4 of spans and
+ * one of offsets per carrier. */
+#define PH_FS_DRV_UBO 1u
+
 enum ph_fs_pre_kind { PH_FS_PRE_BUFFER, PH_FS_PRE_RESULT, PH_FS_PRE_LITERAL };
 
 struct ph_fs_pre_src {
@@ -87,6 +99,12 @@ enum ph_fs_ramp_kind {
    PH_FS_RAMP_DIRECTION,
    PH_FS_RAMP_SCALAR,
    PH_FS_RAMP_PLANE,
+   /* A coordinate unit: texture-address opcode 2 (TEXCOORD, mode 3) hands
+    * the staged coordinate to the combiner, channel d = component comp[d],
+    * staged in carrier 2 + unit's domain.  MEASURED on the P690: s, t, r
+    * pass clamped to [0, 1] within one output LSB, perspective-correct with
+    * the 1/w stream; alpha reads 1. */
+   PH_FS_RAMP_PASS,
 };
 
 struct ph_fs_lookup;
@@ -100,7 +118,7 @@ struct ph_fs_ramp {
    const struct ph_fs_lookup *fn;
    uint8_t unit;
    uint8_t location;       /* VARYING_SLOT_* */
-   uint8_t dims;           /* floored components, 1..3 */
+   uint8_t dims;           /* floored or carried components, 1..3 */
    uint8_t comp[3];
    uint16_t size[3];       /* texels per dimension */
    float lo[3], span[3];   /* coordinate domain [lo, lo + span) */
@@ -142,6 +160,10 @@ struct ph_fs_program {
    unsigned budget;
    struct ph_fs_uexp *uexp;
    unsigned uexp_count;
+   /* Carriers the program reads through a domain (scaled_key) and those
+    * it reads at all (carriers); drv[] holds the current domains. */
+   uint8_t scaled_key, carriers;
+   float drv[PH_FS_DRV_COUNT];
    /* Units the program samples as floor ramps. */
    struct ph_fs_ramp ramps[P3D_MAX_TEXTURE_UNITS];
    unsigned ramp_count;
@@ -149,6 +171,13 @@ struct ph_fs_program {
 
 /* The code step of a ramp dimension of @size texels. */
 unsigned ph_fs_ramp_step(unsigned size);
+
+/* Assign the generic varyings the colour interpolators cannot take to
+ * coordinate units outside @used_units, appending them to @ramps; false
+ * with @reject when there are not enough units. */
+bool ph_fs_assign_pass_units(nir_shader *nir, unsigned used_units,
+                             unsigned max_units, struct ph_fs_ramp *ramps,
+                             unsigned *count, const char **reject);
 
 /* Replace floor(varying * k) by ramp samples on units outside @used_units;
  * false with @reject when a floor has no ramp form. */
@@ -164,6 +193,12 @@ bool ph_fs_compile(nir_shader *nir, unsigned max_instructions,
 bool ph_fs_compile_ramps(nir_shader *nir, unsigned max_instructions,
                          const struct ph_fs_ramp *ramps, unsigned ramp_count,
                          struct ph_fs_program *out);
+
+/* The domain carrier @carrier currently interpolates: the stored value is
+ * (x - lo) / span.  A program reading it through the identity domain is
+ * recompiled to scale on the next ph_fs_update_constants(). */
+void ph_fs_set_domain(struct ph_fs_program *program, unsigned carrier,
+                      const float lo[4], const float span[4]);
 
 /* Free what ph_fs_compile allocated for @program. */
 void ph_fs_program_fini(struct ph_fs_program *program);

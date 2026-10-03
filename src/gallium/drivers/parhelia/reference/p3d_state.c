@@ -1136,7 +1136,9 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			rw[0].reg = P3D_R_TEX_ENABLE + 4 * u;
 			rw[0].val = 0x00040100u | pipes;
 			if (st->single_texture_pipe && u == 0)
-				rw[0].val = lx && nunit == 1 ? 0x00040105u :
+				/* A TEXCOORD unit is not ganged: both pipes would
+				 * pass the coordinate and the merge would add them. */
+				rw[0].val = lx && nunit == 1 && !tu->ta_op ? 0x00040105u :
 					    0x00040101u;
 			else if (st->single_texture_pipe && u == 1)
 				/* SUN90/P690 allocates units 0/1 to pipes 0/2. */
@@ -1230,7 +1232,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 		 * is pipes 0+2, merged with ADD t0, t0, t2; each pipe returns
 		 * zero for the fragments it does not own. */
 		rw[0].reg = P3D_R_COMB_RGB;
-		rw[0].val = lx && nunit == 1 ? 0x00008000u : 0x00004000u;
+		rw[0].val = lx && nunit == 1 && !t->ta_op ? 0x00008000u :
+							    0x00004000u;
 		rw[1].reg = P3D_R_COMB_ALPHA; rw[1].val = rw[0].val;
 		rw[2].reg = 0x126c;           rw[2].val = 0x00000c00u;
 		rw[3].reg = 0x1268;           rw[3].val = 0x00000c00u;
