@@ -3712,8 +3712,11 @@ ph_fs_coordinate_only(nir_def *def, unsigned depth)
       if (user->type == nir_instr_type_tex) {
          const nir_tex_instr *tex = nir_instr_as_tex(user);
          const int c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+         const int q = nir_tex_instr_src_index(tex, nir_tex_src_projector);
 
-         if (c < 0 || &tex->src[c].src != src)
+         /* the projector q is part of the coordinate set */
+         if ((c < 0 || &tex->src[c].src != src) &&
+             (q < 0 || &tex->src[q].src != src))
             return false;
          continue;
       }
@@ -3724,9 +3727,6 @@ ph_fs_coordinate_only(nir_def *def, unsigned depth)
    return true;
 }
 
-/* Generic varyings the program reads as values, assigned to the colour
- * interpolators it does not read itself: v0 first, then v1.  Texture
- * coordinate varyings only feed the texture units and are not routed. */
 /* A varying the combiner reads as a value through a colour interpolator or
  * a coordinate unit: generics, the point coordinate, and texture
  * coordinates read as values (ARB_fragment_program's fragment.texcoord). */
