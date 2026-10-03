@@ -46,8 +46,8 @@ ph_fs_lookup_size(unsigned kind)
 
    if (!size[0]) {
       size[0] = ph_fs_lookup_env_size("PARHELIA_LOOKUP_CUBE", 128, 256);
-      size[1] = ph_fs_lookup_env_size("PARHELIA_LOOKUP_LINE", 1024, 2048);
-      size[2] = ph_fs_lookup_env_size("PARHELIA_LOOKUP_PLANE", 128, 512);
+      size[1] = ph_fs_lookup_env_size("PARHELIA_LOOKUP_LINE", 2048, 2048);
+      size[2] = ph_fs_lookup_env_size("PARHELIA_LOOKUP_PLANE", 256, 512);
    }
    return kind == PH_FS_RAMP_DIRECTION ? size[0] :
           kind == PH_FS_RAMP_SCALAR ? size[1] : size[2];
@@ -808,14 +808,19 @@ ph_fs_lookup_fill(const struct ph_fs_lookup *fn, const struct ph_fs_ramp *r,
    static const unsigned byte_of[4] = { 2, 1, 0, 3 };   /* B8G8R8A8 */
    const unsigned w = r->size[0], h = r->size[1];
    const unsigned faces = fn->kind == PH_FS_RAMP_DIRECTION ? 6 : 1;
+   const size_t count = (size_t)faces * w * h;
    struct ph_fs_lookup_eval e;
+   float *value = malloc(count * 4 * sizeof(*value));
 
-   if (!ph_fs_lookup_begin(&e, fn, constants, size))
+   if (!value)
       return false;
+   if (!ph_fs_lookup_begin(&e, fn, constants, size)) {
+      free(value);
+      return false;
+   }
    for (unsigned face = 0; face < faces; face++)
       for (unsigned y = 0; y < h; y++)
          for (unsigned x = 0; x < w; x++) {
-            uint8_t *texel = texels + 4 * ((face * h + y) * w + x);
             float d[3], len;
 
             if (fn->kind == PH_FS_RAMP_DIRECTION) {
@@ -825,24 +830,98 @@ ph_fs_lookup_fill(const struct ph_fs_lookup *fn, const struct ph_fs_ramp *r,
                for (unsigned c = 0; c < 3; c++)
                   d[c] /= len;
             } else {
-               /* texel centres span the domain end to end */
-               d[0] = r->lo[0] + r->span[0] * (w > 1 ? (float)x / (w - 1) : 0.0f);
-               d[1] = r->lo[1] + r->span[1] * (h > 1 ? (float)y / (h - 1) : 0.0f);
+               /* texel centres at the cell centres of the domain: the
+                * domain's ends are often where a function jumps (x = -1
+                * of atan(y, x)), and no fragment samples them exactly */
+               d[0] = r->lo[0] + r->span[0] * (x + 0.5f) / w;
+               d[1] = r->lo[1] + r->span[1] * (y + 0.5f) / h;
             }
             memset(e.out, 0, sizeof(e.out));
             if (!ph_fs_lookup_run(&e, d, true)) {
                free(e.val);
+               free(value);
                return false;
             }
-            for (unsigned c = 0; c < 4; c++)
-               texel[byte_of[c]] = ph_fs_lookup_unorm8(e.out[c]);
+            memcpy(&value[4 * ((face * h + y) * w + x)], e.out, sizeof(e.out));
          }
+   /* A table must represent its function: between texel centres, the
+    * function has to stay close to what the unit interpolates.  A colour
+    * that changes faster than the texels (fract(x * y) over the window)
+    * is refused, not sampled wrong; isolated jumps (atan's branch cut, a
+    * comparison) pass. */
+   if (fn->kind != PH_FS_RAMP_DIRECTION) {
+      const unsigned stride = h > 1 ? 3 : 1;
+      unsigned checked = 0, bad = 0;
+
+      for (unsigned y = 0; y + (h > 1) < h; y += stride)
+         for (unsigned x = 0; x + 1 < w; x += stride) {
+            const float *v00 = &value[4 * (y * w + x)];
+            const float *v10 = v00 + 4;
+            const float *v01 = h > 1 ? v00 + 4 * w : v00;
+            const float *v11 = h > 1 ? v01 + 4 : v10;
+            float d[2];
+            bool wrong = false;
+
+            d[0] = r->lo[0] + r->span[0] * (x + 1.0f) / w;
+            d[1] = r->lo[1] + r->span[1] * (h > 1 ? y + 1.0f : 0.5f) / h;
+            memset(e.out, 0, sizeof(e.out));
+            if (!ph_fs_lookup_run(&e, d, true))
+               continue;
+            for (unsigned c = 0; c < 4; c++) {
+               const float lerp = h > 1 ?
+                  0.25f * (CLAMP(v00[c], 0, 1) + CLAMP(v10[c], 0, 1) +
+                           CLAMP(v01[c], 0, 1) + CLAMP(v11[c], 0, 1)) :
+                  0.5f * (CLAMP(v00[c], 0, 1) + CLAMP(v10[c], 0, 1));
+
+               if (isnan(e.out[c]) || isnan(lerp))
+                  continue;
+               wrong |= fabsf(CLAMP(e.out[c], 0, 1) - lerp) > 4.0f / 255.0f;
+            }
+            checked++;
+            bad += wrong;
+         }
+      if (bad * 50 > checked) {
+         free(e.val);
+         free(value);
+         return false;
+      }
+   }
    free(e.val);
+   /* An undefined result (NaN: asin beyond 1 between the last fragment and
+    * the vertex) takes its nearest defined neighbour along x, then y, so a
+    * texel no fragment needs does not bleed into those that do. */
+   for (unsigned pass = 0; pass < 2 && fn->kind != PH_FS_RAMP_DIRECTION; pass++) {
+      const unsigned lines = pass ? w : h, len = pass ? h : w;
+      const size_t step = pass ? 4 * w : 4, line_step = pass ? 4 : 4 * w;
+
+      for (unsigned l = 0; l < lines; l++)
+         for (unsigned c = 0; c < 4; c++) {
+            float *v = value + l * line_step + c;
+            int last = -1;
+
+            for (unsigned i = 0; i < len; i++) {
+               if (isnan(v[i * step]))
+                  continue;
+               /* fill the gap before i from both ends */
+               for (int j = last + 1; j < (int)i; j++)
+                  v[j * step] = last >= 0 && j - last < (int)i - j ?
+                                v[last * step] : v[i * step];
+               last = i;
+            }
+            for (unsigned j = last + 1; last >= 0 && j < len; j++)
+               v[j * step] = v[last * step];
+         }
+   }
+   for (size_t i = 0; i < count; i++)
+      for (unsigned c = 0; c < 4; c++)
+         texels[4 * i + byte_of[c]] = ph_fs_lookup_unorm8(value[4 * i + c]);
+   free(value);
    return true;
 }
 
 void
-ph_fs_lookup_stage(const struct ph_fs_ramp *r, const float *src, float c[4])
+ph_fs_lookup_stage(const struct ph_fs_ramp *r, const float *lo,
+                   const float *span, const float *src, float c[4])
 {
    c[0] = c[1] = c[2] = 0.5f;
    c[3] = 1.0f;
@@ -851,8 +930,6 @@ ph_fs_lookup_stage(const struct ph_fs_ramp *r, const float *src, float c[4])
          c[i] = src[r->comp[i]];
       return;
    }
-   /* the domain's ends on the first and last texel centre */
    for (unsigned d = 0; d < r->dims; d++)
-      c[d] = (0.5f + (src[r->comp[d]] - r->lo[d]) / r->span[d] *
-                     (r->size[d] - 1)) / r->size[d];
+      c[d] = (src[r->comp[d]] - lo[d]) / span[d];
 }

@@ -55,7 +55,9 @@ bool ph_fs_saturate_colour(nir_shader *nir);
 
 /* Fill the B8G8R8A8 texels of @fn's texture of @r's size and domain for
  * the fragment constants @constants (@size bytes): a cube map is six faces
- * in GL face order.  False when the program reads constants beyond @size. */
+ * in GL face order.  False when the program reads constants beyond @size
+ * or a one- or two-component table cannot represent the colour (it changes
+ * faster than the texels over that domain). */
 bool ph_fs_lookup_fill(const struct ph_fs_lookup *fn,
                        const struct ph_fs_ramp *r,
                        const void *constants, unsigned size, uint8_t *texels);
@@ -70,8 +72,10 @@ bool ph_fs_lookup_key(const struct ph_fs_lookup *fn, const void *constants,
 bool ph_fs_lookup_eval(const struct ph_fs_lookup *fn, const float *v,
                        const void *constants, unsigned size, float out[4]);
 
-/* The coordinate the unit of @r reads, from the varying's vertex value. */
-void ph_fs_lookup_stage(const struct ph_fs_ramp *r, const float *src,
-                        float c[4]);
+/* The coordinate the unit of @r reads, from the varying's vertex value,
+ * for the batch's domain [@lo, @lo + @span) of a one- or two-component
+ * table. */
+void ph_fs_lookup_stage(const struct ph_fs_ramp *r, const float *lo,
+                        const float *span, const float *src, float c[4]);
 
 #endif

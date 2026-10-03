@@ -8286,6 +8286,9 @@ ph_pass_unit_state(const struct ph_context *ctx, unsigned unit,
       }
 }
 
+static struct pipe_sampler_view *
+ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *ramp);
+
 static void
 ph_domain_reset(struct ph_context *ctx)
 {
@@ -8386,10 +8389,32 @@ ph_quant_domains(struct ph_quant_stage *q, const struct prim_header *prim,
    for (unsigned r = 0; r < q->route_count; r++)
       ph_quant_domain(q, prim, n, q->route_slot[r], q->route_carrier[r],
                       identity, 4);
-   for (unsigned i = 0; i < q->ramp_count; i++)
-      if (q->ramp[i].kind == PH_FS_RAMP_PASS)
-         ph_quant_domain(q, prim, n, q->ramp_src[i], 2 + q->ramp[i].unit,
-                         q->ramp[i].comp, q->ramp[i].dims);
+   for (unsigned i = 0; i < q->ramp_count; i++) {
+      const struct ph_fs_ramp *r = &q->ramp[i];
+      const unsigned k = 2 + r->unit;
+      float lo[3], span[3];
+
+      if (r->kind == PH_FS_RAMP_PASS)
+         ph_quant_domain(q, prim, n, q->ramp_src[i], k, r->comp, r->dims);
+      if (r->kind != PH_FS_RAMP_SCALAR && r->kind != PH_FS_RAMP_PLANE)
+         continue;
+      memcpy(lo, q->ctx->dom_lo[k], sizeof(lo));
+      memcpy(span, q->ctx->dom_span[k], sizeof(span));
+      ph_quant_domain(q, prim, n, q->ramp_src[i], k, r->comp, r->dims);
+      /* A new domain needs the table over it (the old batch is submitted). */
+      if (memcmp(lo, q->ctx->dom_lo[k], sizeof(lo)) ||
+          memcmp(span, q->ctx->dom_span[k], sizeof(span))) {
+         struct pipe_sampler_view *view = ph_lookup_view(q->ctx, r);
+
+         if (!view) {
+            ph_warn_once("no lookup table represents the colour over the "
+                         "batch's varying range; the primitive is dropped\n");
+            return false;
+         }
+         q->ctx->base.set_sampler_views(&q->ctx->base, MESA_SHADER_FRAGMENT,
+                                        r->unit, 1, 0, &view);
+      }
+   }
    return true;
 }
 
@@ -8439,7 +8464,8 @@ ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
       float *c = out->data[q->ramp_slot[i]];
 
       if (r->kind != PH_FS_RAMP_FLOOR && r->kind != PH_FS_RAMP_PASS) {
-         ph_fs_lookup_stage(r, src, c);
+         ph_fs_lookup_stage(r, q->ctx->dom_lo[2 + r->unit],
+                            q->ctx->dom_span[2 + r->unit], src, c);
          continue;
       }
       c[0] = c[1] = c[2] = 0.5f;
@@ -9668,16 +9694,19 @@ ph_lookup_forget(struct ph_context *ctx, uint32_t uid)
  * Tables stay cached, least recently used first out, within a memory
  * budget (PARHELIA_LOOKUP_CACHE_MB, default 16). */
 static struct pipe_sampler_view *
-ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
+ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *ramp)
 {
-   const unsigned n = r->size[0];
-   const size_t bytes = (size_t)n * n * 6 * 4;
+   const bool cube = ramp->kind == PH_FS_RAMP_DIRECTION;
+   const unsigned n = ramp->size[0], h = cube ? n : ramp->size[1];
+   const size_t bytes = (size_t)n * h * (cube ? 6 : 1) * 4;
    struct pipe_resource templ = {
-      .target = PIPE_TEXTURE_CUBE,
+      .target = cube ? PIPE_TEXTURE_CUBE : PIPE_TEXTURE_2D,
       .format = PIPE_FORMAT_B8G8R8A8_UNORM,
-      .width0 = n, .height0 = n, .depth0 = 1, .array_size = 6,
+      .width0 = n, .height0 = h, .depth0 = 1, .array_size = cube ? 6 : 1,
       .bind = PIPE_BIND_SAMPLER_VIEW,
    };
+   struct ph_fs_ramp dom = *ramp;
+   const struct ph_fs_ramp *r = &dom;
    static size_t budget;
    struct ph_lookup_tex *t;
    struct pipe_sampler_view vt;
@@ -9695,6 +9724,22 @@ ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
    if (!ph_fs_lookup_key(r->fn, ctx->fs_const_snap, ctx->fs_const_snap_size,
                          &key, &key_count))
       return NULL;
+   /* A table over the varying's range is built for the batch's domain. */
+   if (!cube) {
+      uint32_t *grown = realloc(key, (key_count + 2 * r->dims) * sizeof(*key));
+
+      if (!grown) {
+         free(key);
+         return NULL;
+      }
+      key = grown;
+      for (unsigned d = 0; d < r->dims; d++) {
+         dom.lo[d] = ctx->dom_lo[2 + r->unit][d];
+         dom.span[d] = ctx->dom_span[2 + r->unit][d];
+         memcpy(&key[key_count++], &dom.lo[d], 4);
+         memcpy(&key[key_count++], &dom.span[d], 4);
+      }
+   }
    ctx->lookup_clock++;
    for (unsigned i = 0; i < ctx->lookup_tex_count; i++) {
       t = &ctx->lookup_tex[i];
@@ -9742,16 +9787,17 @@ ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *r)
       }
       if (ph_env("PARHELIA_TRACE"))
          fprintf(stderr, "parhelia: lookup %u filled %ux%u in %.1f ms "
-                 "(%u cached)\n", r->fn->uid, n, n,
-                 (os_time_get_nano() - t0) / 1e6, ctx->lookup_tex_count);
+                 "(%u cached), domain [%g, +%g] [%g, +%g]\n", r->fn->uid, n, h,
+                 (os_time_get_nano() - t0) / 1e6, ctx->lookup_tex_count,
+                 r->lo[0], r->span[0], r->lo[1], r->span[1]);
    }
    t = &ctx->lookup_tex[ctx->lookup_tex_count];
    memset(t, 0, sizeof(*t));
    t->tex = ctx->base.screen->resource_create(ctx->base.screen, &templ);
    if (t->tex) {
-      u_box_3d(0, 0, 0, n, n, 6, &box);
+      u_box_3d(0, 0, 0, n, h, cube ? 6 : 1, &box);
       ctx->base.texture_subdata(&ctx->base, t->tex, 0, PIPE_MAP_WRITE, &box,
-                                data, n * 4, n * n * 4);
+                                data, n * 4, n * h * 4);
       u_sampler_view_default_template(&vt, t->tex, t->tex->format);
       t->view = ctx->base.create_sampler_view(&ctx->base, t->tex, &vt);
    }
@@ -11104,6 +11150,7 @@ static void *ph_create_fs(struct pipe_context *p,
                budget = P3D_COMB_QUANTUM - (units > 0) - (units > 1);
             }
             /* floor() of a varying samples a ramp texture on a free unit. */
+            const uint32_t unramped_mask = fs->sampler_mask;
             struct ph_fs_ramp ramps[P3D_MAX_TEXTURE_UNITS];
             const char *ramp_reject = NULL;
             unsigned ramp_count = 0, ramp_mask = 0;
@@ -11157,7 +11204,7 @@ static void *ph_create_fs(struct pipe_context *p,
             }
             /* The colour targets are fixed-point: a program refused for a
              * value beyond the combiner's range may fit saturated. */
-            if (!fs->program.valid && ramped && !ramp_count) {
+            if (!fs->program.valid && ramped) {
                nir_shader *sat = nir_shader_clone(NULL, compile_nir);
                struct ph_fs_program sat_prog;
                bool progress;
@@ -11171,7 +11218,8 @@ static void *ph_create_fs(struct pipe_context *p,
                      NIR_PASS(progress, sat, nir_opt_cse);
                      NIR_PASS(progress, sat, nir_opt_dce);
                   } while (progress);
-                  if (ph_fs_compile(sat, budget, &sat_prog)) {
+                  if (ph_fs_compile_ramps(sat, budget, ramps, ramp_count,
+                                          &sat_prog)) {
                      if (sat_prog.sampler_mask & ~fs->sampler_mask) {
                         ph_fs_program_fini(&sat_prog);
                      } else {
@@ -11184,8 +11232,9 @@ static void *ph_create_fs(struct pipe_context *p,
                ralloc_free(sat);
             }
             /* A colour beyond the combiner that is a function of one varying
-             * samples a lookup texture of the program on unit 0. */
-            if (!fs->program.valid && ramped && !ramp_count &&
+             * samples a lookup texture of the program on unit 0, which
+             * replaces the varying's coordinate units. */
+            if (!fs->program.valid && ramped && !floor_ramps &&
                 !fs->unit_remap && !compile_nir->info.fs.uses_discard) {
                struct ph_fs_program lookup_prog;
                struct ph_fs_ramp lookup_ramp;
@@ -11195,12 +11244,14 @@ static void *ph_create_fs(struct pipe_context *p,
                       ph_nir_sampler_mask(compile_nir),
                       MIN2(ph_screen(p->screen)->texture_units,
                            PH_TEXTURE_UNITS_DRIVEN),
-                      1u << PH_FS_RAMP_DIRECTION, &lookup_ramp, &fs->lookup, &lookup_reject)) {
+                      (1u << PH_FS_RAMP_DIRECTION) | (1u << PH_FS_RAMP_SCALAR) |
+                      (1u << PH_FS_RAMP_PLANE), &lookup_ramp, &fs->lookup,
+                      &lookup_reject)) {
                   if (ph_fs_compile_ramps(compile_nir, P3D_COMB_QUANTUM - 1,
                                           &lookup_ramp, 1, &lookup_prog)) {
                      ph_fs_program_fini(&fs->program);
                      fs->program = lookup_prog;
-                     fs->sampler_mask |= 1u;
+                     fs->sampler_mask = unramped_mask | 1u;
                      fs->uses_texture = true;
                   } else {
                      ph_fs_lookup_free(fs->lookup);
