@@ -8960,10 +8960,10 @@ ph_fs_split_taps(struct ph_fs *fs, nir_shader *orig, nir_shader *copy,
       }
       b[i]->sampler_index = b[i]->texture_index = moved_to[i];
    }
-   /* A unit whose own lookup is at an expression rather than a varying
-    * (the centre tap at an offset) stages that coordinate too. */
-   for (unsigned t = 0, n = fs->tap_count; t < n; t++) {
-      const unsigned s = fs->taps[t].gl_unit;
+   /* A unit whose own lookup is at an expression rather than a varying's
+    * leading components (the centre tap at an offset, a packed varying's
+    * .yz) stages that coordinate too. */
+   for (unsigned s = 0; s < P3D_MAX_TEXTURE_UNITS; s++) {
       bool staged = false, varying;
 
       for (unsigned k = 0; k < fs->tap_count; k++)
@@ -8971,7 +8971,9 @@ ph_fs_split_taps(struct ph_fs *fs, nir_shader *orig, nir_shader *copy,
       if (staged || first[s] < 0 || !coord_of[first[s]] ||
           ph_nir_coord_location(coord_of[first[s]]) >= 0 ||
           a[first[s]]->num_srcs != 1 ||
-          !ph_nir_affine_in_varyings(coord_of[first[s]], &varying, 0))
+          a[first[s]]->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+          !ph_nir_affine_in_varyings(coord_of[first[s]], &varying, 0) ||
+          !varying)
          continue;
       fs->taps[fs->tap_count++] = (struct ph_tap){ s, s, coord_of[first[s]] };
    }
@@ -9026,32 +9028,52 @@ ph_fs_find_uniform_coords(struct ph_fs *fs, nir_shader *nir)
 static int
 ph_nir_coord_location(nir_def *def)
 {
+   /* comp[i]: the component of @def that coordinate component i reads */
+   unsigned comp[NIR_MAX_VEC_COMPONENTS];
+   const unsigned n = MIN2(def->num_components, 4);
+
+   for (unsigned i = 0; i < n; i++)
+      comp[i] = i;
    for (unsigned hop = 0; hop < 8; hop++) {
       nir_instr *instr = nir_def_instr(def);
 
       if (instr->type == nir_instr_type_intrinsic) {
          nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         unsigned first;
+         int location;
 
          switch (in->intrinsic) {
          case nir_intrinsic_load_interpolated_input:
          case nir_intrinsic_load_input:
-            return nir_intrinsic_io_semantics(in).location;
+            location = nir_intrinsic_io_semantics(in).location;
+            first = nir_intrinsic_component(in);
+            break;
          case nir_intrinsic_load_deref: {
             nir_variable *var =
                nir_deref_instr_get_variable(nir_src_as_deref(in->src[0]));
 
-            return var && var->data.mode == nir_var_shader_in ?
-                   (int)var->data.location : -1;
+            if (!var || var->data.mode != nir_var_shader_in)
+               return -1;
+            location = var->data.location;
+            first = var->data.location_frac;
+            break;
          }
          default:
             return -1;
          }
+         /* The unit reads the set's components in order from .x. */
+         for (unsigned i = 0; i < n; i++)
+            if (first + comp[i] != i)
+               return -1;
+         return location;
       }
       if (instr->type != nir_instr_type_alu)
          return -1;
       nir_alu_instr *alu = nir_instr_as_alu(instr);
 
       if (alu->op == nir_op_mov) {
+         for (unsigned i = 0; i < n; i++)
+            comp[i] = alu->src[0].swizzle[comp[i]];
          def = alu->src[0].src.ssa;
          continue;
       }
@@ -9060,6 +9082,8 @@ ph_nir_coord_location(nir_def *def)
       for (unsigned i = 1; i < nir_op_infos[alu->op].num_inputs; i++)
          if (alu->src[i].src.ssa != alu->src[0].src.ssa)
             return -1;
+      for (unsigned i = 0; i < n; i++)
+         comp[i] = alu->src[comp[i]].swizzle[0];
       def = alu->src[0].src.ssa;
    }
    return -1;
