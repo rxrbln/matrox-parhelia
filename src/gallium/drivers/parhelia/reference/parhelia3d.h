@@ -726,7 +726,7 @@ struct p3d_state {
 	/* A second colour attribute (kind 6, WARP input v6).  The combiner
 	 * reads it as v1, which is where a lowered GL fog expression expects
 	 * its fog coordinate; it costs three more dwords per vertex. */
-	int		   vertex_colour1;
+	int		   vertex_colour1;	/* 1 present, |2 v1 alpha, |4 v0 alpha */
 	unsigned	   point_class;
 	unsigned	   point_nibble;
 	uint32_t	   point_rastermode;

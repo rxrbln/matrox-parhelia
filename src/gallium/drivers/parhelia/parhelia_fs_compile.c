@@ -111,7 +111,8 @@ struct ph_fs_ctx {
    int tex_end[4][2];
    bool tex_end_cross[4][2];
    unsigned sampler_mask;
-   bool uses_color, uses_color1, uses_fogc, uses_col1;
+   bool uses_color, uses_color1, uses_fogc, uses_col1, uses_color1_alpha;
+   bool uses_color0_alpha;
    int route[2];           /* generic varying slot carried in v0/v1, or -1 */
    /* The fog factor read as v1.x: its root and its per-vertex expression. */
    nir_def *fog_root;
@@ -1191,7 +1192,7 @@ ph_fs_preshade(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
 }
 
 static bool
-ph_fs_varying(struct ph_fs_ctx *ctx, unsigned location, int sel,
+ph_fs_varying(struct ph_fs_ctx *ctx, unsigned location, int lane, int sel,
               struct ph_fs_src *out)
 {
    if (location == VARYING_SLOT_COL0) {
@@ -1216,6 +1217,13 @@ ph_fs_varying(struct ph_fs_ctx *ctx, unsigned location, int sel,
    out->kind = PH_SRC_COLOUR;
    out->channel = sel;
    ctx->uses_color = true;
+   /* An alpha read needs that colour's four-component carrier. */
+   if (sel == 3 || (sel < 0 && lane != PH_LANE_RGB)) {
+      if (out->index == 1)
+         ctx->uses_color1_alpha = true;
+      else
+         ctx->uses_color0_alpha = true;
+   }
    return true;
 }
 
@@ -1230,12 +1238,12 @@ ph_fs_intrinsic(struct ph_fs_ctx *ctx, const nir_intrinsic_instr *load,
       if (!deref || deref->deref_type != nir_deref_type_var ||
           !(deref->var->data.mode & nir_var_shader_in))
          return ph_fs_fail(ctx, "a dereference that is no input variable");
-      return ph_fs_varying(ctx, deref->var->data.location, sel, out);
+      return ph_fs_varying(ctx, deref->var->data.location, lane, sel, out);
    }
    case nir_intrinsic_load_input:
    case nir_intrinsic_load_interpolated_input:
       return ph_fs_varying(ctx, nir_intrinsic_io_semantics(load).location,
-                           sel, out);
+                           lane, sel, out);
    case nir_intrinsic_load_ubo_vec4:
       /* The starting channel is the intrinsic's component index. */
       if (!nir_src_is_const(load->src[0]) || nir_src_as_uint(load->src[0]) ||
@@ -2598,6 +2606,8 @@ ph_fs_compile(nir_shader *nir, unsigned max_instructions,
    out->uses_color = ctx.uses_color;
    out->uses_color1 = ctx.uses_color1;
    out->uses_fogc = ctx.uses_fogc || ctx.fog_root;
+   out->uses_color1_alpha = ctx.uses_color1_alpha;
+   out->uses_color0_alpha = ctx.uses_color0_alpha;
    out->route[0] = ctx.route[0];
    out->route[1] = ctx.route[1];
    if (ctx.fog_root) {

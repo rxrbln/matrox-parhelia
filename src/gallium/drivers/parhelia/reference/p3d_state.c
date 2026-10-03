@@ -368,6 +368,29 @@ p3d_descriptors_add_q(struct p3d_rw *desc, size_t n)
 /* The attribute descriptors, by vertex layout.  Bit fields: [2:0] stream,
  * [11:4] dword offset, [19:16] attribute KIND, [25:22] component mask,
  * [31] last.  Every capture terminates the burst with a zero descriptor. */
+/* The untextured two-colour stream: colour at dword @first (kind 5), then
+ * the second colour (kind 6).  @flags bit 0 = present, bit 1 = the second
+ * colour carries alpha, bit 2 = the first does.  The component mask sits in
+ * [25:22] (7 = RGB, 0xf = RGBA, the encoding the measured kind-5 words
+ * 0x21c5/0x23c5 use) and the dword offset in [11:4]; flags 1 reproduces the
+ * measured 0x21c50020/0xa1c60050 and 0x21c50030/0xa1c60060 exactly. */
+static size_t
+p3d_colour1_descriptors(struct p3d_rw *out, size_t n, unsigned first,
+			int flags)
+{
+	const unsigned c0 = flags & 4 ? 4u : 3u;
+
+	out[n].reg = P3D_R_DESC;
+	out[n].val = 0x20000000u | ((flags & 4 ? 0xfu : 7u) << 22) |
+		     (5u << 16) | (first << 4);
+	n++;
+	out[n].reg = P3D_R_DESC;
+	out[n].val = 0xa0000000u | ((flags & 2 ? 0xfu : 7u) << 22) |
+		     (6u << 16) | ((first + c0) << 4);
+	n++;
+	return n;
+}
+
 static size_t
 p3d_descriptors(struct p3d_rw *out, int textured, int with_z,
 		uint32_t pos_override, uint32_t col_override, int no_colour,
@@ -456,8 +479,7 @@ p3d_descriptors(struct p3d_rw *out, int textured, int with_z,
 				n++;
 			}
 		} else if (vertex_colour1) {
-			out[n].reg = P3D_R_DESC; out[n].val = 0x21c50030u; n++;
-			out[n].reg = P3D_R_DESC; out[n].val = 0xa1c60060u; n++;
+			n = p3d_colour1_descriptors(out, n, 3, vertex_colour1);
 		} else {
 			out[n].reg = P3D_R_DESC;
 			out[n].val = vertex_alpha ? 0xa3c50030u : 0xa1c50030u;
@@ -490,8 +512,7 @@ p3d_descriptors(struct p3d_rw *out, int textured, int with_z,
 		 * fixed-function numbering gives WARP input v6, three dwords
 		 * after the first colour.  It is what carries the fog
 		 * coordinate to the combiner's v1. */
-		out[n].reg = P3D_R_DESC; out[n].val = 0x21c50020u; n++;
-		out[n].reg = P3D_R_DESC; out[n].val = 0xa1c60050u; n++;
+		n = p3d_colour1_descriptors(out, n, 2, vertex_colour1);
 	} else {
 		out[n].reg = P3D_R_DESC; out[n].val = 0xa1c50020u; n++;
 	}
@@ -1343,7 +1364,7 @@ p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 			     st->tex && st->tex->env == P3D_TEXENV_REPLACE,
 			     p3d_state_units(st),
 			     !!st->vertex_alpha, !!st->texcoord3,
-			     !!st->vertex_colour1);
+			     st->vertex_colour1);
 	if (st->oow)
 		p3d_descriptors_add_w(desc, nd);
 	if (st->texcoord_q)

@@ -399,7 +399,7 @@ struct ph_context {
     * primitive class 3 (parhelia-point-size-re.md section 12).  The radius is
     * constant c0.x, so a batch holds points of one size and @point_radius is
     * the size the staged points carry. */
-   bool colour1;		/* the staged stream carries a second colour */
+   uint8_t colour1;	/* second colour in the stream: p3d vertex_colour1 flags */
    bool oow;		/* the staged stream carries 1/w after z */
    bool proj;		/* set 0 carries s,t,r,q for the projective mode */
    bool colour_alpha;	/* the staged colour carries alpha: RGBA, not RGB */
@@ -4586,8 +4586,9 @@ ph_submit_vertices(struct ph_context *ctx)
 	 * attribute and bind the program that forwards it to output 2, so the
 	 * combiner sees it as v1. */
 	if (ctx->colour1 && !texture && ctx->warp_colour1) {
-		state.vertex_colour1 = 1;
-		state.dw_per_vertex += 3;
+		state.vertex_colour1 = ctx->colour1;
+		state.dw_per_vertex += 3 + !!(ctx->colour1 & 2) +
+				      !!(ctx->colour1 & 4);
 		state.warp_entry = ctx->warp_colour1;
 	}
 	/* ph_stage_tri selected the exact one-texture MODULATE source-alpha
@@ -4968,7 +4969,7 @@ out:
 	/* The second colour describes the stream that was just submitted; a
 	 * later draw that stages five dwords while this still says eight
 	 * declares an attribute the stream does not carry. */
-	ctx->colour1 = false;
+	ctx->colour1 = 0;
 	ctx->proj = false;
 	ctx->vertex_alpha = false;
 	ctx->stencil_back = false;
@@ -5421,7 +5422,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	unsigned dpv;
 	bool oow = false;
 	bool proj = false;
-	bool colour1;
+	unsigned colour1;
 	bool colour_alpha;
    float *dst;
    const int fogc = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_FOG, 0);
@@ -5593,15 +5594,21 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	   }
 	   colour1 = ph_colour1_program(ctx);
 	}
+	/* An alpha the program reads widens that colour set to four
+	 * components. */
+	if (colour1) {
+	   colour1 = 1 | (ctx->fs->program.uses_color1_alpha &&
+	                  !ctx->fs->program.uses_fogc ? 2 : 0) |
+	             (ctx->fs->program.uses_color0_alpha ? 4 : 0);
+	   dpv += 3 + !!(colour1 & 2) + !!(colour1 & 4);
+	}
 	if (ph_env("PARHELIA_TRACE_FOG"))
 	   fprintf(stderr,
-	           "parhelia: fog carrier want=%u fs=%p valid=%u uses_v1=%u fogc=%d textured=%u entry=%#x\n",
+	           "parhelia: fog carrier want=%#x fs=%p valid=%u uses_v1=%u fogc=%d textured=%u entry=%#x\n",
 	           colour1, (void *)ctx->fs,
 	           ctx->fs ? ctx->fs->program.valid : 0,
 	           ctx->fs ? ctx->fs->program.uses_color1 : 0, fogc, textured,
 	           ctx->warp_colour1);
-	if (colour1)
-	   dpv += 3;
 	/* An untextured colour with a visible alpha takes the measured
 	 * x,y,z,r,g,b,a stream; z rides along without a depth surface. */
 	colour_alpha = !textured && !vertex_alpha && !colour1 &&
@@ -5789,7 +5796,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 		*dst++ = c[0];
 		*dst++ = c[1];
 		*dst++ = c[2];
-		if (vertex_alpha || colour_alpha)
+		if (vertex_alpha || colour_alpha || (colour1 & 4))
 			*dst++ = c[3];
       if (colour1 && ctx->fs->program.uses_fogc) {
          /* The fog coordinate, broadcast: the combiner reads v1 as a colour
@@ -5808,6 +5815,8 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
          *dst++ = s[0];
          *dst++ = s[1];
          *dst++ = s[2];
+         if (colour1 & 2)
+            *dst++ = s[3];
       }
       if (textured) {
          const float *tc = prim->v[v]->data[texcoord];

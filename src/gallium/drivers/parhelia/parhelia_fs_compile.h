@@ -81,6 +81,8 @@ struct ph_fs_program {
    bool uses_color;
    bool uses_color1;       /* v1: the secondary colour or the fog coordinate */
    bool uses_fogc;         /* v1 is the fog coordinate */
+   bool uses_color1_alpha; /* the program reads v1's alpha */
+   bool uses_color0_alpha; /* the program reads v0's alpha */
    /* A generic varying the program reads as a value rides in a colour
     * interpolator the shader leaves free: route[k] is its varying slot for
     * v0/v1, or -1. */
