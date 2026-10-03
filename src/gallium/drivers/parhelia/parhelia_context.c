@@ -6278,7 +6278,11 @@ ph_expand_line(struct draw_stage *stage, struct prim_header *prim,
    } else {
       const float h = 0.5f * CLAMP(roundf(width), 1.0f, 2048.0f);
       const bool half = rast && rast->half_pixel_center;
-      const float bias = half ? 0.125f : 0.0f;
+      /* The original family's native lines follow GL's diamond rule
+       * (MEASURED): slide the ends along the line, not the whole line. */
+      const bool exact = ph_original_family(
+         ph_screen(((struct ph_stage *)stage)->ctx->base.screen)->chip_id);
+      const float bias = half && !exact ? 0.125f : 0.0f;
 
       if (fabsf(dx) > fabsf(dy)) {
          const float shift = !half ? 0.0f : dx > 0.0f ? -0.5f : 0.5f;
@@ -6286,14 +6290,14 @@ ph_expand_line(struct draw_stage *stage, struct prim_header *prim,
          oy = h;
          for (unsigned i = 0; i < 4; i++) {
             xy[i][0] += shift;
-            xy[i][1] -= bias;
+            xy[i][1] += exact ? shift * dy / dx : -bias;
          }
       } else {
          const float shift = !half ? 0.0f : dy > 0.0f ? -0.5f : 0.5f;
 
          ox = h;
          for (unsigned i = 0; i < 4; i++) {
-            xy[i][0] += bias;
+            xy[i][0] += exact ? shift * dx / dy : bias;
             xy[i][1] += shift;
          }
       }
