@@ -380,6 +380,11 @@ struct ph_context {
     * resources for surfaces the engine cannot address in place (a mip level
     * above 0 or a slice): ctx->fb binds the stand-ins. */
    struct pipe_framebuffer_state fb_api;
+   /* The engine always writes a colour target: a framebuffer without one
+    * draws into this scratch target with every colour plane masked. */
+   struct pipe_resource *colour_stub;
+   bool colour_stub_bound;
+   struct pipe_blend_state *blend_api, blend_nocolour;
    struct ph_level_proxy {
       struct pipe_resource *res, *proxy;
       unsigned level, layer;
@@ -9818,13 +9823,31 @@ static void *ph_memdup(const void *src, size_t size)
 static void *ph_create_blend(struct pipe_context *p,
                              const struct pipe_blend_state *s)
 { (void)p; return ph_memdup(s, sizeof(*s)); }
+/* The blend state the draw paths see: the bound one, or with the colour
+ * stub its copy that writes no colour plane. */
+static void
+ph_update_blend(struct ph_context *ctx)
+{
+   if (!ctx->colour_stub_bound || !ctx->blend_api) {
+      ctx->blend = ctx->blend_api;
+      return;
+   }
+   ctx->blend_nocolour = *ctx->blend_api;
+   ctx->blend_nocolour.logicop_enable = false;
+   for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
+      ctx->blend_nocolour.rt[i].blend_enable = false;
+      ctx->blend_nocolour.rt[i].colormask = 0;
+   }
+   ctx->blend = &ctx->blend_nocolour;
+}
 static void ph_bind_blend(struct pipe_context *p, void *s)
 {
    struct ph_context *ctx = ph_context(p);
-   if (ctx->blend == s)
+   if (ctx->blend_api == s)
       return;
    ph_submit_vertices(ctx);
-   ctx->blend = s;
+   ctx->blend_api = s;
+   ph_update_blend(ctx);
 }
 static void *ph_create_dsa(struct pipe_context *p,
                            const struct pipe_depth_stencil_alpha_state *s)
@@ -11262,6 +11285,42 @@ ph_proxy_bind(struct ph_context *ctx, struct pipe_surface *surf)
    surf->first_layer = surf->last_layer = 0;
 }
 
+/* Bind the colour stub into @fb when it has a depth/stencil surface but no
+ * colour buffer; false when it needs none. */
+static bool
+ph_bind_colour_stub(struct ph_context *ctx, struct pipe_framebuffer_state *fb)
+{
+   struct pipe_resource *stub = ctx->colour_stub, templ;
+
+   for (unsigned i = 0; i < fb->nr_cbufs; i++)
+      if (fb->cbufs[i].texture)
+         return false;
+   if (!fb->zsbuf.texture || !fb->width || !fb->height)
+      return false;
+   if (!stub || stub->width0 < fb->width || stub->height0 < fb->height) {
+      memset(&templ, 0, sizeof(templ));
+      templ.target = PIPE_TEXTURE_2D;
+      templ.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+      templ.width0 = MAX2(fb->width, stub ? stub->width0 : 0);
+      templ.height0 = MAX2(fb->height, stub ? stub->height0 : 0);
+      templ.depth0 = templ.array_size = 1;
+      templ.bind = PIPE_BIND_RENDER_TARGET;
+      stub = ctx->base.screen->resource_create(ctx->base.screen, &templ);
+      if (!stub) {
+         fprintf(stderr, "parhelia: no %ux%u colour stub for a depth-only "
+                 "framebuffer\n", templ.width0, templ.height0);
+         return false;
+      }
+      pipe_resource_reference(&ctx->colour_stub, NULL);
+      ctx->colour_stub = stub;
+   }
+   memset(&fb->cbufs[0], 0, sizeof(fb->cbufs[0]));
+   pipe_resource_reference(&fb->cbufs[0].texture, stub);
+   fb->cbufs[0].format = stub->format;
+   fb->nr_cbufs = 1;
+   return true;
+}
+
 static void
 ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *fb)
 {
@@ -11288,8 +11347,13 @@ ph_set_framebuffer(struct pipe_context *p, const struct pipe_framebuffer_state *
       for (unsigned i = 0; i < bound.nr_cbufs; i++)
          ph_proxy_bind(ctx, &bound.cbufs[i]);
       ph_proxy_bind(ctx, &bound.zsbuf);
+      ctx->colour_stub_bound = ph_bind_colour_stub(ctx, &bound);
       fb = &bound;
    }
+   else {
+      ctx->colour_stub_bound = false;
+   }
+   ph_update_blend(ctx);
    /* Only one depth surface may own the Z unit's tracked state.  A draw that
     * binds no depth surface at all leaves it alone (measured), so a
     * framebuffer without one is not a handover. */
@@ -11969,7 +12033,7 @@ ph_flush(struct pipe_context *p, struct pipe_fence_handle **fence,
          *fence = NULL;
       return;
    }
-   if (ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture)
+   if (ctx->fb.nr_cbufs && ctx->fb.cbufs[0].texture && !ctx->colour_stub_bound)
       color = ph_resource(ctx->fb.cbufs[0].texture);
    /* The X server's native DRI2 blit submits synchronously on the same
     * device.  The kernel submit lock drains prior async render work before
@@ -13283,6 +13347,7 @@ ph_destroy_context(struct pipe_context *p)
       p->delete_sampler_state(p, ctx->lookup_sampler);
    util_unreference_framebuffer_state(&ctx->fb_api);
    util_unreference_framebuffer_state(&ctx->fb);
+   pipe_resource_reference(&ctx->colour_stub, NULL);
    if (p->stream_uploader)
       u_upload_destroy(p->stream_uploader);
    ph_destroy_vertex_ring(ctx);
