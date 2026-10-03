@@ -775,6 +775,18 @@ p3d_state_fetches_colour(const struct p3d_state *st)
 	return 0;
 }
 
+/* The vendor validator admits only sampling kinds (TEX, TEXBEM, TEXREG2AR/GB)
+ * on a ganged mask (PSER 0x17b720, KRN mtx1414): any other stage of the
+ * original family takes its pair's first pipe alone (non-LX n=1/2 tables). */
+static uint32_t
+p3d_orig_unit_pipes(const struct p3d_texture *tu, unsigned u)
+{
+	const unsigned op = tu->ta_op;
+	const int gang = op == 0 || op == 4 || op == 0x10 || op == 0x11;
+
+	return gang ? 0x3u << (2 * u) : 0x1u << (2 * u);
+}
+
 void
 p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 {
@@ -1112,6 +1124,7 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	if (st->tex) {
 		const struct p3d_texture *t = st->tex;
 		unsigned nunit = p3d_state_units(st), u;
+		uint32_t orig_union = 0;
 		/* P690 units of a multi-unit draw sit alone on their pipes: the
 		 * vendor emits no merges and the ALU reads each unit's first pipe
 		 * (an unowned pipe reads alpha 1). */
@@ -1149,8 +1162,11 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			 * table - parhelia-multitexture.md section 1.3).
 			 */
 			static const uint32_t pipe_pair[2] = { 0x3u, 0xcu };
-			const uint32_t pipes = nunit > 2 ? 1u << u : pipe_pair[u];
+			const uint32_t pipes = nunit > 2 ? 1u << u :
+					       st->single_texture_pipe ? pipe_pair[u] :
+					       p3d_orig_unit_pipes(tu, u);
 
+			orig_union |= pipes;
 			rw[0].reg = P3D_R_TEX_ENABLE + 4 * u;
 			rw[0].val = 0x00040100u | pipes;
 			if (st->single_texture_pipe && nunit > 2)
@@ -1239,12 +1255,14 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 			 * variant: it must never widen a production packet without a
 			 * texture-alpha result. */
 			rw[0].val = st->single_texture_pipe == 2 ? 0x0001000cu :
-				    st->single_texture_pipe ? 0 : 0x0001000cu;
+				    st->single_texture_pipe ? 0 : 0x00010000u | (~orig_union & 0xfu);
 			rw[1].reg = P3D_R_TEX_ENABLE + 8;  rw[1].val = 0;
 			rw[2].reg = P3D_R_TEX_ENABLE + 12; rw[2].val = 0;
 			p3d_reglist(cs, rw, 3);
 		} else {
-			rw[0].reg = P3D_R_TEX_ENABLE + 8;  rw[0].val = 0;
+			rw[0].reg = P3D_R_TEX_ENABLE + 8;  rw[0].val =
+				!st->single_texture_pipe && orig_union != 0xfu ?
+				0x00010000u | (~orig_union & 0xfu) : 0;
 			rw[1].reg = P3D_R_TEX_ENABLE + 12; rw[1].val = 0;
 			p3d_reglist(cs, rw, 2);
 		}
