@@ -5447,6 +5447,49 @@ done:
 	return READ_ONCE(pdev->wedged) ? -EIO : 0;
 }
 
+#define PARHELIA_QUIESCE_MS		2000u
+#define PARHELIA_BM_PRIMARY_IDLE	BIT(17)
+#define PARHELIA_BM_WARP_BUSY		(BIT(24) | BIT(25))
+
+/* Teardown, as the vendor's context close does it: wait for every issued
+ * fence and an idle fetcher before bus mastering is revoked and the memory
+ * it reads is freed, then refuse further submits. */
+bool parhelia_submit_quiesce(struct parhelia_device *pdev)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(PARHELIA_QUIESCE_MS);
+	bool idle = false;
+	u32 bm;
+
+	parhelia_submit_lock(pdev);
+	for (;;) {
+		if (!pdev->wedged)
+			parhelia_retire_locked(pdev);
+		bm = parhelia_read(pdev, 0x08f0);
+		if (!pdev->wedged && !pdev->queued_slots &&
+		    (bm & PARHELIA_BM_PRIMARY_IDLE) && !(bm & PARHELIA_BM_WARP_BUSY)) {
+			idle = true;
+			break;
+		}
+		if (pdev->wedged || time_after(jiffies, end))
+			break;
+		parhelia_submit_unlock(pdev);
+		usleep_range(200, 400);
+		parhelia_submit_lock(pdev);
+	}
+	pdev->wedged = true;
+	parhelia_state_shadow_invalidate(pdev, "submit teardown");
+	parhelia_submit_unlock(pdev);
+	cancel_delayed_work_sync(&pdev->retire_work);
+	wake_up_all(&pdev->submit_waitq);
+	dev_info(&pdev->pdev->dev,
+		 "teardown: engine %s, BM=%08x prim=%08x/%08x fence=%08x queued=%u\n",
+		 idle ? "idle" : "NOT idle", bm,
+		 parhelia_read(pdev, PARHELIA_MMIO_RING_START),
+		 parhelia_read(pdev, PARHELIA_MMIO_RING_END),
+		 parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE), pdev->queued_slots);
+	return idle;
+}
+
 void parhelia_submit_fini(struct parhelia_device *pdev)
 {
 	struct parhelia_vertex_bo *entry, *tmp;

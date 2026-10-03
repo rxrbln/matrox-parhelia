@@ -545,18 +545,39 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	return 0;
 }
 
+/* Stop scanout, drain the engine, silence interrupts and hand the
+ * descriptor bank back before bus mastering goes away. */
+static void parhelia_quiesce(struct parhelia_device *pdev)
+{
+	drm_atomic_helper_shutdown(&pdev->drm);
+	parhelia_submit_quiesce(pdev);
+	if (pdev->irq_installed) {
+		parhelia_write(pdev, PARHELIA_MMIO_IRQ_MASK, 0);
+		parhelia_write(pdev, PARHELIA_MMIO_IRQ_ACK, ~0u);
+		free_irq(pdev->pdev->irq, pdev);
+		pdev->irq_installed = false;
+	}
+	parhelia_host_aperture_fini(pdev);
+}
+
 static void parhelia_pci_remove(struct pci_dev *pci)
 {
 	struct drm_device *drm = pci_get_drvdata(pci);
 
-	drm_dev_unregister(drm);
-	drm_atomic_helper_shutdown(drm);
-	if (to_parhelia(drm)->irq_installed) {
-		parhelia_write(to_parhelia(drm), PARHELIA_MMIO_IRQ_MASK, 0);
-		free_irq(pci->irq, to_parhelia(drm));
-	}
+	drm_dev_unplug(drm);
+	parhelia_quiesce(to_parhelia(drm));
 	parhelia_submit_fini(to_parhelia(drm));
-	parhelia_host_aperture_fini(to_parhelia(drm));
+}
+
+static void parhelia_pci_shutdown(struct pci_dev *pci)
+{
+	struct drm_device *drm = pci_get_drvdata(pci);
+
+	if (!drm)
+		return;
+	drm_dev_unplug(drm);
+	parhelia_quiesce(to_parhelia(drm));
+	pci_clear_master(pci);
 }
 
 static struct pci_driver parhelia_pci_driver = {
@@ -564,6 +585,7 @@ static struct pci_driver parhelia_pci_driver = {
 	.id_table = parhelia_pci_table,
 	.probe = parhelia_pci_probe,
 	.remove = parhelia_pci_remove,
+	.shutdown = parhelia_pci_shutdown,
 };
 module_pci_driver(parhelia_pci_driver);
 

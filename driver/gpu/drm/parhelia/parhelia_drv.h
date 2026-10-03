@@ -810,6 +810,7 @@ void parhelia_warp_postclose(struct parhelia_device *pdev, struct drm_file *file
 bool parhelia_warp_entry_allowed(struct parhelia_device *pdev,
 				 struct drm_file *file, u32 entry);
 void parhelia_submit_fini(struct parhelia_device *pdev);
+bool parhelia_submit_quiesce(struct parhelia_device *pdev);
 int parhelia_submit_init(struct parhelia_device *pdev);
 int parhelia_vram_pin(struct drm_gem_vram_object *bo);
 int parhelia_vram_pin_new(struct parhelia_device *pdev,
