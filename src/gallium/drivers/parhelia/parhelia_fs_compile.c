@@ -71,6 +71,7 @@ struct ph_fs_node {
 struct ph_fs_atom {
    nir_def *def;
    int8_t lane, sel;
+   int16_t part;        /* >= 0: a preshaded constant, this part */
 };
 
 struct ph_fs_term {
@@ -416,7 +417,7 @@ ph_fs_atom(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
    if (i == ctx->atoms) {
       if (!PH_FS_GROW(ctx, atom, atoms, atom_cap))
          return ph_fs_fail(ctx, "out of memory");
-      ctx->atom[ctx->atoms++] = (struct ph_fs_atom){ def, lane, sel };
+      ctx->atom[ctx->atoms++] = (struct ph_fs_atom){ def, lane, sel, -1 };
    }
    *out = i;
    return true;
@@ -661,6 +662,12 @@ ph_fs_lower_atom_id(struct ph_fs_ctx *ctx, uint16_t id, struct ph_fs_src *out)
 {
    const struct ph_fs_atom atom = ctx->atom[id];
 
+   if (atom.part >= 0) {
+      *out = (struct ph_fs_src){ .kind = PH_SRC_CONST, .channel = -1,
+                                 .index = atom.part };
+      return true;
+   }
+
    return ph_fs_lower(ctx, atom.def, atom.lane, atom.sel, out);
 }
 
@@ -896,7 +903,9 @@ ph_fs_select(struct ph_fs_ctx *ctx, int lane, const struct ph_fs_poly *p,
     * weight, then the result shift. */
    {
       const float g = p->term[lin >= 0 ? lin : prod].coef;
-      bool common = g > 0.0f && !ph_fs_near(g, 1.0f) && ph_fs_shift_of(g, &shift);
+      /* The constant term divided by g must stay a source's [-1, 1]. */
+      bool common = g > 0.0f && !ph_fs_near(g, 1.0f) &&
+                    ph_fs_shift_of(g, &shift) && fabsf(c0 / g) <= 1.0f;
 
       for (unsigned i = 0; i < p->n && common; i++)
          if (p->term[i].n && !ph_fs_near(p->term[i].coef, g))
@@ -1533,15 +1542,30 @@ ph_fs_assemble(struct ph_fs_ctx *ctx, nir_def *const defs[3],
    for (unsigned i = 0; i < 3; i++) {
       nir_def *def = defs[i];
       nir_instr *instr = def ? nir_def_instr(def) : NULL;
-      int sel = comps[i] == i ? -1 : comps[i];
+      unsigned comp = comps[i];
+      int sel;
       unsigned g;
+
+      /* A channel picked out by a move reads its source's channel, so the
+       * channels of one value share a group. */
+      while (instr && instr->type == nir_instr_type_alu &&
+             (nir_instr_as_alu(instr)->op == nir_op_mov ||
+              nir_instr_as_alu(instr)->op == nir_op_fcanonicalize) &&
+             nir_instr_as_alu(instr)->src[0].src.ssa->num_components <= 4) {
+         const nir_alu_instr *mv = nir_instr_as_alu(instr);
+
+         comp = mv->src[0].swizzle[comp];
+         def = mv->src[0].src.ssa;
+         instr = nir_def_instr(def);
+      }
+      sel = comp == i ? -1 : (int)comp;
 
       literal[i] = 0.0f;
       if (!def)
          continue;
       if (instr->type == nir_instr_type_load_const) {
          literal[i] = nir_const_value_as_float(
-            nir_instr_as_load_const(instr)->value[comps[i]], 32);
+            nir_instr_as_load_const(instr)->value[comp], 32);
          have_literal |= literal[i] != 0.0f;
          continue;
       }
@@ -1909,6 +1933,156 @@ ph_fs_lower_leaf(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
    }
 }
 
+/* Fold the uniform-only factors of every term into preshaded constants:
+ * k0 * u0 * x + k1 * u1 * x + k2 * u2 becomes P * x + Q with P and Q
+ * evaluated per draw, so no combiner slot computes uniform arithmetic. */
+static bool
+ph_fs_poly_preshade(struct ph_fs_ctx *ctx, int lane, struct ph_fs_poly *p)
+{
+   struct ph_fs_poly out;
+   bool done[PH_FS_POLY_TERMS] = { false }, any = false;
+
+   for (unsigned i = 0; i < p->n; i++)
+      for (unsigned a = 0; a < p->term[i].n; a++)
+         any |= ctx->atom[p->term[i].atom[a]].part < 0 &&
+                ph_fs_uniform_only(ctx->atom[p->term[i].atom[a]].def, 0);
+   if (!any)
+      return true;
+   memset(&out, 0, sizeof(out));
+   for (unsigned i = 0; i < p->n; i++) {
+      uint16_t rest[PH_FS_TERM_ATOMS];
+      unsigned nrest = 0;
+      struct ph_fs_pre_src sum[3];
+      bool has_sum = false, has_uniform = false;
+      struct ph_fs_term t;
+
+      if (done[i])
+         continue;
+      for (unsigned a = 0; a < p->term[i].n; a++) {
+         const struct ph_fs_atom *at = &ctx->atom[p->term[i].atom[a]];
+
+         if (at->part < 0 && ph_fs_uniform_only(at->def, 0))
+            has_uniform = true;
+         else
+            rest[nrest++] = p->term[i].atom[a];
+      }
+      if (has_uniform) {
+         /* Worth it only when terms merge or the factor is a product or
+          * scaled: a lone u * x or u is what LRP and MAD take as is. */
+         unsigned group = 0, uatoms = 0;
+
+         for (unsigned j = i; j < p->n; j++) {
+            uint16_t rj[PH_FS_TERM_ATOMS];
+            unsigned nj = 0;
+
+            for (unsigned a = 0; a < p->term[j].n; a++) {
+               const struct ph_fs_atom *at = &ctx->atom[p->term[j].atom[a]];
+
+               if (!(at->part < 0 && ph_fs_uniform_only(at->def, 0)))
+                  rj[nj++] = p->term[j].atom[a];
+               else if (j == i)
+                  uatoms++;
+            }
+            group += nj == nrest && !memcmp(rj, rest, nj * sizeof(rj[0]));
+         }
+         has_uniform = group > 1 || uatoms > 1 ||
+                       !ph_fs_near(fabsf(p->term[i].coef), 1.0f);
+      }
+      if (!has_uniform) {
+         done[i] = true;
+         if (!ph_fs_poly_add(&out, &p->term[i]))
+            return ph_fs_fail(ctx, "a polynomial beyond its terms");
+         continue;
+      }
+      /* Every term with the same non-uniform atoms joins this one. */
+      for (unsigned j = i; j < p->n; j++) {
+         uint16_t rj[PH_FS_TERM_ATOMS];
+         unsigned nj = 0;
+         bool uj = false;
+
+         if (done[j])
+            continue;
+         for (unsigned a = 0; a < p->term[j].n; a++) {
+            const struct ph_fs_atom *at = &ctx->atom[p->term[j].atom[a]];
+
+            if (at->part < 0 && ph_fs_uniform_only(at->def, 0))
+               uj = true;
+            else
+               rj[nj++] = p->term[j].atom[a];
+         }
+         if (nj != nrest || memcmp(rj, rest, nj * sizeof(rj[0])))
+            continue;
+         /* This term's factor, per lane channel. */
+         for (unsigned c = 0; c < ph_fs_lane_channels(lane); c++) {
+            struct ph_fs_pre_src f = { .kind = PH_FS_PRE_LITERAL };
+
+            f.literal.f32 = p->term[j].coef;
+            for (unsigned a = 0; uj && a < p->term[j].n; a++) {
+               const struct ph_fs_atom *at = &ctx->atom[p->term[j].atom[a]];
+               struct ph_fs_pre_src v, srcs[2];
+
+               if (at->part >= 0 || !ph_fs_uniform_only(at->def, 0))
+                  continue;
+               if (!ph_fs_pre_scalar(ctx, at->def,
+                                     at->sel >= 0 ? (unsigned)at->sel :
+                                     lane == PH_LANE_A ? 3 : c, &v))
+                  return false;
+               srcs[0] = f;
+               srcs[1] = v;
+               if (!ph_fs_pre_node(ctx, nir_op_fmul, 32, 2, srcs, &f))
+                  return false;
+            }
+            if (has_sum) {
+               struct ph_fs_pre_src srcs[2] = { sum[c], f };
+
+               if (!ph_fs_pre_node(ctx, nir_op_fadd, 32, 2, srcs, &sum[c]))
+                  return false;
+            } else {
+               sum[c] = f;
+            }
+         }
+         has_sum = true;
+         done[j] = true;
+      }
+      {
+         struct ph_fs_part part;
+         struct ph_fs_src src;
+         uint16_t atom;
+
+         memset(&part, 0, sizeof(part));
+         part.lane = lane;
+         for (unsigned c = 0; c < ph_fs_lane_channels(lane); c++) {
+            if (sum[c].kind != PH_FS_PRE_RESULT) {
+               struct ph_fs_pre_src one = { .kind = PH_FS_PRE_LITERAL };
+
+               one.literal.f32 = 1.0f;
+               if (!ph_fs_pre_node(ctx, nir_op_fmul, 32, 2,
+                                   (struct ph_fs_pre_src[2]){ sum[c], one },
+                                   &sum[c]))
+                  return false;
+            }
+            part.offset[c] = PH_FS_PRE_BASE + sum[c].index;
+         }
+         if (!ph_fs_part(ctx, &part, &src))
+            return false;
+         if (!PH_FS_GROW(ctx, atom, atoms, atom_cap))
+            return ph_fs_fail(ctx, "out of memory");
+         atom = ctx->atoms;
+         ctx->atom[ctx->atoms++] = (struct ph_fs_atom){ NULL, lane, -1,
+                                                        (int16_t)src.index };
+         memset(&t, 0, sizeof(t));
+         t.coef = 1.0f;
+         memcpy(t.atom, rest, nrest * sizeof(rest[0]));
+         t.n = nrest;
+         t.atom[t.n++] = atom;
+         if (!ph_fs_poly_add(&out, &t))
+            return ph_fs_fail(ctx, "a polynomial beyond its terms");
+      }
+   }
+   *p = out;
+   return true;
+}
+
 static bool
 ph_fs_lower(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
             struct ph_fs_src *out)
@@ -1928,6 +2102,8 @@ ph_fs_lower(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
    }
    polynomial = ph_fs_expand(ctx, def, lane, sel, true, &poly);
    if (ctx->reject)
+      return false;
+   if (polynomial && !ph_fs_poly_preshade(ctx, lane, &poly))
       return false;
    self = polynomial && poly.n == 1 && poly.term[0].n == 1 &&
           ph_fs_near(poly.term[0].coef, 1.0f) ?
@@ -2659,7 +2835,10 @@ ph_fs_emit_half(const struct ph_fs_ctx *ctx, const struct ph_fs_node *node,
          const struct ph_fs_node *dep = &ctx->node[s->index];
 
          d->reg = dep->reg;
-         channel = half == PH_LANE_RGB && dep->lane == PH_LANE_A ? 3 : -1;
+         /* A replicate of one channel of the value, or its alpha read
+          * from the RGB half. */
+         channel = s->channel >= 0 ? s->channel :
+                   half == PH_LANE_RGB && dep->lane == PH_LANE_A ? 3 : -1;
          break;
       }
       case PH_SRC_TEX:
@@ -2957,14 +3136,24 @@ ph_fs_dump(const struct ph_fs_program *program, FILE *f)
 
          if (!x->used)
             continue;
+         static const char *const shift[8] = {
+            "", "_x2", "_x4", "_x8", "_s4", "_s5", "_d4", "_d2",
+         };
+
          fprintf(f, "  fs %u %-3s %s%s%s %s", i, h ? "a" : "rgb",
                  op[x->op & 0x3f] ? op[x->op & 0x3f] : "??",
-                 x->sat ? "_sat" : "", x->scale ? "_x" : "",
+                 x->sat ? "_sat" : "", shift[x->scale & 7],
                  reg[MIN2(x->dst, 0x11u)]);
-         for (unsigned s = 0; s < 3; s++)
-            fprintf(f, " %s%s.%c", x->src[s].mod ? "~" : "",
-                    reg[MIN2(x->src[s].reg, 0x11u)], rep[x->src[s].rep & 7 ?
-                    MIN2(x->src[s].rep, 4u) : 0]);
+         /* ~n: source modifier n (P3D_COMB_MOD_*) */
+         for (unsigned s = 0; s < 3; s++) {
+            if (x->src[s].mod)
+               fprintf(f, " ~%u%s.%c", x->src[s].mod,
+                       reg[MIN2(x->src[s].reg, 0x11u)], rep[x->src[s].rep & 7 ?
+                       MIN2(x->src[s].rep, 4u) : 0]);
+            else
+               fprintf(f, " %s.%c", reg[MIN2(x->src[s].reg, 0x11u)],
+                       rep[x->src[s].rep & 7 ? MIN2(x->src[s].rep, 4u) : 0]);
+         }
          fputc('\n', f);
       }
       for (unsigned k = 0; k < 2; k++)
