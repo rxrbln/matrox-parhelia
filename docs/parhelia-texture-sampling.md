@@ -1262,3 +1262,45 @@ mipmapped texture — something no existing capture contains.
 ---
 
 Copyright (C) 2026 René Rebe <rene@exactco.de>
+
+## P690 measured sampling limits (fixfn, 2026-10-03)
+
+Probes: `tools/p690-gl-probes/*.c`, built on the target with
+`gcc -o p p.c -I/usr/X11/include -L/usr/X11/lib64 -lglut -lGL -lm` and run
+against the Mesa parhelia driver. All results MEASURED on the P690 (0x2539).
+
+* **Raw LOD overflows above 12** (`lodprobe.c [maxlod maxlevel base minlod]`).
+  A minification of 2^13 texels per pixel or more selects level 0 at every
+  bias, including bias 0. Base sizes 4, 64 and 1024 behave alike, and neither
+  `GL_TEXTURE_MAX_LOD` nor `GL_TEXTURE_MAX_LEVEL` changes it. The overflow
+  happens before the bias is added. For raw LOD up to 12 every bias in
+  -12..0 selects exactly clamp(L + b). The `GL_TEXTURE_MIN_LOD` clamp is
+  applied after the overflow: MIN_LOD 2 turns the overflowed L >= 13 into
+  level 2. This is a hardware limit, and it is why piglit `lodbias` fails:
+  its bias -12 cells for levels 1 and 2 need raw LOD 13 and 14. The bias
+  field and the advertised +/-12 are exact.
+* **Texture coordinate offsets** (`coordprobe.c`): a 1:1 64x64 quad is exact
+  for s,t offsets up to +/-65536. 131072 fails, which is float32 precision of
+  the coordinate itself.
+* **Bilinear sample position precision** (`bilin.c N`): at 1:1 every
+  power-of-two size is exact and every point-sampled size is exact. NPOT sizes
+  leak a neighbour in the low bits: 96 -> 1 LSB, 160 -> 2, 320 -> 3, 1000 -> 9.
+  The error doubles when s crosses 0.5, so the interpolated coordinate behaves
+  like a float with a ~16-bit mantissa (about 2^-16 relative). Pixel-centre
+  coordinates of a power-of-two texture are exactly representable; NPOT ones
+  are not. No register in the known texture map (0x11c0..0x11e4) carries a
+  texel step or scale; the hardware derives it from 0x11e0's width. This is
+  why piglit `1-1-linear-texture` (160x160, exact compare) fails.
+* **Two-unit sampled alpha** (`alphaprobe.c mode`): the P690 two-unit route
+  (0x1200 = 0x40101, 0x1204 = 0x40104) is exact in RGBA only in the vendor
+  form, with no pipe merges and the ALU reading t0 and t2. The former merges
+  `ADD t0, t0, t1` / `ADD t1, t2, t1` read the parked pipe 1, which returns
+  alpha 1. Every two-unit draw then had alpha 1.0 (Mesa 097970c fixes it).
+* **Dither on 8-bit targets** (`round.c fbo dither`): with GL_DITHER on (the
+  vendor default, 0x12e8 bits [24:23] = 01 for 32-bit targets), a 32-bit
+  target converts colours with a position-dependent threshold. At one pixel
+  0.3..0.7 LSB all stored as 0 in an FBO and as 1 in the window. With dither
+  off, colours round to nearest. piglit `gl-1.1-xor-copypixels -fbo` probes a
+  pixel half a pixel off a quad diagonal, whose green channel is 0.8 LSB. The
+  dither stores it as 0, so the test reports "glCopyPixels appeared to fail"
+  although the copy itself is exact (`copypix.c`).
