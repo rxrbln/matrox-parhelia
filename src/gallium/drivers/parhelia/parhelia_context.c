@@ -9075,6 +9075,25 @@ ph_draw_stippled(struct ph_context *ctx, const struct pipe_draw_info *info,
    return true;
 }
 
+/* Drop the lookup texture of program @uid, whose shader is deleted. */
+static void
+ph_lookup_forget(struct ph_context *ctx, uint32_t uid)
+{
+   for (unsigned i = 0; i < ctx->lookup_tex_count; i++) {
+      struct ph_lookup_tex *t = &ctx->lookup_tex[i];
+
+      if (t->uid != uid)
+         continue;
+      if (ctx->triangles || ctx->points || ctx->lines)
+         ph_submit_vertices(ctx);
+      pipe_sampler_view_reference(&t->view, NULL);
+      pipe_resource_reference(&t->tex, NULL);
+      free(t->constants);
+      *t = ctx->lookup_tex[--ctx->lookup_tex_count];
+      return;
+   }
+}
+
 /* The lookup texture of @r's program for the current fragment constants:
  * one per program, rebuilt when the constants change. */
 static struct pipe_sampler_view *
@@ -10605,6 +10624,8 @@ static void ph_delete_fs(struct pipe_context *p, void *s)
       FREE(fs->kill);
       free(fs->ucoord);
       ph_fs_program_fini(&fs->program);
+      if (fs->lookup)
+         ph_lookup_forget(ph_context(p), fs->lookup->uid);
       ph_fs_lookup_free(fs->lookup);
    }
    FREE(fs);
