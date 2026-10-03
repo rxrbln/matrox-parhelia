@@ -325,6 +325,59 @@ ph_mip_layout_init(struct ph_mip_layout *out, unsigned width, unsigned height,
                                   false);
 }
 
+/* The original Parhelia's 32-bit chain in 64x32 tiles at a 32-aligned pitch.
+ * Levels wider or taller than 32 lie back to back in whole tile rows.  The
+ * first level no larger than 32x32 starts the tail tile: one larger than
+ * 16x16 takes its left half and the smaller levels sit in the vendor tail
+ * slots shifted right by 32; one of 16x16 or less is itself slot 0
+ * (fixfn-cubeprobe with an address fill, every level of 256x256, 64x64,
+ * 32x64, 64x32, 32x32, 16x16 and 8x8 chains).  @level_4k reserves 32-row
+ * bands instead of whole tiles per level (diagnostic). */
+static inline bool
+ph_mip_layout_native_64x32(struct ph_mip_layout *mip, bool level_4k)
+{
+   size_t next = 0, tail_base = 0;
+   unsigned tail = 0, shift = 0;
+
+   mip->native_64x32 = true;
+   for (unsigned l = 0; l < mip->levels; l++) {
+      struct ph_mip_level *level = &mip->level[l];
+      const size_t rows = level->height > 32 ?
+                          ph_mip_align(level->height, 32) / 32 : 1;
+
+      if (level->width <= 32 && level->height <= 32) {
+         if (!tail) {
+            tail_base = next;
+            next += 0x2000;
+            shift = level->width > 16 || level->height > 16 ? 32 : 0;
+         }
+         if (shift && !tail) {
+            level->tail_x = level->tail_y = 0;
+         } else if (tail - !!shift < 5) {
+            ph_mip_tail_position(tail - !!shift, &level->tail_x,
+                                 &level->tail_y);
+            level->tail_x += shift;
+         } else {
+            return false;
+         }
+         tail++;
+         level->pitch = 64;
+         level->offset = tail_base;
+         level->bytes = 0x2000;
+         continue;
+      }
+      level->pitch = ph_mip_align(level->width, 32);
+      level->offset = next;
+      level->tail_x = level->tail_y = 0;
+      level->bytes = level_4k ? rows * level->pitch * 32 * 4 :
+                     (rows * level->pitch + 63) / 64 * 0x2000;
+      next += level->bytes;
+   }
+   if (next > mip->size)
+      mip->size = next;
+   return true;
+}
+
 static inline unsigned
 ph_mip_log2(unsigned value)
 {

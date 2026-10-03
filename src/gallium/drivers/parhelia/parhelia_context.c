@@ -2481,6 +2481,9 @@ ph_view_first_level(const struct parhelia_resource *texture,
 
    if (!first || first >= ph_resource_mip_levels(texture) ||
        texture->mip.level[first].pitch < 64 ||
+       /* a 64x32 tail level inside its tile is no base the unit can name */
+       (texture->mip.native_64x32 &&
+        (texture->mip.level[first].tail_x || texture->mip.level[first].tail_y)) ||
        !(texture->mip_defined & BITFIELD_BIT(first)))
       return 0;
    return first;
