@@ -494,3 +494,16 @@ of all three surfaces replace the "window swap" reading above:
 No consumer of spilled tiles outside the fragment-context class was found
 in `MTXPARD.dll`; Present and blits reach FAA only through the resolve
 before clears and target changes (section 4.1) [C, negative search].
+
+### 11.2 The tagged flush and further resolve attempts (module faa0528-3)
+
+* The `sub_9D560(0xc00)` flush, built by the kernel with its counters, runs
+  without a stall and only writes out cached fragment records (about 500
+  dwords appear in the buffer; colour and depth unchanged): a fragment-cache
+  writeback, not the merge [MEASURED].
+* Flush then the `0xc4 .. DWGCTL 9` resolve changes six colour pixels; with
+  `0x12fc[1:0] = 0` during the resolve nothing changes [MEASURED].
+* A 2-D engine copy of an accumulated target returns the same raw tiles,
+  so reads are not resolved lazily either [MEASURED].
+
+The operation that turns spilled tiles back into pixels is still OPEN.
