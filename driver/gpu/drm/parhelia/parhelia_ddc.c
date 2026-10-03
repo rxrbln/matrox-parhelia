@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 /* Native monitor DDC over the Parhelia 0x1c48 open-drain GPIO register. */
 #include <linux/module.h>
 
@@ -56,7 +57,16 @@ static int parhelia_ddc_pre_xfer(struct i2c_adapter *adapter)
 {
 	struct parhelia_output *output = i2c_get_adapdata(adapter);
 
-	mutex_lock(&output->pdev->ddc_lock);
+	struct parhelia_device *pdev = output->pdev;
+
+	mutex_lock(&pdev->ddc_lock);
+	/* The VBIOS (rom0528 0x4d6a) and HSLPARI2COpenPort drive the channel
+	 * select before every transaction; 0x1c4c reads the pins, so bit 8
+	 * reads 0 and any read-modify-write elsewhere drops the select. */
+	if (pdev->chip->output_family == PARHELIA_OUTPUT_ORIGINAL)
+		parhelia_write(pdev, PARHELIA_DDC_CHANNEL,
+			       parhelia_read(pdev, PARHELIA_DDC_CHANNEL) |
+			       PARHELIA_DDC_CHANNEL_ON);
 	return 0;
 }
 
