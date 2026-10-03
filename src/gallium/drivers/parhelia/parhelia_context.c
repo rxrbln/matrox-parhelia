@@ -12804,10 +12804,15 @@ ph_byte_range_cmp(const void *a, const void *b)
 #define PH_SHADOW_BOX_TEXELS (64 * 1024)
 /* A transfer call costs about as much as 64 downloaded bytes (MEASURED). */
 #define PH_SHADOW_GAP 64
-/* The host aperture addresses VRAM in 32-byte units (MEASURED). */
-#define PH_SHADOW_ALIGN 32
+/* The host aperture addresses VRAM in 32-byte units on the P690 and in
+ * 64-byte units on the 0528 (MEASURED). */
+static unsigned
+ph_shadow_align(const struct parhelia_resource *r)
+{
+   return ph_original_family(ph_screen(r->base.screen)->chip_id) ? 64 : 32;
+}
 
-/* Move only the 32-byte units holding the texels of a box between the CPU
+/* Move only the aperture units holding the texels of a box between the CPU
  * shadow and VRAM (aperture reads cost ~0.4 us per dword, MEASURED on the
  * P690).  Uploads cover whole runs: download the same box before writing. */
 static int
@@ -12815,6 +12820,7 @@ ph_shadow_transfer_box(struct parhelia_resource *r, unsigned level,
                        int x0, int y0, int w, int h, bool upload)
 {
    const unsigned cpp = util_format_get_blocksize(r->base.format);
+   const unsigned align = ph_shadow_align(r);
    struct util_dynarray runs;
    struct ph_byte_range *run;
    unsigned count, n = 0;
@@ -12833,8 +12839,8 @@ ph_shadow_transfer_box(struct parhelia_resource *r, unsigned level,
    for (int y = y0; y < y0 + h; y++)
       for (int x = x0; x < x0 + w; x++) {
          const size_t off = ph_texel_offset(r, level, x, y, cpp, false);
-         const uint64_t start = off & ~(uint64_t)(PH_SHADOW_ALIGN - 1);
-         const uint64_t end = align64(off + cpp, PH_SHADOW_ALIGN);
+         const uint64_t start = off & ~(uint64_t)(align - 1);
+         const uint64_t end = align64(off + cpp, align);
          struct ph_byte_range *last = runs.size ?
             util_dynarray_top_ptr(&runs, struct ph_byte_range) : NULL;
          struct ph_byte_range *next;
