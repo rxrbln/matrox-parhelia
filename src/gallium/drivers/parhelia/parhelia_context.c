@@ -9902,13 +9902,30 @@ static void *ph_create_fs(struct pipe_context *p,
 
             /* Without native integers the uniforms hold floats, so the
              * integer arithmetic GLSL produced becomes float arithmetic. */
-            if (compile_nir->options->no_integers) {
+            {
+               /* The combiner has no control flow: flatten every if, as
+                * non-CF hardware does, textures and discards included. */
+               static const nir_opt_peephole_select_options flatten = {
+                  .limit = ~0u, .indirect_load_ok = true,
+                  .expensive_alu_ok = true, .discard_ok = true,
+               };
+               bool progress;
+
                if (compile_nir == s->ir.nir)
                   compile_nir = nir_shader_clone(NULL, s->ir.nir);
-               NIR_PASS(_, compile_nir, nir_lower_int_to_float);
-               NIR_PASS(_, compile_nir, nir_opt_algebraic);
-               NIR_PASS(_, compile_nir, nir_opt_constant_folding);
-               NIR_PASS(_, compile_nir, nir_opt_dce);
+               if (compile_nir->options->no_integers)
+                  NIR_PASS(_, compile_nir, nir_lower_int_to_float);
+               do {
+                  progress = false;
+                  NIR_PASS(progress, compile_nir, nir_opt_peephole_select,
+                           &flatten);
+                  NIR_PASS(progress, compile_nir, nir_opt_dead_cf);
+                  NIR_PASS(progress, compile_nir, nir_opt_copy_prop);
+                  NIR_PASS(progress, compile_nir, nir_opt_algebraic);
+                  NIR_PASS(progress, compile_nir, nir_opt_constant_folding);
+                  NIR_PASS(progress, compile_nir, nir_opt_cse);
+                  NIR_PASS(progress, compile_nir, nir_opt_dce);
+               } while (progress);
             }
 
             if (ph_fs_compile(compile_nir, budget, &fs->program) &&
