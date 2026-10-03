@@ -12492,6 +12492,39 @@ ph_normalize_box(const struct pipe_box *in, struct pipe_box *out)
    }
 }
 
+/* @box clipped to level @level of @res; false when nothing is left. */
+static bool
+ph_clip_box(const struct pipe_box *box, const struct pipe_resource *res,
+            unsigned level, struct pipe_box *out)
+{
+   const int64_t w = u_minify(res->width0, level);
+   const int64_t h = u_minify(res->height0, level);
+   const int64_t x0 = MAX2((int64_t)box->x, 0);
+   const int64_t y0 = MAX2((int64_t)box->y, 0);
+   const int64_t x1 = MIN2((int64_t)box->x + box->width, w);
+   const int64_t y1 = MIN2((int64_t)box->y + box->height, h);
+
+   *out = *box;
+   if (x0 >= x1 || y0 >= y1)
+      return false;
+   out->x = x0;
+   out->y = y0;
+   out->width = x1 - x0;
+   out->height = y1 - y0;
+   return true;
+}
+
+/* Source sample position of destination pixel @d of a @dsize span scaled
+ * from a @ssize span, relative to a clipped source starting @offset texels
+ * after the span. */
+static float
+ph_blit_coord(int64_t d, int ssize, int dsize, int64_t offset, int clipped)
+{
+   const double f = ((double)d + 0.5) * ssize / dsize - 0.5 + offset;
+
+   return (float)CLAMP(f, -1.0, (double)clipped);
+}
+
 /* General blit through the CPU transfer paths: scaling with nearest or
  * bilinear filtering, colour and depth/stencil format conversion, flips,
  * write masks, scissor and whole volume slices. */
@@ -12509,7 +12542,7 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
    const bool flip_x = (info->src.box.width < 0) != (info->dst.box.width < 0);
    const bool flip_y = (info->src.box.height < 0) != (info->dst.box.height < 0);
    struct pipe_transfer *st = NULL, *dt = NULL;
-   struct pipe_box sb, db;
+   struct pipe_box sb, db, scb, dcb;
    const uint8_t *src;
    uint8_t *dst;
    float *pixels = NULL, *row = NULL;
@@ -12537,19 +12570,25 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
    if (!mask || !sb.width || !sb.height || !db.width || !db.height ||
        sb.depth != db.depth || sb.depth < 1)
       return !mask;
+   /* GL does not clip a scaled blit to the surfaces: the boxes keep the
+    * scale, only the clipped parts are mapped and written. */
+   if (!ph_clip_box(&sb, info->src.resource, info->src.level, &scb))
+      return true;
+   if (!ph_clip_box(&db, info->dst.resource, info->dst.level, &dcb))
+      return true;
    src = p->texture_map(p, info->src.resource, info->src.level,
-                        PIPE_MAP_READ, &sb, &st);
+                        PIPE_MAP_READ, &scb, &st);
    dst = p->texture_map(p, info->dst.resource, info->dst.level,
-                        PIPE_MAP_WRITE | (keep ? PIPE_MAP_READ : 0), &db,
+                        PIPE_MAP_WRITE | (keep ? PIPE_MAP_READ : 0), &dcb,
                         &dt);
    if (zs) {
-      zsrc = MALLOC((size_t)sb.width * sb.height * sizeof(*zsrc));
-      ssrc = MALLOC((size_t)sb.width * sb.height);
-      zrow = MALLOC((size_t)db.width * sizeof(*zrow));
-      srow = MALLOC(db.width);
+      zsrc = MALLOC((size_t)scb.width * scb.height * sizeof(*zsrc));
+      ssrc = MALLOC((size_t)scb.width * scb.height);
+      zrow = MALLOC((size_t)dcb.width * sizeof(*zrow));
+      srow = MALLOC(dcb.width);
    } else {
-      pixels = MALLOC((size_t)sb.width * sb.height * 4 * sizeof(float));
-      row = MALLOC((size_t)db.width * 4 * sizeof(float));
+      pixels = MALLOC((size_t)scb.width * scb.height * 4 * sizeof(float));
+      row = MALLOC((size_t)dcb.width * 4 * sizeof(float));
    }
    if (!src || !dst || (zs ? !zsrc || !ssrc || !zrow || !srow :
                              !pixels || !row)) {
@@ -12563,42 +12602,47 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
       const uint8_t *slice = src + (size_t)l * st->layer_stride;
       uint8_t *dslice = dst + (size_t)l * dt->layer_stride;
 
-      for (int y = 0; y < sb.height; y++) {
+      for (int y = 0; y < scb.height; y++) {
          const uint8_t *in = slice + (size_t)y * st->stride;
 
          if (!zs) {
-            util_format_unpack_rgba(sf, pixels + (size_t)y * sb.width * 4,
-                                    in, sb.width);
+            util_format_unpack_rgba(sf, pixels + (size_t)y * scb.width * 4,
+                                    in, scb.width);
             continue;
          }
          if (sz)
-            util_format_unpack_z_32unorm(sf, zsrc + (size_t)y * sb.width,
-                                         in, sb.width);
+            util_format_unpack_z_32unorm(sf, zsrc + (size_t)y * scb.width,
+                                         in, scb.width);
          if (ss)
-            util_format_unpack_s_8uint(sf, ssrc + (size_t)y * sb.width,
-                                       in, sb.width);
+            util_format_unpack_s_8uint(sf, ssrc + (size_t)y * scb.width,
+                                       in, scb.width);
       }
-      for (int y = 0; y < db.height; y++) {
-         const float fy = ((flip_y ? db.height - 1 - y : y) + 0.5f) *
-                          sb.height / db.height - 0.5f;
+      for (int y = 0; y < dcb.height; y++) {
+         const int64_t ly = (int64_t)dcb.y - db.y + y;
+         /* Source coordinates relative to the clipped source image. */
+         const float fy = ph_blit_coord(flip_y ? db.height - 1 - ly : ly,
+                                        sb.height, db.height,
+                                        sb.y - scb.y, scb.height);
          uint8_t *out = dslice + (size_t)y * dt->stride;
-         const int wy = db.y + y;
+         const int wy = dcb.y + y;
 
          if (zs) {
             if (keep && dz)
-               util_format_unpack_z_32unorm(df, zrow, out, db.width);
+               util_format_unpack_z_32unorm(df, zrow, out, dcb.width);
             if (keep && ds)
-               util_format_unpack_s_8uint(df, srow, out, db.width);
-            for (int x = 0; x < db.width; x++) {
-               const float fx = ((flip_x ? db.width - 1 - x : x) + 0.5f) *
-                                sb.width / db.width - 0.5f;
-               const int sx = CLAMP((int)lroundf(fx), 0, sb.width - 1);
-               const int sy = CLAMP((int)lroundf(fy), 0, sb.height - 1);
-               const size_t i = (size_t)sy * sb.width + sx;
+               util_format_unpack_s_8uint(df, srow, out, dcb.width);
+            for (int x = 0; x < dcb.width; x++) {
+               const int64_t lx = (int64_t)dcb.x - db.x + x;
+               const float fx = ph_blit_coord(flip_x ? db.width - 1 - lx : lx,
+                                              sb.width, db.width,
+                                              sb.x - scb.x, scb.width);
+               const int sx = CLAMP((int)lroundf(fx), 0, scb.width - 1);
+               const int sy = CLAMP((int)lroundf(fy), 0, scb.height - 1);
+               const size_t i = (size_t)sy * scb.width + sx;
 
                if (info->scissor_enable &&
-                   (db.x + x < info->scissor.minx ||
-                    db.x + x >= info->scissor.maxx ||
+                   (dcb.x + x < info->scissor.minx ||
+                    dcb.x + x >= info->scissor.maxx ||
                     wy < info->scissor.miny || wy >= info->scissor.maxy))
                   continue;
                if ((mask & PIPE_MASK_Z) &&
@@ -12606,17 +12650,17 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
                    (sb.width != db.width || sb.height != db.height)) {
                   /* Depth filters like colour (mipmap generation); stencil
                    * stays nearest. */
-                  const float cx = CLAMP(fx, 0.0f, sb.width - 1.0f);
-                  const float cy = CLAMP(fy, 0.0f, sb.height - 1.0f);
+                  const float cx = CLAMP(fx, 0.0f, scb.width - 1.0f);
+                  const float cy = CLAMP(fy, 0.0f, scb.height - 1.0f);
                   const int x0 = (int)cx, y0 = (int)cy;
-                  const int x1 = MIN2(x0 + 1, sb.width - 1);
-                  const int y1 = MIN2(y0 + 1, sb.height - 1);
+                  const int x1 = MIN2(x0 + 1, scb.width - 1);
+                  const int y1 = MIN2(y0 + 1, scb.height - 1);
                   const double ax = cx - x0, ay = cy - y0;
                   const double z =
-                     (zsrc[(size_t)y0 * sb.width + x0] * (1 - ax) +
-                      zsrc[(size_t)y0 * sb.width + x1] * ax) * (1 - ay) +
-                     (zsrc[(size_t)y1 * sb.width + x0] * (1 - ax) +
-                      zsrc[(size_t)y1 * sb.width + x1] * ax) * ay;
+                     (zsrc[(size_t)y0 * scb.width + x0] * (1 - ax) +
+                      zsrc[(size_t)y0 * scb.width + x1] * ax) * (1 - ay) +
+                     (zsrc[(size_t)y1 * scb.width + x0] * (1 - ax) +
+                      zsrc[(size_t)y1 * scb.width + x1] * ax) * ay;
 
                   zrow[x] = (uint32_t)MIN2(z + 0.5, 4294967295.0);
                } else if (mask & PIPE_MASK_Z)
@@ -12625,17 +12669,19 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
                   srow[x] = ssrc[i];
             }
             if (dz)
-               util_format_pack_z_32unorm(df, out, zrow, db.width);
+               util_format_pack_z_32unorm(df, out, zrow, dcb.width);
             if (ds)
-               util_format_pack_s_8uint(df, out, srow, db.width);
+               util_format_pack_s_8uint(df, out, srow, dcb.width);
             continue;
          }
          if (keep)
-            util_format_unpack_rgba(df, row, out, db.width);
-         for (int x = 0; x < db.width; x++) {
-            const float fx = ((flip_x ? db.width - 1 - x : x) + 0.5f) *
-                             sb.width / db.width - 0.5f;
-            const int wx = db.x + x;
+            util_format_unpack_rgba(df, row, out, dcb.width);
+         for (int x = 0; x < dcb.width; x++) {
+            const int64_t lx = (int64_t)dcb.x - db.x + x;
+            const float fx = ph_blit_coord(flip_x ? db.width - 1 - lx : lx,
+                                           sb.width, db.width,
+                                           sb.x - scb.x, scb.width);
+            const int wx = dcb.x + x;
             float texel[4];
 
             if (info->scissor_enable &&
@@ -12644,34 +12690,34 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
                continue;
             if (info->filter == PIPE_TEX_FILTER_LINEAR &&
                 (sb.width != db.width || sb.height != db.height)) {
-               const float cx = CLAMP(fx, 0.0f, sb.width - 1.0f);
-               const float cy = CLAMP(fy, 0.0f, sb.height - 1.0f);
+               const float cx = CLAMP(fx, 0.0f, scb.width - 1.0f);
+               const float cy = CLAMP(fy, 0.0f, scb.height - 1.0f);
                const int x0 = (int)cx, y0 = (int)cy;
-               const int x1 = MIN2(x0 + 1, sb.width - 1);
-               const int y1 = MIN2(y0 + 1, sb.height - 1);
+               const int x1 = MIN2(x0 + 1, scb.width - 1);
+               const int y1 = MIN2(y0 + 1, scb.height - 1);
                const float ax = cx - x0, ay = cy - y0;
 
                for (unsigned c = 0; c < 4; c++) {
-                  const float *p00 = pixels + ((size_t)y0 * sb.width + x0) * 4;
-                  const float *p10 = pixels + ((size_t)y0 * sb.width + x1) * 4;
-                  const float *p01 = pixels + ((size_t)y1 * sb.width + x0) * 4;
-                  const float *p11 = pixels + ((size_t)y1 * sb.width + x1) * 4;
+                  const float *p00 = pixels + ((size_t)y0 * scb.width + x0) * 4;
+                  const float *p10 = pixels + ((size_t)y0 * scb.width + x1) * 4;
+                  const float *p01 = pixels + ((size_t)y1 * scb.width + x0) * 4;
+                  const float *p11 = pixels + ((size_t)y1 * scb.width + x1) * 4;
 
                   texel[c] = (p00[c] * (1 - ax) + p10[c] * ax) * (1 - ay) +
                              (p01[c] * (1 - ax) + p11[c] * ax) * ay;
                }
             } else {
-               const int sx = CLAMP((int)floorf(fx + 0.5f), 0, sb.width - 1);
-               const int sy = CLAMP((int)floorf(fy + 0.5f), 0, sb.height - 1);
+               const int sx = CLAMP((int)floorf(fx + 0.5f), 0, scb.width - 1);
+               const int sy = CLAMP((int)floorf(fy + 0.5f), 0, scb.height - 1);
 
-               memcpy(texel, pixels + ((size_t)sy * sb.width + sx) * 4,
+               memcpy(texel, pixels + ((size_t)sy * scb.width + sx) * 4,
                       sizeof(texel));
             }
             for (unsigned c = 0; c < 4; c++)
                if (mask & (PIPE_MASK_R << c))
                   row[x * 4 + c] = texel[c];
          }
-         util_format_pack_rgba(df, out, row, db.width);
+         util_format_pack_rgba(df, out, row, dcb.width);
       }
    }
    ok = true;
