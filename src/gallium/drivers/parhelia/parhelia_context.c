@@ -11276,6 +11276,8 @@ ph_promote_target(struct ph_context *ctx, struct pipe_resource *res)
       return false;
    }
    ph_resource_swap_storage(r, storage);
+   /* The image is in render order now: sample it through the copy. */
+   r->base.bind |= PIPE_BIND_RENDER_TARGET;
    r->content_generation = storage->content_generation + 1;
    pipe_resource_reference((struct pipe_resource **)&storage, NULL);
    return true;
