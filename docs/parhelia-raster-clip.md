@@ -1122,3 +1122,34 @@ pixel bound and must keep the vendor value.  The colour error seen earlier
 with the draw module's guard band (fog-linear-floor) therefore is not an
 x/y raster limit of window-space vertices; its cause (perspective vertices
 handed through unclipped, the w/z path) is still unmeasured.
+
+## The power-on RGBA second-triangle failure: bisect status (2026-10-03)
+
+MEASURED over 9 power cycles with `parhelia-up.sh`'s warm-up (the stack every
+cycle brings up): Mesa's 7-dword RGBA quads (any untextured draw into a
+target with alpha: vertex-count, a self-written 10x10 `sqbox`, constant or
+per-vertex colour) lose their **second** triangle - 45 of 100 pixels - in
+every power-on state, and keep losing it across processes, X restarts
+(either X module) and 11 minutes of idle time.
+
+Heals (the next Mesa RGBA draw is complete): a Mesa draw through the kernel
+pass-through with a 5-dword x,y,r,g,b stream (`sqbox` with an alpha-less
+visual, with or without the hardware transform), fog-modes,
+arb_vertex_program fogcoord-dp3, fp-fog.
+
+Does not heal: parhelia-drm-test pass-through draws of any colour, 5, 6 or 7
+dwords, distinct and covering, native or not, dithered or not; a degenerate
+or covering second-colour draw; `--render`; `--native-transfer-probe`; Mesa's
+`ph_prime_warp()` (with three identical or twelve distinct vertices);
+glsl-fs-fogcolor-statechange; two-sided-lighting-separate-specular; the
+combiner pads in both halves; a fresh rmmod/insmod (the state survives
+module reload).
+
+Not the trigger: the probe's own T2-free RGBA quads - large and the exact
+10x10 geometry, mmap or native target, dithered - draw both triangles in
+the same power-on state in which Mesa's identical-looking batch fails, and
+Mesa without its context prime fails the same.  The remaining differences
+between the failing Mesa batch and the working probe batch are the 2-D
+clear in the same submit (which writes `0x12c0 = 0xffffffff`, DWGCTL fill),
+the batch-boundary relocation, the `0x11e8` write and the target geometry;
+the healing Mesa batch shares all of them.  Open.
