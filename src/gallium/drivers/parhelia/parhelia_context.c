@@ -66,6 +66,19 @@ static inline bool ph_lx_family(uint32_t chip_id)
    return chip_id == 0x2537 || chip_id == 0x2538 || chip_id == 0x2539;
 }
 
+/* 0x0527 and 0x0528, the original Parhelia (Parhelia-512 / -8X). */
+static inline bool ph_original_family(uint32_t chip_id)
+{
+   return chip_id == 0x0527 || chip_id == 0x0528;
+}
+
+/* RGBA draws take a T2-free program after the per-slot T2 prime: the LX
+ * class, and the original family (latch measured on the 0528). */
+static inline bool ph_t2_free_rgba(uint32_t chip_id)
+{
+   return ph_lx_family(chip_id) || ph_original_family(chip_id);
+}
+
 /* Fixed-function vertex program recognised for hardware transform: the only
  * computed output is POSITION = MVP * input, every other output copies an
  * input attribute verbatim.  The WARP transform programs express exactly that
@@ -1014,8 +1027,8 @@ ph_create_vertex_ring(struct ph_context *ctx)
               screen->async_slots);
 }
 
-/* The P690 draw programs depend on a per-vertex latch (WARP T2) that the
- * setup unit rejects against like a clip-space position; only the
+/* The P690 and 0528 draw programs depend on a per-vertex latch (WARP T2)
+ * that the setup unit rejects against like a clip-space position; only the
  * passthrough, multitexture and replace programs write it, from the vertex
  * colour, and every other program inherits it.  It exists once per primitive
  * slot of a draw packet: after power-on the second slot held a rejecting
@@ -1026,8 +1039,11 @@ static void
 ph_prime_warp(struct ph_context *ctx)
 {
    struct parhelia_screen *screen = ph_screen(ctx->base.screen);
+   /* native colour objects are a P690 class; the original family primes
+    * into a plain render object */
    struct drm_parhelia_create_render target = {
-      .flags = PARHELIA_CREATE_RENDER_NATIVE_COLOR, .width = 64, .height = 16,
+      .flags = screen->chip_id == 0x2539 ? PARHELIA_CREATE_RENDER_NATIVE_COLOR : 0,
+      .width = 64, .height = 16,
    };
    struct parhelia_batch *batch = &ctx->build_batch;
    float point[PH_BATCH_MAX_PACKET_VERTICES][5];
@@ -1035,7 +1051,7 @@ ph_prime_warp(struct ph_context *ctx)
                                PH_BATCH_MAX_PACKET_VERTICES / 3);
    uint32_t fence = 0;
 
-   if (screen->chip_id != 0x2539 ||
+   if ((screen->chip_id != 0x2539 && !ph_original_family(screen->chip_id)) ||
        ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &target))
       return;
    struct p3d_state state = {
@@ -4295,7 +4311,7 @@ ph_colour1_program(struct ph_context *ctx)
       0x00083e00, 0x00440000, 0xb89a2249,
       0x08087ebf, 0x00440215, 0xb89a2249,
    };
-   const bool lx = ph_lx_family(ph_screen(ctx->base.screen)->chip_id);
+   const bool lx = ph_t2_free_rgba(ph_screen(ctx->base.screen)->chip_id);
    const unsigned head_dw = lx ? ARRAY_SIZE(head_lx) : ARRAY_SIZE(head);
    static const uint32_t tail[] = {
       0x00000200, 0x00040000, 0x14c00000,
@@ -4754,10 +4770,10 @@ ph_submit_vertices(struct ph_context *ctx)
 		state.vertex_alpha = 1;
 		state.pos_z = !zpos;
 		state.dw_per_vertex = 7;
-		/* The T2-free pass-through on the LX class only: the 0528 measured
-		 * this stream through the kernel pass-through. */
+		/* The T2-free pass-through: the kernel's writes T2 = colour, which
+		 * rejects (and on the 0528 locked up) alpha-below-colour draws. */
 		if (!state.transform &&
-		    ph_lx_family(ph_screen(ctx->base.screen)->chip_id))
+		    ph_t2_free_rgba(ph_screen(ctx->base.screen)->chip_id))
 			state.warp_entry = ctx->warp_rgba;
 	}
    state.single_texture_pipe = ph_screen(ctx->base.screen)->single_texture_pipe;
@@ -5775,7 +5791,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	colour_alpha = !textured && !vertex_alpha && !colour1 &&
 	               ph_colour_alpha_observable(ctx);
 	if (colour_alpha && !ctx->warp_rgba &&
-	    ph_lx_family(ph_screen(ctx->base.screen)->chip_id)) {
+	    ph_t2_free_rgba(ph_screen(ctx->base.screen)->chip_id)) {
 	   /* Uploading drains the engine: publish the staged batch first. */
 	   if (ctx->triangles || ctx->points || ctx->lines) {
 	      ph_submit_vertices(ctx);
