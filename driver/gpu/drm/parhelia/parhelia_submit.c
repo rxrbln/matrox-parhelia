@@ -1415,6 +1415,99 @@ static int parhelia_validate_reglist(struct parhelia_device *pdev,
 	return pos == length ? 0 : -EINVAL;
 }
 
+/* A stream whose descriptors fetch no colour (attribute kind 5) leaves WARP
+ * input v5 at the previous draw's value, from any client.  warp_textured and
+ * warp_textured_multitex read it, so a stale colour with a channel above its
+ * alpha made the setup unit reject such draws.  For every draw whose bound
+ * entry is one of them and whose descriptor burst has no colour, rewrite the
+ * entry writes that bound it to the no-colour variant, unless the same
+ * entry writes also serve a draw that does fetch a colour.  Entries bound in
+ * an earlier submit are left as they are. */
+struct parhelia_entry_bind {
+	u32 pos[2];
+	u32 count;
+	u32 entry;
+	bool no_colour, colour;
+};
+
+static void parhelia_rebind_apply(struct parhelia_device *pdev, u32 *commands,
+				  const struct parhelia_entry_bind *bind)
+{
+	u32 to, i;
+
+	if (!bind->count || !bind->no_colour || bind->colour)
+		return;
+	if (bind->entry == parhelia_warp_entry(pdev, PARHELIA_WARP_TEXTURED_ENTRY))
+		to = parhelia_warp_entry(pdev, PARHELIA_WARP_TEXTURED_NO_COLOUR_ENTRY);
+	else
+		to = parhelia_warp_entry(pdev,
+				PARHELIA_WARP_TEXTURED_MULTITEX_NO_COLOUR_ENTRY);
+	for (i = 0; i < bind->count; i++)
+		commands[bind->pos[i]] = to;
+}
+
+static void parhelia_rebind_no_colour(struct parhelia_device *pdev,
+				      u32 *commands,
+				      const struct drm_parhelia_packet *packets,
+				      u32 packet_count)
+{
+	const u32 textured = parhelia_warp_entry(pdev, PARHELIA_WARP_TEXTURED_ENTRY);
+	const u32 multitex = parhelia_warp_entry(pdev,
+					PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY);
+	struct parhelia_entry_bind bind = { };
+	bool colour = false, descriptors = false;
+	u32 i;
+
+	if (pdev->pdev->device != PARHELIA_P690)
+		return;
+	for (i = 0; i < packet_count; i++) {
+		const u32 *cmd = commands + packets[i].offset;
+		u32 length = packets[i].length, pos = 1;
+
+		if ((cmd[0] >> 24) == 0x97) {
+			if (descriptors && (bind.entry == textured ||
+					    bind.entry == multitex)) {
+				if (colour)
+					bind.colour = true;
+				else
+					bind.no_colour = true;
+			}
+			continue;
+		}
+		if ((cmd[0] >> 24) != 0x00)
+			continue;
+		while (pos < length) {
+			u32 tag = cmd[pos++];
+			unsigned int slot;
+
+			for (slot = 0; slot < 4 && pos < length; slot++) {
+				u32 index = (tag >> (slot * 8)) & 0xff;
+				u32 value;
+
+				if (index == 0x21)
+					break;
+				value = cmd[pos];
+				if (index == 0x40 || index == 0x41) {
+					if (value != bind.entry || bind.count >= 2) {
+						parhelia_rebind_apply(pdev, commands, &bind);
+						bind = (struct parhelia_entry_bind){
+							.entry = value };
+					}
+					bind.pos[bind.count++] = packets[i].offset + pos;
+				} else if (index == 0x2d) {
+					colour = false;
+					descriptors = true;
+				} else if (index == 0x2e && value &&
+					   ((value >> 16) & 0xf) == 5) {
+					colour = true;
+				}
+				pos++;
+			}
+		}
+	}
+	parhelia_rebind_apply(pdev, commands, &bind);
+}
+
 static int parhelia_validate_packet(struct parhelia_device *pdev,
 				    struct drm_file *file, const u32 *cmd,
 				    const struct drm_parhelia_packet *packet)
@@ -3866,6 +3959,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 		ret = -EINVAL;
 		goto out_relocs;
 	}
+	parhelia_rebind_no_colour(pdev, commands, packets, args->packet_count);
 	ret = parhelia_collect_call_boundaries(relocs, args->reloc_count,
 					       args->packet_count, generic_packet_packing,
 					       call_boundaries, &call_boundary_count);

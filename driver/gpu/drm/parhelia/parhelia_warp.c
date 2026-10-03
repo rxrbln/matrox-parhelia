@@ -251,11 +251,37 @@ static const u32 warp_lighting[] = {
 	0x00080200, 0x00440000, 0x301a21a2,
 };
 
+/* GL_REPLACE needs a white colour, not the vertex's: o1 comes from swizzle
+ * constants, so the program reads no v5 - a stream without a colour leaves
+ * v5 holding the previous draw's value, from any client, and the former
+ * "mul T2, v5, r1.0000; add o1, T2, r1.1111" form inherited it (a stale
+ * colour with a channel above its alpha rejected the draw: incomplete-
+ * cubemap after gl-2.0-vertexattribpointer).  T2 is primed per slot by
+ * parhelia_t2_prime_once() instead. */
 static const u32 warp_replace[] = {
+	0x00083e00, 0x00440000, 0xb89a2249,	/* add o0, v0, v0.0000 */
+	0x00087ebf, 0x00440200, 0xb8adb649,	/* add o1, v0.1111, v0.0000 | mov o11, v0 */
+	0x0078023f, 0x00440200, 0xb01a21a2,	/* mov o3, v7 */
+	0x00000200, 0x00040000, 0x14c00000,
+	0x00080200, 0x00440000, 0x301a21a2,
+};
+
+/* warp_textured and warp_textured_multitex for streams without a colour
+ * fetch; the submit validator binds them in their place (see
+ * parhelia_rebind_no_colour()). */
+static const u32 warp_textured_no_colour[] = {
 	0x00083e00, 0x00440000, 0xb89a2249,
-	0x0800bebf, 0x00440215, 0xba9a2249,
-	0x08087e00, 0x40440109, 0xb89a22db,
+	0x00087ebf, 0x00440200, 0xb8adb649,
 	0x0078023f, 0x00440200, 0xb01a21a2,
+	0x00000200, 0x00040000, 0x14c00000,
+	0x00080200, 0x00440000, 0x301a21a2,
+};
+
+static const u32 warp_textured_multitex_no_colour[] = {
+	0x00083e00, 0x00440000, 0xb89a2249,
+	0x00087ebf, 0x00440200, 0xb8adb649,
+	0x0078023f, 0x00440200, 0xb01a21a2,
+	0x0088024f, 0x00440200, 0xb01a21a2,
 	0x00000200, 0x00040000, 0x14c00000,
 	0x00080200, 0x00440000, 0x301a21a2,
 };
@@ -460,6 +486,8 @@ bool parhelia_warp_entry_allowed(struct parhelia_device *pdev,
 	static const u32 driver_entries[] = {
 		PARHELIA_WARP_PASSTHROUGH_ENTRY, PARHELIA_WARP_TEXTURED_ENTRY,
 		PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY,
+		PARHELIA_WARP_TEXTURED_NO_COLOUR_ENTRY,
+		PARHELIA_WARP_TEXTURED_MULTITEX_NO_COLOUR_ENTRY,
 		PARHELIA_WARP_TRANSFORM_ENTRY,
 		PARHELIA_WARP_TRANSFORM_TEXTURED_ENTRY,
 		PARHELIA_WARP_TRANSFORM_MULTITEX_ENTRY,
@@ -948,7 +976,11 @@ int parhelia_warp_init(struct parhelia_device *pdev)
 	WARP_FITS(PARHELIA_WARP_TEXTURED_ENTRY, warp_textured,
 		  PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY);
 	WARP_FITS(PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY, warp_textured_multitex,
-		  PARHELIA_WARP_TRANSFORM_ENTRY);
+		  PARHELIA_WARP_TEXTURED_NO_COLOUR_ENTRY);
+	WARP_FITS(PARHELIA_WARP_TEXTURED_NO_COLOUR_ENTRY, warp_textured_no_colour,
+		  PARHELIA_WARP_TEXTURED_MULTITEX_NO_COLOUR_ENTRY);
+	WARP_FITS(PARHELIA_WARP_TEXTURED_MULTITEX_NO_COLOUR_ENTRY,
+		  warp_textured_multitex_no_colour, PARHELIA_WARP_TRANSFORM_ENTRY);
 	WARP_FITS(PARHELIA_WARP_TRANSFORM_ENTRY, warp_transform, PARHELIA_WARP_LIGHTING_ENTRY);
 	WARP_FITS(PARHELIA_WARP_LIGHTING_ENTRY, warp_lighting, PARHELIA_WARP_REPLACE_ENTRY);
 	WARP_FITS(PARHELIA_WARP_REPLACE_ENTRY, warp_replace, PARHELIA_WARP_CONSTANT_LOADER_ENTRY);
@@ -998,6 +1030,11 @@ int parhelia_warp_init(struct parhelia_device *pdev)
 	warp_upload(pdev, PARHELIA_WARP_TEXTURED_ENTRY / 4, warp_textured, ARRAY_SIZE(warp_textured));
 	warp_upload(pdev, PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY / 4,
 		    warp_textured_multitex, ARRAY_SIZE(warp_textured_multitex));
+	warp_upload(pdev, PARHELIA_WARP_TEXTURED_NO_COLOUR_ENTRY / 4,
+		    warp_textured_no_colour, ARRAY_SIZE(warp_textured_no_colour));
+	warp_upload(pdev, PARHELIA_WARP_TEXTURED_MULTITEX_NO_COLOUR_ENTRY / 4,
+		    warp_textured_multitex_no_colour,
+		    ARRAY_SIZE(warp_textured_multitex_no_colour));
 	warp_upload(pdev, PARHELIA_WARP_TRANSFORM_ENTRY / 4, warp_transform, ARRAY_SIZE(warp_transform));
 	warp_upload(pdev, PARHELIA_WARP_TRANSFORM_TEXTURED_ENTRY / 4,
 		    warp_transform_textured, ARRAY_SIZE(warp_transform_textured));

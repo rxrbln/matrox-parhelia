@@ -348,6 +348,10 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
  * userspace and place the two-set variant in the unused part of the same
  * 128-instruction allocation. */
 #define PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY	(1896u * 4)
+/* The textured programs for a stream that fetches no colour, in the same
+ * allocation: they write o1 = (1,1,1,1) instead of reading v5. */
+#define PARHELIA_WARP_TEXTURED_NO_COLOUR_ENTRY	(1904u * 4)
+#define PARHELIA_WARP_TEXTURED_MULTITEX_NO_COLOUR_ENTRY	(1912u * 4)
 #define PARHELIA_WARP_TRANSFORM_ENTRY	(2016u * 4)
 #define PARHELIA_WARP_LIGHTING_ENTRY	(2144u * 4)
 #define PARHELIA_WARP_REPLACE_ENTRY	(2272u * 4)
