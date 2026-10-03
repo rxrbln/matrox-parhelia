@@ -6010,6 +6010,7 @@ ph_expand_point(struct draw_stage *stage, struct prim_header *prim,
                 float size, bool smooth)
 {
    const struct ph_context *ctx = ((struct ph_stage *)stage)->ctx;
+   const struct pipe_caps *caps = &ctx->base.screen->caps;
    const struct pipe_rasterizer_state *rast = ctx->rasterizer;
    const int pos = draw_find_shader_output(stage->draw, TGSI_SEMANTIC_POSITION, 0);
    const float *p = prim->v[0]->data[pos];
@@ -6018,7 +6019,8 @@ ph_expand_point(struct draw_stage *stage, struct prim_header *prim,
    unsigned n;
 
    if (!smooth) {
-      const float s = CLAMP(roundf(size), 1.0f, 2048.0f);
+      const float s = CLAMP(roundf(size), caps->min_point_size,
+                            caps->max_point_size);
       /* Integer pixel centres when half_pixel_center is off. */
       const float bias = rast && !rast->half_pixel_center ? 0.5f : 0.0f;
       const bool odd = (unsigned)s & 1;
@@ -6032,7 +6034,9 @@ ph_expand_point(struct draw_stage *stage, struct prim_header *prim,
       xy[3][0] = cx - h - bias; xy[3][1] = cy + h - bias;
       n = 4;
    } else {
-      const float r = 0.5f * CLAMP(size, 1.0f, 2048.0f);
+      /* Rasterization clamps a derived size to the advertised range. */
+      const float r = 0.5f * CLAMP(size, caps->min_point_size_aa,
+                                   caps->max_point_size_aa);
 
       n = r < 2.0f ? 8 : r < 8.0f ? 16 : 32;
       for (unsigned i = 0; i < n; i++) {
