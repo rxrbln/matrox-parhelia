@@ -599,10 +599,14 @@ ph_fs_expand(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
       ph_fs_poly_const(p, v);
       return true;
    }
-   if (instr->type != nir_instr_type_alu ||
-       (!root && !ph_fs_one_user(def)))
+   if (instr->type != nir_instr_type_alu)
       goto leaf;
    alu = nir_instr_as_alu(instr);
+   /* a shared value stays one atom, but a negation or move of one costs
+    * nothing to see through, so -x and x still cancel */
+   if (!root && !ph_fs_one_user(def) && alu->op != nir_op_fneg &&
+       alu->op != nir_op_mov && alu->op != nir_op_fcanonicalize)
+      goto leaf;
    /* A uniform expression is one preshaded atom, but a negated or moved
     * uniform stays the uniform's own atom so terms in it cancel. */
    if (ph_fs_uniform_only(def, 0) && alu->op != nir_op_fneg &&
@@ -878,6 +882,12 @@ ph_fs_poly_linear_coef(const struct ph_fs_poly *p, uint16_t a)
    return 0.0f;
 }
 
+static bool ph_fs_poly_preshade(struct ph_fs_ctx *ctx, int lane,
+                                struct ph_fs_poly *p);
+static int ph_fs_constant_poly(struct ph_fs_ctx *ctx, int lane,
+                               const struct ph_fs_poly *p,
+                               struct ph_fs_src *out);
+
 /* c * x * y + bx * x + by * y + ... = (s1 (x + by/c)) * (s2 (y + bx/c)) + r
  * with s1 s2 = c = +-1: one MAD when both factors and r are sources, as in
  * GL_MODULATE_ADD of inverted operands, (1 - t.a) * (1 - t) + k. */
@@ -919,9 +929,26 @@ ph_fs_try_affine_mad(struct ph_fs_ctx *ctx, int lane,
              !ph_fs_poly_mul(&prod, &f1, &f2))
             continue;
          memset(&r, 0, sizeof(r));
-         if (!ph_fs_poly_sum(&r, p, 1.0f) || !ph_fs_poly_sum(&r, &prod, -1.0f) ||
-             !ph_fs_poly_source(&r))
+         if (!ph_fs_poly_sum(&r, p, 1.0f) || !ph_fs_poly_sum(&r, &prod, -1.0f))
             continue;
+         /* a constant rest (uniforms and literals) is one preshaded part */
+         if (!ph_fs_poly_source(&r)) {
+            const int k = ph_fs_constant_poly(ctx, lane, &r, &sb);
+            bool linear = true;
+
+            if (k < 0)
+               return false;
+            /* a rest of linear terms costs one instruction of its own */
+            for (unsigned t2 = 0; !k && t2 < r.n; t2++)
+               linear &= r.term[t2].n <= 1;
+            if (!k && !linear)
+               continue;
+            if (!k && !ph_fs_select(ctx, lane, &r, &sb))
+               return false;
+            return ph_fs_select(ctx, lane, &f1, &sa) &&
+                   ph_fs_select(ctx, lane, &f2, &sc) &&
+                   ph_fs_node(ctx, lane, P3D_COMB_MAD, &sa, &sb, &sc, out);
+         }
          if (!ph_fs_select(ctx, lane, &f1, &sa) ||
              !ph_fs_select(ctx, lane, &f2, &sc))
             return false;
@@ -1741,9 +1768,6 @@ ph_fs_operand(struct ph_fs_ctx *ctx, const nir_alu_instr *alu, unsigned i,
    return ph_fs_lower(ctx, alu->src[i].src.ssa, lane, req, out);
 }
 
-static bool ph_fs_poly_preshade(struct ph_fs_ctx *ctx, int lane,
-                                struct ph_fs_poly *p);
-
 /* Channel @c of an atom that is a constant part, as a preshader source. */
 static struct ph_fs_pre_src
 ph_fs_part_pre_src(const struct ph_fs_ctx *ctx, unsigned part, unsigned c)
@@ -1815,6 +1839,50 @@ ph_fs_pre_vector(struct ph_fs_ctx *ctx, int lane, struct ph_fs_pre_src v[3],
       part.offset[i] = PH_FS_PRE_BASE + v[i].index;
    }
    return ph_fs_part(ctx, &part, out);
+}
+
+/* @p as one constant source when every term is a literal, a preshaded part
+ * or a uniform value: 1 when built, 0 when @p is not constant. */
+static int
+ph_fs_constant_poly(struct ph_fs_ctx *ctx, int lane, const struct ph_fs_poly *p,
+                    struct ph_fs_src *out)
+{
+   struct ph_fs_pre_src v[3];
+
+   for (unsigned t = 0; t < p->n; t++) {
+      const struct ph_fs_atom *at;
+
+      if (!p->term[t].n)
+         continue;
+      if (p->term[t].n != 1)
+         return 0;
+      at = &ctx->atom[p->term[t].atom[0]];
+      if (at->part < 0 && !(at->def && ph_fs_uniform_only(at->def, 0)))
+         return 0;
+   }
+   for (unsigned c = 0; c < 3; c++)
+      v[c] = (struct ph_fs_pre_src){ .kind = PH_FS_PRE_LITERAL };
+   for (unsigned c = 0; c < ph_fs_lane_channels(lane); c++)
+      for (unsigned t = 0; t < p->n; t++) {
+         struct ph_fs_pre_src f = { .kind = PH_FS_PRE_LITERAL };
+
+         f.literal.f32 = 1.0f;
+         if (p->term[t].n) {
+            const struct ph_fs_atom *at = &ctx->atom[p->term[t].atom[0]];
+
+            if (at->part >= 0)
+               f = ph_fs_part_pre_src(ctx, at->part, c);
+            else if (!ph_fs_pre_scalar(ctx, at->def,
+                                       at->sel >= 0 ? (unsigned)at->sel :
+                                       lane == PH_LANE_A ? 3 : c, &f))
+               return -1;
+         }
+         if (!ph_fs_pre_accumulate(ctx, &v[c], p->term[t].coef, &f))
+            return -1;
+      }
+   for (unsigned c = ph_fs_lane_channels(lane); c < 3; c++)
+      v[c] = v[0];
+   return ph_fs_pre_vector(ctx, lane, v, out) ? 1 : -1;
 }
 
 /* Group value @poly as x * k + a with one non-constant atom x and constant
@@ -2484,7 +2552,10 @@ ph_fs_poly_preshade(struct ph_fs_ctx *ctx, int lane, struct ph_fs_poly *p)
    if (!any)
       return true;
    memset(&out, 0, sizeof(out));
-   for (unsigned i = 0; i < p->n; i++) {
+   /* Terms with uniform factors first, each gathering every term of the
+    * same non-uniform atoms; the rest pass through after. */
+   for (unsigned pass = 0, i = 0; pass < 2; i = 0, pass++)
+   for (; i < p->n; i++) {
       uint16_t rest[PH_FS_TERM_ATOMS];
       unsigned nrest = 0;
       struct ph_fs_pre_src sum[3];
@@ -2501,12 +2572,16 @@ ph_fs_poly_preshade(struct ph_fs_ctx *ctx, int lane, struct ph_fs_poly *p)
          else
             rest[nrest++] = p->term[i].atom[a];
       }
+      if (!pass && !has_uniform)
+         continue;
       if (has_uniform) {
          /* Worth it only when terms merge or the factor is a product or
           * scaled: a lone u * x or u is what LRP and MAD take as is. */
          unsigned group = 0, uatoms = 0;
 
-         for (unsigned j = i; j < p->n; j++) {
+         for (unsigned j = 0; j < p->n; j++) {
+            if (done[j])
+               continue;
             uint16_t rj[PH_FS_TERM_ATOMS];
             unsigned nj = 0;
 
@@ -2530,7 +2605,7 @@ ph_fs_poly_preshade(struct ph_fs_ctx *ctx, int lane, struct ph_fs_poly *p)
          continue;
       }
       /* Every term with the same non-uniform atoms joins this one. */
-      for (unsigned j = i; j < p->n; j++) {
+      for (unsigned j = 0; j < p->n; j++) {
          uint16_t rj[PH_FS_TERM_ATOMS];
          unsigned nj = 0;
          bool uj = false;
@@ -2645,6 +2720,15 @@ ph_fs_lower(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
    polynomial = ph_fs_expand(ctx, def, lane, sel, true, &poly);
    if (ctx->reject)
       return false;
+   /* One LRP or MAD of the polynomial as written beats preshading its
+    * uniform factors first, which can merge the terms those forms read. */
+   if (polynomial && poly.n > 1 &&
+       (ph_fs_try_lrp(ctx, lane, &poly, out) ||
+        ph_fs_try_affine_mad(ctx, lane, &poly, out))) {
+      goto memo;
+   }
+   if (ctx->reject)
+      return false;
    if (polynomial && !ph_fs_poly_preshade(ctx, lane, &poly))
       return false;
    self = polynomial && poly.n == 1 && poly.term[0].n == 1 &&
@@ -2657,6 +2741,7 @@ ph_fs_lower(struct ph_fs_ctx *ctx, nir_def *def, int lane, int sel,
    } else if (!ph_fs_lower_leaf(ctx, def, lane, sel, out)) {
       return false;
    }
+memo:
    if (!PH_FS_GROW(ctx, memo, memos, memo_cap))
       return ph_fs_fail(ctx, "out of memory");
    ctx->memo[ctx->memos++] = (struct ph_fs_memo){ def, lane, sel, *out };
