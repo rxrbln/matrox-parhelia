@@ -8202,7 +8202,11 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
             return true;
          continue;
       }
+      /* A submit inside the draw cleared the batch's program state. */
       ctx->transform = true;
+      ctx->warp_program_entry = entry;
+      ctx->vs_const_vec4s = vs_const_vec4s;
+      ctx->colour_alpha = lay.colour_alpha;
       chunk = MIN2(ntri - done, space - ctx->triangles);
       dst = &ctx->vertices[ctx->triangles * 3 * lay.dpv];
       translate->run_elts(translate, elts + done * 3, chunk * 3, 0, 0, dst);
