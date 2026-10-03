@@ -1622,12 +1622,14 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 	 * installed.  aperture_lock also keeps the mapping's compacted slot stable
 	 * for the duration of the copy.
 	 */
-	ret = parhelia_submit_idle_lock(pdev);
-	if (ret)
-		goto out_gem;
+	/* Pin before the idle lock: an evicted object moves back in through
+	 * parhelia_ttm_move(), which takes that lock itself. */
 	ret = parhelia_vram_pin(&bo->gbo);
 	if (ret)
-		goto out_submit_unlock;
+		goto out_gem;
+	ret = parhelia_submit_idle_lock(pdev);
+	if (ret)
+		goto out_unpin;
 	mutex_lock(&pdev->aperture_lock);
 	ret = parhelia_aperture_alloc_window(pdev, &mapping, SZ_8K, &parked);
 	if (ret)
@@ -1705,9 +1707,9 @@ out_mapping:
 		parhelia_aperture_free_unpublished_locked(&mapping);
 out_aperture_unlock:
 	mutex_unlock(&pdev->aperture_lock);
-	parhelia_vram_unpin(&bo->gbo);
-out_submit_unlock:
 	parhelia_submit_unlock(pdev);
+out_unpin:
+	parhelia_vram_unpin(&bo->gbo);
 out_gem:
 	drm_gem_object_put(gem);
 out_buffer:

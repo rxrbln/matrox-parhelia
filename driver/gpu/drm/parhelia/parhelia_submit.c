@@ -1626,11 +1626,45 @@ static int parhelia_vram_placement_range(struct drm_gem_vram_object *bo,
 	return 0;
 }
 
+/* The original family's Z unit takes the depth window from the colour
+ * address per pixel, so a render target crossing a 16 MiB boundary sent
+ * depth into colour rows (0528: colour 0x1f5e000 + 3 MiB).  One place per
+ * window lets TTM put such an object into any window with room before it
+ * evicts anything; window boundaries in VRAM offsets stay boundaries in
+ * engine addresses, as the bank split is 16 MiB aligned. */
+int parhelia_window_places_init(struct parhelia_device *pdev)
+{
+	u32 i;
+
+	if (!parhelia_original_family(pdev))
+		return 0;
+	pdev->window_count = pdev->vram_size / SZ_16M;
+	pdev->window_places = devm_kcalloc(&pdev->pdev->dev, pdev->window_count,
+					   sizeof(*pdev->window_places),
+					   GFP_KERNEL);
+	if (!pdev->window_places)
+		return -ENOMEM;
+	for (i = 0; i < pdev->window_count; i++) {
+		pdev->window_places[i].mem_type = TTM_PL_VRAM;
+		pdev->window_places[i].fpfn = ((u64)i * SZ_16M) >> PAGE_SHIFT;
+		pdev->window_places[i].lpfn = ((u64)(i + 1) * SZ_16M) >> PAGE_SHIFT;
+	}
+	return 0;
+}
+
 static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 				    u64 vram_size, bool split_banks)
 {
 	struct parhelia_bo *pbo = container_of(bo, struct parhelia_bo, gbo);
+	struct parhelia_device *pdev = to_parhelia(bo->bo.base.dev);
 	u64 band_pages = SZ_32M >> PAGE_SHIFT;
+
+	if (pbo->placement_class == PARHELIA_PLACEMENT_WINDOWED &&
+	    pdev->window_count) {
+		bo->placement.placement = pdev->window_places;
+		bo->placement.num_placement = pdev->window_count;
+		return 0;
+	}
 
 	/* Colour and depth live in different 64 MiB banks: with both in bank B
 	 * a depth-tested fill ran at 202 instead of 666 Mpixel/s (P690 probe). */
@@ -3330,6 +3364,9 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	else if (args->flags & PARHELIA_CREATE_RENDER_NATIVE_SCANOUT)
 		parhelia_bo_set_placement_class(bo,
 			PARHELIA_PLACEMENT_NATIVE_SCANOUT);
+	else if (!args->flags && parhelia_original_family(pdev) &&
+		 bo_size <= SZ_16M)
+		parhelia_bo_set_placement_class(bo, PARHELIA_PLACEMENT_WINDOWED);
 	if (layout == PARHELIA_BO_LAYOUT_TEXTURE) {
 		parhelia_bo_make_unmappable(bo);
 	} else if (args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |

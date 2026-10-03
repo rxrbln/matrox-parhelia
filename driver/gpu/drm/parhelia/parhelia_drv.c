@@ -22,6 +22,10 @@
  * translates and zeroed other objects (a new 512x512 target wiped 77% of a
  * resident texture).  Place new objects without CPU access; the driver
  * clears them through its own aperture window. */
+static bool trace_vram_moves;
+module_param(trace_vram_moves, bool, 0644);
+MODULE_PARM_DESC(trace_vram_moves, "Log each TTM move of a VRAM object (diagnostic)");
+
 /* TTM's own move is a CPU copy over BAR0, which on this chip is a translated
  * window rather than a linear view of VRAM, so a moved object kept only the
  * bytes its first window covered.  Copy through the aperture instead, which
@@ -37,6 +41,16 @@ static int parhelia_ttm_move(struct ttm_buffer_object *bo, bool evict,
 	bool old_vram = old_mem && old_mem->mem_type == TTM_PL_VRAM;
 	bool new_vram = new_mem->mem_type == TTM_PL_VRAM;
 	int ret;
+
+	if (trace_vram_moves && (old_vram || new_vram))
+		dev_info_ratelimited(&pdev->pdev->dev,
+			"move %zu bytes %s %#llx -> %s %#llx evict %d by %s%s\n",
+			bo->base.size, old_vram ? "vram" : "sys",
+			old_vram ? (u64)old_mem->start << PAGE_SHIFT : 0,
+			new_vram ? "vram" : "sys",
+			new_vram ? (u64)new_mem->start << PAGE_SHIFT : 0, evict,
+			current->comm,
+			pdev->submit_owner == current ? " (submit owner)" : "");
 
 	/* A newly created object has nothing to preserve. */
 	if (old_mem && old_mem->mem_type == TTM_PL_SYSTEM && new_vram &&
@@ -509,6 +523,9 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	pdev->ttm_helper_move = pdev->ttm_funcs.move;
 	pdev->ttm_funcs.move = parhelia_ttm_move;
 	drm->vram_mm->bdev.funcs = &pdev->ttm_funcs;
+	ret = parhelia_window_places_init(pdev);
+	if (ret)
+		return ret;
 
 	ret = drmm_mutex_init(drm, &pdev->submit_lock);
 	if (ret)

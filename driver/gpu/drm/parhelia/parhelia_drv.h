@@ -508,6 +508,8 @@ enum parhelia_placement_class {
 	PARHELIA_PLACEMENT_NATIVE_COLOR,
 	PARHELIA_PLACEMENT_NATIVE_DEPTH,
 	PARHELIA_PLACEMENT_NATIVE_SCANOUT,
+	/* anywhere wholly inside one 16 MiB window (original family) */
+	PARHELIA_PLACEMENT_WINDOWED,
 };
 
 struct parhelia_bo {
@@ -552,6 +554,9 @@ struct parhelia_device {
 	void __iomem *vram;
 	void __iomem *mmio;
 	resource_size_t vram_size;
+	/* one TTM place per 16 MiB VRAM window, for PARHELIA_PLACEMENT_WINDOWED */
+	struct ttm_place *window_places;
+	u32 window_count;
 	struct parhelia_bios bios;
 	struct drm_simple_display_pipe pipe;
 	/* the simple pipe's plane helpers plus the asynchronous flip hooks */
@@ -833,6 +838,7 @@ bool parhelia_warp_entry_allowed(struct parhelia_device *pdev,
 void parhelia_submit_fini(struct parhelia_device *pdev);
 bool parhelia_submit_quiesce(struct parhelia_device *pdev);
 int parhelia_submit_init(struct parhelia_device *pdev);
+int parhelia_window_places_init(struct parhelia_device *pdev);
 int parhelia_vram_pin(struct drm_gem_vram_object *bo);
 int parhelia_vram_pin_new(struct parhelia_device *pdev,
 			  struct drm_gem_vram_object *bo);
