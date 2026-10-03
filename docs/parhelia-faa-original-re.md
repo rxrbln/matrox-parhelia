@@ -523,3 +523,26 @@ operation that reads the fragment buffer outside the fragment-context class
 was found [C, negative search]; the merge semantics are being established
 by decoding the records against position-encoded colours (`FAA_LINCOL`)
 and a software blend of the records over the target.
+
+### 11.4 Exact record decode (position-coded colours, run g1)
+
+With fragment colours R = x/256, G = y/256 every record names its pixel:
+
+| word | content | evidence |
+|---|---|---|
+| w0 | `00RRGGBB` fragment colour | [MEASURED] |
+| w1 | `[31:24]` **8-sample** coverage mask; `[23:0]` `0xff8000` (a few `0x800000`) | popcount/8 matches the analytic area of the pixel to 0.058 mean over 432 records, i.e. within one sample [MEASURED] |
+| w2 | `0xff << 24 \| x << 12 \| y >> 1` | 432 of 434 records exact [MEASURED] |
+| w3 | `0x4020ffff` | [MEASURED] |
+
+Records are stored in allocation order at odd 16-byte slots; the depth word
+of each partially covered pixel becomes `0x010000nn` with nn close to the
+record's offset / 256 [MEASURED, the exact link OPEN].  Blending the
+records over the target with c = popcount/8 in software gives
+coverage-weighted values on about 300 of 540 high-contrast edge pixels
+(mean error 0.17-0.2 against the area, MEASURED); the rest belong to tiles
+whose writes were diverted and cannot be restored from this placement.
+Two overlapping depth-tested triangles in mode 3 stall the engine on the
+first draw [MEASURED, g4].  The FAA unit is therefore an 8-sample coverage
+A-buffer; a working accumulation layout (placement/addressing of the
+buffer so that no surface tile is diverted) is still OPEN.
