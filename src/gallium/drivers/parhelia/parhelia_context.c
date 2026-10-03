@@ -4237,6 +4237,16 @@ ph_colour1_program(struct ph_context *ctx)
       0x0800bebf, 0x00440215, 0xba9a2249,
       0x08087e00, 0x00440015, 0xb89a2249,
    };
+   /* The LX class without "mul T2, v5, r1": with a real alpha in the colour
+    * set, T2 = colour rejects every triangle whose corners all have a
+    * channel above alpha, as for the RGBA stream (--colour-alpha-probe).
+    * add o1, v5 | mov o11, v0, the RGBA pass-through's own move. */
+   static const uint32_t head_lx[] = {
+      0x00083e00, 0x00440000, 0xb89a2249,
+      0x08087ebf, 0x00440215, 0xb89a2249,
+   };
+   const bool lx = ph_lx_family(ph_screen(ctx->base.screen)->chip_id);
+   const unsigned head_dw = lx ? ARRAY_SIZE(head_lx) : ARRAY_SIZE(head);
    static const uint32_t tail[] = {
       0x00000200, 0x00040000, 0x14c00000,
       0x00080200, 0x00440000, 0x301a21a2,
@@ -4261,11 +4271,11 @@ ph_colour1_program(struct ph_context *ctx)
       move.src[i].index = P3D_WARP_V_COLOUR1;
       move.src[i].swizzle = P3D_WARP_SWZ_IDENTITY;
    }
-   memcpy(code, head, sizeof head);
-   p3d_warp_encode(&move, code + 9);
-   memcpy(code + 12, tail, sizeof tail);
+   memcpy(code, lx ? head_lx : head, head_dw * sizeof(uint32_t));
+   p3d_warp_encode(&move, code + head_dw);
+   memcpy(code + head_dw + 3, tail, sizeof tail);
    program.code = (uintptr_t)code;
-   program.count = 6;
+   program.count = (head_dw + 3 + ARRAY_SIZE(tail)) / 3;
    if (ioctl(ph_screen(ctx->base.screen)->fd, DRM_IOCTL_PARHELIA_WARP_PROGRAM,
              &program))
       return false;
