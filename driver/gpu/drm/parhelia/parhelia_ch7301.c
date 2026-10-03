@@ -376,10 +376,13 @@ void parhelia_ch7301_enable(struct parhelia_device *pdev, unsigned int dvo,
 
 	if (lock_check)
 		locked = ch7301_pll_check(ch);
+	/* Neither the VBIOS (0x77d7) nor HSLCHRPllCheck treats an exhausted
+	 * check as an error, and 0x4d bit 2 was measured clear on a correct
+	 * picture: it is a lock hint, not a link status. */
 	if (!locked)
-		dev_warn(&pdev->pdev->dev,
-			 "CH7301 %#x: TMDS PLL did not lock at %u kHz\n",
-			 ch->addr, clock_khz);
+		dev_dbg(&pdev->pdev->dev,
+			"CH7301 %#x: 0x4d lock hint stayed clear at %u kHz\n",
+			ch->addr, clock_khz);
 	dev_dbg(&pdev->pdev->dev,
 		"CH7301 %#x for DVO%u at %u kHz: 0x32..0x36 %02x %02x %02x %02x %02x\n",
 		ch->addr, dvo + 1, clock_khz, tpll[1], tpll[2], tpll[3],
