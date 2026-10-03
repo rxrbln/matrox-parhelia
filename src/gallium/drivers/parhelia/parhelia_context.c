@@ -6558,6 +6558,56 @@ ph_depth_to_colour(struct ph_context *ctx, const struct pipe_sampler_view *view,
    return ok;
 }
 
+static bool
+ph_view_swizzled(const struct pipe_sampler_view *view)
+{
+   return view->swizzle_r != PIPE_SWIZZLE_X ||
+          view->swizzle_g != PIPE_SWIZZLE_Y ||
+          view->swizzle_b != PIPE_SWIZZLE_Z ||
+          view->swizzle_a != PIPE_SWIZZLE_W;
+}
+
+/* Level @src_level of @view's colour image written into level @dst_level of
+ * @dst (same format) with the view's swizzle applied: the sampler has no
+ * channel swizzle, and st emulates luminance, intensity and alpha formats in
+ * RGBA storage through one. */
+static bool
+ph_swizzle_to_colour(struct ph_context *ctx,
+                     const struct pipe_sampler_view *view,
+                     struct pipe_resource *dst, unsigned dst_level,
+                     unsigned src_level, const struct pipe_box *box)
+{
+   struct pipe_context *p = &ctx->base;
+   struct pipe_transfer *st = NULL, *dt = NULL;
+   const uint8_t swizzle[4] = { view->swizzle_r, view->swizzle_g,
+                                view->swizzle_b, view->swizzle_a };
+   const unsigned cpp = util_format_get_blocksize(dst->format);
+   const uint8_t *src = p->texture_map(p, view->texture, src_level,
+                                       PIPE_MAP_READ, box, &st);
+   uint8_t *out = src ? p->texture_map(p, dst, dst_level, PIPE_MAP_WRITE,
+                                        box, &dt) : NULL;
+   bool ok = src && out;
+
+   for (int y = 0; ok && y < box->height; y++) {
+      for (int x = 0; x < box->width; x++) {
+         float c[6] = { 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f }, rgba[4];
+
+         util_format_unpack_rgba(view->format, c,
+                                 src + (size_t)y * st->stride + x * cpp, 1);
+         for (unsigned i = 0; i < 4; i++)
+            rgba[i] = swizzle[i] <= PIPE_SWIZZLE_1 ? c[swizzle[i]] : 0.0f;
+         util_format_pack_rgba(view->format,
+                               out + (size_t)y * dt->stride + x * cpp,
+                               rgba, 1);
+      }
+   }
+   if (dt)
+      p->texture_unmap(p, dt);
+   if (st)
+      p->texture_unmap(p, st);
+   return ok;
+}
+
 /* Levels first..last of @v's texture copied into a private chain whose
  * level 0 is the view's first level; rebuilt when the texture changes. */
 static struct pipe_sampler_view *
@@ -6569,6 +6619,9 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
     * and are copied like the others. */
    const unsigned last = MIN2(v->base.u.tex.last_level, r->base.last_level);
    const bool depth = util_format_has_depth(util_format_description(r->base.format));
+   const bool swizzled = !depth && ph_view_swizzled(&v->base) &&
+      util_format_get_blocksize(v->base.format) ==
+      util_format_get_blocksize(r->base.format);
 
    if ((!depth && util_format_get_blocksize(r->base.format) != 4 &&
         !ph_format_widened(r->base.format)) || first > last)
@@ -6581,6 +6634,12 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
        * the depth value (GL_DEPTH_TEXTURE_MODE). */
       if (depth) {
          templ.format = view.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+         view.swizzle_r = PIPE_SWIZZLE_X;
+         view.swizzle_g = PIPE_SWIZZLE_Y;
+         view.swizzle_b = PIPE_SWIZZLE_Z;
+         view.swizzle_a = PIPE_SWIZZLE_W;
+      }
+      if (swizzled) {
          view.swizzle_r = PIPE_SWIZZLE_X;
          view.swizzle_g = PIPE_SWIZZLE_Y;
          view.swizzle_b = PIPE_SWIZZLE_Z;
@@ -6613,6 +6672,12 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
          if (depth) {
             if (!ph_depth_to_colour(ctx, &v->base, v->shadow_view->texture,
                                     l - first, l, &box))
+               return NULL;
+            continue;
+         }
+         if (swizzled) {
+            if (!ph_swizzle_to_colour(ctx, &v->base, v->shadow_view->texture,
+                                      l - first, l, &box))
                return NULL;
             continue;
          }
