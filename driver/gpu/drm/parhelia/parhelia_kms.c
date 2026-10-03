@@ -469,12 +469,9 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 		 * clock source: without this write head 1's clock never
 		 * engaged on hardware. */
 		parhelia_route_dcm(pdev, head, PARHELIA_HSLPAR_PIXEL_CLKSEL);
-		/* Controller A, and only controller A, additionally takes the
-		 * VGA MISC clock-select byte: HSLPARSelectDisplayControllerClock
-		 * writes 0x68 there on that branch, and a head left on the
-		 * legacy clock explains a locked synthesiser with a dark
-		 * monitor.  Controller B gets no MISC write at all. */
-		if (!head)
+		/* The vendor writes MISC 0x68 for controller A only, but the
+		 * original family's controller B follows MISC [3:2] as well. */
+		if (!head || parhelia_original_family(pdev))
 			parhelia_write8(pdev, PARHELIA_VGA_MISC_W, 0x68);
 		parhelia_write(pdev, PARHELIA_DCM_CLKCTL_HEAD,
 			       PARHELIA_DCM_MODE_HIRES);
@@ -539,8 +536,16 @@ static int parhelia_program_clock(struct parhelia_device *pdev, u32 clock,
 			       PARHELIA_DCM_MODE_HIRES);
 	}
 	dev_dbg(&pdev->pdev->dev,
-		"%s pixel clock %u kHz -> %u kHz, word %#08x\n",
-		pdev->chip->name, clock, actual, word);
+		"%s head %u pixel clock %u kHz -> %u kHz, word %#010x\n",
+		pdev->chip->name, head, clock, actual, word);
+	if (pdev->chip->clock_family == PARHELIA_CLOCK_HSLPAR)
+		dev_dbg(&pdev->pdev->dev,
+			"0x0e18=%#010x 0x1c00=%#010x 0x1c04=%#010x 0x1c08=%#010x MISC=%#04x\n",
+			parhelia_read(pdev, 0x0e18),
+			parhelia_read(pdev, PARHELIA_DCM_CLKCTL_A),
+			parhelia_read(pdev, PARHELIA_DCM_CLKCTL_B),
+			parhelia_read(pdev, PARHELIA_DCM_CLKCTL_HEAD),
+			parhelia_read8(pdev, PARHELIA_VGA_MISC_R));
 	pdev->last_clock_khz = actual;
 	return 0;
 }
