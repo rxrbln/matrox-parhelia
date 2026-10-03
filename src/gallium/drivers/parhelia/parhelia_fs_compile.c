@@ -2249,6 +2249,45 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
          return false;
       ctx->node[out->index].def = &alu->def;
       return true;
+   case nir_op_fdot4: {
+      /* dot3 of xyz, then a.w * b.w added in each lane: the DP4 opcode
+       * is proven from the tables but not yet measured. */
+      struct ph_fs_src dp = { 0 }, aw, bw;
+      int req[2];
+      int found = -1;
+
+      for (unsigned i = 0; i < 2; i++) {
+         const uint8_t *sw = alu->src[i].swizzle;
+
+         if (sw[0] == 0 && sw[1] == 1 && sw[2] == 2)
+            req[i] = -1;
+         else if (sw[0] == sw[1] && sw[1] == sw[2])
+            req[i] = sw[0];
+         else
+            return ph_fs_fail(ctx, "a swizzle the replicates cannot express");
+      }
+      for (unsigned i = 0; i < ctx->nodes; i++)
+         if (ctx->node[i].def == &alu->def &&
+             ctx->node[i].lane == PH_LANE_BOTH &&
+             ctx->node[i].op == P3D_COMB_DP3)
+            found = (int)i;
+      if (found >= 0) {
+         ctx->node[found].refs++;
+         dp = (struct ph_fs_src){ .kind = PH_SRC_NODE, .channel = -1,
+                                  .index = (unsigned)found };
+      } else {
+         if (!ph_fs_lower(ctx, alu->src[0].src.ssa, PH_LANE_RGB, req[0], &a) ||
+             !ph_fs_lower(ctx, alu->src[1].src.ssa, PH_LANE_RGB, req[1], &c) ||
+             !ph_fs_node(ctx, PH_LANE_BOTH, P3D_COMB_DP3, &a, NULL, &c, &dp))
+            return false;
+         ctx->node[dp.index].def = &alu->def;
+      }
+      return ph_fs_lower(ctx, alu->src[0].src.ssa, lane,
+                         alu->src[0].swizzle[3], &aw) &&
+             ph_fs_lower(ctx, alu->src[1].src.ssa, lane,
+                         alu->src[1].swizzle[3], &bw) &&
+             ph_fs_node(ctx, lane, P3D_COMB_MAD, &aw, &dp, &bw, out);
+   }
    case nir_op_fsign: {
       /* x >= 0 ? 0 : -1, then -x >= 0 ? that : 1 */
       struct ph_fs_src zero, one, minus, t, nx;
