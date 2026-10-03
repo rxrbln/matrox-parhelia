@@ -8434,7 +8434,13 @@ ph_quant_vertex(struct draw_stage *stage, const struct vertex_header *v,
                 unsigned idx)
 {
    struct ph_quant_stage *q = (struct ph_quant_stage *)stage;
-   struct vertex_header *out = dup_vert(stage, v, idx);
+   /* Staging that only writes its own attributes from other ones, or is
+    * idempotent, runs on the shared vertex itself: a vertex several
+    * primitives share stages to the same values each time.  The routed
+    * domains and rectangle scales rewrite their own input and need a copy. */
+   struct vertex_header *out = q->route_count || q->rect_count ?
+                               dup_vert(stage, v, idx) :
+                               (struct vertex_header *)v;
 
    for (unsigned i = 0; i < q->coord_count; i++) {
       float *c = out->data[q->coord_slot[i]];
