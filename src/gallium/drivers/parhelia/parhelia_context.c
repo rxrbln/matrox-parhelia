@@ -10528,9 +10528,17 @@ ph_fs_smooth_variant(struct ph_context *ctx, struct ph_fs *fs)
       if (var->data.location == VARYING_SLOT_PNTC)
          pntc = var;
    if (!pntc) {
+      unsigned slots = 0;
+
+      /* draw scans inputs by driver location: take the next free one */
+      nir_foreach_shader_in_variable(var, nir)
+         slots = MAX2(slots, var->data.driver_location +
+                             glsl_count_attribute_slots(var->type, false));
       pntc = nir_variable_create(nir, nir_var_shader_in, glsl_vec_type(2),
                                  "gl_PointCoord");
       pntc->data.location = VARYING_SLOT_PNTC;
+      pntc->data.driver_location = slots;
+      nir->num_inputs = MAX2(nir->num_inputs, slots + 1);
    }
    tex = nir_tex_instr_create(nir, 1);
    tex->op = nir_texop_tex;
