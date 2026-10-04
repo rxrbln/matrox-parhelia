@@ -1382,3 +1382,26 @@ edges rather than texture-detail aliasing.
 Committed evidence and reproducible capture/benchmark helpers are in
 `captures/faa-textured-20261004/`; complete working results and negative
 allocation/no-Z experiments are in `campaign/results/faa-textured/`.
+
+
+### 14.7 Performance checkpoint and open controls (2026-10-04)
+
+Isolated Mesa fbf2b5b retains queued FAA, state batching, GPU transforms,
+GPU-ordered metadata clears and linear register decoding. On the original
+0528 at 1024x768, three interleaved 387-frame timedemos measure normal
+28.5/28.3/28.3 FPS versus FAA 24.6/24.5/24.5 FPS. Linear decoding subsequently
+measures FAA 24.6/24.6/24.6. The performance gap remains open. [MEASURED]
+Nine ten-frame analytical cases at this resolution pass 228,855 interior
+pixels/frame; the stencil case preserves 0xa5 over 786,432 pixels. [MEASURED]
+
+Forced-retirement statistics observe five metadata clears (~5.5 ms) and five
+resolves (~1.7 ms) per frame. Instrumentation changes scheduling and includes
+completion waits; these numbers are not ordinary frame-time overhead or
+isolated resolve throughput. A default-off post-resolve metadata observation
+is built but has no hardware result yet. Removing clears still needs proof.
+Application GL control is requested but not implemented; PARHELIA_FAA=1
+remains the control. No standard sample-mask/MSAA contract is claimed.
+
+See captures/faa-perf-20261004/report.md and the current
+[feature/TODO audit](parhelia-hw-gl-feature-audit.md). Shared Mesa 9369ebc and
+DRM f288453 do not contain this isolated FAA implementation.

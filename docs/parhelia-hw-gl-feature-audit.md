@@ -3,179 +3,100 @@
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
-This is the implementation checklist for the Mesa Parhelia driver as inspected
-on 2026-09-11.  It reconciles every hardware-facing OpenGL feature described by
-the documents in this directory with the driver in
-`../src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/parhelia`.
-The three principal source files had SHA-256 prefixes `644bd1a1` (context),
-`07e17ddc` (screen), and `4a5ece5b` (state emitter).  Later changes must re-audit
-the affected rows rather than assuming this snapshot still applies.  This
-snapshot includes Mesa commits `e4a6857` (unit lines), `83c89f6` (2x
-anisotropy), `78a7bd5` (stencil, scissor, and blend state), and `eb7c52e`
-(batched consecutive lines).  Rows 29, 30, 38 and 40 and the counts were
-re-audited on 2026-09-11 after Mesa `96d8758` (masked/scissored clears);
-rows 3, 4, 8, 9, 15 and 16 after Mesa `7b8f33a` (point/line expansion).
+Reconciled with code on 2026-10-04: shared Mesa **9369ebc**, shared DRM
+**f288453**; isolated FAA Mesa **fbf2b5b**, DRM **0f7d564**. The FAA context
+also has uncommitted phase-statistics and metadata-observation diagnostics.
+The shared and experimental stacks must not be treated as the same deployment.
 
-Status has a deliberately strict meaning:
+This replaces the [September 11 inventory](parhelia-hw-gl-feature-audit-20260911.md).
+Its 64-row percentages and line references describe that old snapshot; they
+are not current coverage figures. Functional GL support, native acceleration,
+and retained hardware proof are separate claims. This inventory is not a
+conformance result.
 
-* **I+T**: Mesa reaches the hardware implementation by default and a retained
-  open-driver hardware result exercises the feature.
-* **I+G**: useful code exists, but it is unreachable, opt-in, restricted to one
-  workload, or lacks a retained hardware result.
-* **M**: the documented hardware path is absent.  A Mesa software transform or
-  primitive decomposition does not count as hardware implementation.
-* **C**: current Mesa advertises or accepts more than the emitter implements, or
-  implements a materially narrower/different contract.  This is a correctness
-  contradiction, not merely an opportunity for acceleration.
+## Implemented paths and remaining limits
 
-Vendor captures prove silicon and packet behavior; they do not by themselves
-make an **I+T** Mesa row.  The historical overview is also not authoritative
-where newer documents correct it: the correction table explicitly retracts old
-scissor, viewport, point-size and polygon-offset claims
-(`parhelia-raster-clip.md:967-984`), and the state-slot namespace correction
-invalidates register addresses derived directly from region-2 indices
-(`parhelia-gl-feature-map.md:30-52`).
+| Feature family | Current code and limits |
+|---|---|
+| Triangle rasterization, culling, scissor, polygon modes | Implemented. Nontriangle and unfilled modes may use draw-module decomposition. |
+| Points, lines, smoothing and stipple | Native unit primitives plus triangle expansion for wider/textured cases. Point-coordinate and polygon-stipple lowering now exist; native hardware point-size and strip/loop acceleration remain work. |
+| Matrix transform, perspective and viewport | GPU WARP path exists and is preferred; unsupported programs and clipping can fall back to Mesa draw. They are no longer missing features. |
+| Programmable vertex shaders and lighting | WARP compiler, program upload/cache and constant loading exist; generated lighting can run there. Full vendor 12-light-store coverage is not established. |
+| Fragment programs and texenv | Data-flow compiler replaces the old fixed-shape matcher. Combiner-expressible NIR, lowering and preshaders cover many more programs; arbitrary fragment ISA/GLSL execution is not established. Unsupported programs remain a coverage gap. |
+| Secondary color, fog and texgen | Secondary color is packed; shader lowering can cover fog/texgen expressions. Dedicated vendor fixed-function paths and complete mode coverage remain unproven. |
+| Color/depth/stencil, clears, blending and logic operations | Implemented, including masked/scissored clears, separate blend equations and logic-op lowering. Complete stencil/two-sided-operation coverage still needs targeted hardware validation. |
+| Texture dimensionality and size | 1-D, 2-D, cube and volume resource/view paths exist; cube/volume have measured default paths on P690 and 0528. Maximum 2-D extent is 2048. |
+| Mipmaps, filtering and wrap | Mip chains, trilinear filtering, border/mirrored wrapping and LOD state exist. The original-family LOD-bias issue below remains. |
+| Multitexture | Original family exposes up to four hardware units; LX is limited to two. Coverage depends on compiler lowering and chip capabilities. |
+| Narrow texture formats | Chip-dependent format routes exist; format support must be read from ph_is_format_supported, not the old blanket missing-format list. |
+| S3TC | Upload/sampling code exists behind PARHELIA_S3TC; successful native hardware retirement remains unproven. Keep gated. |
+| Transfers, copy/blit, render-to-texture and mixed-size FBOs | Implemented. Broader format/subresource and shader workloads still need coverage tests. |
+| VRAM eviction and restoration | parhelia_ttm_move is installed; aperture resource/page copies and eviction/restore counters exist. The old patch-only TODO is superseded. |
+| Cursor placement/upload | Cursor uses parhelia_vram_bar_addr and original-family aperture writes. The old direct-flat-BAR claim is superseded; broader placement/display stress remains validation work. |
+| FAA-16x | Implemented and hardware-tested on isolated original-family branch, default off. Textures, ordinary depth/write modes, private depth and stencil preservation work in tested cases. Not merged into shared Mesa/DRM. See below. |
 
-## Geometry and rasterization
+Source entry points: Mesa parhelia_screen.c (caps/formats),
+parhelia_context.c (compiler, draw, state and FAA), parhelia_batch.c and
+reference/p3d_state.c (packets); DRM parhelia_drv.c, parhelia_gem.c,
+parhelia_cursor.c and parhelia_submit.c. Commit references above pin this audit
+without relying on obsolete source line numbers.
 
-| # | hardware GL feature | status | current Mesa evidence and remaining contract | documentation evidence |
-|---:|---|:---:|---|---|
-| 1 | triangle lists, Gouraud interpolation, tiled color output | **I+T** | `parhelia_context.c:3247-3487` packs transformed triangles and `:3028-3034` submits the hardware batch. | An open-driver stream and WARP program match the vendor result (`parhelia-3d-integrated.md:383-405`); Gouraud and full-scene depth coverage are hardware checked (`parhelia-gears-test.md:34-58`). |
-| 2 | flat shading | **I+G** | `parhelia_context.c:2761-2763` forwards `flatshade`; `reference/p3d_state.c:401-404` emits the flat bit.  No retained current-Mesa pixel test isolates flat provoking-color behavior. | Hardware state is documented at `parhelia-gl-feature-map.md:149-167`; quad decomposition has provoking-vertex constraints (`parhelia-vertex-submission.md:239-269`). |
-| 3 | native points, point size, point parameters/sprites | **I+T** | Mesa `7b8f33a`: unit untextured points stay native; sized (1..2048), per-vertex (distance attenuation), smooth and textured points are expanded to hardware triangles in `ph_stage_point()` with GL odd/even centring; sprites use the draw module's wide-point stage (`draw_wide_point_sprites`). | `xf86-video-parhelia/tools/parhelia-gl-prim-test.c` checks exact pixel sets for sizes 1..8 at three sub-pixel offsets, textured and attenuated points on P690.  The hardware POINTSIZE registers (`parhelia-raster-clip.md:893-909`) remain unused. |
-| 4 | native lines, line strip and line loop | **I+T** | Unit untextured `GL_LINES` stay native; strips/loops arrive decomposed by the draw module; textured and smooth lines are expanded to triangles (`ph_expand_line()`, Mesa `7b8f33a`). | GL prim test: native unit line, textured unit line and smooth line coverage on P690. |
-| 5 | triangle strips, fans, polygons, quads and quad strips | **I+G** | Mesa draw decomposes these to triangles before `ph_stage_tri`; the hardware emitter contains topology codes (`reference/p3d_state.c:19-39`) but current Mesa always sets `P3D_TRIANGLES` (`parhelia_context.c:2756-2760`). | All modes are hardware-observed (`parhelia-3d-integrated.md:339-350`); exact native/decomposition rules are at `parhelia-vertex-submission.md:175-209`. |
-| 6 | hardware indexed draws | **I+G** | Gallium maps indices into software draw and expands them (`parhelia_context.c:3651-3696`).  The direct P690 ABI remains disabled and needs a guarded fast path. | Four native packet forms and eight fetch streams are proven from three vendor codebases (`parhelia-indexed-draws.md:15-35`); current-ABI limits are recorded at `parhelia-p690-native-indexed-draw-feasibility.md:8-12,68-76,121-176`. |
-| 7 | direct strided/interleaved vertex-array fetch | **I+G** | A packed hardware vertex ring exists, but arbitrary Gallium streams are first mapped through software draw (`parhelia_context.c:3664-3691`). | Hardware supports eight base/stride streams (`parhelia-indexed-draws.md:17-25,499-516`). |
-| 8 | face culling and `glFrontFace` | **I+T** | Draw-module culling plus the hardware 0x1130 selector (Mesa `c84e3ed`); triangles derived from points, lines and unfilled polygons are never hardware-culled (Mesa `7b8f33a`). | GL prim test: FRONT_AND_BACK and BACK cull polygons but keep wide lines and sized points. |
-| 9 | front/back polygon mode | **I+T** | The draw module's unfilled stage feeds the point/line stages, which now expand textured primitives instead of dropping them. | GL prim test: textured `GL_LINE` quad outline and `GL_POINT` corners on P690.  The hardware face registers (`parhelia-raster-clip.md:758-785`) remain unused. |
-| 10 | polygon offset fill/line/point | **M** | No depth-bias fields reach `p3d_state`; any draw-module adjustment is software. | Five hardware state values and raw factor/units behavior are established at `parhelia-raster-clip.md:791-847`. |
-| 11 | scissor | **I+G** | Mesa retains the Gallium rectangle, clamps it to the target, and emits hardware min/max corners (`parhelia_context.c:997-1003,4129-4138`; `reference/p3d_state.c:406-416`).  Exact register values have an offline self-test (`parhelia_drm_test.c:1150-1191`), but no retained open-driver live result exercises this new path. | Hardware corners and DWGCTL enable are explicit at `parhelia-raster-clip.md:988-995`; a direct standalone test clipped 15,140 pixels to 11,909 (`parhelia-gl-features.md:174-182`). |
-| 12 | hardware viewport and depth-range transform | **M** | Viewport and clip state go only to Mesa draw (`parhelia_context.c:4113-4128`); submitted vertices are already transformed. | Hardware consumes a viewport rectangle and z scale/bias (`parhelia-raster-clip.md:248-352,996-1001`). |
-| 13 | guard-band/frustum clipping | **I+G** | The emitter writes one fixed `0x12f4=32.0` (`reference/p3d_state.c:603-608`); capability-dependent 32/16 behavior, stage count, and CPU fallback are not implemented. | The hardware rules and required selection are summarized at `parhelia-raster-clip.md:380-480,1002-1004`. |
-| 14 | six user clip planes | **M** | Clip planes are consumed by Mesa draw (`parhelia_context.c:4127-4128`), not uploaded to WARP/setup state. | Dedicated plane records and the six-plane hardware path are confirmed at `parhelia-raster-clip.md:483-550`. |
-| 15 | wide lines | **I+T** | `max_line_width` 2048; the draw module's wide-line stage emits hardware triangles (the vendor Linux ICD also expands on the CPU, `parhelia-raster-clip.md:911-963`). | GL prim test: widths 2..4, horizontal/vertical, both directions, under face culling. |
-| 16 | point, line and polygon smoothing/stipple | **I+G** | Smooth points become an aliased disc and smooth lines a perpendicular quad (no coverage antialiasing); line stipple uses the draw module; polygon stipple and sample mask remain no-ops. | Point smoothing has real registers, line smoothing uses geometry, and polygon smoothing is ignored by the vendor (`parhelia-antialiasing.md:684-703,729-739`). |
+## Active feature and bug TODOs
 
-## Transform, lighting and shaders
+1. **FAA performance and application control.** At 1024x768, three matched
+   runs give median normal 28.3 versus FAA 24.5 FPS; linear decoding then
+   gives 24.6 FPS in all three FAA runs. Nine ten-frame analytical cases pass.
+   Resolve/metadata lifecycle optimization remains active. A suitable explicit
+   GL control is requested but not implemented; current control is
+   PARHELIA_FAA=1. Sample buffers/masks and full MSAA semantics are not exposed.
+   Alpha test, application stencil, partial color masks, logic ops, other
+   target formats and special multipass/primitive paths can hand over to
+   ordinary rendering. Full application-wide FAA coverage is not established.
+   See [FAA RE](parhelia-faa-original-re.md), sections 14.6–14.7, and
+   [retained performance results](../captures/faa-perf-20261004/report.md).
+2. **P690 sampled alpha.** Native companion route stays opt-in because spatial
+   failures remain. Production micro/two-pass/CPU routes work but cost time.
+   See parhelia-p690-q3-sampled-alpha-final-audit.md.
+3. **Original-family LOD bias.** Bias encoding exists, but magnified raw LOD
+   clamps at -4 and the GL LOD-bias test still fails. This is a correctness gap,
+   not a missing LOD-field implementation (parhelia_screen.c comments).
+4. **P690 larger primitive packets.** More than the safe two-primitive default
+   can wedge. Do not turn packet-size experiments into a default merely from
+   vendor similarity. See parhelia-p690-multi-primitive-packet-hang.md.
+5. **Fragment/compiler and glamor coverage.** Reproduce remaining text/tile,
+   FBO readback and unsupported-shader failures against the current compiler;
+   historical reports alone do not establish current failures. Expand lowering
+   where the combiner contract supports it.
+6. **Native acceleration.** Polygon offset, user clip planes, direct indexed
+   and strided fetch, native point-size and topology paths remain work. GPU
+   transforms already exist. Prefer GPU paths; retain correct improvements
+   even if one benchmark shows no immediate gain. See
+   parhelia-polygon-offset-hardware-re.md and
+   parhelia-p690-native-indexed-draw-feasibility.md.
+7. **Kernel geometry validation.** Audit fill/blit destination extents against
+   relocated BO bounds beyond register/relocation validation. The historical
+   claim of an exploitable out-of-bounds write needs a current reproducer;
+   do not treat that claim as fresh test evidence.
+8. **Recovery and display coverage.** No validated general engine-reset path;
+   continue isolated bounded tests. Secondary-head/multimonitor and cursor
+   placement stress need current hardware proof.
+9. **Hardware proof gates.** Native S3TC, GigaColor render/sampling and
+   system-memory texture fetch remain unproven. Keep unsupported/gated rather
+   than equating decoded vendor structures with working Mesa support.
 
-| # | hardware GL feature | status | current Mesa evidence and remaining contract | documentation evidence |
-|---:|---|:---:|---|---|
-| 17 | fixed-function matrix transform and perspective divide in WARP | **M** | Vertex shaders execute in Mesa draw (`parhelia_context.c:3837-3848`); normal submits select canned pass-through/texture WARP entries and never set `state.transform`. | Open hardware executed MVP, perspective divide and viewport in WARP (`parhelia-gears-test.md:18-32`). |
-| 18 | fixed-function lighting (up to 12 lights) | **M** | No light/material state is lowered into `p3d_state`; Mesa draw executes the generated GL vertex shader. | The hardware 12-light store is confirmed (`parhelia-vertex-pipeline.md:603-627`), and one-light WARP output has pixel-level tests (`parhelia-gears-test.md:18-58`). |
-| 19 | hardware fog: vertex/table/range/W/Z and fog coordinate | **M** | No fog state appears in `ph_submit_vertices`; fragment-shader inspection only classifies texture/color use. | Hardware fog caps and the fog-coordinate source switch are documented at `parhelia-gl-limits.md:599,802`; fog is graded hardware in `parhelia-3d-coverage.md:63-64`. |
-| 20 | texgen, reflection/normal map generation | **M** | No texgen lowering or WARP variant selection exists. | The hardware texgen emitter and reflection/normal modes are decoded at `parhelia-gl-limits.md:803`. |
-| 21 | secondary/specular color and separate specular color | **M** | `ph_stage_tri` retrieves only `COLOR[0]` (`parhelia_context.c:3251-3253`); no second color is packed. | One vertex slot serves secondary color/specular/fog and hardware color sum (`parhelia-gl-limits.md:790,825-847`). |
-| 22 | programmable WARP vertex shader / `GL_EXT_vertex_shader` class | **M** | Mesa accepts NIR VS solely because software draw executes it (`parhelia_context.c:3837-3848`).  No user program is compiled or uploaded to WARP. | The Linux ICD contains a complete but fenced-off implementation (`parhelia-feature-exposure.md:37-64`); the hardware/driver exposes vs_1_1-class limits (`parhelia-gl-limits.md:591-593,667-761`). |
-| 23 | arbitrary fragment combiner / GLSL 1.20 | **C** | Screen caps claim GLSL 1.20 (`parhelia_screen.c:922-924`), but `ph_create_fs` merely pattern-matches a few fixed NIR shapes (`parhelia_context.c:3850-4049`) and never compiles arbitrary ALU to the fragment ISA. | The complete ps_1.3-class ISA and MTX compiler route are documented at `parhelia-gl-limits.md:593-594,792`; `parhelia-pixel-pipeline-complete.md:57-236` gives the instruction encoding. |
-| 24 | fixed-function fragment `REPLACE` and `MODULATE` | **I+T** | Exact NIR forms select the emitter programs (`parhelia_context.c:3935-3984,4027-4030`); texture and replace WARP entries are kernel-gated at context creation (`:4845-4882`). | Both programs and register differences are captured (`parhelia-multitexture.md:447-532`); the current texture path is hardware-proven (`parhelia-engine-context-bringup.md:5810-5833`). |
-| 25 | fixed-function fragment `DECAL` | **I+G** | The emitter has DECAL and exact NIR FLRP detection (`reference/p3d_state.c:358-364`; `parhelia_context.c:3935-3984`), but no retained current-Mesa target result isolates it. | The packed DECAL sequence is decoded at `parhelia-multitexture.md:447-532,567-599`. |
-| 26 | fixed-function fragment `ADD`, `BLEND`, COMBINE and DOT3 | **C** | The emitter encodes ADD/BLEND (`reference/p3d_state.c:320-363`), but single-unit NIR recognition does not select ADD/BLEND or upload env color; COMBINE/DOT3 are absent.  The advertised fixed-function contract is therefore broader than lowering. | All six texenv families and their hardware programs are documented (`parhelia-multitexture.md:582-588`; `parhelia-gl-limits.md:775-777`). |
+## Historical reports requiring fresh reproduction
 
-## Fragment back end and render targets
+The old NPOT/odd-height bilinear edge discrepancy, scanout LUT-bypass
+candidate, 0528 tile-layout hypothesis, and glamor readback reports remain
+historical leads. Current mip/layout/display changes mean they are neither
+confirmed current bugs nor proven fixed by this audit. Preserve their original
+notes and rerun a focused test before assigning status.
 
-| # | hardware GL feature | status | current Mesa evidence and remaining contract | documentation evidence |
-|---:|---|:---:|---|---|
-| 27 | ARGB/XRGB 32-bit tiled render target and render-to-texture | **I+T** | Format support, native/share resources and color binding are present (`parhelia_screen.c:145-174,317-539`; `parhelia_context.c:2753-2760`). | Native target tiling is hardware solved (`parhelia-3d-integrated.md:357-381`); owned render targets pass the integrated path (`parhelia-own-render-target.md:1-80`). |
-| 28 | Z24 depth attachment, clear, compare functions and write mask | **I+T** | Z24/S8 formats are accepted (`parhelia_screen.c:162-165`); compare/write state is emitted (`parhelia_context.c:963-975,2863-2871`; `reference/p3d_state.c:430-455`). | Open-driver depth is measured (`parhelia-3d-state-complete.md:177-232`) and full-scene coverage agrees within 0.008% (`parhelia-gears-test.md:34-58`). |
-| 29 | stencil clear | **I+T** | Mesa `96d8758`: `ph_clear_zs()` builds the PLNWT mask from `PIPE_CLEAR_DEPTH`/`PIPE_CLEAR_STENCIL` and the stencil write mask, so depth-only, stencil-only and partial-stencil clears preserve the other bits of the S8Z24 word. | `parhelia_drm_test --masked-clear-probe` and `xf86-video-parhelia/tools/parhelia-gl-clear-test.c` pass with 0/65536 mismatches on P690, including a full depth-only clear that preserves stencil (`parhelia-gallium-masked-clear-design.md`, hardware result). |
-| 30 | stencil test, compare, ref/read/write masks, ops and wrap | **I+G** | The front-face Gallium stencil state and dynamic reference are lowered into compare, three operations, read/write masks and the shared S8Z24 packet (`parhelia_context.c:928-975,3716-3726,4149-4157`; `reference/p3d_state.c:430-455`).  The exact register words pass an offline self-test (`parhelia_drm_test.c:1150-1191`).  A live P690 probe now proves EQUAL with KEEP operations and a zero write mask against GPU-merged stencil words (`--masked-clear-probe`, 2026-09-11); the other operations, wrap and two-sided stencil remain live-unvalidated. | The contiguous hardware state and wrap operations are decoded (`parhelia-pixel-pipeline-complete.md:392-528`; `parhelia-gl-limits.md:581-582,789`). |
-| 31 | alpha test from vertex alpha | **I+T** | All compare functions and 8-bit reference are translated (`parhelia_context.c:883-891,958-962`) and emitted (`reference/p3d_state.c:418-428`). | The P690 vertex-alpha cutout controls color and depth correctly (`parhelia-p690-rgb-companion-alpha-cutout.md:154-164`). |
-| 32 | P690 sampled-texture alpha test and source-alpha blend | **I+G** | A unit-1 RGB companion route exists but requires `PARHELIA_NATIVE_SAMPLED_ALPHA=cutout|blend|all` (`parhelia_context.c:1356-1432,4841-4868`).  It is deliberately excluded from default production selection after live spatial/VRAM failures. | The ordinary one-unit route is explicitly unproven (`parhelia-p690-q3-sampled-alpha-final-audit.md:6-16,64-99`); the companion probe proves only the uniform sample and records the missing spatial proof (`parhelia-p690-native-alpha-live-failure.md:62-110`). |
-| 33 | ADD blending with ordinary factors | **I+T** | Factor mapping and enable are emitted (`parhelia_context.c:893-914,978-991`; `reference/p3d_state.c:75-92`). | Depth/vertex-alpha source-over and additive forms pass hardware probes (`parhelia-q3-ui-additive-blend.md:37-73`). |
-| 34 | independent RGB/alpha blend factors | **I+G** | Mesa lowers the four Gallium factors into the hardware RGB and alpha fields (`parhelia_context.c:978-991`; `reference/p3d_state.c:75-92`).  The complete emitter self-test passes offline, but no retained live result isolates unequal RGB/alpha factors. | Four independent hardware factor slots are confirmed (`parhelia-gl-limits.md:602,785`). |
-| 35 | SUBTRACT, REVERSE_SUBTRACT, MIN and MAX blend equations | **I+G** | Gallium equations now reach the shared hardware equation field; MIN/MAX select the required canonical factors (`parhelia_context.c:916-926,978-991`; `reference/p3d_state.c:75-92`).  Exact ADD/SUBTRACT/MIN words pass offline tests (`parhelia_drm_test.c:855-882`), but the new equations lack retained live results. | Hardware equations are confirmed from the vendor emitter (`parhelia-gl-limits.md:786`; `parhelia-fragment-ops.md:729-738`). |
-| 36 | constant blend color/factors | **I+G** | All constant factor cases, dynamic blend-color state, and the two packed 10-bit register values are connected (`parhelia_context.c:893-949,978-991,4139-4147`; `reference/p3d_state.c:418-428`).  Exact words pass offline tests (`parhelia_drm_test.c:855-882,1150-1191`), but no retained live result exercises them. | The hardware opcode/register route is confirmed (`parhelia-gl-limits.md:601,787`; `parhelia-blend-alpha-encoding.md:6-12`). |
-| 37 | logic operations | **M** | No logic-op state or ROP translation exists. | The hardware state-slot route and 16 operations are documented at `parhelia-gl-limits.md:788`. |
-| 38 | per-channel color write mask | **I+T** | Gallium masks become four emitter fields (`parhelia_context.c:992-995`; `reference/p3d_state.c:594-597`).  Mesa `96d8758` marks them explicit, so `glColorMask(0,0,0,0)` emits 0x1324 = 0 instead of the former all-channels default; mask 0 and R-only draws pass live on P690 (`--masked-clear-probe`). | The byte mask is capture-confirmed (`parhelia-3d-coverage.md:58`; `parhelia-pixel-pipeline-complete.md:530-551`). |
-| 39 | dithering | **I+G** | Gallium dither reaches the blend word (`parhelia_context.c:2762`; `reference/p3d_state.c:75-92`), but no retained current-Mesa visual test isolates on/off behavior or format gates. | Dither is part of the decoded BLENDCTL contract (`parhelia-blend-alpha-encoding.md:6-12`). |
-| 40 | masked/scissored color, depth and stencil clears | **I+T** | Mesa `96d8758`: `ph_clear()` passes the clamped scissor rectangle and PLNWT mask to `parhelia_batch_clear_rect_surface()`; `clear_scissored`/`clear_masked` are advertised on the P690 64x16 layout, and `clear_render_target`/`clear_depth_stencil` use the same fill.  The fill's P690 row order (y bits 0/1 swapped) is corrected by splitting partial 4-row groups. | Hardware fill-geometry probe (raw and corrected, five bases), masked-clear probe and GL-level `glClear` test all pass on P690; the vendor clear record carries mask and rectangle (`parhelia-gl-feature-map.md:136-147`; `parhelia-gallium-masked-clear-design.md`). |
-| 41 | GigaColor X2R10G10B10 render target/scanout | **M** | Format support exposes no tested 10-bit target and the draw emitter hard-codes color format `0x32` (`parhelia_context.c:2756-2760`). | `0x34` X2R10G10B10 is binary-proven but still needs a P690 3-D target test (`parhelia-gigacolor-faa-hardware-status.md:19-62`). |
+## Evidence boundaries
 
-## Textures and sampling
-
-| # | hardware GL feature | status | current Mesa evidence and remaining contract | documentation evidence |
-|---:|---|:---:|---|---|
-| 42 | base-level 2-D RGB/XRGB/RGBA texture upload and sampling | **I+T** | 2-D resources, tiled upload, descriptors, nearest/linear filters and texture packets are implemented (`parhelia_screen.c:317-539`; `parhelia_context.c:2623-2735,2787-2820`). | Layout-2 textured triangles are hardware-proven; P690 sampled-alpha is the separate exception (`parhelia-engine-context-bringup.md:5262-5358`; row 32). |
-| 43 | one-dimensional textures | **M** | Format support accepts only BUFFER/2D/RECT and sampler views require `PIPE_TEXTURE_2D` (`parhelia_screen.c:145-174`; `parhelia_context.c:3764-3784`). | The vendor sampler supports 1-D as part of its target priority (`parhelia-gl-limits.md:778-779`). |
-| 44 | three-dimensional/volume textures | **M** | Resource, format and view paths reject 3-D targets. | A real 3-D path and W wrap field are documented (`parhelia-gl-limits.md:574,591,779`). |
-| 45 | cube maps | **M** | Resource, format and view paths reject cube targets. | All six faces use the hardware sampler path (`parhelia-gl-limits.md:591,778`). |
-| 46 | rectangle and non-power-of-two 2-D textures | **I+G** | The screen advertises NPOT and format queries accept RECT (`parhelia_screen.c:148-174,917-925`); raw dimensions reach descriptors.  Retained tests prove several non-square layouts, but no broad current-Mesa NPOT conformance result covers wrap/filter/mipmap combinations. | Hardware NPOT is the principal vendor under-declaration (`parhelia-gl-limits.md:587-592`); sampling remained hardware-test-gated in the detailed audit (`parhelia-texture-sampling.md:878-945`). |
-| 47 | 2048x2048 maximum 2-D texture | **C** | Mesa caps the size at 1024 (`parhelia_screen.c:915-924`) while the documented hardware/vendor limit is 2048. | `parhelia-gl-limits.md:569-579`; `parhelia-multitexture.md:569-588`. |
-| 48 | legacy uncompressed texture formats and RGB5_A1 | **I+G** | Generic 32-bit formats are converted; B5G5R5A1 has a dedicated sampler-only path (`parhelia_screen.c:149-172`; `parhelia_context.c:2789-2799,4552-4623`).  The P690 RGB5_A1 sampled-alpha production route has not passed. | The exact A1 route failed the direct test and remains gated (`parhelia-p690-q3-rgb5a1-alpha-route.md:9-27,181-199`). |
-| 49 | S3TC/DXT1/DXT3/DXT5 compressed textures | **M** | Block-compressed formats fail the generic four-byte-per-texel format test (`parhelia_screen.c:166-172`); there is no compressed upload/layout path. | Native compressed sampling and formats are established at `parhelia-gl-limits.md:579,780`. |
-| 50 | nearest and bilinear min/mag filtering | **I+T** | Gallium nearest/linear map directly into the sampler descriptor (`parhelia_sampler.h:9-18`; `parhelia_context.c:2800-2805`; `reference/p3d_state.c:177-185,665-669`). | Codes are hardware-proven (`parhelia-texture-sampling.md:207-315`). |
-| 51 | mipmap chains, nearest-mip and trilinear filtering | **C** | Mesa accepts mipmapped resources/views but `ph_use_mips` always returns false (`parhelia_context.c:1317-1328,3763-3784`); every draw samples level zero. | The chain, tail and filters are decoded (`parhelia-texture-sampling.md:659-867`), but the exact P690 packet stopped retiring and is intentionally disabled (`parhelia-p690-mipmap-probe.md:11-68`). |
-| 52 | anisotropic filtering up to 2x | **I+G** | Gallium advertises a maximum of 2 and maps a request above 1 to filter code 3 on both texture units (`parhelia_screen.c:925-926`; `parhelia_sampler.h:9-18`; `parhelia_context.c:2800-2805,2843-2848`).  The exact `0x01c0105b` filter word has a retained self-test (`parhelia_drm_test.c:1510-1520`), but the open-driver path has no retained live-hardware result. | Both saved vendor stacks clamp/report 2, and the code-3 sampler encoding is established at `parhelia-texture-sampling.md:292-320`; `parhelia-gl-limits.md:575,781`. |
-| 53 | repeat and clamp-to-edge | **I+T** | Repeat is distinct; every other Gallium wrap currently maps to clamp (`parhelia_context.c:2808-2811`). | Repeat/clamp encodings are hardware-proven (`parhelia-texture-sampling.md:361-430`). |
-| 54 | clamp-to-border, mirrored repeat and independent R wrap | **C** | These modes collapse to ordinary clamp, no border color is uploaded, and only S/T are represented (`parhelia_context.c:2808-2811`; `reference/parhelia3d.h:209-220`). | Border addressing/color and the third wrap field are documented (`parhelia-gl-limits.md:782`; `parhelia-texture-sampling.md:361-443,943-990`). |
-| 55 | texture LOD bias, MIN/MAX_LOD and BASE/MAX_LEVEL | **M** | No Gallium sampler/view values reach the descriptor beyond hard-wired base zero and disabled mip selection. | The hardware fields and the vendor unit>0 LOD-bias bug are documented at `parhelia-gl-limits.md:783-784`; `parhelia-texture-sampling.md:320-359,430-443,794-867`. |
-| 56 | two-texture diffuse×lightmap MODULATE | **I+T** | Two units are exposed; P690 exact MODULATE uses the live-tested one-pass path and other supported shapes serialize (`parhelia_screen.c:947-962`; `parhelia_context.c:2916-3015,4900-4908`). | The physical-pipe-2 route and Q3 image comparison are hardware-proven (`parhelia-multitexture.md:637-690`). |
-| 57 | four simultaneous texture units | **C** | Mesa advertises only two samplers/views (`parhelia_screen.c:947-960`) and lowering recognizes only samplers 0/1. | Four independent units are proven (`parhelia-multitexture.md:30-49,567-588`; `parhelia-gl-limits.md:576,774`). |
-| 58 | partial texture updates / `glTexSubImage` | **I+G** | Staged maps preserve and upload subresources, but the P690 texture-upload ABI still copies the allocation and no retained target test covers all offsets/mip levels (`parhelia_context.c:4633-4802`). | The vendor rectangle update record and Mesa comparison are documented at `parhelia-texture-updates-small-ui.md:1-85`. |
-| 59 | copy/blit and render-target sampling | **I+T** | Hardware batch blits, resolve/upload, `resource_copy_region` and `blit` are installed (`parhelia_screen.c:184-316`; `parhelia_context.c:4330-4493,4921-4923`). | Native copy/present and owned-target paths are retained in `parhelia-own-render-target.md` and `parhelia-kms-linear-frontbuffer.md`. |
-| 60 | 10-bit texture sampling | **M** | No 10-bit sampler format is exposed. | The vendor evidence explicitly does not prove sampling and requires isolated testing (`parhelia-gigacolor-textures.md:59-111,141-152`). |
-
-## Other documented hardware facilities
-
-| # | hardware GL feature | status | current Mesa evidence and remaining contract | documentation evidence |
-|---:|---|:---:|---|---|
-| 61 | FAA-16x / multisample fragment buffer and resolve | **M** | Format support rejects `samples>1`; sample-mask setter is a no-op (`parhelia_screen.c:145-175`; `parhelia_context.c:4159-4160`). | The fragment allocation/command exists, but key registers and P690 validation remain open; truthful policy is to expose no sample buffers (`parhelia-gigacolor-faa-hardware-status.md:64-129`; `parhelia-antialiasing.md:729-744`). |
-| 62 | occlusion query | **M** | No query callbacks or counter state exist.  This is not a short-term implementation candidate because no vendor stack or hardware register contract is known. | The negative vendor-stack audit and its silicon caveat are at `parhelia-feature-exposure.md:111-135`. |
-| 63 | vertex blend matrices / palette skinning | **M** | Mesa has no hardware WARP lowering for the feature. | Four blend matrices and 31 indices are documented hardware capabilities (`parhelia-gl-limits.md:598`). |
-| 64 | displacement mapping | **M** | No tessellation/displacement path exists. | Evidence is Windows-only and no Linux packet recipe has been recovered (`parhelia-feature-exposure.md:66-80`). |
-
-The documentation also establishes one negative boundary outside the scored
-matrix: sRGB texture decode and framebuffer encode are not documented hardware
-features.  Mesa correctly rejects those formats (`parhelia_screen.c:135-143`),
-consistent with both vendor GL drivers and the distinction between the scanout
-gamma LUT and GL color-space conversion
-(`parhelia-gamma-lut-srgb-vendor-re.md:104-158`).
-
-## Counts and remaining room
-
-The 64 positive hardware-feature rows classify as follows:
-
-| status | rows | share |
-|---|---:|---:|
-| I+T | 19 | 29.7% |
-| I+G | 18 | 28.1% |
-| M | 21 | 32.8% |
-| C | 6 | 9.4% |
-
-Counting a gated/partial row as half complete gives a rough hardware-feature
-coverage of **28/64 = 43.8%**.  This is an engineering inventory, not a GL
-conformance score: rows deliberately represent user-visible feature families,
-and a small state such as scissor has the same weight as a large compiler such
-as programmable WARP.  The result nevertheless quantifies the opportunity:
-**45/64 rows (70.3%) still require default enablement, validation,
-implementation, or correction**, and 27/64 (42.2%) are wholly missing or
-contradicted.  The first number includes the 18 useful-but-gated or unvalidated
-rows; the second is the narrower estimate of functionality with no usable
-implementation or a current correctness contradiction.
-
-The highest-impact next implementations, ordered by benefit versus recovered
-evidence, are:
-
-1. **Masked/scissored clear — done 2026-09-11 (rows 29, 40).**  Implemented
-   and hardware-verified; see `parhelia-gallium-masked-clear-design.md`.
-2. **Native points and remaining line modes.**  Unit-width untextured
-   `GL_LINES` is connected and offline-tested.  Points still emit no pixels;
-   textured/smooth/wide lines and strips/loops remain absent despite decoded
-   topology words and vendor target results.
-3. **Texture completeness:** S3TC first on 0x0528-class hardware, then the
-   P690 mip prerequisite, border modes and 2048 sizing.  Cube/3-D
-   resources require broader resource/view work but have strong vendor recipes.
-4. **Hardware raster/T&L state:** cull, polygon offset, viewport/depth range,
-   clip planes, fog and lighting.  These eliminate software-draw work and expose
-   capabilities already decoded in detail, but they need coordinated WARP
-   program/state selection.
-5. **A real fragment/WARP compiler or truthful caps.**  Until arbitrary NIR is
-   lowered, GLSL 1.20 is a false capability.  A staged implementation can first
-   add the documented fixed-function ADD/BLEND/COMBINE/DOT3 shapes, then expand
-   to the recovered fragment ISA.
-
-FAA, 10-bit texture sampling, native P690 mipmapping, and ordinary one-unit P690
-sampled alpha should remain behind explicit hardware proof.  Their documents
-record failed or incomplete target evidence, so enabling them from static packet
-similarity would convert known limitations into regressions.
+Occlusion queries have no driver callbacks and no recovered usable hardware
+counter contract; the negative vendor audit is not an implementation recipe
+(parhelia-occlusion-query-re.md). Skinning/palette and displacement remain
+vendor capability/RE leads, not ready implementation tasks. Native sRGB decode
+and framebuffer encode are not established hardware features. No percentage
+completion score is assigned to these unequal and partially validated families.
