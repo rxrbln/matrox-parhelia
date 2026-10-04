@@ -4,7 +4,7 @@ Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
 Reconciled with code on 2026-10-04: shared Mesa **9369ebc**, shared DRM
-**f288453**; isolated Mesa **4aa7fa7**, DRM **0f7d564**. Diagnostics **8719c74**
+**f288453**; isolated Mesa **dac942a**, DRM **0f7d564**. Diagnostics **8719c74**
 include phase statistics, overlapping transform-fixup causes and default-off
 metadata observation (no observation-mode hardware result yet).
 The shared and experimental stacks must not be treated as the same deployment.
@@ -14,6 +14,41 @@ Its 64-row percentages and line references describe that old snapshot; they
 are not current coverage figures. Functional GL support, native acceleration,
 and retained hardware proof are separate claims. This inventory is not a
 conformance result.
+
+
+## GPU affine texture link checkpoint: dac942a, 2026-10-04
+
+The isolated gpu-features branch links affine fragment texture coordinates
+into private WARP vertex programs (o3/o4). Fragment-consumed lane masks let
+packed lighting plus raw coordinates share a generic varying without requiring
+unused coordinate lanes to fit the clamped color carrier. Two taps of one
+texture are independently composed. Clipped and rejected native draws retain
+CPU coordinate/varying fixups; original application NIR remains unchanged.
+
+Hardware proof: ten frames per single/two-tap case at 1024x768, FAA=0,
+662592 pixels per frame with zero mismatches, and linked GPU draw markers.
+Additional two-tap 1408-triangle grids pass native, clipped (657024 pixels),
+forced-software and disabled-GPU-multitexture cases. All compiler selftests
+and seven focused Piglit regressions pass. The glmark texture profile shows
+one compiled GPU transform draw/frame, with software tails for clipping.
+
+One short matched texture scene scores 219 before / 227 after; this is a
+ballpark result, not proof of a stable speedup. One new short regression pass:
+Quake3 387 frames / 13.6 seconds / 28.4 FPS; glmark build/shading/bump
+62/24/230 FPS (three-second scenes). Earlier measurements used different
+lengths and are not a matched comparison. No repeated benchmark campaign.
+Future runner defaults to one pass per latest user instruction.
+
+Limits: at most two coordinate units, affine varying expressions, smooth
+interpolation, complete single-block VS outputs. Uniform-dependent coordinates,
+secondary generic color routing, ramps, nonlinear expressions and wider shader
+coverage remain gaps. Native indexed/strided fetch remains unproven. The
+small smooth-point coverage candidate stays preserved on faa-textured and is
+not deployed. This milestone adds no FAA work.
+
+Deployed binary SHA-256:
+`cdf00a996b6509294fb812d539a98db7a9baaf626f861db6e984d3311ddd0e68`.
+Prefix `/root/parhelia-mesa-gpu-features`; DRM/boot unchanged.
 
 ## Implemented paths and remaining limits
 
