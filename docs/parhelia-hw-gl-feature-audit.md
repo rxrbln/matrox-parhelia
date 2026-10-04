@@ -95,7 +95,7 @@ hardwarelock. All routineperformance checks default to one short run.
 | Mipmaps, filtering and wrap | Mip chains, trilinear filtering, border/mirrored wrapping and LOD state exist. The original-family LOD-bias issue below remains. |
 | Multitexture | Original family exposes up to four hardware units; LX is limited to two. Coverage depends on compiler lowering and chip capabilities. |
 | Narrow texture formats | Chip-dependent format routes exist; format support must be read from ph_is_format_supported, not the old blanket missing-format list. |
-| S3TC | Upload/sampling code exists behind PARHELIA_S3TC; successful native hardware retirement remains unproven. Keep gated. |
+| S3TC | Original-family BC1 storage uses measured block addressing and physical tile footprints (841aa83). Native 64x32/128x128 sampling and eight GL RGB/RGBA upload/subimage/readback cases pass, including punch-through alpha. Mip chains, filtering, broader dimensions and BC2/BC3 remain open; keep PARHELIA_S3TC gated. |
 | Transfers, copy/blit, render-to-texture and mixed-size FBOs | Implemented. Broader format/subresource and shader workloads still need coverage tests. |
 | VRAM eviction and restoration | parhelia_ttm_move is installed; aperture resource/page copies and eviction/restore counters exist. The old patch-only TODO is superseded. |
 | Cursor placement/upload | Cursor uses parhelia_vram_bar_addr and original-family aperture writes. The old direct-flat-BAR claim is superseded; broader placement/display stress remains validation work. |
@@ -168,7 +168,7 @@ resolves. Benchmarks and Piglit remain FAA off.
 4. **P690 larger primitive packets.** More than the safe two-primitive default
    can wedge. Do not turn packet-size experiments into a default merely from
    vendor similarity. See parhelia-p690-multi-primitive-packet-hang.md.
-5. **Fragment/compiler and glamor coverage.** Current remaining transform gaps include bump lookup ramps, secondary
+5. **Fragment/compiler and glamor coverage.** 0a47bf5 adds GPU direction lookup ramps for the proven single-unit direction-cube route, preserving VS normalization and clipped fallbacks. Native varying, normalized and clipped pixel checks pass. Current remaining transform gaps include secondary
    generic routing, nonlinear texture coordinates and
    unsupported shader expressions. dac942a now links up to two affine
    texture coordinates into GPU vertex programs; clipped draws retain CPU
@@ -200,9 +200,13 @@ resolves. Benchmarks and Piglit remain FAA off.
 8. **Recovery and display coverage.** No validated general engine-reset path;
    continue isolated bounded tests. Secondary-head/multimonitor and cursor
    placement stress need current hardware proof.
-9. **Hardware proof gates.** Native S3TC, GigaColor render/sampling and
+9. **Hardware proof gates.** BC2/BC3 and complete S3TC mip/filter coverage, GigaColor render/sampling and
    system-memory texture fetch remain unproven. Keep unsupported/gated rather
    than equating decoded vendor structures with working Mesa support.
+
+10. **Presentation and submission performance.** Fullscreen flips, double-buffer reuse and asynchronous submission are explicit priorities. The current 0528 X configuration has PageFlip=false; the Quake3 helper defaults to a window on a 1920x1200 desktop. The DRI loader already carries the two-back-buffer flip fix, but P690 flip evidence does not establish original-family operation. Native client end-of-frame flush avoids a redundant fence wait; retain completion ordering for CPU access and Present consumers. Kernel submit_stats=0 disables statistics, not the async capability. Collect non-serializing upload/ioctl timings and accepted async/sync/fallback counts before changing queue behavior.
+
+The default-off native-offset candidate d6df48e retired safely but failed six of seventeen depth-effect cases on 0528: nonzero slope/units behaved as no offset. Known-good DRM0f7d564 and X were restored. Vendor c178/mode86/d7 captures establish packet generation only; do not enable native GL offset from them. Q3's offset fallback is one draw/eighteen vertices per frame, so major performance work takes precedence.
 
 ## Historical reports requiring fresh reproduction
 
