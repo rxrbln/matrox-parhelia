@@ -1260,3 +1260,61 @@ Recovery caveat: the shared power-cycle script used to skip a healthy recent
 cycle even with `FORCE=1`. That guard is corrected, and subsequent runners
 record and compare boot IDs. Empty earlier cycle logs identify same-boot
 repeats, not independent boots.
+
+
+### 14.5 Per-application GL experiment and glxgears (2026-10-04)
+
+The next isolated Mesa branch is based on main `9369ebc`, commit `20306f8`
+in `wip/faa-gl/mesa-driver`. `PARHELIA_FAA=1` enables the experiment per
+application; it defaults off. A 16 MiB fragment BO, the corrected draw arm,
+reserved stencil bit, -0.5 XY convention and resolve/hand-over on flush,
+clear or target change now operate on actual glxgears. The GL entry path
+currently accepts opaque, untextured, LESS-tested writable Z24 triangles
+with application stencil off; it uses CPU vertex processing and separate
+synchronous batches. General textured, blending, stencil and multiple-owner
+GL use is not validated. No multisample visuals are advertised.
+
+Kernel `967dea2` changes only the diagnostic placement predicate: a batch
+which resolves and turns FAA off still needs its fragment/depth roles,
+even though its last raster word has mode zero. It uses any FAA write for
+placement and keeps the existing last-word rule for the terminal drain.
+The screenshot boot uses `faa_vendor_banks=1 faa_bank_variant=4
+faa_boundary=0`; ordinary colour stays in its available A window.
+
+Real `/usr/X11/bin/glxgears` produces paired 600x600 images. A capture shim
+freezes only the application's animation clock and reads its actual GL_BACK
+pixels; it does no rendering or antialiasing. Captured 1,170 vertices (390
+triangles) have identical Z/RGB and only the expected -0.5 FAA XY bias.
+The executed stream has one arm, 196 draw packets and one DWGCTL 9 resolve;
+colour `01986000`, fragment `09000000` (B), depth `02000000` (A). The
+FAA image has visibly smoother silhouettes and hole edges. Ten successive
+swaps resolve successfully; frame 10 is byte-identical to frame one at the
+fixed angle. [MEASURED]
+
+Untraced performance boot: 30 warm-up + 500 timed frames, three repeats,
+600x600 with swap interval zero. Medians are 398.712 FPS ordinary defaults,
+266.028 FPS ordinary CPU/synchronous/no-aggregation, 210.286 FPS FAA with
+the same CPU/submission settings. FAA adds 0.996 ms/frame, **26.5% frame
+time** against that matched baseline (21.0% fewer FPS). Against normal
+defaults the current prototype costs 47.3% of FPS, including its CPU vertex
+and submission changes. This is end-to-end GL/X frame timing, not isolated
+hardware resolve time. All 1,590 FAA swaps in the three runs finish, with
+no Parhelia wedge in the kernel log. [MEASURED]
+
+The matched benchmark masks only the async-submission capability to select
+Mesa's existing synchronous fallback in both clients; it changes no register
+values and bypasses no validation. The animation-clock freeze does not
+modify CLOCK_MONOTONIC used for timings. Kernel trace/dump options are off;
+logs are on tmpfs during measurement. Full evidence, images, timings,
+builder checks and all 144 passing Mesa selftests are under
+`campaign/results/faa-gl/`. The isolated kernel/Mesa artifacts and source
+patches are under `campaign/agents/faa0528/0003-*`. The shared stack is
+restored after diagnostics and remains FAA-disabled.
+
+For textures, the fragment-buffer bank contract and resolve lifecycle are
+expected to be shared, but textured WARP/interpolation, sampler/combiner
+state and the vendor's texture-format-dependent validation hooks in 12.3
+must be exercised together. The untextured record evidence does not prove
+textured shading semantics. Removing the current GL texture guard is not
+such a validation. Texture filtering/mipmap minification and polygon-edge
+FAA address different sources of aliasing.
