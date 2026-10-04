@@ -1084,3 +1084,69 @@ accumulated without a resolve; the single resolve then locks up every time,
 so the failure grows with the fragments the resolve must walk.  The largest
 remaining difference is the vertex/WARP path the resolve's plane packet runs
 through.  [MEASURED]
+
+## 14. Everything the emulated vendor capture contains (extraction, 2026-10-04)
+
+Sources: `captures/faaemu/*.json.gz` (keys `primary`, `submits`, `exec`,
+`mmio`), decodes `*.flat.txt` / `*.annotated.txt`, diffs `diff-*.txt`.
+`mmio` entries are `[R|W, offset, value, size, eip, phase]`.  [DERIVED
+unless marked]
+
+### 14.1 Direct MMIO outside the command stream
+
+| phase | writes | content |
+|---|---|---|
+| miniport init | 0x920 = 0 (on-chip WARP store), memory/clock setup | `0x920` is read then written 0 in `ioctl 232280` and again in `ioctl 23231c` |
+| `ioctl 23212c` | `0x404 = 0x08080000`, `0x400 = write-back page` | primary ring lives in VRAM (engine address `0x08080000`); `0x408` is the put pointer, one write per submit |
+| `ioctl 232294` | `0x8f8/0x8fc = 0x40000/0x40000`, then `0x10000/0x50000` | meaning OPEN; written once before the first submits |
+| `ioctl 232380`, `ddraw`, `context`, every clear/draw | host-aperture descriptor slots `0x10..0x13c` (`d0 = 0x10000000 | coord`, `d1` = engine address, `d2` = surface config, `d3` = dims), each with `0x314 = 1` | BAR0 views for CPU access; context creation programs all 20 slots |
+| every FAA draw phase | `0x918` = instruction index, `0x91c` x 3n = WARP instructions | on-chip store: four programs at index 0 (15, 14, 29, 47 instructions), then 0x2f (19) and 0x42 (12); identical in every frame and identical with AA off (`noaa-aamode54`) |
+
+The draw entry `0x1100 = 0x108` is store index `0x42` x 4.  Programs:
+`captures/faaemu/warp-store-<n>-idx<i>.hex` (3 dwords per instruction).
+Because the WARP path is the same with and without AA, it is not part of
+the FAA mechanism; it remains the largest difference between our draws and
+the vendor's, which matters only if the resolve depends on vertex-path state.
+
+### 14.2 The command stream, per phase (faa-default)
+
+* **create / context**: section submits that load engine defaults and
+  WARP constants (`0x41` block loads, `0x10f0/0x1100/0x10c0..0x10d8`).
+* **frameN-clear**: 2-D fills (`DWGCTL 0x5c0`) of colour and of depth
+  (plane mask `0x01ffffff`: Z and stencil bit 0 cleared), `0x307` fences.
+* **frame0-draw**: arm (`0x12fc = 0x04868027`, `0x12f8 = 0x007fffff`,
+  `0x12c8 = 0x000e00e7`, masks `0xfe/0x1fe`, slot 2 = buffer
+  `0x10000020`), `[0x307, tag|1, tag, 0x12b0 = 0x3ffe0842]`, draw
+  `DWGCTL 0x00b60ec4`, pretransformed draw packet `0x97080001` (5 dwords
+  per vertex), end-of-call `[0x307, tag|1, tag, resume]`.
+* **frame0-present**: re-validate (`PRIMWORD 0x0002305c`, `VTXBASE0..7`,
+  strides), slots 0/2/1, `[0x1324 = ~0, 0x12cc, 0x12d0]`,
+  `[0xc4, 0x132c = 0x0fff0fff, 0x1328 = 0, 0x12c8, 0x12fc]`, 28 setup-plane
+  writes (all end at 0), `[DWGCTL 9, 0xc4]`, `[0x107 ...]`, `[0x207 ...]`,
+  `[0x307, 0xc4][4, 0x407, tags, 0xc4]`, then the 2-D BITBLT
+  (`DWGCTL 0x2c2`, 32x64 strips) to the primary with FAA still armed.
+* **frame1/2**: draws without a resolve while state stays constant (the
+  resolve unlinks the target; only dirty blend/colour-write/MSAA/ZFUNC
+  state relinks it), present blit only.
+
+### 14.3 Vendor vs probe: status of every difference
+
+| difference | probe status | hardware result |
+|---|---|---|
+| stencil field 7, masks `0xfe/0x1fe`, ThresholdAA `0x7fffff`, draw DWGCTL bit 20, resume `0xc4` | replicated (`FAA_VFRAME`) | lockups later, not gone (series23) |
+| `0x12fc` word identical (`0x04868027`) | replicated | same |
+| post-resolve `[0x307][4, 0x407]` | replicated (`FAA_POSTFLUSH=3`) | same |
+| MemLevels only through the tagged arm | replicated (`FAA_MLARM`) | same |
+| PRIMWORD bit 18 clear before the setup planes | replicated (`FAA_RESOLVEPRIM`, Mesa clone) | full 6/3/4, half none/7/none; A5 still locks (series25) |
+| separated pipe regions (`0x1340`/`0x13c0`) with all of the above | replicated (B1, Q layouts) | half: 1, 4, 3 (series26, partial) |
+| resolve once after N frames | tested | N = 5 always locks in the resolve |
+| depth surface descriptor | already identical (`0x36020100`) | - |
+| on-chip WARP store programs, entry `0x108`, VTXFMT `0x23/0x00a87210`, 5-dword vertices | **not replicated** (kernel owns memory WARP programs) | - ; not FAA-specific (14.1) |
+| per-batch kernel drain: vendor has no drain inside an FAA frame other than its own tagged fences; our kernel ends every batch with `0x307` under `faa_boundary=8` (all series 23-26) | **not combined**: module -10's `0x707` drain (boundary 0) was never run with the VFRAME state | - |
+| command sections in VRAM (class 0), primary ring in VRAM | **not replicated** (our sections are host memory) | - |
+| vendor depth clear by plane-masked 2-D fill vs our full-word fill | equivalent for bit 24 | - |
+
+Conclusion of the extraction: the vendor's FAA-specific words are all
+reproduced and the resolve still locks up as fragments accumulate.  What is
+left differs in *how* the stream reaches the engine (sections in VRAM, the
+per-batch drain, on-chip WARP store), not in the FAA register values.
