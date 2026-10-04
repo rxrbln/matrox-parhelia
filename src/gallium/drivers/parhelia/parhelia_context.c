@@ -1682,6 +1682,17 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
       if (ret)
          return ret;
    }
+   /* The original family's column-strip fills are still landing when 3D
+    * work in the same stream starts (0528: depth and colour strips over
+    * finished pixels); the vendor drains after every fill. */
+   if (ctx->aggregate_state_stream && draw_batch &&
+       ph_original_family(ph_screen(ctx->base.screen)->chip_id) &&
+       ctx->pending_batch.packet_count &&
+       !ph_batch_has_draw(&ctx->pending_batch)) {
+      ret = ph_drain_batch(ctx);
+      if (ret)
+         return ret;
+   }
    if (ctx->aggregate_state_stream &&
        batch->packet_count + stage_calls > ctx->batch_limits.packets)
       return -E2BIG;
