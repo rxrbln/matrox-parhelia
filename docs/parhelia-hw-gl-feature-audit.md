@@ -42,6 +42,10 @@ reference/p3d_state.c (packets); DRM parhelia_drv.c, parhelia_gem.c,
 parhelia_cursor.c and parhelia_submit.c. Commit references above pin this audit
 without relying on obsolete source line numbers.
 
+Current user priority: implement/test hardware GPU features and optimize
+Quake 3/glmark2 with FAA **off** until further notice. Piglit must also use
+FAA off. FAA implementation/performance/control work below is deferred.
+
 ## Active feature and bug TODOs
 
 1. **FAA performance and application control.** At 1024x768, three matched
