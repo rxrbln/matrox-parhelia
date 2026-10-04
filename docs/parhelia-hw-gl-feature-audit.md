@@ -138,13 +138,16 @@ resolves. Benchmarks and Piglit remain FAA off.
 4. **P690 larger primitive packets.** More than the safe two-primitive default
    can wedge. Do not turn packet-size experiments into a default merely from
    vendor similarity. See parhelia-p690-multi-primitive-packet-hang.md.
-5. **Fragment/compiler and glamor coverage.** Current glmark2 evidence
-   identifies texture-tap/varying-route fixups, bump lookup ramps, and shading
-   generic-output routing as GPU-transform gaps. c45282b now links a proven
+5. **Fragment/compiler and glamor coverage.** Current remaining transform gaps include bump lookup ramps, secondary
+   generic routing, uniform-dependent/nonlinear texture coordinates and
+   unsupported shader expressions. dac942a now links up to two affine
+   texture coordinates into GPU vertex programs; clipped draws retain CPU
+   fixups. Single/two-tap pixel and fallback checks pass. c45282b now links a proven
    bounded generic color varying to WARP o1, including normalized matrix
    lighting and GPU saturation. Matrix-lighting pixel checks pass for ten
-   frames on native, forced-CPU and clipped paths. Generic1 and unbounded
-   varying domains remain gaps. 4538ca2 enables the affine bounding-box
+   frames on native, forced-CPU and clipped paths. Generic1 and unsupported
+   varying domains remain gaps; dac942a proves only fragment-consumed color
+   lanes so unused raw texture coordinates need no clamped-color bound. 4538ca2 enables the affine bounding-box
    clip gate by default, avoiding repeated CPU position interpretation while
    retaining GPU transforms; native shading improved from 8 to 27 FPS in
    diagnostic runs. The latest 20-second run gives 26 FPS at 1024x768.
