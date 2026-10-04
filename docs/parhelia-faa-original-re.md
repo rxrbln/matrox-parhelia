@@ -733,6 +733,63 @@ objects in one process [MEASURED]:
 
 Re-zeroing the buffer is not the cause, and an idle wait does not help.
 
+### 11.15 Summary of the hardware results (modules faa0528-10 .. -15, 2026-10-04)
+
+**Fragment unit words** (`0x1340..0x134c`, `0x13c0..0x13cc`, written by the
+vendor only in its activate path):
+
+* `0x1340 + 4i` is the allocation pointer of pixel pipe *i* (four pipes), in
+  256-byte units: with explicit loads the records of the four pipes start
+  exactly at the loaded values times 256 (`0x12190`, `0x24250`, `0x363d0` for
+  `0x121`, `0x242`, `0x363`; `0x400030`.. for `0x4000`..) [MEASURED].  The
+  long-known 24 KiB ceiling `0x5130` is the first dumped word `0x51` times 256
+  plus the slot.
+* `0x13c0 + 4i` places the pipes when the pointers are zero: any non-zero
+  set spreads the records over the buffer, all zero stacks the four pipes at
+  offset 0; addresses wrap at the buffer end [MEASURED placement]; the exact
+  word-to-pipe mapping (base of pipe *i* or end of pipe *i-1*) is OPEN.
+* Power-on pointers are small (`1, 1, 1` or `0, 0, 0` read back), so without a
+  load all pipes allocate in the same 24 KiB and overwrite each other's chunks:
+  the data loss of 11.6 [INFERRED].  The resolve leaves the pointers at 0.
+* The vendor loads zeros for a fresh owner (4.2); what separates its pipes
+  then is OPEN.
+
+**Buffer format.**  The allocation unit is a 256-byte chunk of 8 rows by 8
+dwords.  Records (4 dwords: colour, coverage mask, position, `0x4020ffff`)
+sit in rows 0/1/4/5, columns 4-7; colour pixels of the target tile the chunk
+belongs to sit in rows 6/7.  Each pipe's colour data stays within its own
+chunk range [MEASURED layout, meaning INFERRED].  Pixels whose colour is in
+a chunk that the resolve does not write back remain at the background value
+("holes", 161-195 of 373 edge pixels at half size).
+
+**Z tile tracking** is required state: with X stopped and no Z commands the
+first FAA frame locks up in 4 of 4 boots; with tracking on (`DWGCTL 0x20a`)
+and a Z-init load (`0x12b4` + `DWGCTL 0x008`) ahead of the FAA submit it
+completes in 14 of 19.  The Z-init reset `0x108` makes it worse (5 of 6 boots
+lock up in frame 1).  Z-init does not rewrite depth memory: references of
+earlier frames stay there (they are not the cause: frame 1 also fails).
+
+**Resolve behaviour.**  A counter-only marker fence between draw and resolve
+always completes: the draw finishes and the resolve (`DWGCTL 9`) is what does
+not, with the engine left on the post-resolve `0x107` fence.  The resolve
+merges (k/8 steps, error 0.07 for completed pixels) only in the same stream as
+the draw; any flush fence between them (`0x107`, `0x207`, `0x307`) locks it
+up and `0xc07` ends the session.  No dumped state (record counts, chunk
+extents, depth references) separates frames whose resolve completes from those
+that lock up.  Variants without effect: kernel strobes and stage CALLs removed
+(worse), `full_sync`, MemLevels through the vendor's tagged arm and other
+MemLevels bits, ThresholdAA `0x007fffff`, a 4 or 16 MiB buffer, a resolve
+scissored to the bounding box, X stopped, the hand-over and arm flushes.
+
+**Stable envelope.**  With X stopped, `FAA_ZINIT=2` (tracking on + Z-init at
+the head of each frame, tracking off after the resolve), the vendor's post
+fences and the default 1.18 MB buffer: a triangle of 0.25 or 0.4 of the probe
+size (up to about 800 non-zero buffer dwords) ran 10 of 10 frames on 5 of 5
+boots; from 0.5 upward lockups appear (frame 2-8), the full triangle locks
+up within 1-7 frames.  FAA is not usable for real scenes on the 0528 until the
+resolve lockup is understood; the vendor command stream recorded under
+emulation is the next reference.
+
 ## 12. The vendor FAA frame pair, packet by packet (static, original family)
 
 Scope: `MTXPARD.dll` with `caps & 0x7fc00 == 0` (0x0527/0x0528), one D3D
