@@ -1318,3 +1318,67 @@ must be exercised together. The untextured record evidence does not prove
 textured shading semantics. Removing the current GL texture guard is not
 such a validation. Texture filtering/mipmap minification and polygon-edge
 FAA address different sources of aliasing.
+
+
+### 14.6 Textured GL FAA, depth contracts and Quake 3 (2026-10-04)
+
+Mesa `72131b1` on isolated branch `faa-textured` extends the default-off
+`PARHELIA_FAA=1` path to ordinary textured triangles. Kernel `0f7d564`,
+following merge `9cd8564` onto main `f288453`, advertises automatic FAA
+placement through GET_PARAM 33. Diagnostic bank options are no longer
+required. Shared sources and deployments remain unchanged.
+
+Two additional contracts explain the new failures. First, move the 16 MiB
+fragment allocation into the bank opposite depth **before** pinning the
+required depth window. The initial allocation occupied that window; the
+ordinary allocation fallback produced different draw/resolve depth
+addresses and corrupted the image. The FAA allocator now requires the
+window and retains the same depth address through resolve. [MEASURED]
+
+Second, the vendor does not disable the hardware Z unit for D3D ZENABLE=0.
+Textured emulator captures emit ZFUNC `0x000e00ef` (enabled ALWAYS) and
+ZWRITE `0xfe` (depth writes off). Direct hardware Z disable wedges FAA;
+the vendor mapping passes 100 textured frames and the overlapping-draw
+checks. Regular enabled depth comparisons and write bits are preserved.
+The emulator now accepts `--texture opaque|alpha` and repeated
+`--render-state NAME=VALUE`. These are command captures, not rendered
+images or timing evidence. [MEASURED]
+
+FAA owns physical stencil bit zero. Native mappings are CPU shadows, so
+preserving the application's bit requires download before saving and again
+before restoring/uploading current depth after handover. CPU-only restore
+failed with 0xa4 instead of 0xa5. Correct transfers preserve all 65,536
+stencil pixels across ten FAA/stencil transitions, including a subsequent
+8-bit EQUAL draw. Colour-only drawables use private Z24 metadata storage
+while retaining disabled application depth semantics. [MEASURED]
+
+GPU checks pass nearest, linear, real minified LOD 1, two-texture modulation,
+vertex-alpha blending, alpha-channel visuals, readback without glFinish,
+and near/far depth occlusion in both orders. Suppressed depth writes and
+disabled depth tests allow a subsequent farther draw as required. All 144
+ordinary Mesa selftests and focused ASan/UBSan builder checks pass.
+Actual Quake 3 completes repeated 387-frame timedemos without a wedge.
+Paired SDL swap-200 captures show coherent textured gameplay with smoother
+roof and silhouette edges. [MEASURED]
+
+At 640x480, swap interval zero, untraced kernel, one 387-frame run per path:
+ordinary defaults 35.4 FPS (28.2 ms/frame), matched ordinary CPU/synchronous/
+no-aggregation 22.6 FPS (44.2 ms/frame), FAA 16.0 FPS (62.5 ms/frame).
+About 47% of the added frame time is reproduced by prototype restrictions
+without FAA; the remaining 18.3 ms/frame includes metadata, resolve,
+handover and other FAA work. This is not isolated hardware resolve timing
+or a promise of recoverable FPS. Removing eager handovers around GPU alpha
+micro passes still gave 16.0 FPS and was reverted. Next work is compatible
+batching/async ordering, hardware transforms with viewport bias, and phase
+profiling. [MEASURED]
+
+Coverage remains experimental: RGB32 plus Z24/private Z24 on the original
+family. Application stencil, alpha test, partial colour masks, logic ops,
+other formats, points/lines and special CPU/multipass paths hand over to
+ordinary rendering; those draws do not all receive FAA. Multiple owners
+remain unvalidated, and no MSAA visual is advertised. FAA addresses geometry
+edges rather than texture-detail aliasing.
+
+Committed evidence and reproducible capture/benchmark helpers are in
+`captures/faa-textured-20261004/`; complete working results and negative
+allocation/no-Z experiments are in `campaign/results/faa-textured/`.
