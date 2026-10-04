@@ -4,7 +4,7 @@ Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
 Reconciled with code on 2026-10-05: shared Mesa **9369ebc**, shared DRM
-**f288453**; isolated Mesa **867b45a** (production **4cb3944**), actual DRM
+**f288453**; isolated Mesa **ec09fd7** (production **879b212**), actual DRM
 **0f7d564**. Performance DRM **12d2626** has passed isolated hardware tests
 and was restored afterward. It is not the currently loaded kernel.
 The latest GPU-gap report records exact source, binary and configuration evidence.
@@ -96,7 +96,7 @@ hardwarelock. All routineperformance checks default to one short run.
 | Mipmaps, filtering and wrap | Mip chains, trilinear filtering, border/mirrored wrapping and LOD state exist. The original-family LOD-bias issue below remains. |
 | Multitexture | Original family exposes up to four hardware units; LX is limited to two. Coverage depends on compiler lowering and chip capabilities. |
 | Narrow texture formats | Chip-dependent format routes exist; format support must be read from ph_is_format_supported, not the old blanket missing-format list. |
-| S3TC | Original BC1 storage supports 20 measured base shapes covering all 211 opaque nonlightmap Quake3 benchmark candidates. 39,201 raw addresses and 79 added native pixel checks pass; exact app RGBA encoding and bilinear/trilinear repeat filtering are independently verified. One opt-in compressed 1024x768 windowed GL1 run reaches 46.2 FPS, with an inspected gameplay capture. Anisotropy-specific coverage and BC2/BC3 remain open. Native S3TC remains gated by PARHELIA_S3TC. |
+| S3TC | Original BC1 storage supports 20 measured base shapes covering all 211 opaque nonlightmap Quake3 benchmark candidates. 39,201 raw addresses and 79 added native pixel checks pass; exact app RGBA encoding and bilinear/trilinear repeat filtering are independently verified. One opt-in compressed 1024x768 windowed GL1 run reaches 46.2 FPS, with an inspected gameplay capture. Anisotropy2 axis-aligned2:1 minification atLOD1 has vendor/native proof; broader perspective/diagonal footprints and BC2/BC3 remain open. Native S3TC remains gated by PARHELIA_S3TC. |
 | Transfers, copy/blit, render-to-texture and mixed-size FBOs | Implemented. Broader format/subresource and shader workloads still need coverage tests. |
 | VRAM eviction and restoration | parhelia_ttm_move is installed; aperture resource/page copies and eviction/restore counters exist. The old patch-only TODO is superseded. |
 | Cursor placement/upload | Cursor uses parhelia_vram_bar_addr and original-family aperture writes. The old direct-flat-BAR claim is superseded; broader placement/display stress remains validation work. |
@@ -189,7 +189,7 @@ resolves. Benchmarks and Piglit remain FAA off.
    historical reports alone do not establish current failures. Expand lowering
    where the combiner contract supports it.
 6. **Native acceleration.** Native polygon offset, crossing user clip planes, direct indexed
-   and strided fetch, native point-size and topology paths remain work. Conservative all-inside user-plane GPU acceptance is implemented and verified. Packed 8-bit vertex-colour fetch is under development from exact original-family vendor descriptors; it is not yet hardware-proven. GPU
+   and strided fetch, native point-size and topology paths remain work. Conservative all-inside user-plane GPU acceptance is implemented and verified. Packed 8-bit vertex-colour fetch is implemented opt-in from exact original-family vendor descriptors;48nativepixelchecks pass with depth, blending and one/two textures, retaining GPU transforms and reducing vertexbytes20–33%. Broader BGRA/interpolation/clipping/alpha/FAA tests remain before default enable. GPU
    transforms already exist. Prefer GPU paths; retain correct improvements
    even if one benchmark shows no immediate gain. See
    parhelia-polygon-offset-hardware-re.md and
