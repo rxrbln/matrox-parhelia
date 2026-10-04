@@ -1016,3 +1016,42 @@ OPEN: the meaning of the memory-config bit 27 that gates Windows
 `EnableZinit`; which 2-D entry points a D3D present takes on Windows
 (`sub_2C070` vs the D3D blit), so whether a vendor frame pair contains the
 hand-over or only the `0x707` blit fence.
+
+## 13. The vendor FAA stream under emulation (faaemu, 2026-10-04)
+
+`tools/faaemu/` runs the unmodified MTXPARD.dll and MTXPARM.sys under
+Unicorn (PE loader, WIN32K/VIDEOPRT/ntoskrnl stubs, MMIO and 20-slot BAR0
+model, fences retire at once) and drives them like dxg and the D3D9 runtime:
+PDEV, surface, DirectDraw, D3D context, then per frame `DrawPrimitives2`
+(clear, XYZRHW+diffuse draw) and a `DdBlt` present.  Captures and diffs are
+in `captures/faaemu/` (`3D.AAMode=0x53` FAA, `0x54` AA off).  Register
+writes are the vendor's own code; their context depends on the model.
+[DERIVED]
+
+- Arm: `0x12fc = 0x04868027` (size field 0x121a for a 256x256 target),
+  `0x12f8 = 0x007fffff`, slot 2 `0x1230`/`0x1234 = 0x10000020`, packet
+  `[0x307, tag|1, tag, 0x12b0]` then draw DWGCTL `0x00b60ec4`.
+- Under FAA `0x12c8` carries stencil bits 7 (`0x000e00e7`, AA off 4) and
+  the stencil masks are `0xfe/0x1fe` (AA off `0xf0/0x1f0`): stencil bit 0
+  (depth word bit 24) belongs to the fragment unit.  Depth format for AA
+  is D24X4S4 or D16 only; the slot-1 config `0x36020100` equals ours.
+- Resolve runs inside the present blit's source access: re-validate, slots,
+  `[0x1324, 0x12cc, 0x12d0]`, `[0xc4, 0x132c, 0x1328, 0x12c8, 0x12fc]`, the
+  34-dword plane packet, `[9, 0xc4]`, fences `0x107`/`0x207` each resuming
+  `0xc4`, `[0x307][4, 0x407]`, then the 2-D blit with FAA still armed.
+- The resolve unlinks the target; it is relinked only by dirty state (blend,
+  colour write, MSAA, ZFUNC).  With constant state only frame 0 resolves;
+  with `EnableZinit` frame N resolves at frame N+1's Z-init clear.
+- The vendor draws through its pretransformed path: 5-dword vertices, header
+  `0x97080001`, VTXFMT `0x23/0x00a87210`, `0x1100 = 0x108`, `0x10c0 = 2`,
+  `0x1130 = 0x02002207`, WARP microcode as `0x41` block loads.
+- The 0528 rev 6 chip class is `0x100`, not `0x200` (miniport
+  0x1888b..0x1889f).  [PROVEN]
+
+Hardware replica (faa0528 series23/24, module faa0528-15): the vendor draw
+state above makes `0x12fc` identical and moves lockups from frame 1 to frames
+2-9, but does not remove them.  Draws never lock up, including five frames
+accumulated without a resolve; the single resolve then locks up every time,
+so the failure grows with the fragments the resolve must walk.  The largest
+remaining difference is the vertex/WARP path the resolve's plane packet runs
+through.  [MEASURED]
