@@ -2271,8 +2271,15 @@ ph_fs_operation(struct ph_fs_ctx *ctx, nir_alu_instr *alu, int lane, int sel,
       }
       return ph_fs_operand(ctx, alu, 0, lane, sel, out);
    case nir_op_fsat:
-      return ph_fs_operand(ctx, alu, 0, lane, sel, out) &&
-             ph_fs_saturated(ctx, lane, out);
+      if (!ph_fs_operand(ctx, alu, 0, lane, sel, out))
+         return false;
+      /* a saturated pass unit already clamps to [0, 1] */
+      for (unsigned r = 0; out->kind == PH_SRC_TEX && !out->mod &&
+                           r < ctx->ramp_count; r++)
+         if (ctx->ramps[r].kind == PH_FS_RAMP_PASS &&
+             ctx->ramps[r].saturated && ctx->ramps[r].unit == out->index)
+            return true;
+      return ph_fs_saturated(ctx, lane, out);
    case nir_op_fneg:
       return ph_fs_operand(ctx, alu, 0, lane, sel, out) &&
              ph_fs_apply(ctx, lane, out, P3D_COMB_MOD_NEG);
@@ -4349,8 +4356,10 @@ ph_fs_assign_pass_units(nir_shader *nir, unsigned used_units,
 {
    unsigned location[VARYING_SLOT_MAX], read[VARYING_SLOT_MAX];
    unsigned generics = 0, colours = 2, u = 0;
+   bool sat_only[VARYING_SLOT_MAX];
 
    memset(read, 0, sizeof(read));
+   memset(sat_only, true, sizeof(sat_only));
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
@@ -4389,6 +4398,10 @@ ph_fs_assign_pass_units(nir_shader *nir, unsigned used_units,
             if (i == generics)
                location[generics++] = loc;
             read[loc] |= nir_def_components_read(&in->def) << first;
+            nir_foreach_use_including_if(src, &in->def)
+               sat_only[loc] &= !nir_src_is_if(src) &&
+                  nir_src_use_instr(src)->type == nir_instr_type_alu &&
+                  nir_instr_as_alu(nir_src_use_instr(src))->op == nir_op_fsat;
          }
       }
    }
@@ -4444,6 +4457,7 @@ ph_fs_assign_pass_units(nir_shader *nir, unsigned used_units,
             ramp->unit = u++;
             ramp->location = location[g];
             ramp->kind = PH_FS_RAMP_PASS;
+            ramp->saturated = sat_only[location[g]];
          }
          ramp->comp[ramp->dims] = c;
          ramp->size[ramp->dims] = 1;

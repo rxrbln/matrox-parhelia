@@ -207,6 +207,10 @@ struct ph_fs {
    unsigned stipple_unit;
    bool stipple_failed;
    bool stipple_affine;    /* a stipple variant sampling nothing else */
+   /* Samplers looked up with a depth comparison, and this program with the
+    * comparison lowered onto the combiner, per bound function and swizzle. */
+   uint32_t compare_mask;
+   struct util_dynarray compare_variants;
 };
 
 /* Semantic index of the extra attribute carrying unit k's uniform coordinate,
@@ -238,6 +242,8 @@ struct ph_sampler_view {
     * needs the same swizzle. */
    bool baked, baked_depth;
    uint8_t baked_swizzle[4];
+   /* The same image unswizzled: a comparison reads the depth itself. */
+   struct pipe_sampler_view *compare_view;
 };
 
 struct ph_context;
@@ -387,6 +393,7 @@ struct ph_context {
     * ph_draw_stippled(). */
    uint32_t stipple[32];
    bool stipple_dirty, stippling;
+   bool comparing;
    struct pipe_resource *stipple_tex;
    struct pipe_sampler_view *stipple_view;
    void *stipple_sampler;
@@ -8761,7 +8768,7 @@ ph_quant_domains(struct ph_quant_stage *q, const struct prim_header *prim,
       const unsigned k = 2 + r->unit;
       float lo[3], span[3];
 
-      if (r->kind == PH_FS_RAMP_PASS)
+      if (r->kind == PH_FS_RAMP_PASS && !r->saturated)
          ph_quant_domain(q, prim, n, q->ramp_src[i], k, r->comp, r->dims);
       if (r->kind != PH_FS_RAMP_SCALAR && r->kind != PH_FS_RAMP_PLANE)
          continue;
@@ -10136,6 +10143,292 @@ ph_draw_stippled(struct ph_context *ctx, const struct pipe_draw_info *info,
    return true;
 }
 
+
+/* One lowered variant of a program with depth comparisons: the bound
+ * function and depth-mode swizzle of each compared unit. */
+struct ph_compare_variant {
+   enum compare_func func[P3D_MAX_TEXTURE_UNITS];
+   nir_lower_tex_shadow_swizzle swizzle[P3D_MAX_TEXTURE_UNITS];
+   struct ph_fs *fs;
+};
+
+static uint32_t
+ph_nir_compare_mask(nir_shader *nir)
+{
+   uint32_t mask = 0;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+
+               if (tex->texture_index < 32 &&
+                   nir_tex_instr_src_index(tex, nir_tex_src_comparator) >= 0)
+                  mask |= BITFIELD_BIT(tex->texture_index);
+            }
+         }
+      }
+   }
+   return mask;
+}
+
+/* The reference R read through a load of its own: the coordinate load then
+ * stays a coordinate, and R alone rides on a coordinate unit like the
+ * vendor's TEXCOORD helper, perspective-correct and unscaled. */
+static void
+ph_nir_split_compare_ref(nir_builder *b, nir_tex_instr *tex)
+{
+   const int cmp = nir_tex_instr_src_index(tex, nir_tex_src_comparator);
+   nir_scalar s;
+   nir_intrinsic_instr *in, *ref;
+
+   if (cmp < 0)
+      return;
+   s = nir_scalar_resolved(tex->src[cmp].src.ssa, 0);
+   if (!nir_scalar_is_intrinsic(s))
+      return;
+   in = nir_def_as_intrinsic(s.def);
+   if (in->intrinsic == nir_intrinsic_load_deref) {
+      nir_deref_instr *deref = nir_src_as_deref(in->src[0]);
+      nir_variable *var, *one;
+
+      if (!deref || deref->deref_type != nir_deref_type_var ||
+          !(deref->var->data.mode & nir_var_shader_in) ||
+          !glsl_type_is_vector_or_scalar(deref->var->type))
+         return;
+      var = deref->var;
+      one = nir_variable_clone(var, b->shader);
+      one->type = glsl_float_type();
+      one->data.location_frac = var->data.location_frac + s.comp;
+      nir_shader_add_variable(b->shader, one);
+      b->cursor = nir_after_instr(&in->instr);
+      nir_src_rewrite(&tex->src[cmp].src, nir_load_var(b, one));
+      return;
+   }
+   if (in->intrinsic != nir_intrinsic_load_input &&
+       in->intrinsic != nir_intrinsic_load_interpolated_input)
+      return;
+   ref = nir_instr_as_intrinsic(nir_instr_clone(b->shader, &in->instr));
+   ref->num_components = 1;
+   nir_intrinsic_set_component(ref, nir_intrinsic_component(in) + s.comp);
+   nir_def_init(&ref->instr, &ref->def, 1, in->def.bit_size);
+   b->cursor = nir_after_instr(&in->instr);
+   nir_builder_instr_insert(b, &ref->instr);
+   nir_src_rewrite(&tex->src[cmp].src, &ref->def);
+}
+
+/* A comparison's R on its own load, without the projector: q reaches no
+ * unit (see ph_nir_projective_mask's users), so R is taken as it is, like
+ * s and t. */
+static bool
+ph_nir_drop_compare_projector(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const int proj = nir_tex_instr_src_index(tex, nir_tex_src_projector);
+
+   (void)data;
+   if (nir_tex_instr_src_index(tex, nir_tex_src_comparator) < 0)
+      return false;
+   if (proj >= 0)
+      nir_tex_instr_remove_src(tex, proj);
+   ph_nir_split_compare_ref(b, tex);
+   return true;
+}
+
+struct ph_compare_key_ref {
+   const enum compare_func *func;
+   const nir_lower_tex_shadow_swizzle *swizzle;
+};
+
+/* nir_lower_tex_shadow's lowering, R taken as one varying channel and
+ * compared with the depth as the sampled copy stores it. */
+static bool
+ph_nir_lower_compare(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct ph_compare_key_ref *key = data;
+   const int cmp = nir_tex_instr_src_index(tex, nir_tex_src_comparator);
+   const unsigned u = tex->texture_index;
+
+   if (cmp < 0 || u >= P3D_MAX_TEXTURE_UNITS)
+      return false;
+   b->cursor = nir_after_instr(&tex->instr);
+   nir_def *r = nir_fsat(b, tex->src[cmp].src.ssa);
+   tex->is_shadow = false;
+   nir_tex_instr_remove_src(tex, cmp);
+   const unsigned n = tex->def.num_components;
+   tex->def.num_components = 4;
+   nir_def *pass = nir_b2f32(b, nir_compare_func(b, key->func[u], r,
+                                                 nir_channel(b, &tex->def, 0)));
+   nir_def *one = nir_imm_float(b, 1.0f), *zero = nir_imm_float(b, 0.0f);
+   nir_def *lookup[6] = { pass, zero, zero, one, zero, one };
+   const nir_lower_tex_shadow_swizzle *sw = &key->swizzle[u];
+   nir_def *c[4] = { lookup[sw->swizzle_r], lookup[sw->swizzle_g],
+                     lookup[sw->swizzle_b], lookup[sw->swizzle_a] };
+   nir_def *res = nir_vec(b, c, n);
+
+   nir_def_rewrite_uses_after(&tex->def, res);
+   return true;
+}
+
+/* x * b2f(c) as c ? x : 0: the combiner's CMP selects in one slot where the
+ * product costs two (the compared result times the vertex colour). */
+static bool
+ph_nir_select_b2f_product(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   (void)data;
+   if (alu->op != nir_op_fmul)
+      return false;
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar c = nir_scalar_resolved(alu->src[i].src.ssa,
+                                         alu->src[i].swizzle[0]);
+      bool same = true;
+
+      for (unsigned k = 1; k < alu->def.num_components; k++)
+         same &= alu->src[i].swizzle[k] == alu->src[i].swizzle[0];
+      if (!same || !nir_scalar_is_alu(c) ||
+          nir_scalar_alu_op(c) != nir_op_b2f32)
+         continue;
+      b->cursor = nir_before_instr(&alu->instr);
+      nir_def *cond = nir_scalar_chase_alu_src(c, 0).def;
+      nir_def *x = nir_ssa_for_alu_src(b, alu, 1 - i);
+
+      cond = nir_channel(b, cond, nir_scalar_chase_alu_src(c, 0).comp);
+      nir_def_replace(&alu->def,
+                      nir_bcsel(b, cond, x, nir_imm_zero(b, x->num_components,
+                                                         x->bit_size)));
+      return true;
+   }
+   return false;
+}
+
+/* @fs with each depth comparison evaluated by the combiner on the sampled
+ * depth and the clamped R, as the vendor's original-family ICD does (four
+ * combiner slots and a coordinate unit for R, MTXPARD 0x1810d0); the
+ * texture's depth-mode swizzle applies to the result.  NULL when the
+ * program cannot take it. */
+static struct ph_fs *
+ph_fs_compare_variant(struct ph_context *ctx, struct ph_fs *fs)
+{
+   struct ph_compare_variant key = {0};
+   struct pipe_shader_state state = { .type = PIPE_SHADER_IR_NIR };
+   nir_shader *nir;
+   struct ph_fs *v;
+
+   u_foreach_bit(u, fs->compare_mask) {
+      const struct pipe_sampler_state *s =
+         u < PIPE_MAX_SAMPLERS ? ctx->bound_samplers[u] : NULL;
+      const struct pipe_sampler_view *view =
+         u < PIPE_MAX_SAMPLERS ? ctx->bound_views[u] : NULL;
+
+      if (u >= P3D_MAX_TEXTURE_UNITS || !view)
+         return NULL;
+      /* A shadow sampler without a comparison is undefined; the vendor
+       * returns the lit value then (MTXPARD 0x1812a0). */
+      key.func[u] = s && s->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE ?
+                    (enum compare_func)s->compare_func : COMPARE_FUNC_ALWAYS;
+      key.swizzle[u] = (nir_lower_tex_shadow_swizzle) {
+         view->swizzle_r, view->swizzle_g, view->swizzle_b, view->swizzle_a,
+      };
+   }
+   util_dynarray_foreach(&fs->compare_variants, struct ph_compare_variant, c)
+      if (!memcmp(c->func, key.func, sizeof(key.func)) &&
+          !memcmp(c->swizzle, key.swizzle, sizeof(key.swizzle)))
+         return c->fs;
+   if (!fs->draw || fs->draw->base.type != PIPE_SHADER_IR_NIR)
+      return NULL;
+   /* The product with the colour or its select, whichever fits. */
+   v = NULL;
+   for (unsigned select = 0; select < 2 && !v; select++) {
+      const struct ph_compare_key_ref ref = { key.func, key.swizzle };
+
+      nir = nir_shader_clone(NULL, fs->draw->base.ir.nir);
+      NIR_PASS(_, nir, nir_shader_tex_pass, ph_nir_drop_compare_projector,
+               nir_metadata_control_flow, NULL);
+      NIR_PASS(_, nir, nir_shader_tex_pass, ph_nir_lower_compare,
+               nir_metadata_control_flow, (void *)&ref);
+      NIR_PASS(_, nir, nir_opt_algebraic);
+      if (select)
+         NIR_PASS(_, nir, nir_shader_alu_pass, ph_nir_select_b2f_product,
+                  nir_metadata_control_flow, NULL);
+      NIR_PASS(_, nir, nir_opt_dce);
+      state.ir.nir = nir;
+      v = ph_create_fs(&ctx->base, &state);
+      if (v && (v->drop_reason || v->compare_mask || !v->program.valid)) {
+         if (ph_env("PARHELIA_TRACE"))
+            fprintf(stderr, "parhelia: depth comparison variant %u refused: %s\n",
+                    select, v->drop_reason ? v->drop_reason :
+                    v->compare_mask ? "comparison left" : "no combiner program");
+         ph_delete_fs(&ctx->base, v);
+         v = NULL;
+      }
+      if (!v)
+         ralloc_free(nir);
+   }
+   key.fs = v;
+   util_dynarray_append(&fs->compare_variants, key);
+   return v;
+}
+
+/* The bound view without its swizzle, for the depth itself. */
+static struct pipe_sampler_view *
+ph_compare_view(struct ph_context *ctx, struct pipe_sampler_view *view)
+{
+   struct ph_sampler_view *v = (struct ph_sampler_view *)view;
+
+   if (!ph_view_swizzled(view))
+      return view;
+   if (!v->compare_view) {
+      struct pipe_sampler_view templ = *view;
+
+      templ.swizzle_r = PIPE_SWIZZLE_X;
+      templ.swizzle_g = PIPE_SWIZZLE_Y;
+      templ.swizzle_b = PIPE_SWIZZLE_Z;
+      templ.swizzle_a = PIPE_SWIZZLE_W;
+      v->compare_view = ctx->base.create_sampler_view(&ctx->base,
+                                                      view->texture, &templ);
+   }
+   return v->compare_view;
+}
+
+/* A draw whose program compares depth: replay it with the lowered variant
+ * and the compared units' unswizzled views bound. */
+static bool
+ph_draw_compared(struct ph_context *ctx, const struct pipe_draw_info *info,
+                 unsigned drawid_offset,
+                 const struct pipe_draw_start_count_bias *draws)
+{
+   struct pipe_sampler_view *old[P3D_MAX_TEXTURE_UNITS] = {0};
+   struct ph_fs *fs = ctx->fs, *v;
+
+   if (ctx->comparing || !fs || !fs->compare_mask)
+      return false;
+   if (!(v = ph_fs_compare_variant(ctx, fs))) {
+      PH_REFUSE("a depth comparison the combiner cannot take is dropped\n");
+      return true;
+   }
+   ctx->comparing = true;
+   u_foreach_bit(u, fs->compare_mask) {
+      struct pipe_sampler_view *raw = ph_compare_view(ctx, ctx->bound_views[u]);
+
+      pipe_sampler_view_reference(&old[u], ctx->bound_views[u]);
+      ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, u, 1, 0,
+                                  &raw);
+   }
+   ctx->base.bind_fs_state(&ctx->base, v);
+   if (ph_env("PARHELIA_TRACE"))
+      fprintf(stderr, "parhelia: depth comparison fs=%p variant=%p valid=%d ramps=%u units=%#x\n",
+              (void *)fs, (void *)v, v->program.valid, v->program.ramp_count,
+              v->sampler_mask);
+   ctx->base.draw_vbo(&ctx->base, info, drawid_offset, NULL, draws, 1);
+   ctx->base.bind_fs_state(&ctx->base, fs);
+   u_foreach_bit(u, fs->compare_mask) {
+      ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, u, 1, 0,
+                                  &old[u]);
+      pipe_sampler_view_reference(&old[u], NULL);
+   }
+   ctx->comparing = false;
+   return true;
+}
 static void
 ph_lookup_release(struct ph_context *ctx, unsigned i)
 {
@@ -10487,6 +10780,8 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    }
    if (!num_draws || indirect || ctx->submit_error)
       return;
+   if (ph_draw_compared(ctx, info, drawid_offset, draws))
+      return;
    if (ph_draw_stippled(ctx, info, drawid_offset, draws))
       return;
    if (ph_draw_ramped(ctx, info, drawid_offset, draws))
@@ -10760,6 +11055,7 @@ ph_sampler_view_destroy(struct pipe_context *p, struct pipe_sampler_view *view)
 
    (void)p;
    pipe_sampler_view_reference(&v->shadow_view, NULL);
+   pipe_sampler_view_reference(&v->compare_view, NULL);
    pipe_resource_reference(&view->texture, NULL);
    FREE(v);
 }
@@ -11677,6 +11973,9 @@ static void *ph_create_fs(struct pipe_context *p,
          if (s->type == PIPE_SHADER_IR_NIR) {
             fs->sampler_mask = ph_nir_sampler_mask(s->ir.nir);
             fs->projective_mask = ph_nir_projective_mask(s->ir.nir);
+            /* measured on the 0528 only; the P690 keeps dropping these */
+            if (ph_original_family(ph_screen(p->screen)->chip_id))
+               fs->compare_mask = ph_nir_compare_mask(s->ir.nir);
          }
          fs->uses_texture = fs->sampler_mask != 0 ||
             (s->type == PIPE_SHADER_IR_NIR && ph_nir_uses_texture(s->ir.nir));
@@ -11982,6 +12281,15 @@ static void ph_delete_fs(struct pipe_context *p, void *s)
          ph_delete_fs(p, fs->stipple);
          ralloc_free(nir);
       }
+      util_dynarray_foreach(&fs->compare_variants, struct ph_compare_variant, c) {
+         if (c->fs) {
+            nir_shader *nir = c->fs->draw->base.ir.nir;
+
+            ph_delete_fs(p, c->fs);
+            ralloc_free(nir);
+         }
+      }
+      util_dynarray_fini(&fs->compare_variants);
       draw_delete_fragment_shader(ph_context(p)->draw, fs->draw);
       if (fs->kill) {
          ph_fs_program_fini(&fs->kill->alpha_x);

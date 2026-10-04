@@ -126,6 +126,9 @@ struct ph_fs_ramp {
    uint16_t size[3];       /* texels per dimension */
    float lo[3], span[3];   /* coordinate domain [lo, lo + span) */
    uint16_t extent[2];     /* texels a pixel lookup fills: the framebuffer */
+   /* A pass varying read only through a clamp to [0, 1]: it keeps the
+    * identity domain and the unit's own clamp does the saturation. */
+   bool saturated;
 };
 
 struct ph_fs_program {
