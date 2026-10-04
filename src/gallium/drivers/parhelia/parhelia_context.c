@@ -206,6 +206,10 @@ struct ph_fs {
    struct ph_fs *stipple;
    unsigned stipple_unit;
    bool stipple_failed;
+   /* This program with GL_POINT_SMOOTH's coverage on unit smooth_unit. */
+   struct ph_fs *smooth;
+   unsigned smooth_unit;
+   bool smooth_failed;
    bool stipple_affine;    /* a stipple variant sampling nothing else */
    /* Samplers looked up with a depth comparison, and this program with the
     * comparison lowered onto the combiner, per bound function and swizzle. */
@@ -395,6 +399,18 @@ struct ph_context {
    uint32_t stipple[32];
    bool stipple_dirty, stippling;
    bool comparing;
+   /* Smooth points as sprites with a coverage table, one per point size. */
+   bool smoothing;
+   struct pipe_rasterizer_state smooth_rast;
+   struct ph_coverage_tex {
+      float size;
+      struct pipe_resource *tex;
+      struct pipe_sampler_view *view;
+      uint64_t last_use;
+   } *coverage;
+   unsigned coverage_count, coverage_cap;
+   uint64_t coverage_clock;
+   void *coverage_sampler;
    struct pipe_resource *stipple_tex;
    struct pipe_sampler_view *stipple_view;
    void *stipple_sampler;
@@ -10480,6 +10496,251 @@ ph_draw_compared(struct ph_context *ctx, const struct pipe_draw_info *info,
    ctx->comparing = false;
    return true;
 }
+
+/* @fs with its colour alpha multiplied by the coverage table on the unit
+ * after its samplers, read at gl_PointCoord: GL's smooth point drawn as a
+ * sprite, coverage clamp(size / 2 - |pc - 0.5| * size, 0, 1) as Mesa's
+ * nir_lower_point_smooth computes it.  NULL when the program cannot take
+ * it. */
+static struct ph_fs *
+ph_fs_smooth_variant(struct ph_context *ctx, struct ph_fs *fs)
+{
+   const unsigned unit = util_last_bit(fs->sampler_mask);
+   struct pipe_shader_state state = { .type = PIPE_SHADER_IR_NIR };
+   nir_variable *pntc = NULL;
+   nir_shader *nir;
+   nir_tex_instr *tex;
+   unsigned stores = 0;
+   struct ph_fs *v;
+
+   if (fs->smooth || fs->smooth_failed)
+      return fs->smooth;
+   fs->smooth_failed = true;
+   if (!fs->draw || fs->draw->base.type != PIPE_SHADER_IR_NIR ||
+       unit >= MIN2(ph_screen(ctx->base.screen)->texture_units,
+                    PH_TEXTURE_UNITS_DRIVEN))
+      return NULL;
+   nir = nir_shader_clone(NULL, fs->draw->base.ir.nir);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+
+   nir_foreach_shader_in_variable(var, nir)
+      if (var->data.location == VARYING_SLOT_PNTC)
+         pntc = var;
+   if (!pntc) {
+      pntc = nir_variable_create(nir, nir_var_shader_in, glsl_vec_type(2),
+                                 "gl_PointCoord");
+      pntc->data.location = VARYING_SLOT_PNTC;
+   }
+   tex = nir_tex_instr_create(nir, 1);
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_float32;
+   tex->texture_index = tex->sampler_index = unit;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord,
+                                     nir_channels(&b, nir_load_var(&b, pntc), 0x3));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_def *coverage = nir_channel(&b, &tex->def, 3);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         nir_intrinsic_instr *st;
+         nir_variable *out;
+
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         st = nir_instr_as_intrinsic(instr);
+         if (st->intrinsic != nir_intrinsic_store_deref ||
+             !(out = nir_intrinsic_get_var(st, 0)) ||
+             out->data.mode != nir_var_shader_out ||
+             (out->data.location != FRAG_RESULT_COLOR &&
+              out->data.location != FRAG_RESULT_DATA0))
+            continue;
+         if (nir_intrinsic_write_mask(st) != 0xf ||
+             st->src[1].ssa->num_components != 4) {
+            ralloc_free(nir);
+            return NULL;
+         }
+         b.cursor = nir_before_instr(instr);
+         nir_def *c = st->src[1].ssa;
+         nir_src_rewrite(&st->src[1],
+                         nir_vector_insert_imm(&b, c,
+                            nir_fmul(&b, nir_channel(&b, c, 3), coverage), 3));
+         stores++;
+      }
+   }
+   if (!stores) {
+      ralloc_free(nir);
+      return NULL;
+   }
+   nir->info.inputs_read |= VARYING_BIT_PNTC;
+   BITSET_SET(nir->info.textures_used, unit);
+   BITSET_SET(nir->info.samplers_used, unit);
+   nir_progress(true, impl, nir_metadata_none);
+
+   state.ir.nir = nir;
+   v = ph_create_fs(&ctx->base, &state);
+   if (!v || v->drop_reason || !v->program.valid ||
+       !(v->sampler_mask & BITFIELD_BIT(unit))) {
+      ph_delete_fs(&ctx->base, v);
+      ralloc_free(nir);
+      return NULL;
+   }
+   fs->smooth = v;
+   fs->smooth_unit = unit;
+   fs->smooth_failed = false;
+   return v;
+}
+
+/* The coverage table of a smooth point of @size pixels over gl_PointCoord,
+ * texel centres as the lookup tables place them, at their size; the
+ * least recently used of more than eight sizes is released. */
+static struct pipe_sampler_view *
+ph_coverage_view(struct ph_context *ctx, float size)
+{
+   const unsigned n = ph_fs_lookup_size(PH_FS_RAMP_PLANE);
+   const struct pipe_resource templ = {
+      .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+      .width0 = n, .height0 = n, .depth0 = 1, .array_size = 1,
+      .bind = PIPE_BIND_SAMPLER_VIEW,
+   };
+   struct ph_coverage_tex *t;
+   struct pipe_sampler_view vt;
+   struct pipe_box box;
+   uint8_t *data;
+
+   ctx->coverage_clock++;
+   for (unsigned i = 0; i < ctx->coverage_count; i++)
+      if (ctx->coverage[i].size == size) {
+         ctx->coverage[i].last_use = ctx->coverage_clock;
+         return ctx->coverage[i].view;
+      }
+   if (ctx->coverage_count >= 8) {
+      unsigned lru = 0;
+
+      for (unsigned i = 1; i < ctx->coverage_count; i++)
+         if (ctx->coverage[i].last_use < ctx->coverage[lru].last_use)
+            lru = i;
+      if (ctx->triangles || ctx->points || ctx->lines)
+         ph_submit_vertices(ctx);
+      pipe_sampler_view_reference(&ctx->coverage[lru].view, NULL);
+      pipe_resource_reference(&ctx->coverage[lru].tex, NULL);
+      ctx->coverage[lru] = ctx->coverage[--ctx->coverage_count];
+   }
+   if (ctx->coverage_count == ctx->coverage_cap) {
+      const unsigned cap = ctx->coverage_cap ? ctx->coverage_cap * 2 : 2;
+      struct ph_coverage_tex *grown =
+         realloc(ctx->coverage, cap * sizeof(*grown));
+
+      if (!grown)
+         return NULL;
+      ctx->coverage = grown;
+      ctx->coverage_cap = cap;
+   }
+   if (!(data = malloc((size_t)n * n * 4)))
+      return NULL;
+   for (unsigned y = 0; y < n; y++)
+      for (unsigned x = 0; x < n; x++) {
+         const float dx = (x + 0.5f) / n - 0.5f, dy = (y + 0.5f) / n - 0.5f;
+         const float a = CLAMP(0.5f * size - sqrtf(dx * dx + dy * dy) * size,
+                               0.0f, 1.0f);
+         uint8_t *texel = data + 4 * ((size_t)y * n + x);
+
+         texel[0] = texel[1] = texel[2] = 255;
+         texel[3] = (uint8_t)lrintf(a * 255.0f);
+      }
+   t = &ctx->coverage[ctx->coverage_count];
+   memset(t, 0, sizeof(*t));
+   t->tex = ctx->base.screen->resource_create(ctx->base.screen, &templ);
+   if (t->tex) {
+      u_box_2d(0, 0, n, n, &box);
+      ctx->base.texture_subdata(&ctx->base, t->tex, 0, PIPE_MAP_WRITE, &box,
+                                data, n * 4, 0);
+      u_sampler_view_default_template(&vt, t->tex, t->tex->format);
+      t->view = ctx->base.create_sampler_view(&ctx->base, t->tex, &vt);
+   }
+   free(data);
+   if (!t->view) {
+      pipe_resource_reference(&t->tex, NULL);
+      return NULL;
+   }
+   t->size = size;
+   t->last_use = ctx->coverage_clock;
+   ctx->coverage_count++;
+   return t->view;
+}
+
+/* GL_POINT_SMOOTH on the original family: replay the points as sprites with
+ * the coverage variant of the program, as the shader-based smooth points
+ * of Mesa's drivers do.  The vendor draws an unsnapped square without any
+ * coverage; a program without a free unit keeps the aliased disc. */
+static bool
+ph_draw_smooth_points(struct ph_context *ctx, const struct pipe_draw_info *info,
+                      unsigned drawid_offset,
+                      const struct pipe_draw_start_count_bias *draws)
+{
+   const struct pipe_rasterizer_state *rs = ctx->rasterizer;
+   const struct pipe_caps *caps = &ctx->base.screen->caps;
+   struct pipe_sampler_view *old_view = NULL, *view;
+   struct ph_fs *fs = ctx->fs, *v;
+   void *old_sampler;
+   unsigned unit;
+   float size;
+
+   if (ctx->smoothing || !rs || !rs->point_smooth || rs->multisample ||
+       rs->point_quad_rasterization || rs->point_size_per_vertex || !fs ||
+       u_reduced_prim(info->mode) != MESA_PRIM_POINTS ||
+       !ph_original_family(ph_screen(ctx->base.screen)->chip_id))
+      return false;
+   size = CLAMP(rs->point_size, caps->min_point_size_aa,
+                caps->max_point_size_aa);
+   if (!ctx->coverage_sampler) {
+      const struct pipe_sampler_state templ = {
+         .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+         .min_img_filter = PIPE_TEX_FILTER_LINEAR,
+         .mag_img_filter = PIPE_TEX_FILTER_LINEAR,
+         .min_mip_filter = PIPE_TEX_MIPFILTER_NONE,
+      };
+
+      ctx->coverage_sampler = ctx->base.create_sampler_state(&ctx->base,
+                                                             &templ);
+   }
+   if (!ctx->coverage_sampler || !(v = ph_fs_smooth_variant(ctx, fs)) ||
+       !(view = ph_coverage_view(ctx, size))) {
+      PH_REFUSE("a smooth point without a free texture unit for its coverage keeps the aliased disc\n");
+      return false;
+   }
+   unit = fs->smooth_unit;
+   pipe_sampler_view_reference(&old_view, ctx->bound_views[unit]);
+   old_sampler = ctx->bound_samplers[unit];
+   ctx->smoothing = true;
+   ctx->smooth_rast = *rs;
+   ctx->smooth_rast.point_smooth = 0;
+   ctx->smooth_rast.point_quad_rasterization = 1;
+   ctx->smooth_rast.sprite_coord_enable = 0;
+   ctx->smooth_rast.point_size = size;
+   ctx->base.bind_rasterizer_state(&ctx->base, &ctx->smooth_rast);
+   ctx->base.bind_fs_state(&ctx->base, v);
+   ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, unit, 1, 0,
+                               &view);
+   ctx->base.bind_sampler_states(&ctx->base, MESA_SHADER_FRAGMENT, unit, 1,
+                                 &ctx->coverage_sampler);
+   ctx->base.draw_vbo(&ctx->base, info, drawid_offset, NULL, draws, 1);
+   ctx->base.bind_sampler_states(&ctx->base, MESA_SHADER_FRAGMENT, unit, 1,
+                                 &old_sampler);
+   ctx->base.set_sampler_views(&ctx->base, MESA_SHADER_FRAGMENT, unit, 1, 0,
+                               &old_view);
+   ctx->base.bind_fs_state(&ctx->base, fs);
+   ctx->base.bind_rasterizer_state(&ctx->base, (void *)rs);
+   ctx->smoothing = false;
+   pipe_sampler_view_reference(&old_view, NULL);
+   return true;
+}
+
 static void
 ph_lookup_release(struct ph_context *ctx, unsigned i)
 {
@@ -10837,6 +11098,8 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    if (ph_draw_compared(ctx, info, drawid_offset, draws))
       return;
    if (ph_draw_stippled(ctx, info, drawid_offset, draws))
+      return;
+   if (ph_draw_smooth_points(ctx, info, drawid_offset, draws))
       return;
    if (ph_draw_ramped(ctx, info, drawid_offset, draws))
       return;
@@ -12344,6 +12607,13 @@ static void ph_delete_fs(struct pipe_context *p, void *s)
          }
       }
       util_dynarray_fini(&fs->compare_variants);
+
+      if (fs->smooth) {
+         nir_shader *nir = fs->smooth->draw->base.ir.nir;
+
+         ph_delete_fs(p, fs->smooth);
+         ralloc_free(nir);
+      }
       draw_delete_fragment_shader(ph_context(p)->draw, fs->draw);
       if (fs->kill) {
          ph_fs_program_fini(&fs->kill->alpha_x);
@@ -14785,6 +15055,13 @@ ph_destroy_context(struct pipe_context *p)
    pipe_resource_reference(&ctx->stipple_tex, NULL);
    if (ctx->stipple_sampler)
       p->delete_sampler_state(p, ctx->stipple_sampler);
+   for (unsigned i = 0; i < ctx->coverage_count; i++) {
+      pipe_sampler_view_reference(&ctx->coverage[i].view, NULL);
+      pipe_resource_reference(&ctx->coverage[i].tex, NULL);
+   }
+   free(ctx->coverage);
+   if (ctx->coverage_sampler)
+      p->delete_sampler_state(p, ctx->coverage_sampler);
    for (unsigned i = 0; i < ctx->ramp_tex_count; i++) {
       pipe_sampler_view_reference(&ctx->ramp_tex[i].view, NULL);
       pipe_resource_reference(&ctx->ramp_tex[i].tex, NULL);
