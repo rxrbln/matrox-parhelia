@@ -4,7 +4,7 @@ Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
 Reconciled with code on 2026-10-04: shared Mesa **9369ebc**, shared DRM
-**f288453**; isolated Mesa **dac942a**, DRM **0f7d564**. Diagnostics **8719c74**
+**f288453**; isolated Mesa **57739f6**, DRM **0f7d564**. Diagnostics **8719c74**
 include phase statistics, overlapping transform-fixup causes and default-off
 metadata observation (no observation-mode hardware result yet).
 The shared and experimental stacks must not be treated as the same deployment.
@@ -40,8 +40,8 @@ lengths and are not a matched comparison. No repeated benchmark campaign.
 Future runner defaults to one pass per latest user instruction.
 
 Limits: at most two coordinate units, affine varying expressions, smooth
-interpolation, complete single-block VS outputs. Uniform-dependent coordinates,
-secondary generic color routing, ramps, nonlinear expressions and wider shader
+interpolation, complete single-block VS outputs. Uniform-dependent coordinates are added by 17f8248 (UBO0, constant offsets).
+Secondary generic color routing, ramps, nonlinear expressions and wider shader
 coverage remain gaps. Native indexed/strided fetch remains unproven. The
 small smooth-point coverage candidate stays preserved on faa-textured and is
 not deployed. This milestone adds no FAA work.
@@ -49,6 +49,36 @@ not deployed. This milestone adds no FAA work.
 Deployed binary SHA-256:
 `cdf00a996b6509294fb812d539a98db7a9baaf626f861db6e984d3311ddd0e68`.
 Prefix `/root/parhelia-mesa-gpu-features`; DRM/boot unchanged.
+
+
+## Combined uniform and user-plane checkpoint, 2026-10-04
+
+Main GPU feature HEAD57739f6; production implementation54c83b6. Runtime UBO0
+fragment uniforms with constant offsets now drive up to two affine GPU
+texture coordinates (17f8248). Constants are refreshed per draw; same-program
+changing-uniform simulation and hardware oracles pass. Nonlinear expressions,
+more texture units and lookup ramps remain gaps.
+
+54c83b6 preserves GPU transforms when eight affine bounding-box corners prove
+that every enabled user plane leaves the draw unchanged, with a floating-point
+margin. Crossings/outside, separate ClipVertex/ClipDistance, nonaffine positions
+and ambiguous boundaries keep software clipping. This is not native clipping.
+The independent geometry fixture checks thirty1024x768 frames with zero
+mismatches and native plane markers. The combined build additionally passes
+full selftests, ten changing-uniform two-tapgrid frames and ten changing-plane
+fixed-function frames, allFAA0 with zero mismatches. No repeated benchmarks.
+
+Combined deployment /root/parhelia-mesa-gpu-features, binarySHA256
+`04c0f01f7f44b38280ede21b9816f531daf5786642531514d0c10cf72ddd0a57`.
+DRM0f7d564/targetboot unchanged; sharedstack unchanged.
+
+Vendor emulator fixtures establish packet-generation ground truth, not actual
+GPU retirement: registered system-memory indexed DP2 still emits97080001;
+RGB/DXT1/3/5 sampler state differs only in texture format/layout (plus DMA
+addresses); signed slope/units offset emits c178 + mode86/d7 and resets97.
+Native compressed sampling, indexed fetch and full native offset remain open.
+Parallel agents continue these major gaps, serialized by the established
+hardwarelock. All routineperformance checks default to one short run.
 
 ## Implemented paths and remaining limits
 
@@ -139,7 +169,7 @@ resolves. Benchmarks and Piglit remain FAA off.
    can wedge. Do not turn packet-size experiments into a default merely from
    vendor similarity. See parhelia-p690-multi-primitive-packet-hang.md.
 5. **Fragment/compiler and glamor coverage.** Current remaining transform gaps include bump lookup ramps, secondary
-   generic routing, uniform-dependent/nonlinear texture coordinates and
+   generic routing, nonlinear texture coordinates and
    unsupported shader expressions. dac942a now links up to two affine
    texture coordinates into GPU vertex programs; clipped draws retain CPU
    fixups. Single/two-tap pixel and fallback checks pass. c45282b now links a proven
