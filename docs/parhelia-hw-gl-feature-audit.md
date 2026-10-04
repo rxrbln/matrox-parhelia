@@ -95,7 +95,7 @@ hardwarelock. All routineperformance checks default to one short run.
 | Mipmaps, filtering and wrap | Mip chains, trilinear filtering, border/mirrored wrapping and LOD state exist. The original-family LOD-bias issue below remains. |
 | Multitexture | Original family exposes up to four hardware units; LX is limited to two. Coverage depends on compiler lowering and chip capabilities. |
 | Narrow texture formats | Chip-dependent format routes exist; format support must be read from ph_is_format_supported, not the old blanket missing-format list. |
-| S3TC | Original-family BC1 storage uses measured block addressing and physical tile footprints (841aa83). Native 64x32/128x128 sampling and eight GL RGB/RGBA upload/subimage/readback cases pass, including punch-through alpha. Mip chains, filtering, broader dimensions and BC2/BC3 remain open; keep PARHELIA_S3TC gated. |
+| S3TC | Original BC1 storage and bank-aware square/2:1 mip chains through512-square are implemented; 60 GL mip/alpha/base/max-level/subimage checks pass with matching native draws. Other shapes, filtering and BC2/BC3 remain open; keep PARHELIA_S3TC gated. |
 | Transfers, copy/blit, render-to-texture and mixed-size FBOs | Implemented. Broader format/subresource and shader workloads still need coverage tests. |
 | VRAM eviction and restoration | parhelia_ttm_move is installed; aperture resource/page copies and eviction/restore counters exist. The old patch-only TODO is superseded. |
 | Cursor placement/upload | Cursor uses parhelia_vram_bar_addr and original-family aperture writes. The old direct-flat-BAR claim is superseded; broader placement/display stress remains validation work. |
