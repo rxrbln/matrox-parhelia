@@ -1002,10 +1002,22 @@ ph_resource_create_class(struct pipe_screen *pscreen,
     * at least 64 texels, so measuring a 32-texel chain against its own pitch
     * doubled the row count and silently dropped mipmapping for a tall narrow
     * base (32x512 sampled level 0 at every level). */
+   /* The original family asks for wider rows of the same storage instead:
+    * a 256 cube chain needs 2064 rows of 1 KiB (S10, MEASURED). */
+   unsigned alloc_width = templ->width0;
+
+   while (native_64x32_texture && alloc_width < 2048 &&
+          (r->mip.size + (size_t)ph_mip_align(alloc_width, 32) * 4 - 1) /
+          ((size_t)ph_mip_align(alloc_width, 32) * 4) > 2048)
+      alloc_width = MIN2(ph_mip_align(alloc_width, 32) * 2, 2048u);
    if (mip_levels > 1 &&
-       (r->mip.size + (size_t)MAX2(r->mip.level[0].pitch, 64u) * 4 - 1) /
-       ((size_t)MAX2(r->mip.level[0].pitch, 64u) * 4) > 2048) {
+       (native_64x32_texture ?
+          (r->mip.size + (size_t)ph_mip_align(alloc_width, 32) * 4 - 1) /
+          ((size_t)ph_mip_align(alloc_width, 32) * 4) :
+          (r->mip.size + (size_t)MAX2(r->mip.level[0].pitch, 64u) * 4 - 1) /
+          ((size_t)MAX2(r->mip.level[0].pitch, 64u) * 4)) > 2048) {
       mip_levels = 1;
+      alloc_width = templ->width0;
       if (!ph_mip_layout_init_chip(&r->mip, templ->width0, templ->height0,
                                    mip_levels, true, p690_native_texture32))
          PH_CREATE_FAIL();
@@ -1017,12 +1029,25 @@ ph_resource_create_class(struct pipe_screen *pscreen,
                                    ph_mip_align(templ->height0, 32) * 4,
                                    0x2000);
       }
+      /* the original family keeps its 64x32 order for the level left */
+      if (native_64x32_texture) {
+         if (layered)
+            r->mip.level[0].pitch = ph_mip_align(templ->width0, 32);
+         else if (!ph_mip_layout_native_64x32(&r->mip))
+            PH_CREATE_FAIL();
+         r->mip.native_64x32 = true;
+      }
       /* A cube map too large for its chain keeps six level-0 faces. */
       if (layered) {
          r->mip.slices = slices;
          r->mip.cube = cube_target;
          r->mip.level[0].bytes = (size_t)r->mip.level[0].pitch *
                                  ph_mip_align(templ->height0, 16) * 4;
+         r->mip.size = ph_mip_align(r->mip.level[0].bytes * slices, 0x2000);
+      }
+      if (layered && native_64x32_texture) {
+         r->mip.level[0].bytes = (size_t)r->mip.level[0].pitch *
+                                 ph_mip_align(templ->height0, 32) * 4;
          r->mip.size = ph_mip_align(r->mip.level[0].bytes * slices, 0x2000);
       }
    }
@@ -1034,10 +1059,11 @@ ph_resource_create_class(struct pipe_screen *pscreen,
     * max(32, align(width, 32)); asking for rows of a wider pitch halved the
     * storage of 32-wide chains (32x64 failed the size check below). */
    const unsigned row_pitch = native_64x32_texture ?
-      MAX2(ph_mip_align(templ->width0, 32), 32u) : create_pitch;
+      MAX2(ph_mip_align(alloc_width, 32), 32u) : create_pitch;
    struct drm_parhelia_create_render create = {
       .width = p690_native_texture32 ? MAX2(templ->width0, 64u) :
-               cpp != 4 || block_bytes ? create_pitch : templ->width0,
+               cpp != 4 || block_bytes ? create_pitch :
+               native_64x32_texture ? alloc_width : templ->width0,
       /* Rows of the (possibly wider) allocation that hold the chain.  A
        * single-level native image also needs them whenever its layout
        * reserves more rows than it has, which a one-row 1-D image always
