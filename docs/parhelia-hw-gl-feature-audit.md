@@ -3,10 +3,11 @@
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
-Reconciled with code on 2026-10-04: shared Mesa **9369ebc**, shared DRM
-**f288453**; isolated Mesa **57739f6**, DRM **0f7d564**. Diagnostics **8719c74**
-include phase statistics, overlapping transform-fixup causes and default-off
-metadata observation (no observation-mode hardware result yet).
+Reconciled with code on 2026-10-05: shared Mesa **9369ebc**, shared DRM
+**f288453**; isolated Mesa **867b45a** (production **4cb3944**), actual DRM
+**0f7d564**. Performance DRM **12d2626** has passed isolated hardware tests
+and was restored afterward. It is not the currently loaded kernel.
+The latest GPU-gap report records exact source, binary and configuration evidence.
 The shared and experimental stacks must not be treated as the same deployment.
 
 This replaces the [September 11 inventory](parhelia-hw-gl-feature-audit-20260911.md).
@@ -95,7 +96,7 @@ hardwarelock. All routineperformance checks default to one short run.
 | Mipmaps, filtering and wrap | Mip chains, trilinear filtering, border/mirrored wrapping and LOD state exist. The original-family LOD-bias issue below remains. |
 | Multitexture | Original family exposes up to four hardware units; LX is limited to two. Coverage depends on compiler lowering and chip capabilities. |
 | Narrow texture formats | Chip-dependent format routes exist; format support must be read from ph_is_format_supported, not the old blanket missing-format list. |
-| S3TC | Original BC1 storage and bank-aware mip chains through512-square plus14 eligible base shapes are implemented. Rectangle coverage passes88 native pixel checks and35,875 raw address checks; exact Quake3 RGBA-to-BC1 upload adds14 native checks with mip format/compression queries. Six actuallyloaded Quake3 base shapes remain under investigation; broader filtering and BC2/BC3 remain open. Keep PARHELIA_S3TC gated until loaded-image coverage and gameplay proof. |
+| S3TC | Original BC1 storage supports 20 measured base shapes covering all 211 opaque nonlightmap Quake3 benchmark candidates. 39,201 raw addresses and 79 added native pixel checks pass; exact app RGBA encoding and bilinear/trilinear repeat filtering are independently verified. One opt-in compressed 1024x768 windowed GL1 run reaches 46.2 FPS, with an inspected gameplay capture. Anisotropy-specific coverage and BC2/BC3 remain open. Native S3TC remains gated by PARHELIA_S3TC. |
 | Transfers, copy/blit, render-to-texture and mixed-size FBOs | Implemented. Broader format/subresource and shader workloads still need coverage tests. |
 | VRAM eviction and restoration | parhelia_ttm_move is installed; aperture resource/page copies and eviction/restore counters exist. The old patch-only TODO is superseded. |
 | Cursor placement/upload | Cursor uses parhelia_vram_bar_addr and original-family aperture writes. The old direct-flat-BAR claim is superseded; broader placement/display stress remains validation work. |
@@ -151,7 +152,7 @@ resolves. Benchmarks and Piglit remain FAA off.
 1. **Deferred: FAA performance and application control.** At 1024x768, three matched
    runs give median normal 28.3 versus FAA 24.5 FPS; linear decoding then
    gives 24.6 FPS in all three FAA runs. Nine ten-frame analytical cases pass.
-   Resolve/metadata lifecycle optimization is deferred until the user resumes FAA work. A suitable explicit
+   Main work remains FAA off; the active goal now requests occasional FAA correctness/performance checks. Current Mesa867b45a predecessor457a116 passes ten textured depth-occlusion frames at1024x768 on actual0f7d564. Combined performance-kernel FAA proof remains pending. A suitable explicit
    GL control is requested but not implemented; current control is
    PARHELIA_FAA=1. Sample buffers/masks and full MSAA semantics are not exposed.
    Alpha test, application stencil, partial color masks, logic ops, other
@@ -168,7 +169,7 @@ resolves. Benchmarks and Piglit remain FAA off.
 4. **P690 larger primitive packets.** More than the safe two-primitive default
    can wedge. Do not turn packet-size experiments into a default merely from
    vendor similarity. See parhelia-p690-multi-primitive-packet-hang.md.
-5. **Fragment/compiler and glamor coverage.** 0a47bf5 adds GPU direction lookup ramps for the proven single-unit direction-cube route, preserving VS normalization and clipped fallbacks. Native varying, normalized and clipped pixel checks pass. Current remaining transform gaps include secondary
+5. **Fragment/compiler and glamor coverage.** Main82dcff9 adds bounded generic identity-domain coordinate linking and componentwise vector reciprocal/division/sqrt; native saturated PASS and clipped PLANE proofs pass with zero pixel mismatches. Quake3 GL2 still fails startup on uniform-selected output-alpha discard. Its exact NIR has three predicates; lowering and native cutoff/blend oracles are in progress.  0a47bf5 adds GPU direction lookup ramps for the proven single-unit direction-cube route, preserving VS normalization and clipped fallbacks. Native varying, normalized and clipped pixel checks pass. Current remaining transform gaps include secondary
    generic routing, nonlinear texture coordinates and
    unsupported shader expressions. dac942a now links up to two affine
    texture coordinates into GPU vertex programs; clipped draws retain CPU
@@ -187,8 +188,8 @@ resolves. Benchmarks and Piglit remain FAA off.
    FBO readback and unsupported-shader failures against the current compiler;
    historical reports alone do not establish current failures. Expand lowering
    where the combiner contract supports it.
-6. **Native acceleration.** Polygon offset, user clip planes, direct indexed
-   and strided fetch, native point-size and topology paths remain work. GPU
+6. **Native acceleration.** Native polygon offset, crossing user clip planes, direct indexed
+   and strided fetch, native point-size and topology paths remain work. Conservative all-inside user-plane GPU acceptance is implemented and verified. Packed 8-bit vertex-colour fetch is under development from exact original-family vendor descriptors; it is not yet hardware-proven. GPU
    transforms already exist. Prefer GPU paths; retain correct improvements
    even if one benchmark shows no immediate gain. See
    parhelia-polygon-offset-hardware-re.md and
@@ -204,7 +205,7 @@ resolves. Benchmarks and Piglit remain FAA off.
    system-memory texture fetch remain unproven. Keep unsupported/gated rather
    than equating decoded vendor structures with working Mesa support.
 
-10. **Presentation and submission performance.** Fullscreen flips, double-buffer reuse and asynchronous submission are explicit priorities. The current 0528 X configuration has PageFlip=false; the Quake3 helper defaults to a window on a 1920x1200 desktop. The DRI loader already carries the two-back-buffer flip fix, but P690 flip evidence does not establish original-family operation. Native client end-of-frame flush avoids a redundant fence wait; retain completion ordering for CPU access and Present consumers. Kernel submit_stats=0 disables statistics, not the async capability. Collect non-serializing upload/ioctl timings and accepted async/sync/fallback counts before changing queue behavior.
+10. **Presentation and submission performance.** Original-family scanout placement, genuine async flips, final framebuffer/controller identity and pixel checks now pass, including generic unreachable FB rejection. Native scanout remains opt-in; actual restored X uses PageFlip=false. Performance kernel977a1e5 and Mesa0fde61f negotiate16384DWORD owned payloads with independent4096DWORD fetch bounds; sync/async dense/sparse pixel checks pass. One fullscreen FAAoff GL1 run32.4FPS reduces submissions80→35/frame. Kernel12d2626 allows opt-in scalar register caching plus adjacent packet packing; host sanitizer contracts, fetch/scanout/rejection and one Q3run pass, omitting177730/191312 eligible state packets across the workflow. Its33.7FPS is not an isolated speedup because app settings differ. Current restored0f7d564 uses the Mesa4096/221 fallback. Fullscreen native-BC1 performance, cache-default adoption and combined-kernel FAA remain separate checks. Preserve completion ordering for CPU access and Present consumers.
 
 The default-off native-offset candidate d6df48e retired safely but failed six of seventeen depth-effect cases on 0528: nonzero slope/units behaved as no offset. Known-good DRM0f7d564 and X were restored. Vendor c178/mode86/d7 captures establish packet generation only; do not enable native GL offset from them. Q3's offset fallback is one draw/eighteen vertices per frame, so major performance work takes precedence.
 
