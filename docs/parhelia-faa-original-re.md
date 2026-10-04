@@ -1138,7 +1138,7 @@ the vendor's, which matters only if the resolve depends on vertex-path state.
 | post-resolve `[0x307][4, 0x407]` | replicated (`FAA_POSTFLUSH=3`) | same |
 | MemLevels only through the tagged arm | replicated (`FAA_MLARM`) | same |
 | PRIMWORD bit 18 clear before the setup planes | replicated (`FAA_RESOLVEPRIM`, Mesa clone) | full 6/3/4, half none/7/none; A5 still locks (series25) |
-| separated pipe regions (`0x1340`/`0x13c0`) with all of the above | replicated (B1, Q layouts) | half: 1, 4, 3 (series26, partial) |
+| separated pipe regions (`0x1340`/`0x13c0`) with all of the above | replicated (B1, Q layouts) | full: 1 in 4 of 4; half: 1, 3, 4, 3 - worse than stacked pipes (series26) |
 | resolve once after N frames | tested | N = 5 always locks in the resolve |
 | depth surface descriptor | already identical (`0x36020100`) | - |
 | on-chip WARP store programs, entry `0x108`, VTXFMT `0x23/0x00a87210`, 5-dword vertices | **not replicated** (kernel owns memory WARP programs) | - ; not FAA-specific (14.1) |
