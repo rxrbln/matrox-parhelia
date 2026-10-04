@@ -4,7 +4,7 @@ Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
 Reconciled with code on 2026-10-04: shared Mesa **9369ebc**, shared DRM
-**f288453**; isolated Mesa **54d121b**, DRM **0f7d564**. Diagnostics **8719c74**
+**f288453**; isolated Mesa **11ded06**, DRM **0f7d564**. Diagnostics **8719c74**
 include phase statistics, overlapping transform-fixup causes and default-off
 metadata observation (no observation-mode hardware result yet).
 The shared and experimental stacks must not be treated as the same deployment.
@@ -46,12 +46,22 @@ Current user priority: implement/test hardware GPU features and optimize
 Quake 3/glmark2 with FAA **off** until further notice. Piglit must also use
 FAA off. FAA implementation/performance/control work below is deferred.
 
-## Active feature and bug TODOs
+## Latest FAA-off hardware checkpoint
 
-1. **FAA performance and application control.** At 1024x768, three matched
+11ded06 fixes fast depth-clear state surviving context destruction and owns
+its depth resource across framebuffer unbind. On the original 0528 board,
+three old-build context-owner/scissored-clear pairs all failed the second
+test; all three fixed-build pairs passed. Seven focused shader, lighting,
+texgen and depth-clear Piglit tests then passed, with PARHELIA_FAA=0.
+Concurrent-context cache ownership still needs separate coverage. The isolated
+stack remains deployed; this does not constitute a shared-stack merge.
+
+## Feature and bug TODOs
+
+1. **Deferred: FAA performance and application control.** At 1024x768, three matched
    runs give median normal 28.3 versus FAA 24.5 FPS; linear decoding then
    gives 24.6 FPS in all three FAA runs. Nine ten-frame analytical cases pass.
-   Resolve/metadata lifecycle optimization remains active. A suitable explicit
+   Resolve/metadata lifecycle optimization is deferred until the user resumes FAA work. A suitable explicit
    GL control is requested but not implemented; current control is
    PARHELIA_FAA=1. Sample buffers/masks and full MSAA semantics are not exposed.
    Alpha test, application stencil, partial color masks, logic ops, other
@@ -70,8 +80,16 @@ FAA off. FAA implementation/performance/control work below is deferred.
    vendor similarity. See parhelia-p690-multi-primitive-packet-hang.md.
 5. **Fragment/compiler and glamor coverage.** Current glmark2 evidence
    identifies texture-tap/varying-route fixups, bump lookup ramps, and shading
-   generic-output routing as GPU-transform gaps. Short vector outputs are
-   now compiled, but do not alone enable the shading program on the GPU.
+   generic-output routing as GPU-transform gaps. c45282b now links a proven
+   bounded generic color varying to WARP o1, including normalized matrix
+   lighting and GPU saturation. Matrix-lighting pixel checks pass for ten
+   frames on native, forced-CPU and clipped paths. Generic1 and unbounded
+   varying domains remain gaps. 4538ca2 enables the affine bounding-box
+   clip gate by default, avoiding repeated CPU position interpretation while
+   retaining GPU transforms; native shading improved from 8 to 27 FPS in
+   diagnostic runs. The latest 20-second run gives 26 FPS at 1024x768.
+   Native shading still submits about three times as many triangles as the
+   CPU route; indexed/strided reuse remains a performance priority.
    See ../captures/gpu-gaps-20261004/report.md. Reproduce remaining text/tile,
    FBO readback and unsupported-shader failures against the current compiler;
    historical reports alone do not establish current failures. Expand lowering
