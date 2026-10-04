@@ -513,6 +513,7 @@ struct ph_fs_lookup_eval {
    const struct ph_fs_lookup *fn;
    const uint8_t *constants;
    unsigned size;
+   const float *drv;       /* the driver constants, constant buffer 1 */
    nir_const_value *val;   /* 16 per SSA def */
    float out[4];
 };
@@ -530,6 +531,17 @@ ph_fs_lookup_read_uniform(struct ph_fs_lookup_eval *e, nir_intrinsic_instr *in,
       base = e->val[in->src[1].ssa->index * 16].u32;
       break;
    case nir_intrinsic_load_ubo_vec4:
+      if (e->val[in->src[0].ssa->index * 16].u32 == PH_FS_DRV_UBO && e->drv) {
+         base = ((uint64_t)nir_intrinsic_base(in) +
+                 e->val[in->src[1].ssa->index * 16].u32) * 4 +
+                nir_intrinsic_component(in);
+         for (unsigned c = 0; c < in->def.num_components; c++) {
+            if (in->def.bit_size != 32 || base + c >= PH_FS_DRV_COUNT)
+               return false;
+            dst[c].f32 = e->drv[base + c];
+         }
+         return true;
+      }
       if (e->val[in->src[0].ssa->index * 16].u32)
          return false;
       base = ((uint64_t)nir_intrinsic_base(in) +
@@ -712,11 +724,12 @@ ph_fs_lookup_run(struct ph_fs_lookup_eval *e, const float *v, bool varying)
 
 static bool
 ph_fs_lookup_begin(struct ph_fs_lookup_eval *e, const struct ph_fs_lookup *fn,
-                   const void *constants, unsigned size)
+                   const void *constants, unsigned size, const float *drv)
 {
    e->fn = fn;
    e->constants = constants;
    e->size = size;
+   e->drv = drv;
    e->val = calloc((size_t)fn->num_defs * 16, sizeof(*e->val));
    if (!e->val)
       return false;
@@ -729,7 +742,8 @@ ph_fs_lookup_begin(struct ph_fs_lookup_eval *e, const struct ph_fs_lookup *fn,
 
 bool
 ph_fs_lookup_key(const struct ph_fs_lookup *fn, const void *constants,
-                 unsigned size, uint32_t **key, unsigned *count)
+                 unsigned size, const float *drv, uint32_t **key,
+                 unsigned *count)
 {
    struct ph_fs_lookup_eval e;
    uint32_t *k = NULL;
@@ -737,7 +751,7 @@ ph_fs_lookup_key(const struct ph_fs_lookup *fn, const void *constants,
 
    *key = NULL;
    *count = 0;
-   if (!ph_fs_lookup_begin(&e, fn, constants, size))
+   if (!ph_fs_lookup_begin(&e, fn, constants, size, drv))
       return false;
    nir_foreach_block(block, nir_shader_get_entrypoint(fn->nir)) {
       nir_foreach_instr(instr, block) {
@@ -766,12 +780,13 @@ ph_fs_lookup_key(const struct ph_fs_lookup *fn, const void *constants,
 
 bool
 ph_fs_lookup_eval(const struct ph_fs_lookup *fn, const float *v,
-                  const void *constants, unsigned size, float out[4])
+                  const void *constants, unsigned size, const float *drv,
+                  float out[4])
 {
    struct ph_fs_lookup_eval e;
    bool ok;
 
-   if (!ph_fs_lookup_begin(&e, fn, constants, size))
+   if (!ph_fs_lookup_begin(&e, fn, constants, size, drv))
       return false;
    memset(e.out, 0, sizeof(e.out));
    ok = ph_fs_lookup_run(&e, v, true);
@@ -806,7 +821,8 @@ ph_fs_lookup_cube_dir(unsigned face, float sc, float tc, float d[3])
 
 bool
 ph_fs_lookup_fill(const struct ph_fs_lookup *fn, const struct ph_fs_ramp *r,
-                  const void *constants, unsigned size, uint8_t *texels)
+                  const void *constants, unsigned size, const float *drv,
+                  uint8_t *texels)
 {
    static const unsigned byte_of[4] = { 2, 1, 0, 3 };   /* B8G8R8A8 */
    const unsigned w = r->size[0], h = r->size[1];
@@ -817,7 +833,7 @@ ph_fs_lookup_fill(const struct ph_fs_lookup *fn, const struct ph_fs_ramp *r,
 
    if (!value)
       return false;
-   if (!ph_fs_lookup_begin(&e, fn, constants, size)) {
+   if (!ph_fs_lookup_begin(&e, fn, constants, size, drv)) {
       free(value);
       return false;
    }

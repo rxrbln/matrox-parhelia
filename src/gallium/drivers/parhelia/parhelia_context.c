@@ -8787,6 +8787,32 @@ ph_quant_domains(struct ph_quant_stage *q, const struct prim_header *prim,
    for (unsigned r = 0; r < q->route_count; r++)
       ph_quant_domain(q, prim, n, q->route_slot[r], q->route_carrier[r],
                       identity, 4);
+   /* A lookup reading gl_PointCoord's derivatives is built for the batch's
+    * sprites: new derivatives submit what is staged and rebuild it. */
+   if (n == 3 && q->ctx->fs && q->ctx->fs->point_deriv && q->win_slot >= 0) {
+      float d[4];
+
+      ph_pntc_derivatives(q->ctx->draw, prim, q->win_slot, d);
+      if (memcmp(d, q->ctx->pntc_deriv, sizeof(d))) {
+         if (q->ctx->triangles || q->ctx->points || q->ctx->lines)
+            ph_submit_vertices(q->ctx);
+         memcpy(q->ctx->pntc_deriv, d, sizeof(d));
+         for (unsigned i = 0; i < q->ramp_count; i++) {
+            const struct ph_fs_ramp *r = &q->ramp[i];
+            struct pipe_sampler_view *view;
+
+            if (r->kind != PH_FS_RAMP_SCALAR && r->kind != PH_FS_RAMP_PLANE)
+               continue;
+            if (!(view = ph_lookup_view(q->ctx, r))) {
+               ph_warn_once("no lookup table represents the colour for the "
+                            "sprite size; the primitive is dropped\n");
+               return false;
+            }
+            q->ctx->base.set_sampler_views(&q->ctx->base, MESA_SHADER_FRAGMENT,
+                                           r->unit, 1, 0, &view);
+         }
+      }
+   }
    for (unsigned i = 0; i < q->ramp_count; i++) {
       const struct ph_fs_ramp *r = &q->ramp[i];
       const unsigned k = 2 + r->unit;
@@ -10518,8 +10544,11 @@ ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *ramp)
       budget = (size_t)(e && atoi(e) > 0 ? atoi(e) : 16) << 20;
    }
    ph_fs_snapshot_constants(ctx);
+   if (ctx->fs && ctx->fs->point_deriv)
+      ph_fs_set_point_derivatives(&ctx->fs->program, ctx->pntc_deriv);
+   const float *drv = ctx->fs ? ctx->fs->program.drv : NULL;
    if (!ph_fs_lookup_key(r->fn, ctx->fs_const_snap, ctx->fs_const_snap_size,
-                         &key, &key_count))
+                         drv, &key, &key_count))
       return NULL;
    /* A table over the varying's range is built for the batch's domain. */
    if (!cube) {
@@ -10577,7 +10606,7 @@ ph_lookup_view(struct ph_context *ctx, const struct ph_fs_ramp *ramp)
       const int64_t t0 = os_time_get_nano();
 
       if (!ph_fs_lookup_fill(r->fn, r, ctx->fs_const_snap,
-                             ctx->fs_const_snap_size, data)) {
+                             ctx->fs_const_snap_size, drv, data)) {
          free(data);
          free(key);
          return NULL;
