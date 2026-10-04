@@ -4,8 +4,9 @@ Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
 Reconciled with code on 2026-10-04: shared Mesa **9369ebc**, shared DRM
-**f288453**; isolated FAA Mesa **fbf2b5b**, DRM **0f7d564**. The FAA context
-also has uncommitted phase-statistics and metadata-observation diagnostics.
+**f288453**; isolated Mesa **54d121b**, DRM **0f7d564**. Diagnostics **8719c74**
+include phase statistics, overlapping transform-fixup causes and default-off
+metadata observation (no observation-mode hardware result yet).
 The shared and experimental stacks must not be treated as the same deployment.
 
 This replaces the [September 11 inventory](parhelia-hw-gl-feature-audit-20260911.md).
@@ -22,7 +23,7 @@ conformance result.
 | Points, lines, smoothing and stipple | Native unit primitives plus triangle expansion for wider/textured cases. Point-coordinate and polygon-stipple lowering now exist; native hardware point-size and strip/loop acceleration remain work. |
 | Matrix transform, perspective and viewport | GPU WARP path exists and is preferred; unsupported programs and clipping can fall back to Mesa draw. They are no longer missing features. |
 | Programmable vertex shaders and lighting | WARP compiler, program upload/cache and constant loading exist; generated lighting can run there. Full vendor 12-light-store coverage is not established. |
-| Fragment programs and texenv | Data-flow compiler replaces the old fixed-shape matcher. Combiner-expressible NIR, lowering and preshaders cover many more programs; arbitrary fragment ISA/GLSL execution is not established. Unsupported programs remain a coverage gap. |
+| Fragment programs and texenv | Data-flow compiler replaces the old fixed-shape matcher. Combiner-expressible NIR, lowering and preshaders cover many more programs; arbitrary fragment ISA/GLSL execution is not established. Unsupported programs remain a coverage gap. 54d121b adds scalar/vec2/vec3 stores, verified with executable WARP simulation. |
 | Secondary color, fog and texgen | Secondary color is packed; shader lowering can cover fog/texgen expressions. Dedicated vendor fixed-function paths and complete mode coverage remain unproven. |
 | Color/depth/stencil, clears, blending and logic operations | Implemented, including masked/scissored clears, separate blend equations and logic-op lowering. Complete stencil/two-sided-operation coverage still needs targeted hardware validation. |
 | Texture dimensionality and size | 1-D, 2-D, cube and volume resource/view paths exist; cube/volume have measured default paths on P690 and 0528. Maximum 2-D extent is 2048. |
@@ -63,7 +64,11 @@ without relying on obsolete source line numbers.
 4. **P690 larger primitive packets.** More than the safe two-primitive default
    can wedge. Do not turn packet-size experiments into a default merely from
    vendor similarity. See parhelia-p690-multi-primitive-packet-hang.md.
-5. **Fragment/compiler and glamor coverage.** Reproduce remaining text/tile,
+5. **Fragment/compiler and glamor coverage.** Current glmark2 evidence
+   identifies texture-tap/varying-route fixups, bump lookup ramps, and shading
+   generic-output routing as GPU-transform gaps. Short vector outputs are
+   now compiled, but do not alone enable the shading program on the GPU.
+   See ../captures/gpu-gaps-20261004/report.md. Reproduce remaining text/tile,
    FBO readback and unsupported-shader failures against the current compiler;
    historical reports alone do not establish current failures. Expand lowering
    where the combiner contract supports it.
