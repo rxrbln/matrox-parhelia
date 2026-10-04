@@ -4,7 +4,7 @@ Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
 Reconciled with code on 2026-10-04: shared Mesa **9369ebc**, shared DRM
-**f288453**; isolated Mesa **11ded06**, DRM **0f7d564**. Diagnostics **8719c74**
+**f288453**; isolated Mesa **4aa7fa7**, DRM **0f7d564**. Diagnostics **8719c74**
 include phase statistics, overlapping transform-fixup causes and default-off
 metadata observation (no observation-mode hardware result yet).
 The shared and experimental stacks must not be treated as the same deployment.
@@ -44,7 +44,10 @@ without relying on obsolete source line numbers.
 
 Current user priority: implement/test hardware GPU features and optimize
 Quake 3/glmark2 with FAA **off** until further notice. Piglit must also use
-FAA off. FAA implementation/performance/control work below is deferred.
+FAA off. Occasional standalone FAA smoke checks are allowed. FAA
+implementation/performance/control work below is deferred. Prioritize major
+hardware gaps and performance; defer small conformance/pixel details. Retain
+correct features, cleanups and optimizations even when benchmark FPS is equal.
 
 ## Latest FAA-off hardware checkpoint
 
@@ -55,6 +58,28 @@ test; all three fixed-build pairs passed. Seven focused shader, lighting,
 texgen and depth-clear Piglit tests then passed, with PARHELIA_FAA=0.
 Concurrent-context cache ownership still needs separate coverage. The isolated
 stack remains deployed; this does not constitute a shared-stack merge.
+
+4aa7fa7 accounts for the existing two-triangle packets when limiting batch
+size. Points and lines keep one primitive per packet; staging, vertex bounds
+and the hardware packet shape are unchanged. At 1024x768 with FAA off, a
+20-second shading comparison reduces draw batches from 92 to 64 and submits
+from 92 to 65 per frame, with 14348 triangles and 258264 vertex dwords in both.
+FPS is 26 versus 27. Three repeats of the four selected five-second scenes
+give shading medians 25 versus 26; Quake 3 medians are 28.5 versus 28.3 FPS,
+so no Quake 3 speedup is claimed. A 1408-triangle analytic mesh passes ten
+frames on native, CPU-control and clipped paths. Large point/line checks also
+pass. Native indexed reuse remains a separate gap.
+
+A smooth-point coverage discrepancy occurs on both old and new builds. The
+zero-coverage discard candidate is retained but incomplete: it currently
+refuses the coverage shader and takes the aliased-disc fallback. It is not in
+the deployed 4aa7fa7 checkpoint. The new fractional-alpha fixture must request
+an alpha framebuffer; that refined check has not run. This pixel-detail work
+is deferred under the user's current priority.
+
+The occasional 1024x768 FAA off/on occlusion smoke passes ten frames per arm
+(228855 interior pixels/frame); the on arm confirms 20 FAA batches and ten
+resolves. Benchmarks and Piglit remain FAA off.
 
 ## Feature and bug TODOs
 
