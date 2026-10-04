@@ -1827,6 +1827,11 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    caps->min_line_width = caps->min_line_width_aa = 1.0f;
    caps->max_point_size = caps->max_line_width = 2048.0f;
    caps->max_point_size_aa = caps->max_line_width_aa = 10.0f;
+   /* The vendor's 10.0 smooth-point clamp is dead code (ICD 0x114343): its
+    * smooth points take any size.  The original family draws them as
+    * coverage sprites at any size, so its range is the sprites'. */
+   if (s->chip_id == 0x0527 || s->chip_id == 0x0528)
+      caps->max_point_size_aa = caps->max_point_size;
    caps->point_size_granularity = caps->line_width_granularity = 0.25f;
    /* The PLNWT solid fill takes an arbitrary rectangle and bit-plane mask;
     * partial-tile fills are hardware-verified only on the P690 64x16 layout. */
