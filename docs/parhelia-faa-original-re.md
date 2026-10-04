@@ -1136,17 +1136,127 @@ the vendor's, which matters only if the resolve depends on vertex-path state.
 | stencil field 7, masks `0xfe/0x1fe`, ThresholdAA `0x7fffff`, draw DWGCTL bit 20, resume `0xc4` | replicated (`FAA_VFRAME`) | lockups later, not gone (series23) |
 | `0x12fc` word identical (`0x04868027`) | replicated | same |
 | post-resolve `[0x307][4, 0x407]` | replicated (`FAA_POSTFLUSH=3`) | same |
-| MemLevels only through the tagged arm | replicated (`FAA_MLARM`) | same |
+| MemLevels through the tagged arm, after raster and surface bindings | old `FAA_MLARM` prepended it before those bindings; corrected in the resume clone | ordering correction alone still locks |
 | PRIMWORD bit 18 clear before the setup planes | replicated (`FAA_RESOLVEPRIM`, Mesa clone) | full 6/3/4, half none/7/none; A5 still locks (series25) |
 | separated pipe regions (`0x1340`/`0x13c0`) with all of the above | replicated (B1, Q layouts) | full: 1 in 4 of 4; half: 1, 3, 4, 3 - worse than stacked pipes (series26) |
 | resolve once after N frames | tested | N = 5 always locks in the resolve |
 | depth surface descriptor | already identical (`0x36020100`) | - |
 | on-chip WARP store programs, entry `0x108`, VTXFMT `0x23/0x00a87210`, 5-dword vertices | **not replicated** (kernel owns memory WARP programs) | - ; not FAA-specific (14.1) |
-| per-batch kernel drain: vendor has no drain inside an FAA frame other than its own tagged fences; our kernel ends every batch with `0x307` under `faa_boundary=8` (all series 23-26) | **not combined**: module -10's `0x707` drain (boundary 0) was never run with the VFRAME state | - |
+| per-batch kernel drain: vendor has no drain inside an FAA frame other than its own tagged fences; our kernel ends every batch with `0x307` under `faa_boundary=8` (all series 23-26) | now tested with corrected VFRAME arm ordering and `0x707` | locks on frame 2; adding captured end-of-draw `0x307` locks on frame 3 |
 | command sections in VRAM (class 0), primary ring in VRAM | **not replicated** (our sections are host memory) | - |
 | vendor depth clear by plane-masked 2-D fill vs our full-word fill | equivalent for bit 24 | - |
 
-Conclusion of the extraction: the vendor's FAA-specific words are all
-reproduced and the resolve still locks up as fragments accumulate.  What is
-left differs in *how* the stream reaches the engine (sections in VRAM, the
-per-batch drain, on-chip WARP store), not in the FAA register values.
+The earlier comparison missed the tagged arm's ordering and normalised away
+the address bank bits. Matching individual register values did not establish
+the same state at the arm or the same surface address contract. See 14.4.
+
+### 14.4 Resume: raw bank pairing and pixel centres (2026-10-04)
+
+`tools/faaemu/streamdiff.py` now preserves chronological batches when CALL
+IDs repeat, and can retain addresses and counters with `--raw-addresses`
+and `--raw-tags`. `audit.py` reports the actual raster and surface state at
+each arm and resolve. The previous parser grouped equal CALL IDs across
+batches, which could interleave different frames. [PROVEN source defect]
+
+Running MTXPARD through the emulator with 16 draws, 128 overlapping copies,
+and repeated state validation gives the same FAA raster/surface/MemLevels
+contract as the original capture. The overlapping capture sends 384
+triangles (23,040 vertex bytes). Blend toggles re-link the target for a
+resolve on each frame; re-sending unchanged state alone does not. The
+`--trace-faa` hooks record host context state at lifecycle entries. Command
+register writes now reach the model's MMIO readback file; replaying the
+overlap capture after that correction produces the same 880 frame events.
+FAA allocation pointers still stay zero in this model: it does not generate
+fragments or model resolve timing. [CAPTURED; emulator limits]
+
+The vendor binds colour `0x08240000`, fragments `0x09ede400` (both bank B),
+and depth `0x01000000` (bank A). Our earlier probes put all three in bank A.
+The 16 MiB placement variants therefore did not test this bank pairing.
+The old `FAA_MLARM` also armed against the preceding state; the corrected
+probe expands the original MemLevels packet in place, after the surfaces.
+Correct ordering alone still locks on the post-resolve `0x107`. [MEASURED]
+
+An isolated kernel option, `faa_vendor_banks=1`, pins FAA colour into B's
+first 16 MiB window, fragments into B's second, and depth into A's second.
+It applies only to armed original-family FAA batches, uses the ordinary
+reservations/pin ranges/relocations, and leaves validators intact. On 0528,
+with the corrected arm and the captured end-of-draw `0x307`:
+
+- Control, option off: locks on frame 3, 217 fragment records plus 691
+  spilled LINCOL colour words in the fragment buffer.
+- Vendor pairing: ten full-size resolves complete, 635 records and zero
+  spilled LINCOL words. Another ten complete on the same boot.
+- Five accumulated draws followed by one resolve complete on a new boot;
+  twenty moving draws also complete on that boot.
+
+This is evidence for an address-layout aliasing mechanism, rather than
+command-fetch location or the WARP store being necessary explanations for
+these lockups. Which individual bank relationship is required is being
+isolated; do not infer that all three placements are independently required.
+
+The intact image exposes a separate pixel-centre mismatch: the FAA geometry
+is shifted by half a pixel in both axes against the ordinary probe. A
+`FAA_VERTEX_BIAS=-0.5` on FAA positions, retaining colour attributes, yields
+ten resolves with **zero interior and exterior differences**. 449 of 540
+high-contrast edge pixels have intermediate values; mean coverage error is
+0.056. A verified fresh-boot 1024x768 run also completes ten resolves with
+zero interior/exterior differences; using its constant blue channel gives
+2,474 intermediate edge pixels and mean coverage error 0.048. [MEASURED]
+
+An overlapping two-triangle run initially completed ten resolves but its
+second draw-order case was refused with `-EBUSY` during placement. Draining
+earlier async pins before moving a surface, using the same bounded retry as
+ordinary depth placement, fixes that refusal. On a verified new boot both
+orders complete ten resolves, have zero interior/exterior differences, and
+their resolved images differ in **zero pixels**. [MEASURED]
+
+Changing only the fragment placement to bank A completes ten resolves but
+corrupts interior pixels (806 on the first frame, 372 on the tenth); changing
+only depth to bank B locks at the first resolve with `DWGCTL=0x107`. The
+captured B/B/A pairing is therefore significant for correctness, not merely
+an arbitrary choice that happens to avoid a lock. Colour itself need not be
+in B: A colour in its ordinary available window, B fragments, and A depth
+in the next window also completes ten resolves with zero interior/exterior
+differences. Its image is byte-identical to the corrected B/B/A image.
+The colour-in-A variant initially could not allocate in the reserved first
+window; that refusal is not a GPU failure. The passing retry uses colour
+`0x01002000`, fragments `0x09000000`, and depth `0x02000000`.
+
+The reverse pairing also passes on a verified new boot: colour B,
+fragments A (`0x03000000`), depth B. Its image is byte-identical to the
+corrected vendor-pair image. Thus the supported rule is **opposite VRAM
+banks for fragments and depth**, not an absolute requirement for fragment
+bank B or colour bank B. The two tested same-bank fragment/depth cases
+produce corrupt images or resolve lockups. [MEASURED]
+
+This explains the prior aliasing evidence: FAA colour words landed in the
+fragment buffer and too few fragment records survived. A resolve must
+consume depth-held fragment references; corrupted metadata is a credible
+explanation for its density-dependent hang at the following `0x107`.
+The exact internal addressing/link-cycle mechanism remains an inference;
+the controlled bank tests establish the allocation contract on this card.
+The successful tests retain host-memory command sections and the existing
+kernel WARP programs, so neither transport change is required for them.
+
+Final source `aab6776` (probe) and `f08c892` (isolated kernel), with variant
+4 (colour A / fragments B / depth A), completes **50 full-size resolves**
+on a verified new boot. First and last images have zero interior/exterior
+differences. Probe selftests: 136 pass; Valgrind: zero memory-access errors
+(the existing NIR selftest leaks remain). The emulator chronology/readback
+regression checks also pass. [MEASURED, `LAYOUT4-FINAL50-1`]
+
+Integration still needs a default-off GL FAA lifecycle: allocate the
+fragment buffer in the bank opposite the pinned depth surface, preserve
+ordinary colour placement where possible, account for the pixel-centre
+convention, and resolve/retire on render-target changes. The diagnostic
+does not advertise GL multisampling or enable FAA in the shared stack.
+
+Artifacts: `campaign/results/faaemu-resume/` and
+`campaign/results/faa0528/{BANKCTL-*,BANKPAIR-*,BANKBIAS-*,LAYOUT*}`;
+isolated source repos `wip/faa-resume/{mesa-driver,linux-drm}`. These are
+probe results; the production GL path is not enabled.
+
+Recovery caveat: the shared power-cycle script used to skip a healthy recent
+cycle even with `FORCE=1`. That guard is corrected, and subsequent runners
+record and compare boot IDs. Empty earlier cycle logs identify same-boot
+repeats, not independent boots.
