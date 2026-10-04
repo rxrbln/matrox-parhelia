@@ -3,7 +3,27 @@
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
-## Result
+## Current status, 2026-10-04
+
+The proposal below is historical, not the current ABI inventory. The current
+private UAPI includes stream/index relocations and a mode-7 diagnostic. Mesa
+still does not expose native indexed acceleration: `PARHELIA_PARAM_NATIVE_INDEXED`
+remains zero. Retained P690 class-0 VRAM and class-3 coherent diagnostics both
+stalled at the final primary CALL. No successful P690 vendor mode-7 runtime
+capture is retained. Static vendor packet construction is insufficient proof
+of a working submission. See the newer
+[actual vendor-path audit](parhelia-p690-mode7-actual-vendor-path-audit.md).
+
+The current GPU WARP transform path also supersedes the description below
+that every draw uses software transforms. It expands source indices and packs
+vertices for the verified address-mode packets, with safe two-triangle
+batching. Native index reuse and bound strided fetch remain performance gaps.
+
+Next work must derive the missing direct-fetch state/lifecycle from vendor
+execution or a matching capture before enabling production mode 7. Do not
+repeat speculative packets based only on the historical ABI proposal.
+
+## Historical feasibility result
 
 **Native indexed drawing is supported by the Parhelia hardware and is a
 credible high-value Q3 optimization, but it is not reachable through the
