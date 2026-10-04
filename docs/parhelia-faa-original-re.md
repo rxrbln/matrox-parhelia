@@ -790,6 +790,35 @@ up within 1-7 frames.  FAA is not usable for real scenes on the 0528 until the
 resolve lockup is understood; the vendor command stream recorded under
 emulation is the next reference.
 
+### 11.16 Against the emulated vendor stream (series 22-24, modules faa0528-14/-15)
+
+The vendor's own FAA frames, recorded by executing MTXPARD under emulation
+(faaemu, [DERIVED]), differ from the probe in the FAA draw state and in the
+vertex path, not in the depth surface:
+
+* The depth surface descriptor is identical (`0x36020100`, the 0x36 code is
+  the D24X4S4 class).  Under FAA the vendor sets `0x12c8 = 0x000e00e7`
+  (stencil bits 7), stencil masks `0xfe` / `0x1fe` (stencil bit 0, depth
+  word bit 24, belongs to the fragment unit), ThresholdAA `0x007fffff`, the
+  draw DWGCTL with bit 20 (`0x00b60ec4`), and leaves DWGCTL at `0xc4` after
+  the resolve and its `0x107`/`0x207` fences, followed by `0x307` and
+  `4, 0x407`.  The probe now reproduces all of this (`FAA_VFRAME`,
+  `FAA_MLARM`, `FAA_POSTFLUSH=3`, 0x12fc `0x04868027` as the vendor).
+* With that state the lockups move later (half size: frames 5, 6, 9 instead
+  of 1-3; full: 6, 1, 2) but remain [MEASURED].  Moving the fragment buffer
+  to another window or loading the WARP stages once per FAA session changes
+  nothing.
+* Draws alone never lock up.  Accumulating N frames into the armed buffer
+  and resolving once: N = 2 completed in 3 of 4 boots, N = 5 locked up in the
+  resolve in 4 of 4 [MEASURED].  The resolve lockup becomes certain as more
+  fragments accumulate before it.
+* The vendor's vertex path is the remaining difference: pretransformed
+  5-dword vertices, `0x1100 = 0x108`, `0x10c0 = 2`, `0x1130 = 0x02002207`,
+  VTXFMT `0x23` / `0x00a87210`, and `0x41` block-file constant loads; the
+  probe uses the kernel's WARP microcode stage CALLs.  Replicating it needs
+  the kernel to admit exactly those words and blocks on the original family
+  (not implemented).
+
 ## 12. The vendor FAA frame pair, packet by packet (static, original family)
 
 Scope: `MTXPARD.dll` with `caps & 0x7fc00 == 0` (0x0527/0x0528), one D3D
