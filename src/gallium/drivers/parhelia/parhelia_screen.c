@@ -838,14 +838,11 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    const bool cube_probe = cube_target && p690_native_texture32 &&
                            ph_env("PARHELIA_CUBE_PROBE");
    const bool cube_chain = cube_target && p690_native_texture32;
-   /* Original-family cube chains in the vendor order, exact for power-of-two
-    * faces 1..128 (ph_mip_layout_cube_64x32).  NPOT chains read wrong at every
-    * size measured (20..100), so they stay a diagnostic. */
+   /* Original-family cube chains in the vendor order (ph_mip_layout_cube_64x32),
+    * every level exact on the 0528 for faces 1..256 and NPOT 20..100. */
    const bool o528_cube_chain = cube_target && o528_layered &&
-      templ->width0 <= 128 &&
-      (!(templ->width0 & (templ->width0 - 1)) ||
-       /* PARHELIA_0528_NPOT_CUBE=1 (diagnostic): NPOT cube chains, to measure */
-       ph_env("PARHELIA_0528_NPOT_CUBE"));
+      (!(templ->width0 & (templ->width0 - 1)) ? templ->width0 <= 256 :
+                                                templ->width0 <= 100);
    /* P690 NPOT chains, 2-D and cube, are exact for every texel of every
     * level up to 256 (fixfn cubeprobe); larger NPOT bases keep level 0 until
     * measured (a 600x20 probe met a concurrent lockup: inconclusive).  The original family's
@@ -857,7 +854,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
       ph_mip_native_64x32_chain_exact(templ->width0, templ->height0,
                                       templ->last_level + 1);
    mip_levels = ((p690_native_texture32 && (pot || p690_npot)) ||
-                 (native_64x32_texture && (pot || o528_npot))) &&
+                 (native_64x32_texture && (pot || o528_npot || o528_cube_chain))) &&
                 (!layered || cube_chain || o528_cube_chain) ?
                    templ->last_level + 1 : 1;
    if (!ph_mip_layout_init_cpp(&r->mip, templ->width0, templ->height0,
@@ -1852,11 +1849,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
     * textures have no hardware target at all and stay at zero. */
    if (s->volume_targets)
       caps->max_texture_3d_levels = 9;
-   /* The original family samples cube faces exactly up to 128 (a 256 face
-    * reads back transposed-like, MEASURED on the 0528). */
+   /* The original family's cube chains are measured up to 256. */
    if (s->cube_targets)
       caps->max_texture_cube_levels =
-         s->chip_id == 0x0527 || s->chip_id == 0x0528 ? 8 : 10;
+         s->chip_id == 0x0527 || s->chip_id == 0x0528 ? 9 : 10;
    /* There is no pipe fence object yet.  Native window swaps are ordered by
     * the following Present blit, so the DRI frontend must not request a NULL
     * fence solely to throttle every swap in the client. */
