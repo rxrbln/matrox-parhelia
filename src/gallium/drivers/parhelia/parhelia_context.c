@@ -247,6 +247,7 @@ struct ph_sampler_view {
 };
 
 struct ph_context;
+static bool ph_fs_window_lookups_only(const struct ph_fs *fs);
 static unsigned ph_sampler_tiled_pitch(unsigned width);
 static unsigned ph_sampler_storage_pitch(struct pipe_screen *screen,
                                          unsigned width, unsigned cpp);
@@ -6113,6 +6114,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
 	/* PARHELIA_NO_OOW=1 (diagnostic) keeps the affine stream. */
 	/* The stipple's window coordinates interpolate linearly. */
 	oow = textured && !ctx->fs->stipple_affine &&
+	      !ph_fs_window_lookups_only(ctx->fs) &&
 	      !native_sampled_alpha &&
 	      !cpu_alpha_cutout && !rgb_alpha_two_pass && !alpha_micro &&
 	      !alpha_micro_cutout && !three_coord && !ph_env("PARHELIA_NO_OOW");
@@ -8747,6 +8749,28 @@ ph_quant_domain(struct ph_quant_stage *q, const struct prim_header *prim,
    }
 }
 
+/* Every unit of the program looks up a function of the window position
+ * (gl_FragCoord): those coordinates are affine in window space, so the
+ * draw takes the affine stream without 1/w. */
+static bool
+ph_fs_window_lookups_only(const struct ph_fs *fs)
+{
+   const struct ph_fs_program *prog = fs ? &fs->program : NULL;
+   unsigned units = 0;
+
+   if (!prog || !prog->valid || !prog->ramp_count || fs->tap_count)
+      return false;
+   for (unsigned r = 0; r < prog->ramp_count; r++) {
+      const struct ph_fs_ramp *rp = &prog->ramps[r];
+
+      if ((rp->kind != PH_FS_RAMP_SCALAR && rp->kind != PH_FS_RAMP_PLANE) ||
+          rp->location != VARYING_SLOT_POS)
+         return false;
+      units |= 1u << rp->unit;
+   }
+   return units == prog->sampler_mask;
+}
+
 /* Keep every carried value of @prim inside its carrier's domain: a value
  * outside submits what is staged and widens the domain, so each batch
  * interpolates one domain (both carriers clamp to [0, 1]). */
@@ -8776,8 +8800,9 @@ ph_quant_domains(struct ph_quant_stage *q, const struct prim_header *prim,
       memcpy(span, q->ctx->dom_span[k], sizeof(span));
       if (r->fn->pixel) {
          /* The unit interpolates perspective-correctly, the window
-          * position affinely: they agree at equal w only. */
-         for (unsigned v = 1; v < n; v++)
+          * position affinely: they agree at equal w only, unless the
+          * draw takes the affine stream. */
+         for (unsigned v = 1; !ph_fs_window_lookups_only(q->ctx->fs) && v < n; v++)
             if (prim->v[v]->data[q->ramp_src[i]][3] !=
                 prim->v[0]->data[q->ramp_src[i]][3]) {
                ph_warn_once("a lookup of the window position across corners "
