@@ -617,3 +617,25 @@ This is a CPU/parser design stage, not native support. Separate fullGL2
 lighting fixturef97ece6 compiles with mergedpreflight (aeea1cb), native remains
 unexecuted. Scaled GPU RGBA8 paired-pipe candidate passed12native cases
 (nearestexact/linearmax1/sourceunchanged); noninteger resize validation pending.
+
+## 2026-10-05 native signed matrix and GPU scaled blits
+
+Root matrix-only native prooffe326cd uses reviewed fixtured795467/diag
+53a3ff42... underlock60secouter/2secfences, orthographicW1, opcodeA only.
+Ordinary sampledRGBA controlPASS; five signed/bx2/bias/source-generation
+phases63982checkedpixels each/zeroerrors (colour tolerance2), fullD24/stencil
+unchanged, everyword of source+three16MiB helpers unchanged, independent
+readonlydepthconsumerPASS. Actual15instruction uploaded code/entry retained,
+raw fivecolour/fivedepth snapshots fetched. Boot/X unchangedhealthy, no
+module/prefixchanges. Independent offline decode pending; spatialtexture/
+perspective/normalization/specular/deluxe/fullQ3lighting remain open. Previously
+held correctedperspective/depthopcodeE workflows were not executed.
+
+GPUscaledRGBA8 integrated1d70cb9: default-off option, originalownednative
+RGBA8 distinctlevel0BOs/fullsource/inboundsdest; nearest admits provenhalf/
+doubleperaxis, linear admitspositive scales. Twelve nativehalf/doublecases
+pass (nearestexact/linearmax1), fractional333x197linearpass/max2 versusCPU,
+source/exterior/alpha/postsampling preserved. Two firstalpha255 failures
+resolved by normal originalpairedpipe+explicitMOVRGBA; fractionalnearest
+boundaryfailure retained and usesCPUfallback. Unsupportedmasks/flips/scissor/
+crops retainfallback; broadblitcoverage next. Combinedbuild verification pending.
