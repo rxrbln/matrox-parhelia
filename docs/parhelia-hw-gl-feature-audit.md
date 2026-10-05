@@ -522,3 +522,36 @@ OccasionalFAA textured1024x768 occlusion10frames PASS,228855pixels/frame,
 20drawbatches/10resolves, depth24/stencil0 (4a72b83). NoD16FAA/performanceclaim.
 ProductionMesa1f5318b and known-goodDRM0f7d564 unchanged; targethealthy/restored
 X1920x1200, boot8d9d7a3b-db70-4d7d-9870-db28b50f0feb.
+
+## 2026-10-05 subpage alignment and D16 reconstruction
+
+Mesa0c531ca / DRM b42d0cf add separately gated GET41/reloc13 for64-byte
+source alignment. Existing GET39/reloc12 remains4096-byte aligned even
+with the new gate enabled. Mixed12/13 requests reject before patching.
+Merged kernel128admission/8192capability/762packetmutation cases PASS.
+The agent native campaign retired three routes×eight frames with exact
+control hashes and240550 analytic pixels/frame, including source offset
+0x7c0 (64-byte but not128-byte aligned). Representative three-source pool
+shrinks2696→1800DW; no changed Q3 FPS result yet. Known-good module/X
+restored. Whole-pool fallback homogeneity guard is being completed before
+combined benchmark; hardware proof does not replace malformed-input proof.
+
+D16 compatible layout2 view and three-combiner reconstruction are retained
+in Mesabf7e75f. Full32768 producer pixels exact, source65536bytes unchanged,
+RGB32 control byte-exact, reconstructed normalized depth max1 UNORM8 step.
+Exhaustive rational arithmetic covers65536 stored codes; actual GPU proof
+covers32 boundary codes. Frontend generation/filter/feedback and comparison
+semantics remain open; CPU/GPU quantization equality is not established.
+
+Shader-depth host diagnostic integrated24a7a08/6fa7e79: exact14-instruction
+custom upload provenance, five initialized independent owned BOs, actual
+emitted matrix clip checks, bounded stop-on-first-failure and independent
+read-only depth consumer. Combined build/CPU suite PASS (fafb08a); native
+execution NOT RUN. No general shader-depth cap or normal admission change.
+Corrected unequal-W retry remains pending explicit approval following
+automatic review rejection for previous wedge/service disruption risk.
+
+One combined1024x768 windowed glmark rotation (cf506c9) has texture208FPS
+smoke; buffer shader link fails unsupported fexp2. Printed buffer67FPS,
+zero exit status and score136 are invalid rendering/performance evidence.
+Vendor exp/log and matrix-lighting RE continue; fullGL2 remains incomplete.
