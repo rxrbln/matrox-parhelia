@@ -790,3 +790,21 @@ fragment EXP/LOG/POW draw. Accepted TEXCOORD/dependent-dot matrix capture
 provides a possible glmark2 route, with unit-domain clamp and precision
 constraints still unresolved. Runtime multipass implementation is underway;
 normal/specular/deluxe effects and full glmark2 rendering remain incomplete.
+
+
+Current full-rendering integration checkpoint: Mesa runtime05cbe2f and
+dependent scalar dcec282 now coexist with RG normal producer d3a9666 and
+direct normal-Z helper db882eb. Combined build and CPU suite pass. The
+runtime backend is callable but has no complete full-lightall graph caller.
+Vendor buffer emitter54258b2 independently matches all56 combiner writes;
+resource/code binding and precision remain open. No new target deployment.
+
+Direct normal helper tests distinguish exact RG8 knots from continuous
+bilinear sampling. Texel-center mapping matters; ideal endpoint-aligned
+lookup error does not certify raw normalized dependent coordinates. All-mip
+GPU repacking must preserve original filtering and prove sampler storage.
+The installed79-file glmark shader snapshot80d82ad covers source requirements
+beyond buffer: terrain, refraction, shadow/FragCoord and multi-tap paths.
+Static inventory does not establish scene pass/fail. Full GL2 and complete
+glmark rendering remain unfinished; latest measured36.7GL1/16.8restrictedGL2
+are unchanged. The exact-artifact upload approval holds remain in force.
