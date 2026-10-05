@@ -340,3 +340,22 @@ Q3 missing-specular-map specialization builds but both full-map and simpler
 specular-enabled startup encounter the varying allocator limit before gameplay:
 more value varyings than colour interpolators and coordinate units. No gameplay
 or performance result is claimed for that app change.
+
+Follow-up packed depth-clipping proof: far-Z frame7 takes two ordinary1408-triangle
+software tails and frame8 returns to ten successful native async submissions.
+Both images match dense controls exactly (507642 analytical pixels per route).
+Main Mesa includes packed implementation/evidence throughbdb93e0; kernel gate
+e2aa290 remains default-off, with known-good0f7d564 restored after testing.
+
+One Q3 packed indexed run at1024x768 fullscreen, uncompressed textures, anisotropy
+enabled and per-submit tracing:387frames/13.2seconds =29.4FPS.12654 actual async
+submissions succeed. This configuration differs from the earlier compressed
+54.1FPS profile and does not establish a gain/regression. No repeated benchmark.
+Submission aggregation is the next performance target; preserve the feature.
+
+Appf519e7f defers both ordinary and constant-white-specular lighting variants
+until actual bind. Full-map gameplay reaches lightmap variant1 (specularMap0),
+whose NIR reads four samplers and19 live value components. It exceeds the proven
+physical carrier budget; the remaining issue is actual gameplay lighting, not
+only eager startup compilation. Diagnostic Mesae0a924c captures rejected NIR.
+Full-map GL2 remains incomplete, including additional nonlinear fragment ALU.
