@@ -9,7 +9,7 @@ GL2 rendering take priority; keep the GL1>40/full GL2>15 goals intact.
 
 | Topic | State / owner | Required next evidence |
 |---|---|---|
-| Q3 GL2 runtime stage graph / scratch links | Finishing round: native_geometry actual chain construction | Executable original-NIR stages and linked consumer, final depth/blend/discard/order |
+| Q3 GL2 runtime stage graph / scratch links | Host chainf25811d complete; kernels/precision/native proof open | Executable original-NIR stages and linked consumer, final depth/blend/discard/order |
 | Normal maps / dependent texture resources | Host cache milestone integrated 07929c0; native proof pending | Cache ownership/failure proof, real GPU repack bindings, filtering precision |
 | glmark2 FragCoord scenes | Host milestone integrated9ece93a; native window test held | Real conditionals/function/loop compiler paths and pixel oracle |
 | Q3 GL1 batching / submission performance | 37.0 FPS measured on7a52cb4;37vs36.7 within one-run noise | Remaining drains/capacity gaps; one matching1024x768 run when authorized |
@@ -36,3 +36,10 @@ execution and preserve/restore known-good DRM/X. The explicit existing upload
 and spatial-test approval holds remain in force; this delegation request does
 not approve their transfer/execution. No two agents run target tests together.
 Host evidence, native pixel proof and performance measurements are distinct.
+
+Round stopped for requested P690 swap. All three agents completed their signed
+milestones; final combined Mesa f25811d build/full CPU suite and chain/replay
+contracts pass. Kernel a51792f module/active-output cursor contract pass.
+Normal target poweroff command returned0 under the hardware lock; subsequent
+SSH no longer reached192.168.2.60. No new target test or agent rotation starts
+before hardware swap handoff. Remaining topics retain their open scope.

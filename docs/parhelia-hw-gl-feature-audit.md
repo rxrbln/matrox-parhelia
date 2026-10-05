@@ -865,3 +865,13 @@ stream omits denominators; full alpha remains open. Kernelec20aff rejects
 late attachment base rewrites; full pitch/scissor/destination extent remains
 open. Kernela51792f shares active-output selector for cursor; readiness gates
 remain unchanged, dual-head/reset remain open. These were not in37.0FPSrun.
+
+2026-10-05 round-end: mainf25811d actual original-IR chain construction
+compiles linked producers/final colour+discard, both orientations, derived
+GPU VS, owned source sampler/view copies and scratch, with rollback. It
+refuses missing physical kernels and uncertified storage; no full-lightall
+app admission. Final combined build/full CPU suite and actual constructor/
+replay contracts PASS; local library763c14410d46eb6df7f4e6e5f7006846ca07c7cd95ed5e140672e207a0f15cfb
+not uploaded. All agents stopped. User-authorized normal poweroff executed
+under hardware lock,rc0; target no longer reachable over SSH. Prepared for
+physical P690 swap. Production module/Mesa had been restored before shutdown.
