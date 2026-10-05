@@ -734,3 +734,14 @@ establish translation only. Undefined-alpha initialprobe has no payload and
 is retainednegative despiteDDRVAL0. No nativeprecision, sqrt/rsq orfinal
 normalization claim. Remaining major GPURGBdomain normalization andwide
 mixed batching are beingimplemented andmust pass their CPU/native gates.
+
+2026-10-05 GPU finiteRGBdomain6972f31 combinedcbcf256 build/fullhostCPU pass.
+Signed/overbrightRGB normalization usesGPU ADD/MUL andexistingFScompensation,
+alphaunchanged/currentuniforms/pendingvertexpublish beforedomainmutation.
+OwnedFS trial refusesdomain growth thatoutgrowscombiner slots. Defaultoff;
+nativequeued-domain/texture/depth/alpha controls pending, no newFPS.
+Kernelordinarywideb81affa/buildproof8f5c797 passes; separate43/15 exactwidths
+6/8/9/10/11 andordinarywholeframe16k, indexed4096 unchanged/old14unchanged.
+Frontend andnativeproof pending. Cube473eb24/c5004b3 exact22/29VS setup is
+MAX/reciprocalpreconditioning, notEXP/RSQ; pervertexscaling changes spatial
+interpolation (independent0.23306componenterror). Fullnormalization remainsopen.
