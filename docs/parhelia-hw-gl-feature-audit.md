@@ -428,3 +428,17 @@ initializing WARP. Hardware tests held during ATX recovery. Vendor unequal-W
 capture changes input FLOAT4 declaration/stride only; no evidence supports an
 invented TA perspective bit. Resident WARP export/setup versus custom vendor
 VS contract is under investigation; no retry of the failed packet state.
+
+Recovery and diagnostic correction: cold ATX recovery restored known-good0f7d564
+and X:1 1920x1200, boot8d9d7a3b-db70-4d7d-9870-db28b50f0feb. Integrated CPU
+selftests pass (Mesacf766b7). The failed unequal-W fixture used column-major
+matrix element11 in a row-major constant contract, producing out-of-frustum
+vertices instead of unequal W. It therefore does not prove valid perspective
+TA failure. Corrected emitted-matrix semantic checks precede the next proof.
+
+External depth Piglit rotation (Mesaf841c6d, sourceea8eae4/core48cd2d9,
+librarySHA b00e58356d8224942e98d41c82c33d8bb453066a3d7c2a326e37783349af544a):
+fbo-readpixels-depth-formats PASS; fbo-depth-sample-compare fails at link on
+unsupported non-colour shader output (fragment depth), before sampling.
+Fragment-written depth remains a hardware/shader gap; this result does not
+contradict the depth-shadow conversion fixture. FAA off, no version override.
