@@ -258,4 +258,12 @@ frames retain23 GPU instructions, update normal-buffer contents and change
 live matrix uniforms, with ordinary draws interleaved; two final ordinary
 RGBA frames check cleanup. Logs confirm80 successful owned indexed submissions,
 not only selection before potential fallback. The workflow restores actual
-0f7d564/X1920. Source promotion is pending; no performance claim yet.
+0f7d564/X1920. The guarded Gallium implementation is integrated as553ef26; production remains39b0e2e pending the combined build. No performance claim yet.
+
+Main8289aa9 extends proven direct render sampling to all four physical units
+and retains extra sampler resources across deferred batches. Six1024x768 image
+checks pass over three changing generations, including a pending unit3 partial
+producer and deletion of source attachments/views before readback. Maximum
+channel error is1 against the analytical weighted sum (tolerance3). Distinct
+BO traces confirm all four units consume real render storage. Blend, CPU alpha,
+lookup and depth-sampling gates remain; no performance measurement is claimed.
