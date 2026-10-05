@@ -682,3 +682,17 @@ via fallback with zero GPUmarkers; no acceleration claim yet. See retained
 campaign/results/depth-sampling-20261005/texture-cropped-q3-gameplay.png/log.
 Normal route vendor70da778 confirms dependent RG and FLOAT4basis/viewW
 translation only; cube normalization and complete Q3 lighting remain open.
+
+2026-10-05 presentation/mixed progress: nearest RGBA8→native BGRX
+presentation integrated0cc211b. ExactRGBidentity/Xzero swizzle admits real
+Mesa frontend copy;4GPUnearest/4linearfallback cases and12pairedimages exact.
+Restricted Q3 gameplay logs ten actual1024x768 GPUpresentation copies.
+Large BGRXlinear prototype retires butmax7error, retainedfailure/fallback;
+existingRGBAlinear remains. GPUcopy already uses asynchronous aggregate/fence
+framework, so no redundant submission route added. ONErestrictedHDR1/toneMap0
+normal/spec/deluxe0 estimate16.8FPS is unmatched prior profile, not fullGL2.
+Combined4902dd4 build/fullCPU passes; no combinedGPU/perf claim.
+Mixed bridge e1af656/firstevidence3185e33 retains nonclaim: automaticindexing
+prevented interleaving. Corrected true5frame request rejects beforedoorbell;
+CPU identifies primitiveprefix2305c→6305c finalstate checker mismatch, fix
+pending. Known-goodmodule/X restored. Full goals/GL1>40/fullGL2>15 remain open.
