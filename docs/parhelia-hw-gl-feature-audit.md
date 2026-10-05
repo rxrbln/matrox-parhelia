@@ -442,3 +442,17 @@ fbo-readpixels-depth-formats PASS; fbo-depth-sample-compare fails at link on
 unsupported non-colour shader output (fragment depth), before sampling.
 Fragment-written depth remains a hardware/shader gap; this result does not
 contradict the depth-shadow conversion fixture. FAA off, no version override.
+
+Multi-stream owned indexed aggregation integratedMesa306a22c/kernel493a7d7:
+GET39/reloc12, default-off gates, page-aligned independently owned vertex
+segments, complete state/reset per segment, invariant owned attachments.
+Fallback preflights every segment then extracts old offset-zero streams and
+uses the proven async/sync splitter. Combined full build/CPU tests pass,
+including exact three-stream reconstruction and transactional schema/capacity
+failure (Mesa506dd26). Hardware/source-overwrite/deaggregation proof and any
+performance claim remain pending. Production prefix/module unchanged.
+
+Corrected perspective diagnostic integrated81495c5 with actual emitted-matrix
+and all-vertex clip/frustum checks plus vendor WARP export evidence. Automatic
+approval review rejected its native run because of prior wedge/service risk;
+it has not executed. Host-only shader-depth/vendor RE continues.
