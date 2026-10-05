@@ -777,3 +777,16 @@ known-good0f driver and1920x1200 desktop. Restricted GL2 remains16.8FPS;
 full normal/specular/deluxe effects have no valid FPS result. New changes
 above are host-only. The pinned wide-domain deployment bundle remains held
 pending explicit user approval after automatic approval-review rejection.
+
+
+Rendering priority follow-up: full glmark2 and Q3GL2 now take precedence.
+Kernel7c70f2b supersedes early stored implicit-fence capture: a temporary
+readiness snapshot preserves normal fresh WRITE-fence capture; an async-only
+late dependency guard rejects unfinished scanout before pin/programming.
+CPU oracle includes a new writer after the early snapshot; module build
+passes. No target deployment or hardware pixel claim.
+Vendor nonlinear controls d719468 verify exact fog tables but no actual
+fragment EXP/LOG/POW draw. Accepted TEXCOORD/dependent-dot matrix capture
+provides a possible glmark2 route, with unit-domain clamp and precision
+constraints still unresolved. Runtime multipass implementation is underway;
+normal/specular/deluxe effects and full glmark2 rendering remain incomplete.
