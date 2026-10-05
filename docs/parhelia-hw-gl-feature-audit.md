@@ -490,3 +490,35 @@ repeat-wait and delete allPASS. fbo-depth-sample-compare still fails, now at
 fragment-coordinate colour arithmetic after depth-identity admission. Retained
 proof/loader logs in Mesae5a8e16. Q3/native workflows already used candidate
 library first; their performance and pixel results are unaffected.
+
+## 2026-10-05 two-texture indexing and native D16 attachments
+
+Exact two-ST owned indexing integratedMesab86b71e/kernel f62cf7b behindquery40,
+with explicit opt-in. Hardwaree63c42b proves three routes×eight exact full
+frames/1,924,400 analytic pixels per route, independent ST0/ST1 checkers,
+volatile client/VBO sources, near/far depth, mixed6/8/8 streams and ordinary
+blend interleave/re-entry. Sixteen accepted async requests versus32 lossless
+sync chunks; all returns0/nonzero fences. No general blend-conformance claim.
+
+ONE matching integrated Q3 run (3d6d869) reached31.7FPS versus32.4, ballpark
+flat. Native10808 accepted requests group25778 segments;9552100DW previous
+page pool becomes20900500DW, of which9643004DW useful/11257496DW padding.
+New TWO-ST admission includes many tiny draws (83%under32 triangles). Retain
+full feature/correctness; subpage source alignment and dispatch cost are next.
+Vendor direct-fetch groundtruth now shows subpage source addresses; newquery41
+andreloc13 are reserved for a separately gated64-byte alignment contract,
+keeping oldquery39/reloc12 page requirements unchanged. Native proof pending.
+
+Original D16 attachments integrated5042738, PARHELIA_NATIVE_D16 defaultfalse:
+three1024x768 textured generations exactRGBA, depthmax1/65536, actual16-bit
+resource1572864bytes versus24-bit storage3145728. No newkernelABI needed;
+ownedcpp2 allocation probe gates original0528 only. Fast-Z remains refused
+forD16 untilproven; plane clears useGPU. Direct sampling remains unadvertised.
+Vendor D16→ARGB32 DPS conversion uses RGB565 sampler layout2; fullcompatible
+view/conversion native proof is being derived, not ordinarylayout4 relabeling.
+
+Combinedsourceb86b71e/core48cd2d9/library8a8e8d90... fullCPU suite passes.
+OccasionalFAA textured1024x768 occlusion10frames PASS,228855pixels/frame,
+20drawbatches/10resolves, depth24/stencil0 (4a72b83). NoD16FAA/performanceclaim.
+ProductionMesa1f5318b and known-goodDRM0f7d564 unchanged; targethealthy/restored
+X1920x1200, boot8d9d7a3b-db70-4d7d-9870-db28b50f0feb.
