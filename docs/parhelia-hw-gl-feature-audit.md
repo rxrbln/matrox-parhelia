@@ -4,7 +4,7 @@ Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
 Reconciled with code on 2026-10-05: shared Mesa **9369ebc**, shared DRM
-**f288453**; isolated Mesa **39b0e2e** (deployed isolated prefix SHA2b728792...), outer NIR **e1817b2**, actual DRM
+**f288453**; isolated Mesa **1f5318b** (deployed isolated prefix SHA65008177...), outer NIR **e1817b2**, actual DRM
 **0f7d564**. Performance DRM **12d2626** has passed isolated hardware tests
 and was restored afterward. It is not the currently loaded kernel.
 The latest GPU-gap report records exact source, binary and configuration evidence.
@@ -281,3 +281,12 @@ vector. Main6eb2921 explicitly rejects mixed FLOAT4/indexed and packed layouts;
 full integrated build, CPU/state and shader selftests pass. Compact RGB and
 packed byte layouts are preserved. Combined native integration and two-ST
 validation are in progress; production remains39b0e2e. No FPS gain is claimed.
+
+Latest combined deployment:1f5318b/SHA65008177... is installed in the isolated
+production prefix. Full merged build and CPU/state+shader suites pass; combined
+single-ST FLOAT4 integration passes144 cases. Main1f5318b admits direct render
+sampling for exactONE/ONE RGB+alpha ADD consumers, leaving other blends on
+fallback. The integrated additive native gate passes six1024x768 images,
+maximum channel error1, with boot unchanged. Previous production39b0e2e notes
+above describe earlier checkpoints. Two-ST uniform-range fallback still loses
+alpha and is under investigation; valid two-ST GPU cases have separate proof.
