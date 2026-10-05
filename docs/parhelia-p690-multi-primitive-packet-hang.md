@@ -232,3 +232,32 @@ immediately before the packet, so `end` is the address of the draw packet
 itself, while this driver points `start`/`end` at a separate pinned vertex
 object.  That is a kernel ABI change, and the measured value of a larger
 packet is still 0.1-0.2 fps.
+
+## 2026-10-05: renewed vendor trace and current performance
+
+The two-triangle default remains an unresolved GPU-wedge workaround, not a
+proved hardware maximum. User explicitly requests tracing the original vendor
+commands and correctly lifting it. The earlier throughput comparisons do not
+close this correctness task or prove today's optimized submission path has
+identical costs.
+
+Genuine MtxPser instruction oracles now cover upstream vertex copy/prelude,
+range emission, actual CALL publication, old-allocation fence tagging, selector
+retirement and rollover. The endpoint is the old vertex payload's exclusive
+end; after header rollover it need not equal the new header address. Therefore
+matching end to header in every case is not the complete vendor contract.
+
+The next active trace examines uninterrupted prelude→CALL publication→inline
+vertex copy→range header→CALL publication. Vendor publication boundaries
+exclude vertex payload bytes from executable command spans. This is a concrete
+structural difference under investigation, not yet a native fix or proof of
+why our separate DMA vertex ranges wedge. Guard-band/high-bound retries remain
+refuted; no speculative larger-packet native run has been performed this round.
+
+Current P690 GL1 baseline is 38.1 FPS at1024x768 fullscreen FAAoff/vsyncoff,
+uncompressed/aniso1, two-triangle commands, after a57fbfb fixed mapped-ring
+allocation beyond the kernel's1MiB ABI. Async submits68→11/frame andCPU
+upload/submit14.5→5.0ms. An opt-in doubled mapped capacity test retained smaller
+commands but four ring slots, yielded32.6FPS/9submits/9.6ms upload, and stays
+opt-in. Correct improvements remain retained; defaults use the faster measured
+path. Main evidence is in mesa-driver/tests/p690-swap.
