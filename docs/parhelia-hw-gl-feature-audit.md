@@ -725,3 +725,12 @@ per-fragment backend is required; VS EXP or broadening CPU fog evaluation
 would not close this feature. Existing buffer printedFPS remains invalid.
 Combined linked-input library accd534a... upload specifically rejected;
 explicit artifact/destination approval pending, no combined benchmark yet.
+
+2026-10-05 vendor normal radius groundtruth integrateddf521a5/1c64ac9.
+Fresh split,scale2,clamp andcorrectedbias variants emit actual13VS and264-byte
+draw payloads; SHAmanifest andindependent65536bytepair checks pass. CMP
+078380aa, signed/saturated subtract126c00500600/01500600 andbiasMAD028381ca
+establish translation only. Undefined-alpha initialprobe has no payload and
+is retainednegative despiteDDRVAL0. No nativeprecision, sqrt/rsq orfinal
+normalization claim. Remaining major GPURGBdomain normalization andwide
+mixed batching are beingimplemented andmust pass their CPU/native gates.
