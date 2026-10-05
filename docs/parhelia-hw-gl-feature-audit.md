@@ -188,8 +188,7 @@ resolves. Benchmarks and Piglit remain FAA off.
    FBO readback and unsupported-shader failures against the current compiler;
    historical reports alone do not establish current failures. Expand lowering
    where the combiner contract supports it.
-6. **Native acceleration.** Native polygon offset, crossing user clip planes, direct indexed
-   and strided fetch, native point-size and topology paths remain work. Conservative all-inside user-plane GPU acceptance is implemented and verified. Packed 8-bit vertex-colour fetch is default for verified FAA-off0528 fixed-functionRGBA/BGRA8 inputs in1d6ffc0.48nativechecks plus12gradient/BGRA/far-clipping and32RGB-above-alpha cases pass; GPU transforms retained. One Q3run31.6FPS reports~18% fewer vertexDWORDs, without an isolated speedup claim. Float/compiled/current-colour paths retain existing layouts; packedFAA remains experimental. Existing ordinaryFAA textured depth smoke passes after promotion. GPU
+6. **Native acceleration.** Native polygon offset, crossing user clip planes, native point-size and additional topology paths remain work. Owned indexed/strided DMA is implemented behind verified private kernel gates;64-byte subpage packing and mixed ordinary/indexed batching now have native image, source-preservation and matching Quake3 evidence. Ordinary9/10/11-DWORD layouts and owned frames above4096DWORDs remain outside the current mixed contract; a separately gated43/15 extension is in development. Conservative all-inside user-plane GPU acceptance is implemented and verified. Packed 8-bit vertex-colour fetch is default for verified FAA-off0528 fixed-functionRGBA/BGRA8 inputs in1d6ffc0.48nativechecks plus12gradient/BGRA/far-clipping and32RGB-above-alpha cases pass; GPU transforms retained. One Q3run31.6FPS reports~18% fewer vertexDWORDs, without an isolated speedup claim. Float/compiled/current-colour paths retain existing layouts; packedFAA remains experimental. Existing ordinaryFAA textured depth smoke passes after promotion. GPU
    transforms already exist. Prefer GPU paths; retain correct improvements
    even if one benchmark shows no immediate gain. See
    parhelia-polygon-offset-hardware-re.md and
@@ -717,3 +716,12 @@ HDR1/basic profile; full normal/specular/deluxe lighting remains incomplete.
 AG-only normal repack upload was specifically rejected by automatic approval
 review; explicit artifact/destination permission pending, no native result.
 Spatial matrix and unequal-W retries remain separately held. No bypass.
+
+2026-10-05 actual installed glmark buffer shaders retained in Mesa1305d58.
+The exponential input is min(dist.xyz*dist.w), not a uniform or plain fog
+coordinate. Independent equal-W triangle counterexample gives correct centre
+intensity1/256 versus1 if evaluated at vertices then interpolated. A genuine
+per-fragment backend is required; VS EXP or broadening CPU fog evaluation
+would not close this feature. Existing buffer printedFPS remains invalid.
+Combined linked-input library accd534a... upload specifically rejected;
+explicit artifact/destination approval pending, no combined benchmark yet.
