@@ -417,3 +417,14 @@ check at1024x768:228855 interior pixels/frame,20 draw batches,10 resolves,
 depth24/stencil0. Evidence committed inMesad3aa086. Main development stays
 FAA off. Production Mesa remains1f5318b and known-good DRM0f7d564; newer
 features are tested in isolated prefixes. Multi-binding aggregation is underway.
+
+Follow-up: D24S8 integrated Mesa ea8eae4 after exact three-generation
+producer/source and two-filter shadow-comparison proof; bool option now honors
+'=0'. Integrated full build passes. Still opt-in, same raw rounding limits.
+
+Spatially varying TEXDP3 equal-W interpolation passed3072 components, but
+unequal-W diagnostic wedged the engine; known-good reload then timed out
+initializing WARP. Hardware tests held during ATX recovery. Vendor unequal-W
+capture changes input FLOAT4 declaration/stride only; no evidence supports an
+invented TA perspective bit. Resident WARP export/setup versus custom vendor
+VS contract is under investigation; no retry of the failed packet state.
