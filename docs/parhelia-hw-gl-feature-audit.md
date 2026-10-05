@@ -652,3 +652,18 @@ earlier combined run was256x256; d29082f corrects that documentation.
 D16/scaled options off during FAA; main development FAA off. No FPS claim.
 Mixed ordinary/indexed GET42/reloc14 parser and flipped/scissored full-source
 blits remain in agent worktrees, not delivered features.
+
+2026-10-05 follow-up: main2cf971f excludes coordinate-only branches from
+shared-load pass-unit component demand; LOD/unknown uses remain conservative.
+CPU cases prove one/two-component allocation and genuine over-capacity rejection.
+Native5db96be proof passes three shared-XY texture/changing-Z phases at1024x768
+with both colour carriers, zero RGB errors outside2-step tolerance/GL0.
+Flipped/scissored GPU copies integratedd47a002 pass24 native cases; bounded
+cropped blits integrated96f6871 pass16 native cases on isolated agent build,
+nearestexact/linearmax2, fullsource/exterior/alpha/postsample preserved.
+Scaled-blit flag remains off by default; cropped linear enlargement falls back.
+Spatial matrix fixture84f91e7 is host-proven only: automatic review rejected
+its upload and explicit approval is pending; no native spatial claim.
+Vendor scalar WARP f01dc1e fresh EXP/LOG/EXPP/LOGP uploads independently checked;
+original91/92 tuple instructions differ from full scalar expansion. No GPU
+semantic or generic fragment exp/pow claim. FullQ3lighting remains open.
