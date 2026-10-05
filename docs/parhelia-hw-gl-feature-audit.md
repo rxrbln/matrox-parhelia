@@ -843,3 +843,25 @@ private-FBO plain submission-flush waits and linear resolves, preserving legacy
 end-of-frame/display/shared/finish/fence-FD behavior. Actual callback oracle
 256 combinations/failures passes. Combined build/full CPU suite and scratch
 replay/vertex ownership contracts pass. Hardware/FPS proof is still pending.
+
+2026-10-05 requested target benchmark: one matching main7a52cb4/core48cd2d9
+run on existing mixed kernel937bd13 yields387frames/10.5sec/**37.0FPS**,
+1024x768 fullscreen/uncompressed/aniso1/FAAoff,vsync0/com_maxfps0.
+Library77b9f83370dd3b2edc936d1c04a0a3348235b9148e0253fd6c00129c13866a2b.
+Compared with prior36.7 this~0.8% difference does not establish a reliable
+isolated gain.8dense image hashes match;6121accepted mixed requests,
+47910ownedframes,28async submits/frame,0sync/fallback,126.8GPUtransformdraws.
+Known0fmodule/X1920x1200 restored, boot unchanged. Retained compressed logs,
+manifest and checker committed main2caf0e3 tests/integration-bench-20261005.
+User now requests finish this agent round then shutdown for P690 swap;
+no further target tests start this round. FullGL2stillunmeasured/restricted16.8.
+
+Host-only followups:dcd7af5/00c9070 retain GPU transforms for uniform depth
+with correct clipped software tail;54b3b05 retains complete GPU triangle
+prefixes before crossing;42f2c30 adds unequal-W BC1 bilinear/trilinear oracle.
+b8923e9 actual P690 vendor range block720cases does not prove native >2draw
+safety.193ad43 refuses alpha-companion perspective/projective draws whose
+stream omits denominators; full alpha remains open. Kernelec20aff rejects
+late attachment base rewrites; full pitch/scissor/destination extent remains
+open. Kernela51792f shares active-output selector for cursor; readiness gates
+remain unchanged, dual-head/reset remain open. These were not in37.0FPSrun.
