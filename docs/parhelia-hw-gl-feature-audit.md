@@ -229,3 +229,13 @@ completion score is assigned to these unequal and partially validated families.
 Compiled GPU lighting input stream5461138 defaults to6DWORD instead of8 within the proved original0528/FAAoff/single-raster-set/RGB scope, retaining all23WARP instructions. Native lighting/clipping/consumed-ST fallback and integrated10frame pixel proof pass. One short1024glmark build51FPS vs earlier33–34 ballpark; no Quake3 gain established. Opt out with PARHELIA_TCL_COMPACT_INPUTS=0.
 
 General affine RGB matrix lowering d00d0b2 collects shared sampled-channel atoms into three native MAD slots. Full selftests, unchanged Piglit colour-matrix, five changing-uniform native cases (327680pixels/zero mismatches/channel error at most2), and four neighbouring dot/swizzle Piglit cases pass. Signed coefficients, offsets, sampled alpha and immutable source textures are covered; unsupported uniform magnitudes remain rejected.
+
+Original inline32 indexed-draw RE checkpoint: fresh Windows writer execution
+proves exact8b0a0005/sixDWORD indices and65535+3 index splitting; this is
+CPU command construction, not GPU retirement. Candidate kernel a934e0d
+(on performance12d2626) adds default-off query36/reloc11 diagnostic with
+synchronous kernel-owned copied vertices, at most6indices, strict bounds
+and stream/primitive/descriptor cleanup. Its build and78 recognizer
+mutation cases pass. Native class3 indexed retirement/depth interlock
+remain unproved; production97drawing stays unchanged. No native indexed
+capability or performance claim follows from this candidate.
