@@ -667,3 +667,18 @@ its upload and explicit approval is pending; no native spatial claim.
 Vendor scalar WARP f01dc1e fresh EXP/LOG/EXPP/LOGP uploads independently checked;
 original91/92 tuple instructions differ from full scalar expansion. No GPU
 semantic or generic fragment exp/pow claim. FullQ3lighting remains open.
+
+2026-10-05 mixed/presentation update: kernel mixed admission integrateda652542
+and full module build800824a pass, default-off/unloaded. Mesa pure assembly
+foundationb5bd61d and combined proof2db31a9 pass39 focused actual-code cases,
+including lossless227-draw4086DWORD→two bounded replay chunks. Context wiring
+and native mixed ordering/performance remain pending. Benchmark helper0d3612e
+rejects excessive console entries before config/GPU changes; existing matching
+Q3 recipe16entries is within ioq3 limit32, so current32.9FPS is unaffected.
+Corrected restricted GL2 readiness capture reaches q3dm6 gameplay at1024x768.
+Actual presentation is RGBA8→BGRA-X with full-height vertical source flip;
+current blit destination format gate rejects it. First BGRA-X test pixels pass
+via fallback with zero GPUmarkers; no acceleration claim yet. See retained
+campaign/results/depth-sampling-20261005/texture-cropped-q3-gameplay.png/log.
+Normal route vendor70da778 confirms dependent RG and FLOAT4basis/viewW
+translation only; cube normalization and complete Q3 lighting remain open.
