@@ -696,3 +696,24 @@ Mixed bridge e1af656/firstevidence3185e33 retains nonclaim: automaticindexing
 prevented interleaving. Corrected true5frame request rejects beforedoorbell;
 CPU identifies primitiveprefix2305c→6305c finalstate checker mismatch, fix
 pending. Known-goodmodule/X restored. Full goals/GL1>40/fullGL2>15 remain open.
+
+2026-10-05 mixed batching now native-verified: narrow finalprimitive correction
+de030ba/fullmodule d31d631 admits legitimate2305c→6305c prefixes and retains
+reverse/unknown rejection. Eight genuine5frame mixed requests and ordered
+fallback images/source/depth all pass12845cf/5314d7f. ONE matching1024x768,
+uncompressed, FAAoff GL1 run reaches36.7FPS versus32.9 (~11.6% estimate),
+59→28async/frame,0sync/fallback/explicitwait and unchanged GPUgeometry.
+Integrated evidence3a8ba4e checkerPASS; runtime5314d7f/core48cd2d9 build and
+fullCPU evidence0158235. Known-good0f/X1920/boot unchanged restored.
+Next major admission gaps are ordinary9/10/11 fetch layouts and large owned
+frames; query43/reloc15 reserved for a separate contract, not yet implemented.
+
+GL2 linked-input liveness180cb97/evidence369ffa6 allocates fetch ports after
+unused outputs and inputs are pruned. FullCPU and144native cases pass
+(96GPU/48fallback); corrected10frame gameplay shows155GPUlinked draws and
+10presentation copies after readiness with existing FLOAT4 optin enabled.
+No performance estimate yet for this change. Earlier16.8 remains restricted
+HDR1/basic profile; full normal/specular/deluxe lighting remains incomplete.
+AG-only normal repack upload was specifically rejected by automatic approval
+review; explicit artifact/destination permission pending, no native result.
+Spatial matrix and unequal-W retries remain separately held. No bypass.
