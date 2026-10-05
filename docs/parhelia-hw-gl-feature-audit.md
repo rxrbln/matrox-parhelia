@@ -4,7 +4,7 @@ Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
 Reconciled with code on 2026-10-05: shared Mesa **9369ebc**, shared DRM
-**f288453**; isolated Mesa **25747ef** (main deployed production **1d6ffc0**; ad6f680 verified in a separate prefix), outer NIR **e1817b2**, actual DRM
+**f288453**; isolated Mesa **5461138** (deployed isolated prefix SHA699a5e32...), outer NIR **e1817b2**, actual DRM
 **0f7d564**. Performance DRM **12d2626** has passed isolated hardware tests
 and was restored afterward. It is not the currently loaded kernel.
 The latest GPU-gap report records exact source, binary and configuration evidence.
@@ -225,3 +225,5 @@ counter contract; the negative vendor audit is not an implementation recipe
 vendor capability/RE leads, not ready implementation tasks. Native sRGB decode
 and framebuffer encode are not established hardware features. No percentage
 completion score is assigned to these unequal and partially validated families.
+
+Compiled GPU lighting input stream5461138 defaults to6DWORD instead of8 within the proved original0528/FAAoff/single-raster-set/RGB scope, retaining all23WARP instructions. Native lighting/clipping/consumed-ST fallback and integrated10frame pixel proof pass. One short1024glmark build51FPS vs earlier33–34 ballpark; no Quake3 gain established. Opt out with PARHELIA_TCL_COMPACT_INPUTS=0.
