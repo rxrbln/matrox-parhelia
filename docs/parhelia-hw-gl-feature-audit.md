@@ -745,3 +745,35 @@ Kernelordinarywideb81affa/buildproof8f5c797 passes; separate43/15 exactwidths
 Frontend andnativeproof pending. Cube473eb24/c5004b3 exact22/29VS setup is
 MAX/reciprocalpreconditioning, notEXP/RSQ; pervertexscaling changes spatial
 interpolation (independent0.23306componenterror). Fullnormalization remainsopen.
+
+
+## Integrated host checkpoint: normal producer, cube tails and flip fences
+
+Mesa2534810 integrates normal-map AG producer NIR builders: separate
+4(A-.5)^2 and 4(G-.5)^2 scratch planes followed by clamped1-QA-QG.
+Actual compiler/packet evaluation passes256 random fragments per stage;
+combined overlay build and full CPU suite pass. The unsplit polynomial
+correctly refuses the combiner slot budget. GPU execution, scratch precision,
+sqrt, world-normal reconstruction and the full runtime multipass backend
+remain open; this does not enable full Quake3 GL2 lighting.
+
+Vendor full cube mip chains16/32/64 now provide measured tail XY and ownership
+fields before/after emitted draws. Independent storage model and existing
+cleanroom helpers match all43,002 texel offsets exactly, with bounds,
+non-overlap and unused-byte preservation checks. No storage rewrite is needed.
+Native normalization orientation/filtering and dependent sampling remain open.
+
+Kernelcfea2a3 fixes implicit render-fence capture before async-flip promotion.
+Existing original scanout allocation, Mesa/DDX flags and buffer policy were
+already wired. Pending/error render fences now retain the normal nonblocking
+commit worker wait; completed implicit fences retain the immediate flip path.
+Actual-function CPU contract and module build pass. Native queued-render/flip
+pixels, display identity and performance remain unproved.
+
+The matching GL1 timedemo proof checker was rerun:387frames/10.5seconds,
+36.7FPS,1024x768 fullscreen/uncompressed/aniso1/FAAoff. This belongs to the
+isolated mixed candidate; active target remains production1f5318b with restored
+known-good0f driver and1920x1200 desktop. Restricted GL2 remains16.8FPS;
+full normal/specular/deluxe effects have no valid FPS result. New changes
+above are host-only. The pinned wide-domain deployment bundle remains held
+pending explicit user approval after automatic approval-review rejection.
