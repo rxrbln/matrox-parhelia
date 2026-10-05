@@ -9,7 +9,7 @@ GL2 rendering take priority; keep the GL1>40/full GL2>15 goals intact.
 
 | Topic | State / owner | Required next evidence |
 |---|---|---|
-| Q3 GL2 runtime stage graph / scratch links | Host chainf25811d complete; kernels/precision/native proof open | Executable original-NIR stages and linked consumer, final depth/blend/discard/order |
+| Q3 GL2 runtime stage graph / scratch links | Host chain and original power3f12b45 integrated; native_geometry compiling actual full retained GLSL | Actual full GLSL frontend/compiler failures, executable stages/linked consumer, final depth/blend/discard/order |
 | Normal maps / dependent texture resources | Host cache milestone integrated 07929c0; native proof pending | Cache ownership/failure proof, real GPU repack bindings, filtering precision |
 | glmark2 FragCoord scenes | Host milestone integrated9ece93a; native window test held | Real conditionals/function/loop compiler paths and pixel oracle |
 | Q3 GL1 batching / submission performance | 0528 37.0 FPS; P690 38.1 FPS with ringfixa57fbfb,1024x768 FAAoff/vsyncoff | Remaining drains/capacity gaps; one matching1024x768 run when authorized |
@@ -20,7 +20,7 @@ GL2 rendering take priority; keep the GL1>40/full GL2>15 goals intact.
 | Geometry acceleration | Safe GPU prefixes54b3b05 host proof; native crossings open | Polygon offset, crossing user planes, point-size/topologies, GPU transform preservation |
 | Texture coverage | Perspective BC1 oracle42f2c30 host proof; native proof open | Remaining S3TC shapes/filter footprints, perspective anisotropy, GigaColor/system fetch proof |
 | Original-family LOD bias | Queued: lod_bias | Current -4 clamp root cause and actual failing GL test |
-| P690 sampled alpha | Raw mask/depth-order PASS within1LSB; GL fallback exact; native admission tracing bfa089c | Actual route/primitive rejection trace, then native GL pixels and sustained Q3 cutouts |
+| P690 sampled alpha | Raw mask/depth-order PASS within1LSB; GL fallback exact; tc initialization-order fix8a7d237 hostPASS | After target recovery: native route marker plus full GL pixels, then sustained Q3 cutouts |
 | Shared original/P690 larger packets | Corrected renderer86878af/kernel35980e2 integrated; raw pixel PASS; sustained Q3 WEDGE561dc2c | Investigate actual failed aggregate/publication/lifetime; candidate remainsdefaultoff, no FPS claim |
 | Kernel geometry BO bounds | Late target identityec20aff host proof; extent bounds open | Current destination extent/relocation validation evidence; no inherited exploit claim |
 | Recovery / multiple heads / cursor | Cursor active-outputa51792f host proof; dual-head/reset open | Actual reset mechanism and placement/display ownership contracts |
