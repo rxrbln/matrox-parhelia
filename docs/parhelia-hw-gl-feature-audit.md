@@ -250,3 +250,12 @@ strides fall back. The independent CPU oracle passes, including2100-index
 multi-group cases and degenerate triangles. This is preparation only: Gallium
 selection/submission and VBO pixel validation remain pending, and production
 remains39b0e2e. No app performance benefit is claimed yet.
+
+The guarded Gallium candidate now passes a native VBO pipeline proof on the
+query36-enabled temporary kernel. Ten1024x768 frames each check662592 pixels
+with zero error and hashes identical to the dense control. Eight lighting
+frames retain23 GPU instructions, update normal-buffer contents and change
+live matrix uniforms, with ordinary draws interleaved; two final ordinary
+RGBA frames check cleanup. Logs confirm80 successful owned indexed submissions,
+not only selection before potential fallback. The workflow restores actual
+0f7d564/X1920. Source promotion is pending; no performance claim yet.
