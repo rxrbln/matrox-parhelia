@@ -575,3 +575,24 @@ fails (nearest max1 colour step, linear max2), retained explicitly. Separate
 comparison2filters/full images/source exact, GPUdepthconversion bypassed.
 No default promotion/performance claim. Next texture gap: GPU scaled RGBA8
 blits, currently CPUmapped for scaled cases; vendor grounding underway.
+
+## 2026-10-05 submission attribution
+
+Optional counters e124bae/bf267d9 and frame-report correctionbebf583 change
+no scheduling. Signed native attribution43203fe retains the initial
+shutdown-only missing-output run and corrected100frame snapshots. Both
+eight-frame sanity images exact, known-good0f/X/boot restored. Corrected
+Q3 framebuffernative_shared1/1024x768 measured directly. Stable300→400
+interval:24drains/frame beforeRGB5A1eligibility (13indexed),13indexed→ordinary,
+26ordinary→indexed,2indexedcapacity,3ordinarycapacity,1flushresource and
+1fill→draw. Explicitwait/flush addzero new drains inthis interval; counts
+are attempts, not timing. Diagnostic31.6FPS is attribution evidence only.
+
+Next implementation shares read-only structural/cached rejection checks
+before repack drainage, still runs existing preparation for bookkeeping,
+preserves actualrepack/restore ordering. Mixedordinary/indexed transport
+remains a separate major grammar/ownership feature, not a blind drain removal.
+GPUscaledRGBA8 firstnativecase RGBexact/alpha255incorrect, source/postcopy
+identity preserved; explicit sampledRGBA combiner correction under test.
+Lighting template remains host-only: freshvendor signedT3consumer findings
+require corrected biased output oracle before native execution.
