@@ -389,3 +389,31 @@ is coverage proof rather than a newoptimization. VendoremulatorTEXM3x3_COORD
 creation/draw0 and exact emittedTAchain/payload groundtruth is captured inmain
 dfd0f23; matrix-addressing native retirement and full multipasslighting remain
 open.
+
+## 2026-10-05 combined hardware/performance checkpoint
+
+Matching uncompressed Quake3 GL1 1024x768 profile: one combined run reached
+32.0 FPS (387 frames/12.1s), versus earlier 29.4 FPS (387/13.2s).
+Successful native submissions fell from 12654 to 8408; total submissions from
+68–69 to 58–59 per frame. Source362286a/core48cd2d9; retained evidence in
+Mesa4683648. This is a combined-change result, not an isolated attribution.
+The >40 FPS goal in this profile and full GL2 lighting remain open.
+
+The earlier depth-shadow severe boundary errors are resolved in the opt-in
+Z24X8 path: three generations, eighteen consumer images, exact full source
+snapshots. Consumer rounding remains max1 nearest/max2 linear colour levels;
+strict pixel equality is not claimed. Shader comparisons retain CPU conversion.
+D24S8 follow-up has passed producer and source equality checks; final comparison
+proof and integration remain pending. Neither path is promoted by this note.
+
+Original GPU texture-address TEXDP3 arithmetic is now proven using the captured
+vendor helper dimensions/filter/wrap/auxiliary state: five basis cases,
+zero mismatches across15360 RGB components. Agentf529322 integrated asfaee431.
+Spatial interpolation, perspective and matrix chaining remain to be proved;
+this foundation does not implement full GL2 material lighting.
+
+Combined source7e2543f/core48cd2d9 passed one ten-frame textured FAA occlusion
+check at1024x768:228855 interior pixels/frame,20 draw batches,10 resolves,
+depth24/stencil0. Evidence committed inMesad3aa086. Main development stays
+FAA off. Production Mesa remains1f5318b and known-good DRM0f7d564; newer
+features are tested in isolated prefixes. Multi-binding aggregation is underway.
