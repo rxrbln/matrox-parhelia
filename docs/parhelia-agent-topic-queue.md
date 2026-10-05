@@ -12,7 +12,7 @@ GL2 rendering take priority; keep the GL1>40/full GL2>15 goals intact.
 | Q3 GL2 runtime stage graph / scratch links | Host chainf25811d complete; kernels/precision/native proof open | Executable original-NIR stages and linked consumer, final depth/blend/discard/order |
 | Normal maps / dependent texture resources | Host cache milestone integrated 07929c0; native proof pending | Cache ownership/failure proof, real GPU repack bindings, filtering precision |
 | glmark2 FragCoord scenes | Host milestone integrated9ece93a; native window test held | Real conditionals/function/loop compiler paths and pixel oracle |
-| Q3 GL1 batching / submission performance | 37.0 FPS measured on7a52cb4;37vs36.7 within one-run noise | Remaining drains/capacity gaps; one matching1024x768 run when authorized |
+| Q3 GL1 batching / submission performance | 0528 37.0 FPS; P690 33.1 FPS on7a52cb4,1024x768 FAAoff/vsyncoff | Remaining drains/capacity gaps; one matching1024x768 run when authorized |
 | Fullscreen presentation / double buffering | Host milestone integrated7a52cb4; target proof pending | Pending/ready render-fence flips, pixels/display identity, async lifetime |
 | Fragment BRDF / nonlinear math | Dependency graph integratede4f41fa; executable BRDF kernels pending | Executable normalization/division/pow/exp2 stage kernels, retained exact effects |
 | Vendor-driver ground truth | Seven captures integratedd6a9ce6; further RE queued | Established Windows emulator captures for unresolved coordinate/filter/TA semantics |
@@ -20,11 +20,11 @@ GL2 rendering take priority; keep the GL1>40/full GL2>15 goals intact.
 | Geometry acceleration | Safe GPU prefixes54b3b05 host proof; native crossings open | Polygon offset, crossing user planes, point-size/topologies, GPU transform preservation |
 | Texture coverage | Perspective BC1 oracle42f2c30 host proof; native proof open | Remaining S3TC shapes/filter footprints, perspective anisotropy, GigaColor/system fetch proof |
 | Original-family LOD bias | Queued: lod_bias | Current -4 clamp root cause and actual failing GL test |
-| P690 sampled alpha | Affine guard193ad43 host proof; full sampled alpha open | Spatial companion failure evidence and correct accelerated path |
-| P690 larger packets | Vendor range proofb8923e9; larger native draws held | Established safe two-primitive boundary, host/vendor bounds before any held-risk GPU test |
+| P690 sampled alpha | Corrected native alpha mask exact; RGB634/depth1042 errors remain | Spatial companion failure evidence and correct accelerated path |
+| P690 larger packets | Active geometry_features: upstream copy/rollover9aeb2c6; larger draws held | Established safe two-primitive boundary, host/vendor bounds before any held-risk GPU test |
 | Kernel geometry BO bounds | Late target identityec20aff host proof; extent bounds open | Current destination extent/relocation validation evidence; no inherited exploit claim |
 | Recovery / multiple heads / cursor | Cursor active-outputa51792f host proof; dual-head/reset open | Actual reset mechanism and placement/display ownership contracts |
-| FAA extension / regression / throughput | Queued: faa_support | App control semantics, occasional correct1024 test; main rendering stays FAA off |
+| FAA extension / regression / throughput | Active depth_shadow: P690 FAA capability/vendor RE requested | P690 capability/surface/bank evidence and native FAA proof; app controls/throughput remain open, baseline FAA off |
 
 Every agent owns an isolated checkout and names edited files before overlapping
 work. Commit major progress with DCO signoff; retain correct features and
@@ -37,9 +37,15 @@ and spatial-test approval holds remain in force; this delegation request does
 not approve their transfer/execution. No two agents run target tests together.
 Host evidence, native pixel proof and performance measurements are distinct.
 
-Round stopped for requested P690 swap. All three agents completed their signed
-milestones; final combined Mesa f25811d build/full CPU suite and chain/replay
-contracts pass. Kernel a51792f module/active-output cursor contract pass.
-Normal target poweroff command returned0 under the hardware lock; subsequent
-SSH no longer reached192.168.2.60. No new target test or agent rotation starts
-before hardware swap handoff. Remaining topics retain their open scope.
+P690 swap completed and work resumed by user instruction. Boot
+49b5213d-00d4-43fe-a0d8-79dd41691aa9, PCI01:00.0 102b:2539rev01,
+128MiB BAR0; known0f7d564 warmups/preflight and X start pass. One bounded
+Quake3 GL1 run33.1FPS (387frames/11.7s),1024x768 fullscreen uncompressed/aniso1,
+FAAoff/vsyncoff, deployed7a52cb4/core48cd2d9, conservative2primitives/packet.
+Main58192cf integrates default-off native target-class scratch allocation;
+combined overlay/full CPU suite pass. native_geometry is preparing physical
+same-BO producer/consumer proof. geometry_features traces genuine allocation
+lifetime after vendor rollover evidence. depth_shadow retains alpha mask/RGB
+failure evidence and investigates requested P690 FAA. Both kernel and Mesa
+currently exclude2539 FAA; ordinary fallback is not native FAA validation.
+Root owns all target tests. Specific pre-existing approval holds unchanged.
