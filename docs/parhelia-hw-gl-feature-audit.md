@@ -639,3 +639,16 @@ source/exterior/alpha/postsampling preserved. Two firstalpha255 failures
 resolved by normal originalpairedpipe+explicitMOVRGBA; fractionalnearest
 boundaryfailure retained and usesCPUfallback. Unsupportedmasks/flips/scissor/
 crops retainfallback; broadblitcoverage next. Combinedbuild verification pending.
+
+2026-10-05 combined verification update: main c97ff04 build and complete
+target CPU suite pass with matrix/scaled/preflight changes integrated.
+Independent raw matrix checker e3ef04b/evidence350343b passes all five cases
+with exact RGB, 7381 interior and 56491 exterior pixels per phase and all
+65536 D24S8 words unchanged. Scope remains constant texture/orthographic;
+spatial normal reconstruction, normalization and full GL2 lighting are open.
+Corrected FAA test9f43eac passes ten textured depth-occlusion frames at
+1024x768 (228855 interior pixels/frame,20 draw batches,10 resolves). The
+earlier combined run was256x256; d29082f corrects that documentation.
+D16/scaled options off during FAA; main development FAA off. No FPS claim.
+Mixed ordinary/indexed GET42/reloc14 parser and flipped/scissored full-source
+blits remain in agent worktrees, not delivered features.
