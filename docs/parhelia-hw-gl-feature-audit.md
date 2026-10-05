@@ -456,3 +456,37 @@ Corrected perspective diagnostic integrated81495c5 with actual emitted-matrix
 and all-vertex clip/frustum checks plus vendor WARP export evidence. Automatic
 approval review rejected its native run because of prior wedge/service risk;
 it has not executed. Host-only shader-depth/vendor RE continues.
+
+## 2026-10-05 aggregation retirement and shader depth identity
+
+Multi-binding aggregation is now natively proven (Mesa74f3405): three routes,
+eight exact full frames/2,046,336 analytic pixels per route, retained source
+ownership across changed textures/MVP/depth, ordinary interleave and re-entry.
+One matching integrated Q3 run (c856c92) reached32.4FPS versus32.0: ballpark
+flat, not a clear speed gain. Native submissions7334 versus8408 (-12.8%);
+11882 owned segments grouped into4246 single/2014 double/688 triple/386 quad
+requests. Page-aligned sourcepool9552100DW includes2629624paddingDW above
+6922476usefulDW. Keep the feature and proven alignment; TWO-ST draw coverage
+is next, based on captured exact8DWORD schema/query40. No repeat benchmark.
+
+Original D16 vendor producer descriptors at three widths plus17 complete
+64KiB native raw snapshots match the measured16-bit render decoder exactly
+(Mesaccb14cb/adb7092). Narrow sampler storage has a different layout, so these
+producer proofs do not authorize source relabeling. Original D16 native depth
+attachment implementation is in isolated testing; CPU sampling remains separate.
+
+Exact unconditional gl_FragDepth=gl_FragCoord.z now preserves raster depth
+(Mesae5a8e16). Twenty-three compiler forms/negative cases plus full CPU suite
+pass; native three-phase1024x768 RGB/depth oracle checks1,481,088 interior
+pixels, including farther occlusion and nearer replacement. General fragment
+depth output remains open. Vendor accepted TEXM3x2DEPTH op0xE/bit28 ratio
+route/math is captured, native precision/order unproved (076544a/7441762).
+
+Correction: earlier root external Piglit candidate claims used LIB=production,
+which preloaded production1f5318b via libGLX_mesa DT_NEEDED before DRI lookup.
+Those results are production evidence only. Candidate-first library order is
+now confirmed by loader trace; corrected external ARBsync timeout-zero,
+repeat-wait and delete allPASS. fbo-depth-sample-compare still fails, now at
+fragment-coordinate colour arithmetic after depth-identity admission. Retained
+proof/loader logs in Mesae5a8e16. Q3/native workflows already used candidate
+library first; their performance and pixel results are unaffected.
