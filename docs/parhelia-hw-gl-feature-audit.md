@@ -596,3 +596,24 @@ GPUscaledRGBA8 firstnativecase RGBexact/alpha255incorrect, source/postcopy
 identity preserved; explicit sampledRGBA combiner correction under test.
 Lighting template remains host-only: freshvendor signedT3consumer findings
 require corrected biased output oracle before native execution.
+
+## 2026-10-05 rejected repack scheduling improvement
+
+Integrated7259414 shares structural/cached RGB5A1 eligibility before draining,
+still calls preparation for identical bookkeeping and preserves actual
+repack/restore conditions. Actual-code11case oracle and combinedbuild/fullCPU
+PASS (78ec548). Paired old/new native8frame images match exactly, four actual
+1555 selections each, covering binary/fractional alpha, cache/generation and
+mip rejection. ONE1024fullscreen/uncompressed/aniso1/FAA0 Q3 run32.9FPS
+versus prior diagnostic31.6 (ballpark4%); repackpreflight drains24→0/frame,
+totalasync69–70→59/frame, CPUuploadsubmit12.36–12.47→11.14–11.39ms. Actual
+indexed10808requests unchanged, allret0/nonzero fence, explicitwait/sync/
+fallback0. Known0f/X1920/boot restored. Full signed campaign integration
+pending geometry agent; no repeated control.
+
+Next major batching contract reservedGET42/reloc14 for ordered owned ordinary
+97 plus indexed8b segments, preservingGET41/13 and all older source contracts.
+This is a CPU/parser design stage, not native support. Separate fullGL2
+lighting fixturef97ece6 compiles with mergedpreflight (aeea1cb), native remains
+unexecuted. Scaled GPU RGBA8 paired-pipe candidate passed12native cases
+(nearestexact/linearmax1/sourceunchanged); noninteger resize validation pending.
