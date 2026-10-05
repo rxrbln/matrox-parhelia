@@ -314,3 +314,29 @@ occlusion frames at1024x768 pass228855 interior pixel checks per frame, with
 20 FAA draw batches and10 resolves. Packed FAA remains disabled. This checks
 textured/depth correctness after the combined shader and render-sampling
 changes; it is not an FPS or overhead measurement.
+
+2026-10-05 perspective and packed-input checkpoint: main Mesa6ef7404 fixes
+compiled viewport export to carry reciprocal clip W in all four position lanes.
+Vendor control and independent orthographic/perspective cases pass144/144 each;
+96 GPU and48 fallback cases preserve separate UVs, alpha, blend and depth.
+Production deployment remains1f5318b until combined native validation.
+
+Packed one-ST indexed candidate Mesa7191534/kernel92a5f8d passes eight1024x768
+dense/native exact frame hashes and255792 analytical pixels per frame. Logs show
+80 successful async submissions with nonzero fences. The last XY crossing is
+inside the supported hardware guard band and remains native; it does not prove
+software clipping fallback. A separate Z-crossing/rebind test is pending. The
+bounded workflow restored known-good0f7d564 and X1920 without reboot. No FPS gain
+is claimed; this path remains experimental and disabled by default.
+
+Native depth storage and reconstruction diagnostics integrated through737240e:
+650240 depth pixels prove B=low/G=middle/R=high bytes of surface36 storage when
+sampled through colour32. Prescaled three-stage GPU arithmetic resolves high-end
+clipping and demonstrates lower-byte contribution.528320 output pixels match
+exactly and121920 differ by one8-bit level at rounding boundaries. This does not
+prove exact24-bit depth sampling; production CPU depth fallback remains.
+
+Q3 missing-specular-map specialization builds but both full-map and simpler
+specular-enabled startup encounter the varying allocator limit before gameplay:
+more value varyings than colour interpolators and coordinate units. No gameplay
+or performance result is claimed for that app change.
