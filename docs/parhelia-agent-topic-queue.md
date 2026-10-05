@@ -20,11 +20,11 @@ GL2 rendering take priority; keep the GL1>40/full GL2>15 goals intact.
 | Geometry acceleration | Safe GPU prefixes54b3b05 host proof; native crossings open | Polygon offset, crossing user planes, point-size/topologies, GPU transform preservation |
 | Texture coverage | Perspective BC1 oracle42f2c30 host proof; native proof open | Remaining S3TC shapes/filter footprints, perspective anisotropy, GigaColor/system fetch proof |
 | Original-family LOD bias | Queued: lod_bias | Current -4 clamp root cause and actual failing GL test |
-| P690 sampled alpha | Corrected native alpha mask exact; RGB634/depth1042 errors remain | Spatial companion failure evidence and correct accelerated path |
-| P690 larger packets | Active geometry_features: upstream copy/rollover9aeb2c6; larger draws held | Established safe two-primitive boundary, host/vendor bounds before any held-risk GPU test |
+| P690 sampled alpha | Raw mask/depth-order PASS within1LSB; GL fallback exact; native admission tracing bfa089c | Actual route/primitive rejection trace, then native GL pixels and sustained Q3 cutouts |
+| Shared original/P690 larger packets | Corrected renderer86878af/kernel35980e2 integrated; raw pixel PASS; sustained Q3 WEDGE561dc2c | Investigate actual failed aggregate/publication/lifetime; candidate remainsdefaultoff, no FPS claim |
 | Kernel geometry BO bounds | Late target identityec20aff host proof; extent bounds open | Current destination extent/relocation validation evidence; no inherited exploit claim |
 | Recovery / multiple heads / cursor | Cursor active-outputa51792f host proof; dual-head/reset open | Actual reset mechanism and placement/display ownership contracts |
-| FAA extension / regression / throughput | Active depth_shadow: P690 FAA capability/vendor RE requested | P690 capability/surface/bank evidence and native FAA proof; app controls/throughput remain open, baseline FAA off |
+| FAA extension / regression / throughput | Active depth_shadow: genuine SUN90 surface PASS; cached clock producers534d68f, D3Dgateclosed | Genuine memory-clock/FAA heap/bank evidence and native FAA proof; baseline FAA off |
 
 Every agent owns an isolated checkout and names edited files before overlapping
 work. Commit major progress with DCO signoff; retain correct features and
