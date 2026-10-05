@@ -555,3 +555,23 @@ One combined1024x768 windowed glmark rotation (cf506c9) has texture208FPS
 smoke; buffer shader link fails unsupported fexp2. Printed buffer67FPS,
 zero exit status and score136 are invalid rendering/performance evidence.
 Vendor exp/log and matrix-lighting RE continue; fullGL2 remains incomplete.
+
+## 2026-10-05 one subpage Q3 run and D16 sampler integration
+
+Final whole-pool fallback homogeneity patch ac6d10f rejects mixed12/13
+contracts before extracting any ordinal; combined build/full CPU PASS.
+Hardware proof aa6010e and ONE Q3 run a652a8a are retained. Matching
+1024x768 fullscreen/uncompressed/aniso1/FAA0 Q3 reaches31.8FPS versus31.7:
+ballpark flat. Accepted10808async requests/25778segments remain unchanged.
+Source pool20900500→9681604DW (-53.7%); useful9643004DW, padding11257496→38600
+(-99.66%). Feature retained; submission boundaries/dispatch/presentation are
+next, not another repeated benchmark. All8 merged sanity frames match and
+known0f/X1920/boot restored unchanged.
+
+D16 sampler feature integrated697e46c, combined build/full CPU retained
+f12d721. Both originalD16 and GPUdepthshadow defaultoff. Three generations
+sourcebyteidentity and all18raw imagecases retire; strictCPU/GPU equality
+fails (nearest max1 colour step, linear max2), retained explicitly. Separate
+comparison2filters/full images/source exact, GPUdepthconversion bypassed.
+No default promotion/performance claim. Next texture gap: GPU scaled RGBA8
+blits, currently CPUmapped for scaled cases; vendor grounding underway.
