@@ -12,7 +12,7 @@ GL2 rendering take priority; keep the GL1>40/full GL2>15 goals intact.
 | Q3 GL2 runtime stage graph / scratch links | Host chainf25811d complete; kernels/precision/native proof open | Executable original-NIR stages and linked consumer, final depth/blend/discard/order |
 | Normal maps / dependent texture resources | Host cache milestone integrated 07929c0; native proof pending | Cache ownership/failure proof, real GPU repack bindings, filtering precision |
 | glmark2 FragCoord scenes | Host milestone integrated9ece93a; native window test held | Real conditionals/function/loop compiler paths and pixel oracle |
-| Q3 GL1 batching / submission performance | 0528 37.0 FPS; P690 33.1 FPS on7a52cb4,1024x768 FAAoff/vsyncoff | Remaining drains/capacity gaps; one matching1024x768 run when authorized |
+| Q3 GL1 batching / submission performance | 0528 37.0 FPS; P690 38.1 FPS with ringfixa57fbfb,1024x768 FAAoff/vsyncoff | Remaining drains/capacity gaps; one matching1024x768 run when authorized |
 | Fullscreen presentation / double buffering | Host milestone integrated7a52cb4; target proof pending | Pending/ready render-fence flips, pixels/display identity, async lifetime |
 | Fragment BRDF / nonlinear math | Dependency graph integratede4f41fa; executable BRDF kernels pending | Executable normalization/division/pow/exp2 stage kernels, retained exact effects |
 | Vendor-driver ground truth | Seven captures integratedd6a9ce6; further RE queued | Established Windows emulator captures for unresolved coordinate/filter/TA semantics |
@@ -42,10 +42,11 @@ P690 swap completed and work resumed by user instruction. Boot
 128MiB BAR0; known0f7d564 warmups/preflight and X start pass. One bounded
 Quake3 GL1 run33.1FPS (387frames/11.7s),1024x768 fullscreen uncompressed/aniso1,
 FAAoff/vsyncoff, deployed7a52cb4/core48cd2d9, conservative2primitives/packet.
-Main58192cf integrates default-off native target-class scratch allocation;
-combined overlay/full CPU suite pass. native_geometry is preparing physical
-same-BO producer/consumer proof. geometry_features traces genuine allocation
+Main integrates native target-class scratch allocation and ringfixa57fbfb;
+combined overlay/full CPU suite pass. Raw and Gallium same-BO nearest/linear proofs pass; native_geometry is
+preparing scoped admission/fullGL2 work. geometry_features traces genuine allocation
 lifetime after vendor rollover evidence. depth_shadow retains alpha mask/RGB
-failure evidence and investigates requested P690 FAA. Both kernel and Mesa
+failure evidence and investigates requested P690 FAA. Resolve018312e and trackingaff05c4
+are vendor-grounded; bank placement/admission/native FAA remain open. Both kernel and Mesa
 currently exclude2539 FAA; ordinary fallback is not native FAA validation.
 Root owns all target tests. Specific pre-existing approval holds unchanged.
