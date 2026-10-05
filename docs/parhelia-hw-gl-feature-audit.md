@@ -267,3 +267,17 @@ producer and deletion of source attachments/views before readback. Maximum
 channel error is1 against the analytical weighted sum (tolerance3). Distinct
 BO traces confirm all four units consume real render storage. Blend, CPU alpha,
 lookup and depth-sampling gates remain; no performance measurement is claimed.
+
+### Programmable FLOAT4 colour and constant-bank legalization
+
+Main dfc53c6 integrates measured FLOAT4 fetch/export and live per-draw range
+proof behind default-off PARHELIA_TCL_FLOAT4. Native144-case evidence covers
+independent RGBA, all texture-alpha codes, discard, depth/blend and changing
+uniforms that select GPU -> conservative fallback -> GPU without relinking.
+The actual vendor compiler rejects MAD operands using two distinct constant
+vectors; accepted split MUL/ADD and temporary-materialized MAD controls explain
+the earlier zero-output failure. Lowering now materializes the second constant
+vector. Main6eb2921 explicitly rejects mixed FLOAT4/indexed and packed layouts;
+full integrated build, CPU/state and shader selftests pass. Compact RGB and
+packed byte layouts are preserved. Combined native integration and two-ST
+validation are in progress; production remains39b0e2e. No FPS gain is claimed.
