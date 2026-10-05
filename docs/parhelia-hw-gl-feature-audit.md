@@ -299,3 +299,12 @@ remains open: a fresh D24S8 TEXTURE|ZBUFFER vendor fixture returns success from
 creation and both callbacks but emits no sampler descriptor or draw. Callback
 success alone is not evidence of a supported depth-sampler format; D16/D24X8
 and private vendor paths are being investigated before hardware probing.
+
+Async owned indexed candidate proof: a separate default-off kernel gate and
+GETPARAM37 admit the exact0528 owned stream into fence-retained async slots.
+Ten1024x768 frames match the synchronous indexed control with zero analytical
+error and identical hashes. Logs prove80 async submissions with successful
+returns and nonzero fences, with no synchronous fallback. Client vertex-buffer
+reuse, changing uniforms and ordinary draw interleave are covered. Existing
+index/state/bounds validation remains; the workflow restores actual0f7d564/X1920.
+The candidate is not the loaded kernel, and no FPS improvement is inferred.
