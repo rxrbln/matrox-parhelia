@@ -36,3 +36,14 @@ alpha, and run the existing fragment compiler selftests. Do not transform
 texture contents on the CPU or silently accept an unsupported program.
 
 This remains open behind the major GL2 startup and GPU throughput work.
+
+Resolved measured lowering gap: main d00d0b2 collects shared affine
+atoms into RGB columns and lowers the general matrix to three MAD slots.
+Fixed constant range prescale is tracked separately from uniform magnitude.
+Full integrated selftests, unchanged Piglit and five changing-uniform
+native cases pass (327680pixels, zero mismatches, channel error at most2),
+including signed/nonsymmetric coefficients, offsets and1.25magnitude;
+unsupported100magnitude is safely refused. Sampled alpha/source texture
+remain intact. Isolated deployment SHA3a2f0f35aafdfdfa2b22941d030eaac4c8c33d89816665ab4dfd92d1da8c1d98.
+See captures/gpu-gaps-20261004/matrix-integrated-proof.log and Mesa
+tests/colour-matrix-gl.md. This does not establish arbitrary fragment ISA.
