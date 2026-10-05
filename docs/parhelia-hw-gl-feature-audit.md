@@ -238,3 +238,15 @@ synchronous kernel-owned copied vertices, at most6indices, strict bounds
 and stream/primitive/descriptor cleanup. Its build and78 recognizer
 mutation cases pass. Native class3 owned-inline32 retirement/depth interlock now passes three1024x768 scenes: near/far both orders and shared four-vertex rectangle, each zero colour/depth mismatches including subsequent97cleanup draw. Main diagnostic kernelfc378ed remains defaultoff; production97drawing stays unchanged. Repeated native index packets now pass: kernel11fd0fe/fixturee2084e2,24small packets share one4/6vertex stream and match dense144vertex controls in all three1024x768 colour/depth scenes, including97cleanup. Gallium indexed reuse, other fetch layouts and async integration remain open. No native indexed
 capability or performance claim follows from this candidate.
+
+### Indexed reuse preparation (2026-10-05)
+
+Main6a2cb92/42d5b2c adds a bounded owned indexed emitter and a raw FLOAT3
+XYZ/RGB tuple cache. Cache groups preserve triangle order and bit-exact inputs,
+with at most682 owned vertices and942 indices per group. Resource generations,
+source indices, offsets, strides and translation keys invalidate the cache;
+user/volatile data, unsupported formats and ambiguous same-buffer per-element
+strides fall back. The independent CPU oracle passes, including2100-index
+multi-group cases and degenerate triangles. This is preparation only: Gallium
+selection/submission and VBO pixel validation remain pending, and production
+remains39b0e2e. No app performance benefit is claimed yet.
