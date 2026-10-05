@@ -825,3 +825,21 @@ and d6a9ce6 seven independent Windows-emulator dependent filter captures.
 Combined build/full CPU suite pass; actual replay and ownership contracts pass.
 Full lightall stage selection, intermediate precision and native coordinates
 remain unproven; no new Q3 FPS measurement or full GL2 admission.
+
+2026-10-05 host integration checkpoint7a52cb4:9ece93a restores pureXY
+window-only expressions before floor/carrier lowering, recognizes real
+load_frag_coord and keys lookup cache by actual framebuffer extents. CPU
+window table generation remains the fallback; GPU nearest sampling consumes
+tables. Installed conditional/function/constant-loop host proofs pass; dynamic
+loops and native full-scene rendering remain open. Exact isolated window
+payload staging was rejected by automatic approval review, pending explicit
+user approval; no upload or GPU run occurred.
+
+ed61b7c links up to four original expressions through one projective varying;
+e4f41fa derives actual SSA predecessor/root sets and deterministic stage order,
+including separate original alpha/discard dependencies. These do not certify
+physical BRDF kernels or intermediate storage precision.7a52cb4 removes
+private-FBO plain submission-flush waits and linear resolves, preserving legacy
+end-of-frame/display/shared/finish/fence-FD behavior. Actual callback oracle
+256 combinations/failures passes. Combined build/full CPU suite and scratch
+replay/vertex ownership contracts pass. Hardware/FPS proof is still pending.
