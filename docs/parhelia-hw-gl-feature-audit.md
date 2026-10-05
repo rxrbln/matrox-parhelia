@@ -308,3 +308,9 @@ returns and nonzero fences, with no synchronous fallback. Client vertex-buffer
 reuse, changing uniforms and ordinary draw interleave are covered. Existing
 index/state/bounds validation remains; the workflow restores actual0f7d564/X1920.
 The candidate is not the loaded kernel, and no FPS improvement is inferred.
+
+Occasional FAA regression on deployed1f5318b/known-good0f7d564: ten textured
+occlusion frames at1024x768 pass228855 interior pixel checks per frame, with
+20 FAA draw batches and10 resolves. Packed FAA remains disabled. This checks
+textured/depth correctness after the combined shader and render-sampling
+changes; it is not an FPS or overhead measurement.
