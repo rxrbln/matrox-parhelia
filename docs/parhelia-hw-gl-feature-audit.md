@@ -290,3 +290,12 @@ fallback. The integrated additive native gate passes six1024x768 images,
 maximum channel error1, with boot unchanged. Previous production39b0e2e notes
 above describe earlier checkpoints. Two-ST uniform-range fallback still loses
 alpha and is under investigation; valid two-ST GPU cases have separate proof.
+
+Two-ST FLOAT4 follow-up:96 valid-range cases pass with a patterned second
+texture and independent UV2, confirming the11-DWORD descriptor and both UV
+inputs. Uniform-range fallback still loses alpha; its failed test is retained
+and complete transition support remains unproven. Native depth sampling also
+remains open: a fresh D24S8 TEXTURE|ZBUFFER vendor fixture returns success from
+creation and both callbacks but emits no sampler descriptor or draw. Callback
+success alone is not evidence of a supported depth-sampler format; D16/D24X8
+and private vendor paths are being investigated before hardware probing.
