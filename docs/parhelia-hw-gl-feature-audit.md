@@ -808,3 +808,20 @@ beyond buffer: terrain, refraction, shadow/FragCoord and multi-tap paths.
 Static inventory does not establish scene pass/fail. Full GL2 and complete
 glmark rendering remain unfinished; latest measured36.7GL1/16.8restrictedGL2
 are unchanged. The exact-artifact upload approval holds remain in force.
+
+2026-10-05 fresh deployed FAA regression: original0528 on unchanged boot
+8d9d7a3b-db70-4d7d-9870-db28b50f0feb and known DRM0f7d564 passes ten
+textured depth-occlusion frames at1024x768:228855 interior pixels/frame,
+20 FAA draw batches,10 resolves. Deployed library SHA256
+650081772438ad952eb02f9bdee7bf410651d13088ef989de725a1e01cece283.
+Existing test only, bounded flock/45sec, no upload/module/config changes.
+X and boot preserved. Host log wip/gpu-features/faa-current-deployed-20261005.log.
+This does not validate the newer host-only GL2 commits or measure throughput.
+
+Main Mesa d6a9ce6 integrates07929c0 normal resource caches,f0ca9b5 projective
+NIR links,7ac20e8 owned linked FS,6d3aca3 owned hardware projective VS,
+9ce19b0 per-stage VS binding/restoration,064cd60 repeated-index packing memo,
+and d6a9ce6 seven independent Windows-emulator dependent filter captures.
+Combined build/full CPU suite pass; actual replay and ownership contracts pass.
+Full lightall stage selection, intermediate precision and native coordinates
+remain unproven; no new Q3 FPS measurement or full GL2 admission.

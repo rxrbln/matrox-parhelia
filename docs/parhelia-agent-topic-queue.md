@@ -12,11 +12,11 @@ GL2 rendering take priority; keep the GL1>40/full GL2>15 goals intact.
 | Q3 GL2 runtime stage graph / scratch links | Host milestone integrated f0ca9b5; runtime wiring pending | Executable original-NIR stages and linked consumer, final depth/blend/discard/order |
 | Normal maps / dependent texture resources | Host cache milestone integrated 07929c0; native proof pending | Cache ownership/failure proof, real GPU repack bindings, filtering precision |
 | glmark2 FragCoord scenes | Running: shader_gaps | Real conditionals/function/loop compiler paths and pixel oracle |
-| Q3 GL1 batching / submission performance | Running: gl1_performance | Remaining drains/capacity gaps; one matching1024x768 run when authorized |
+| Q3 GL1 batching / submission performance | Host milestone integrated064cd60; target FPS pending | Remaining drains/capacity gaps; one matching1024x768 run when authorized |
 | Fullscreen presentation / double buffering | Queued: presentation | Pending/ready render-fence flips, pixels/display identity, async lifetime |
-| Fragment BRDF / nonlinear math | Queued: fragment_brdf | Executable normalization/division/pow/exp2 stage kernels, retained exact effects |
-| Vendor-driver ground truth | Running: vendor_re | Established Windows emulator captures for unresolved coordinate/filter/TA semantics |
-| Depth comparisons / shadow / Piglit | Queued: depth_shadow | Actual sampled depth comparison and FragCoord depth paths; focused current failures |
+| Fragment BRDF / nonlinear math | Running: fragment_brdf | Executable normalization/division/pow/exp2 stage kernels, retained exact effects |
+| Vendor-driver ground truth | Seven captures integratedd6a9ce6; further RE queued | Established Windows emulator captures for unresolved coordinate/filter/TA semantics |
+| Depth comparisons / shadow / Piglit | Running: depth_shadow | Actual sampled depth comparison and FragCoord depth paths; focused current failures |
 | Geometry acceleration | Queued: geometry_features | Polygon offset, crossing user planes, point-size/topologies, GPU transform preservation |
 | Texture coverage | Queued: texture_coverage | Remaining S3TC shapes/filter footprints, perspective anisotropy, GigaColor/system fetch proof |
 | Original-family LOD bias | Queued: lod_bias | Current -4 clamp root cause and actual failing GL test |
