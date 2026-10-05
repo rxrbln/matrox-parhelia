@@ -97,7 +97,7 @@ hardwarelock. All routineperformance checks default to one short run.
 | Multitexture | Original family exposes up to four hardware units; LX is limited to two. Coverage depends on compiler lowering and chip capabilities. |
 | Narrow texture formats | Chip-dependent format routes exist; format support must be read from ph_is_format_supported, not the old blanket missing-format list. |
 | S3TC | Original BC1 storage supports 20 measured base shapes covering all 211 opaque nonlightmap Quake3 benchmark candidates. 39,201 raw addresses and 79 added native pixel checks pass; exact app RGBA encoding and bilinear/trilinear repeat filtering are independently verified. Opt-in compressed GL1 reaches 46.2 FPS in the earlier 1024x768 windowed run and 54.1 FPS in a new fullscreen run with performanceDRM12d2626/cache/async scanout; these are distinct configurations, not an isolated speedup comparison. A textured gameplay capture is inspected. Anisotropy2 axis-aligned2:1 minification atLOD1 has vendor/native proof; broader perspective/diagonal footprints remain open. BC2/BC3 allocation/upload and complete mip chains now support six measured 2-D shapes in ad6f680: 64x32, 64x128, 128x32, 128x128, 32x128 and 32x32. All 4,606 captured addresses and 130 native GL checks pass, including alpha, tail updates and mip rebasing; the integrated build also passes. Bilinear LOD1 and trilinear LOD1.5 sampled alpha also pass 24 native checks over 35,840 pixels, including repeat boundaries (25747ef). Other shapes, broader filtering footprints, encoders and layered textures remain open. Native S3TC remains gated by PARHELIA_S3TC. |
-| Transfers, copy/blit, render-to-texture and mixed-size FBOs | Functional paths are implemented, with a substantial native acceleration gap: `ph_blit` uses CPU conversion; equal-size colour `ph_copy_texture_box` waits for async work, downloads shadows, stages texels and uploads the destination. The imported-resource type2-to-type1 linear resolve uses GPU BITBLT. Native equal-format level0 colour/depth copies now pass on exact0528/64x32 tiled owned render allocations in57a7867, including subsequentdraw/sample/readback and outside-box preservation. Main39b0e2e additionally samples owned RGBA8 render storage directly on exact0528/64x32 with matching render/sampler pitch, level0 and up to two physical units in native colour shaders. Three changing1024x768 generations are byte-identical to forced-shadow controls (nearest/linear/nearest); nearest is analytically exact, while both linear paths retain the same maximum5-LSB discrepancy. Blend, CPU alpha/lookup, depth, feedback and other formats remain on the copy path; four-unit coverage is in progress. The integrated build is deployed (SHA2b728792...); complete CPU/state and shader selftests and unchanged Piglit colour-matrix pass. It has no measured performance claim. Scaling, other layouts/chips and subresource coverage remain open. GL2 profiling identified a costly screen-depth readback; the app now omits it when no effect consumes it. |
+| Transfers, copy/blit, render-to-texture and mixed-size FBOs | Functional paths are implemented, with a substantial native acceleration gap: `ph_blit` uses CPU conversion; equal-size colour `ph_copy_texture_box` waits for async work, downloads shadows, stages texels and uploads the destination. The imported-resource type2-to-type1 linear resolve uses GPU BITBLT. Native equal-format level0 colour/depth copies now pass on exact0528/64x32 tiled owned render allocations in57a7867, including subsequentdraw/sample/readback and outside-box preservation. Main39b0e2e additionally samples owned RGBA8 render storage directly on exact0528/64x32 with matching render/sampler pitch, level0 and up to two physical units in native colour shaders. Three changing1024x768 generations are byte-identical to forced-shadow controls (nearest/linear/nearest); nearest is analytically exact, while both linear paths retain the same maximum5-LSB discrepancy. Blend, CPU alpha/lookup, depth, feedback and other formats remain on the copy path; four-unit coverage and additive ONE/ONE native consumers now pass six distinct-source images (max1LSB), including retained-source lifetime. Production1f5318b is deployed (SHA65008177...); complete CPU/state and shader selftests and unchanged Piglit colour-matrix pass. It has no measured performance claim. Scaling, other layouts/chips and subresource coverage remain open. GL2 profiling identified a costly screen-depth readback; the app now omits it when no effect consumes it. |
 | VRAM eviction and restoration | parhelia_ttm_move is installed; aperture resource/page copies and eviction/restore counters exist. The old patch-only TODO is superseded. |
 | Cursor placement/upload | Cursor uses parhelia_vram_bar_addr and original-family aperture writes. The old direct-flat-BAR claim is superseded; broader placement/display stress remains validation work. |
 | FAA-16x | Implemented and hardware-tested on isolated original-family branch, default off. Textures, ordinary depth/write modes, private depth and stencil preservation work in tested cases. Not merged into shared Mesa/DRM. See below. |
@@ -359,3 +359,33 @@ whose NIR reads four samplers and19 live value components. It exceeds the proven
 physical carrier budget; the remaining issue is actual gameplay lighting, not
 only eager startup compilation. Diagnostic Mesae0a924c captures rejected NIR.
 Full-map GL2 remains incomplete, including additional nonlinear fragment ALU.
+
+Real completion fences, main Mesaf6d41fe/core48cd2d9: reference-counted kernel
+sequence handles implement poll/finite/infinite waits. Native swaps retain
+frontend throttle=false; explicit native completion requests no longer require
+an unconditional client wait. Duplicate device descriptors retain fence access
+across originating context destruction. Finish hints/CPU resolves still wait;
+sync-file export remains unsupported. No FPS gain is claimed.
+
+Native testing exposed a frontend ordering defect: FenceSync flushed the pipe
+while immediate-mode vertices remained buffered. Core48cd2d9 flushes those
+vertices and uses st_flush to include cached bitmaps. The independent trace
+checker rejects the before log and passes the fixed log: each quad precedes its
+fence, three1024x768 frames have786432 exactRGB pixels each, actualzero-timeout
+ETIME/finitecompletion and shared-context fence lifetime pass. Full driverCPU
+selftests pass. Production Mesa has not yet been updated with these changes.
+
+Mainf5130cb keeps tiny packed draws on normal GPU host aggregation; force-small
+coverage option preserves the indexed feature. No repeated Q3 benchmark. Agent
+larger-indexed-group candidate hit pre-doorbellE2BIG from the224primaryCALL limit;
+packing-aware dispatch/losslesssync-rechunk is pending nativeproof. Depth-shadow
+GPU production candidate remains unpromoted: multigeneration raw comparison has
+severe boundary mismatches, and a subsequent boundedtest timedout. Health
+classification and feedback guards are in progress; this is not a provenhang.
+
+Original0528 raw TEXCOORD native control now validates16384 coordinate pixels
+with max0.0029 RGBerror/A1. Existing compiler PASS already uses TAopcode2, so this
+is coverage proof rather than a newoptimization. VendoremulatorTEXM3x3_COORD
+creation/draw0 and exact emittedTAchain/payload groundtruth is captured inmain
+dfd0f23; matrix-addressing native retirement and full multipasslighting remain
+open.
