@@ -30,3 +30,15 @@ the copy and reading/sampling it, since stale CPU shadows can overwrite a
 correct GPU result. Scaling, format conversion and mip/layer copies remain
 separate hardware work. Prefer native copies over further optimisation of
 CPU texel loops.
+
+Measured first slice implemented in57a7867: exact0528/64x32 tile layout,
+owned distinct render allocations, cpp4 formats32/36, equal pipeformat,
+level0 single-sample positive unscaled/unflipped in-bounds copies.
+Integrated fullbuild/selftests and four native1024x768 checks pass:
+colour partial draw, sampling copied destination, depth/stencil copy,
+and subsequent depth-tested draw, each786432pixels/zero mismatches.
+Real BITBLT trace and source/destination rectangle retained in
+`captures/gpu-gaps-20261004/native-copy-integrated-proof.log`.
+Isolatedmain SHA4bd13acb5bdf05f55f1adf044bfe87516401380607a0678e4ef2969a33983149,
+actualkernel0f7d564 unchanged. Other classes/chips/layouts and scaling
+retain fallback. No performance gain is inferred from these pixel checks.
