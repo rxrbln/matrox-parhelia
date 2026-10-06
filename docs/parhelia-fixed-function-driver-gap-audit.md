@@ -1,5 +1,10 @@
 # Parhelia fixed-function hardware gap audit
 
+This audit records an older implementation snapshot. For the integrated
+2026-10-06 P690 state, GPU batch/FAA/filter validation and remaining TODOs, see
+[the current checkpoint](parhelia-p690-current-status.md). References to
+"current" below describe the reviewed commit, not today's driver.
+
 This audit compares the saved vendor Linux/Windows implementation with the
 Mesa Parhelia Gallium driver after Mesa commit `e4a6857`.  It separates state
 that already runs on the GPU, state currently evaluated by Gallium's software
@@ -24,7 +29,7 @@ texgen, and clipping, but it does not use the vendor's native WARP variants.
 The fragment-side NIR recognizer is considerably narrower and can silently
 select a simpler texture environment for algebra it has not classified.
 
-## Current support versus vendor hardware
+## Support in the reviewed snapshot versus vendor hardware
 
 | GL state | Vendor implementation | Current Mesa path | Remaining work |
 |---|---|---|---|

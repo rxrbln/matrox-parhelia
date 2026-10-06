@@ -3,6 +3,12 @@
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
+Implementation update, 2026-10-06: native P690 FAA textures/depth and finite
+clipping controls now pass. See [the current checkpoint](parhelia-p690-current-status.md)
+for the exact options, board and limits. The static capability discussion below
+is historical and does not supersede those later proofs; GigaColor/MSAA and
+other hardware families retain their separate validation requirements.
+
 This is the capability boundary for the open P690 driver.  It consolidates
 static evidence from the saved Matrox Linux and Windows drivers and distinguishes
 what an open driver can safely expose from hardware mechanisms which still need a
@@ -140,7 +146,7 @@ state until a Windows capture with `AAMode=0x53` identifies the unresolved
 registers and independently validates allocation, rendering, resolve, blending,
 stencil, target change, and teardown on the P690.
 
-## 3. Current implementation decision
+## 3. Historical implementation decision at this audit
 
 The kernel and Mesa drivers must retain the working `0x32` colour plus `0x36`
 S8Z24 path.  They must not advertise 10-bit texture formats, FAA/MSAA FBConfigs,

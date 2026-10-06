@@ -3,6 +3,12 @@
 Copyright 2026 René Rebe <rene@exactco.de>
 SPDX-License-Identifier: GPL-2.0
 
+This historical static follow-up is superseded for the FAA enable/resolve
+interpretation by [the original-family correction](parhelia-faa-original-re.md)
+and for current P690 implementation status by
+[the native checkpoint](parhelia-p690-current-status.md). In particular, the
+`0x20a/0x00a` Z tracking one-shots below are not the FAA enable switch.
+
 This is a static follow-up to `parhelia-antialiasing.md`.  It examines only the
 saved Windows `MTXPARD.dll`; it does not load a vendor driver or issue a target
 probe.  The findings narrow the interface that an eventual FAA implementation
