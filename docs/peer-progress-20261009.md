@@ -8,8 +8,8 @@ alone does not prove an agent is still running.
 
 | Tree | HEAD | Inspection |
 | --- | --- | --- |
-| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `c7196c7` | Clean; also includes record-output ownership and interpolation/backtracking fixes |
-| `src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/drivers/gpu/drm` | `9d854ea` | Coherent command backing integrated; canonical module build matches tested candidate |
+| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `3784444` | Also includes coordinate planning, opt-in sRGB controls and bounded capacity diagnostics |
+| `src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/drivers/gpu/drm` | `b1b3cf2` | Coherent command backing and ownership comment; behavior matches tested candidate |
 | `xf86-video-parhelia` | Includes October 9 topic evidence | Progress log is newer than the general handover/status headers |
 
 ## Peer work remaining to reconcile
@@ -64,6 +64,10 @@ Mesa `67cfae0` gates colour-specific output templates away from float records an
 The combined DSO SHA `7ed5a8301348469ba03ea3558e74d738271438ab61969db0efad8fcf21acaee2` rendered ten exact GLSL fixtures on the unchanged boot and promoted DRM `ca1ee48`: floor187 now renders in 16 passes, weapon199 in 5; both have zero pixels differing from llvmpipe by more than 8 byte levels. All eight controls pass the same bound, with facing controls exact. No skipped draws, queue or wedge. [Complete proof](../tests/m9-gl2-fixed-20261010/README.md). Full gameplay remains a separate check.
 
 Command-cache A/B used the same baseline Mesa `a6e0cb7` and candidate module for both modes, once each at 1024x768 / three seconds / vsync off. Map 55→56 FPS and subdata 56→55 FPS are flat within one-run precision. The change is retained; canonical module build is byte-identical to the tested module. All four captures were visually reviewed and target health stayed clean. [Proof and runner caveats](../tests/m9-command-cache-20261009/README.md).
+
+Opt-in sRGB now passes all24 extended GPU phases (live colours, lines and mixed MRT masks) on Mesa `e7efe22`; [complete proof](../tests/m9-srgb-hardware-20261010/README.md). Default remains held for current sRGB/core regression selections.
+
+Full Quake3 gameplay currently fails a software BO-capacity check, while the GPU remains healthy:142draws,568records,words4929/8192,relocs377/8192,BOs128/128. [Evidence and invalid-timing warning](../tests/m9-q3-capacity-20261010/README.md). A proper live-owner batching gate is being implemented. The selected24 Piglit controls expose6 compiler timeouts to fix, alongside14 existing failures and4 preserved passes.
 
 ## Current next actions
 
