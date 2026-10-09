@@ -8,9 +8,9 @@ alone does not prove an agent is still running.
 
 | Tree | HEAD | Inspection |
 | --- | --- | --- |
-| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `25e32d9` | Hardware-qualified through9906bee; opt-in constantLOD candidate pendingGPU |
+| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `3142d3d` | Grouped record-mask, VS and queued-presentation proof complete; advanced-game floor remains wrong |
 | `src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/drivers/gpu/drm` | `b1b3cf2` | Coherent command backing and ownership comment; behavior matches tested candidate |
-| `xf86-video-parhelia` | Includes October 9 topic evidence | Progress log is newer than the general handover/status headers |
+| `xf86-video-parhelia` | `0701f90f` | Vendor record-mask proof and independent varied floor references integrated |
 
 ## Peer work remaining to reconcile
 
@@ -73,7 +73,9 @@ Compact floor scheduling now needs9passes/6slots, and all ten images are byte-id
 
 ## Current next actions
 
-Validate full Quake3 GL2 gameplay with deterministic frame captures at 1024x768. Continue separate sRGB extended-control, remaining Piglit undef/execution and CPU varying-store performance tracks. Preserve GPU transforms and tested hardware limits. Root alone owns the locked target queue; a stalled track switches to another open topic rather than repeating an unproductive probe.
+Continue separate FAA handoff, selected coordinate-lane GPU transform and scanout
+ownership tracks. Preserve tested hardware limits. Root alone owns the locked
+target queue; a stalled track switches to another open topic.
 
 All command construction must follow [the capture policy](gpu-capture-replay-policy.md):
 derive addresses, descriptors, extents and timeline fields from live owners.
@@ -87,3 +89,21 @@ Grouped `9906bee` GPU proof: texturebias4/5failed→0/5, defaultunset sRGB24phas
 ## October10 01:27 grouped continuation
 
 Mesa3ba6624 is now GPU-qualified; source/rawview/layout fixes and boundedLOD support are retained. All10LOD,5bias,24sRGBphasespass, all15fixturePPMsunchanged, ordinary40.1FPSvs40.2flat. AdvancedQ3 completes387frameswithzero dropped/refused/skipped draws; armourHUDfixed, floororangequadpersists, so itsFPSremainsunqualified. SelectedPiglit5PASS/19FAIL/0TIMEOUT andcore8PASS/1existingFAILunchanged. Boot56289a98…/moduleca1 unchanged, healthyfullyretired. Exactscope/screenshots/runner/hashes: [grouped proof](../tests/m9-layout-lod-hardware-20261010/README.md). Activeagents: finalvendorlow-pairmask, selected-outputinputpruning, aggregationowner/pixel/performancequalification.
+
+## 2026-10-10 02:03 — record masks and actual aggregation qualified
+
+Mesa `3142d3d` passes the same selected 24 shader tests, previously 5 PASS /
+19 FAIL. All five matrix controls and three varied floor fixtures match software
+references. Real four-job aggregation posts retire with exact pixels; gameplay
+also issues two-to-four-job posts. Ordinary Quake3 is 40.4 FPS versus 40.1 FPS,
+flat at single-run precision, and both captures are byte-identical. Advanced
+captures also remain byte-identical to the previous failure: the orange floor
+quad persists, so its printed timing is excluded. Native-input pruning removes
+240 module draws per 40 warm advanced frames; remaining paths are near-plane
+clipping and multipass programs. Bias 5/5, LOD 10/10, sRGB 24/24 and core 8/1
+remain unchanged. The promoted module is restored with aggregation disabled;
+boot unchanged, final transport healthy and retired. [Complete evidence](../tests/m9-mask-aggregate-hardware-20261010/README.md).
+
+Parallel tracks now cover a source-proven FAA state overwrite, coordinate-lane
+vertex admission and the old scanout pin's release before the vblank wait.
+These next candidates have no hardware qualification yet.
