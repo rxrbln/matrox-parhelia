@@ -8,8 +8,8 @@ alone does not prove an agent is still running.
 
 | Tree | HEAD | Inspection |
 | --- | --- | --- |
-| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `a6e0cb7` | Clean; includes shader select, uniform inlining and record texel-pair fixes |
-| `src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/drivers/gpu/drm` | `ca1ee48` | Engine read/fill enabled; engine upload remains optional |
+| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `c7196c7` | Clean; also includes record-output ownership and interpolation/backtracking fixes |
+| `src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/drivers/gpu/drm` | `9d854ea` | Coherent command backing integrated; canonical module build matches tested candidate |
 | `xf86-video-parhelia` | Includes October 9 topic evidence | Progress log is newer than the general handover/status headers |
 
 ## Peer work remaining to reconcile
@@ -22,7 +22,7 @@ has not been promoted merely because it exists.
 | `m9piglit3-mesa/mesa-26.2.2/src/gallium/drivers/m9x` | `a6e0cb7`, `undef` | Two dirty files: constant folding and undef lowering, plus temporary dumps. Not integrated |
 | `m9unify6-mesa/mesa-26.2.2/src/gallium/drivers/m9x` | `c0c1be2`, `m9fbo9` | Five dirty files completing sRGB constant blending, target masks and non-native draws; default-on change awaits its extended proof |
 | `m9unify-mesa/mesa-26.2.2/src/gallium/drivers/m9x` | `fed13b9`, `m9logic` | Four dirty files in context/draw/native plumbing. Older branch; preserve separately |
-| `m9glperf-drm-wt` | `df0e59a`, `cmdcached` | Clean committed command-BO coherent backing, based on canonical `ca1ee48`. Built module; short locked hardware A/B pending |
+| `m9glperf-drm-wt` | `df0e59a`, `cmdcached` | Clean committed command-BO coherent backing, based on canonical `ca1ee48`. Integrated as `9d854ea`; locked cache A/B flat (map 55→56, subdata 56→55 FPS); retained |
 | `m9fbo5-drm` | `927f76a`, `m9fbo5` | Clean S3TC small-kind validator patch; not in main; previous notes explicitly leave validator admission pending |
 | `m9fbo5-mesa/mesa-26.2.2/src/gallium/drivers/m9x` | `f3769f1` | Clean; record texel-pair fix already integrated as `97845af` |
 | `m9q3c-mesa/mesa-26.2.2/src/gallium/drivers/m9x` | `e75ec3b` | Clean older snapshot; current main has later compiler fixes |
@@ -57,13 +57,17 @@ The promoted module stage identifies DRM `ca1ee48` and build ID
 `c6697c086d2cfd8da0870fadb74a2526be0f9a37`. Target prefix names alone do
 not prove which Mesa revision an application loads; verify the DSO hash.
 
+## October 10 integration and hardware proof
+
+Mesa `67cfae0` gates colour-specific output templates away from float records and resets retry route ownership. `c7196c7` distinguishes interpolation pressure, retries earlier cut choices and bounds the search. Both are committed with production compiler sanitizer/reference controls.
+
+The combined DSO SHA `7ed5a8301348469ba03ea3558e74d738271438ab61969db0efad8fcf21acaee2` rendered ten exact GLSL fixtures on the unchanged boot and promoted DRM `ca1ee48`: floor187 now renders in 16 passes, weapon199 in 5; both have zero pixels differing from llvmpipe by more than 8 byte levels. All eight controls pass the same bound, with facing controls exact. No skipped draws, queue or wedge. [Complete proof](../tests/m9-gl2-fixed-20261010/README.md). Full gameplay remains a separate check.
+
+Command-cache A/B used the same baseline Mesa `a6e0cb7` and candidate module for both modes, once each at 1024x768 / three seconds / vsync off. Map 55→56 FPS and subdata 56→55 FPS are flat within one-run precision. The change is retained; canonical module build is byte-identical to the tested module. All four captures were visually reviewed and target health stayed clean. [Proof and runner caveats](../tests/m9-command-cache-20261009/README.md).
+
 ## Current next actions
 
-Retest the exact Quake3 floor/weapon fixtures on main before using old probe
-results. Investigate interpolation-pressure split ranking and record-producing
-passes that take colour-specific instruction templates. Keep proven register
-limits and GPU transforms. Test command-buffer caching separately at
-1024x768 with the same Mesa DSO; its build is not a measured speedup.
+Validate full Quake3 GL2 gameplay with deterministic frame captures at 1024x768. Continue separate sRGB extended-control, remaining Piglit undef/execution and CPU varying-store performance tracks. Preserve GPU transforms and tested hardware limits. Root alone owns the locked target queue; a stalled track switches to another open topic rather than repeating an unproductive probe.
 
 All command construction must follow [the capture policy](gpu-capture-replay-policy.md):
 derive addresses, descriptors, extents and timeline fields from live owners.
