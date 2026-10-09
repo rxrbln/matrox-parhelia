@@ -77,3 +77,5 @@ Validate full Quake3 GL2 gameplay with deterministic frame captures at 1024x768.
 
 All command construction must follow [the capture policy](gpu-capture-replay-policy.md):
 derive addresses, descriptors, extents and timeline fields from live owners.
+
+Current `e565872` sRGB251/core18 controls reproduce76sRGB passes,2failures and4multisample timeouts; core is unchanged with opt-in (16PASS/2same depthprecisionFAIL, archived list has duplicate commands). Short1024x768 glmark check: refract4,terrain3,bump normals121FPS. Rendered scene captures are intact; matrix first-column math passes but two-pass residual fails, narrowing the remaining shader track. [Batch evidence and limitations](../tests/m9-features-hardware-20261010/README.md).
