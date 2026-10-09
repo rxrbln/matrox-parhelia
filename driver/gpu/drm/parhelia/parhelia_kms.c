@@ -1231,8 +1231,8 @@ static const struct drm_simple_display_pipe_funcs parhelia_pipe_funcs = {
 	.update = parhelia_pipe_update,
 	.enable_vblank = parhelia_pipe_enable_vblank,
 	.disable_vblank = parhelia_pipe_disable_vblank,
-	.begin_fb_access = matrox_kms_pipe_begin_fb_access,
-	.end_fb_access = matrox_kms_pipe_end_fb_access,
+	.prepare_fb = matrox_kms_pipe_prepare_fb,
+	.cleanup_fb = matrox_kms_pipe_cleanup_fb,
 };
 
 static const uint32_t parhelia_formats[] = {
