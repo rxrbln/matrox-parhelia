@@ -8,7 +8,7 @@ alone does not prove an agent is still running.
 
 | Tree | HEAD | Inspection |
 | --- | --- | --- |
-| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `3784444` | Also includes coordinate planning, opt-in sRGB controls and bounded capacity diagnostics |
+| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `e565872` | Also includes live BO admission, compact shader schedules and bounded search |
 | `src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/drivers/gpu/drm` | `b1b3cf2` | Coherent command backing and ownership comment; behavior matches tested candidate |
 | `xf86-video-parhelia` | Includes October 9 topic evidence | Progress log is newer than the general handover/status headers |
 
@@ -67,7 +67,9 @@ Command-cache A/B used the same baseline Mesa `a6e0cb7` and candidate module for
 
 Opt-in sRGB now passes all24 extended GPU phases (live colours, lines and mixed MRT masks) on Mesa `e7efe22`; [complete proof](../tests/m9-srgb-hardware-20261010/README.md). Default remains held for current sRGB/core regression selections.
 
-Full Quake3 gameplay currently fails a software BO-capacity check, while the GPU remains healthy:142draws,568records,words4929/8192,relocs377/8192,BOs128/128. [Evidence and invalid-timing warning](../tests/m9-q3-capacity-20261010/README.md). A proper live-owner batching gate is being implemented. The selected24 Piglit controls expose6 compiler timeouts to fix, alongside14 existing failures and4 preserved passes.
+The prior full-game BO-capacity failure is documented in [historical capacity evidence](../tests/m9-q3-capacity-20261010/README.md). Mesa `e565872` fixes admission from live owners; full configured gameplay now completes387frames at42.0FPS without refused/skipped draws or context loss. Matched software screenshots agree within8 byte levels for99.96%/99.60% of pixels. GPU stays healthy on the unchanged boot. Advanced effects remain disabled; full-feature GL2 is open. [Complete game proof and scope](../tests/m9-q3-game-fixed-20261010/README.md).
+
+Compact floor scheduling now needs9passes/6slots, and all ten images are byte-identical to the preceding successful GPU captures. Search fixes preserve4PASS/20existingFAIL and eliminate all6 introduced timeouts in the selected24 Piglit cases. [Compact/search proof](../tests/m9-compact-search-hardware-20261010/README.md).
 
 ## Current next actions
 
