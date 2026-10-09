@@ -8,7 +8,7 @@ alone does not prove an agent is still running.
 
 | Tree | HEAD | Inspection |
 | --- | --- | --- |
-| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `e565872` | Also includes live BO admission, compact shader schedules and bounded search |
+| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `25e32d9` | Hardware-qualified through9906bee; opt-in constantLOD candidate pendingGPU |
 | `src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/drivers/gpu/drm` | `b1b3cf2` | Coherent command backing and ownership comment; behavior matches tested candidate |
 | `xf86-video-parhelia` | Includes October 9 topic evidence | Progress log is newer than the general handover/status headers |
 
@@ -81,3 +81,5 @@ derive addresses, descriptors, extents and timeline fields from live owners.
 Current `e565872` sRGB251/core18 controls reproduce76sRGB passes,2failures and4multisample timeouts; core is unchanged with opt-in (16PASS/2same depthprecisionFAIL, archived list has duplicate commands). Short1024x768 glmark check: refract4,terrain3,bump normals121FPS. Rendered scene captures are intact; matrix first-column math passes but two-pass residual fails, narrowing the remaining shader track. [Batch evidence and limitations](../tests/m9-features-hardware-20261010/README.md).
 
 Advanced normal/specular/deluxe-enabled Quake3 is now measured separately: gameplay completes but has recurring record/build refusal and3skipped draws per40frames, with an orange floor quad and corrupt/missing armour model. Timing is excluded, GPU healthy; matched exact software cvars/images preserved. [Advanced-mapping failure evidence](../tests/m9-q3-mapping-20261010/README.md). Canonical Mesa now includes `84230e7` bias ownership, `925d3e7` qualified sRGB default, and `dad5643` range-cache improvement; grouped build/hardware qualification is pending.
+
+Grouped `9906bee` GPU proof: texturebias4/5failed→0/5, defaultunset sRGB24phasesPASS,optoutPASS,ten shaderimagesbyteidentical,selectedPiglit5PASS19FAIL0TIMEOUT(one matrixgain), unique core8PASS1knownFAIL. OrdinaryQ3single40.2FPSvsprior42.0,nearphase~2.05→1.45ms,overallFPSgain notclaimed. Advancedtrace proves6pass14stream prepared layout vs5pass12stream current and orphaned reservation; refresh/transaction fix pending. [Grouped evidence](../tests/m9-grouped-hardware-20261010/README.md).
