@@ -1,0 +1,533 @@
+# Parhelia command construction — captured from live hardware
+
+How the vendor OpenGL ICD actually builds and submits work. Captured 2026-09-05
+on a real Parhelia 0x0528 (`Subsystem: Matrox Parhelia PCI 256MB`, PCI/PCI-X, no
+AGP or PCIe capability) running the vendor 2009 mtx stack on kernel 2.6.30.
+
+Instrument: `tools/parhelia-glsweep.c` — a GLX client that snapshots every
+`/dev/matrox/mtx0` mapping of its own process before and after each GL
+operation and records the changed dwords. This supersedes the earlier
+gdb PRE/POST method: no breakpoints, one run captures the whole feature sweep.
+Raw capture: `captures/glsweep-0528-raw.txt`.
+
+Method note: the snapshot records the **whole changed span**, not only the
+dwords that differ. A dword rewritten with the value it already held is still
+part of the packet stream, and filtering to differences alone corrupts any
+attempt to frame the records.
+
+## The mapping set
+
+The ICD maps `/dev/matrox/mtx0` seven times. Observed in one client:
+
+| Region | Size | Role |
+|---|---|---|
+| **0** | 4096 | **control block**; `+0x230` = submitted stream length in bytes |
+| 1, 3 | 4096 each | small control/status pages |
+| **2** | 139264 (136K) | **command record stream**, rebuilt from offset 0 every submission |
+| **4** | 3276800 (3M) | **vertex ring** (`0x320000`) |
+| **5** | 688128 (672K) | **command ring** (`0xa8000`) |
+| 6 | 4194304 (4M) | third heap (`0x400000`), not used per draw |
+
+The ring sizes match the ICD's own allocation constants exactly, which is what
+identifies each region. Regions 4 and 5 are addressed in lockstep: draw *n* uses
+slot `n * 0x2000` in both — command packets at `0x2000*n` in region 5, vertex
+data at `align64(0x2000*n) + 0x40` in region 4.
+
+## Per-draw work — it is remarkably small
+
+Once state is established, an entire triangle costs **three dword updates plus
+the vertex data**. For `tri_flat` (the second draw in the sweep):
+
+```
+region 2  0x18 = 0x00002000     slot start
+          0x20 = 0x0000201d     slot start + 0x1d
+          0x28 = 0x00002040     slot start + 0x40   (= vertex data base)
+region 5  0x2000 .. 0x2018      the 7-dword descriptor (below)
+region 4  0x2040 .. 0x2074      3 vertices x 20 bytes
+```
+
+The next draw (`tri_gouraud`) writes the identical shape at `0x4000` and
+`0x4040`, and only regions 2/4/5 change.
+
+Those region 2 dwords are **not** a submission head/tail: they are payload
+inside a DRAW record (see the correction below), carrying the vertex-ring
+offsets for this draw.
+
+## The per-draw command packets (region 5) — CAPTURED + CONFIRMED in the ICD
+
+What the capture showed as "seven dwords" is **two concatenated command
+packets**, confirmed against the ICD disassembly (the 64-bit `libGL.so.1.3.0`
+under `opengl6/lib64/` — `opengl6/libGL.so.1.3.0` itself is the 32-bit build).
+
+Generic packet form: `[header][payload...]`, header = `(opcode << 24) | count`.
+
+```
++0x00  0x8f000001   DRAW packet: opcode 0x8f, count 1
++0x04  first        first vertex index in this slot's vertex array
++0x08  last         one-past-end vertex index
+---- second packet ----
++0x0c  0x00000002   REGISTER-WRITE list, 2 registers
++0x10  0x21212425   index bytes 0x25, 0x24, then 0x21 = END-OF-PACKET
++0x14  fence value  -> reg 0x1094
++0x18  fence addr   -> reg 0x1090
+```
+
+**Index 0x21 TERMINATES the packet — it is not a filler (CONFIRMED from the
+kernel's own stream interpreter).** The next dword after a 0x21 is read as a new
+header, which is why packets can be short. The pad/no-op that *can* sit in the
+middle of a tag is **index 0x20 (reg 0x1080, DMAPAD)**. Getting these two the
+wrong way round produces a stream the engine mis-parses, so: 0x20 to fill, 0x21
+to end.
+
+**Count semantics differ per opcode (CONFIRMED):** a draw header's low 16 bits
+accumulate +2 per appended range and are decremented once at flush, so on the
+wire `count = payload dwords - 1`; one range gives exactly `0x8f000001`.
+Register-list counts are *not* decremented — count = number of registers.
+
+Draw header bits: `0x03000000 | ctx[0xa040] | ctx[0xa044] | count`, where
+`ctx[0xa040]` bit27 set means **sequential vertex ranges** (payload = `first,
+last` pairs) and clear means a **packed 16-bit index list**. So `0x8f000000` =
+"draw sequential ranges", `0x07000000` = "draw packed index pairs".
+
+### Corrections to my first reading of this capture
+
+Three things inferred from the capture alone were wrong; the disassembly settles
+them. Recorded because the wrong readings were plausible and someone re-deriving
+this from the raw capture would make them again:
+
+| First reading | Actually |
+|---|---|
+| `+0x04` = a GL_POINTS flag | **first vertex index** — it was 1 because that batch had already accumulated one vertex |
+| `+0x08` = vertex count | **one-past-end vertex index**; count = last - first |
+| `+0x18` = vertex buffer bus address | **fence write-back address** (reg 0x1090); `+0x14` is the fence value (reg 0x1094) |
+
+That also disposes of the "stale leading record" theory: points, strips and fans
+read one higher simply because `first` was 1, not because a stale vertex was
+present. The earlier guess that `+0x14`/`+0x18` are the two payload dwords for
+regs 0x1094/0x1090 was correct.
+
+`0x1090` holds the 32-bit bus address of a 4-byte completion word and `0x1094`
+the value the engine writes there; the ring allocator spins on that word. Both
+are per-context constants, which is why `+0x18` never varied between draws.
+
+## Primitive type — SOLVED: register 0x10b0 (index 0x2c)
+
+Not in the descriptor. It is emitted as its own 3-dword register packet:
+
+```
+0x10b0 = 0x00040000 | ((B[p] & 7) << 12) | (A[p] & 0x7f)
+```
+
+| primitive | p | reg 0x10b0 |
+|---|---|---|
+| GL_POINTS | 0 | 0x00040020 |
+| GL_LINES | 1 | 0x0004103d |
+| GL_LINE_STRIP | 2 | 0x0004203d |
+| GL_LINE_LOOP | 3 | 0x0004203d |
+| GL_TRIANGLES | 4 | 0x0004305c |
+| GL_TRIANGLE_STRIP | 5 | 0x0004405c |
+| GL_TRIANGLE_FAN / GL_POLYGON | 6 | 0x0004505c |
+| GL_QUADS | 7 | 0x0004605c |
+| GL_QUAD_STRIP | 8 | 0x0004705c |
+
+INFERRED: bits[6:0] take only three values (0x20 point / 0x3d line / 0x5c
+triangle) and look like a WARP setup-program entry address; bits[14:12] are the
+topology selector; bit18 is always set.
+
+**Why the sweep never showed a 0x10b0 write:** the ICD emits it only when the
+primitive code changes *and* old and new fall in the same equivalence class
+(`{0}{1,2}{3}{4,5,6}{7,8}`). Across a class boundary it emits nothing here and
+the change is handled by state validation on the server side. A run of
+same-primitive draws therefore carries no primitive packet at all.
+
+GL_QUADS and GL_QUAD_STRIP are **decomposed on the CPU** into 16-bit index
+lists. GL_LINE_LOOP emits the range packet plus a `0x07000001` packet carrying
+`(first<<16)|(last-1)` as the closing segment.
+
+### The 0x008 lead, resolved
+
+Region 2 offset 0x008 was observed carrying what looked like the GL primitive
+enum (points 0, lines 1, triangles 4, strip 5, fan 6), then refuted as a
+dedicated field because state-only operations wrote unrelated values there.
+Both halves were right. Those values are the ICD's internal **primitive code**
+`p` — the same `p` that indexes the table above — which the ICD stores at
+`ctx+0xa080` and, per the disassembly, never reads back itself. It reaches the
+kernel through this shared region. Offsets 0x000-0x030 of region 2 are a
+**submit record** whose fields are per-record-type, which is why non-draw
+records put other things at 0x008.
+
+## CORRECTION: region 2 is a record stream, not a submit-record array
+
+An earlier reading here treated region 2 offsets 0x008-0x028 as a 0x28-byte
+submit record with fields `{primcode, handle, START, END|1}`, aligning
+`0x018 = 0x2000` and `0x020 = 0x201d` as START and END-with-low-bit-set. **That
+was wrong.** It pattern-matched three dwords and happened to fit.
+
+The correct model, independently verified: region 2 is a **variable-length
+record stream that the ICD rebuilds from offset 0 on every submission**, and the
+control block in region 0 carries its length:
+
+```
+region0 + 0x230 = submitted stream length in bytes
+    clear_depth -> 0x2c    (2-dword opcode + 9-dword CLEAR record)
+    tri_flat    -> 0x30    (2-dword opcode + 10-dword DRAW record)
+```
+
+Those lengths match a record-based decode of region 2 exactly, which is the
+check that settles it — a flat `(index,value)` pair decode does not reproduce
+them. `(index,value)` pairs are the *dominant* record type, but draw, clear,
+rect and vertex-format records are **not** pairs and will mis-slice into
+plausible-looking but fake register writes if decoded as such.
+
+Two practical consequences for anyone decoding this format:
+
+- The driver overwrites the first two dwords of every stream with `(0xff, 1)`,
+  so each stream's **first opcode is unrecoverable** from a capture.
+- The `0x2000`/`0x201d`/`0x2040` dwords are DRAW-record payload naming this
+  draw's vertex-ring offsets, not ring pointers.
+
+Decoder: `tools/parhelia-glsweep-decode.py`, self-tested against two anchors
+(region 2 `0x0cc` -> reg 0x1298 = 2048.0f, and `0x0d4`.. -> regs 0x1100-0x117c =
+0xffffffff). Per-feature results: docs/parhelia-gl-feature-map.md.
+
+## Vertex format — how the stride is built (CONFIRMED)
+
+A prefix sum over per-attribute sizes with a **fixed attribute order**; the
+total is the stride. Position is always at offset 0.
+
+| Attribute | Selector | Sizes |
+|---|---|---|
+| position | fmt[1:0] | {8, 12, 16, 8} (xy / xyz / xyzw) |
+| diffuse colour | fmt[3:2] | {0, 12, 0, 8} |
+| specular colour | fmt[7] | {0, 12} |
+| texcoord 0 | fmt[6:4] | {0, 12, 4, 8, 8, 16, 0, 0} |
+| texcoord 1 | fmt[10:8] | same table |
+| fog / point size | fmt[30:29] | {0, 4} |
+| extra 0..3 | fmt>>{16,19,22,25} & 7 | {0, 4, 8, 12, 16, 0, 0, 0} |
+
+The captured `[x,y,r,g,b]` stride 20 is exactly `fmt[1:0]=0` (8 bytes: x,y) plus
+`fmt[3:2]=1` (12 bytes: r,g,b), everything else zero. **Adding a 2-float
+texcoord** sets `fmt[6:4]=3`: +8 bytes, stride 28, texcoord at offset 20.
+**Adding a secondary colour** sets `fmt[7]`: +12 bytes at offset 20, pushing
+texcoord 0 to 32. The stride grows; the order never changes.
+
+## The two rings
+
+| Ring | Size | Region |
+|---|---|---|
+| vertex | 0x320000 (3276800) | region 4 |
+| command | 0xa8000 (688128) | region 5 |
+| third heap | 0x400000 | region 6, unused per draw |
+
+Slot size is hard-coded **0x2000**, which is the per-draw stride the capture
+shows. The ring base is 16-byte aligned and each flush aligns the write cursor
+**up to 64** before writing — the source of the observed `+0x40` vertex offset.
+Vertex *k* lives at `align64(slotStart) + k*stride`, and the draw packet's
+`first`/`last` index into that array.
+
+Batch capacity is chosen per `(primitive, stride)` so `maxVerts*stride` fits
+0x2000 and is a multiple of the primitive size — e.g. (TRIANGLES, 24) -> 339,
+(LINES, 20) -> 408, (TRIANGLES, 32) -> 255.
+
+## Scissor
+
+If the scissor is dirty the chunk is prefixed with
+`[2][0x2121a1a0][(f3<<16)|f0][(f1<<16)|f2]` -> regs **0x1280 / 0x1284**, values
+clamped to +/-1024. This confirms the documented guard-band scissor encoding.
+
+## Still open in the ICD
+
+- Draw-header bit30 (0x40000000), gated on `ctx+0xa4f2`.
+- Register 0x1104 (index 0x41), alternating 0/4 on line-strip/loop draws.
+- Where the vertex-ring **base address** reaches the hardware: libGL emits only
+  four register indices in total (0x2c, 0x41, 0xa0/0xa1, 0x24/0x25), so the base
+  must be bound once at context creation by the server/kernel side.
+
+
+
+## Vertex format — CONFIRMED TWICE, INDEPENDENTLY
+
+`tri_gouraud` (`glColor3f` per vertex, positions (0.5,0.9) (0.1,0.1) (0.9,0.1),
+colours red/green/blue) lands in region 4 as:
+
+```
+0x4040: 3f000000 3f666666 3f800000 00000000 00000000   0.5 0.9 | 1 0 0
+0x4054: 3dcccccd 3dcccccd 00000000 3f800000 00000000   0.1 0.1 | 0 1 0
+0x4068: 3f666666 3dcccccd 00000000 00000000 3f800000   0.9 0.1 | 0 0 1
+```
+
+**`[x, y, r, g, b]`, five IEEE-754 floats, stride 20 bytes.** `tri_flat` with
+`glColor3f(1,1,0)` gives `1.0 1.0 0.0` in the colour slot of all three vertices,
+as it must. This independently reproduces the earlier gdb capture of the ICD's
+internal vertex array, by a completely different route — so the layout is settled.
+
+Positions are the raw GL coordinates (0.5, 0.9, 0.1 …), *not* screen space: the
+viewport transform happens after this buffer.
+
+**CORRECTION: "z and w are not streamed" is wrong as a general statement.** It
+holds only for this particular vertex format. The format is **dynamic and
+announced per submission**, matching the ICD's prefix-sum stride table:
+
+| Stride | Contents |
+|---|---|
+| 20 | x, y, r, g, b |
+| 24 | + z |
+| 28 | + alpha |
+| 24 | x, y, z + **normal** (lighting path) |
+| 32 | window-space wide line |
+
+Two related corrections from the same capture: the **viewport transform is not
+CPU-applied** — region 4 holds raw object-space `glVertex` values, and only the
+wide-line path stores window coordinates. And **lighting runs on the GPU**: the
+lighting draw streams the `glNormal3f` normal rather than a CPU-lit colour.
+
+## The state stream (region 2) — (index, value) pairs
+
+Region 2's lower part is a stream of **(register-index, value) dword pairs**,
+register = `0x1000 + index*4`. Proof from the capture, at byte offset 0x0d4:
+
+```
+0x0d4: 40 ffffffff  41 ffffffff  42 ffffffff ...  5f ffffffff
+```
+
+= registers **0x1100-0x117c all set to 0xffffffff**, the whole vertex/attribute
+register file initialised. And at 0x0cc the pair `a6, 45000000` = register
+**0x1298 = 2048.0f**. Both match the independent gdb capture exactly.
+
+Further pairs decoded from the same run: `0x0ac: 0c,24` = 0x1030 = 0x24;
+`0x0b4: 17,02` = 0x105c = 2; `0x0bc: 26,3f800000` = 0x1098 = 1.0f;
+`0x0c4: 9b,00` = 0x126c = 0.
+
+The pair stream is **not** aligned at offset 0 and is interrupted by other
+record types — the buffer also holds 64-bit kernel pointers of the form
+`0xffffc200_05c59004` (x86-64 vmalloc addresses on 2.6.30), which makes region 2
+a control structure shared between the ICD and the kernel driver rather than a
+pure GPU command buffer. A decoder must locate and validate the pair runs, not
+assume alignment.
+
+## What this means for the open driver
+
+The submission model to reproduce:
+
+1. Allocate the buffers and learn their bus addresses (kernel side).
+2. Emit state as (index, value) pairs into the command buffer.
+3. Write the interleaved `[x,y,r,g,b]` vertex array into the vertex heap.
+4. Write the 7-dword descriptor naming the vertex count, sequence and vertex
+   buffer address.
+5. Publish the slot by updating the head/tail dwords.
+6. The kernel arms the engine (0x12b8/0x10b0/0x300/0x384/0x308) and submits via
+   the DMA ring: `0x404` = buffer bus address, `0x408` = `end|3` per packet,
+   `0x314` = 1 to kick, then poll `0x8f0` / the `0x450` fence.
+
+Bus addresses here are plain PCI addresses with no GART; see
+docs/parhelia-3d-driving.md "Address-space caveat" for how AGP and PCIe differ.
+
+## Buffer allocation — observed live
+
+The buffers are **locked (pinned) page allocations**, made by the kernel driver
+when the GL context is created, not preallocated at module load. When the
+capture box (512 MB RAM) ran short, the driver logged:
+
+```
+[mtx] *ERROR* Parhelia OS: Failed to allocate locked pages (nb: 801, type: 2)
+[mtx] *ERROR* Failed to create device buffer (size: 3280896, type: 1)
+[mtx] *ERROR* Parhelia OS: Failed to allocate locked pages (nb: 2, type: 2)
+```
+
+801 pages x 4096 = 3,280,896 bytes, which is the 3 MB vertex heap (region 4)
+plus one page. So region 4 is one pinned allocation of 801 pages, and the small
+control pages are 2-page allocations. The `type:` field is the buffer memory
+class the `GET_BUFFER` ioctl takes (VRAM / system / locked); the driver retries
+a failed type 2 as type 1, which is visible above.
+
+Consequences worth knowing before reproducing this: allocation failure is **not**
+reported to the GL client as an error — the client blocks in `glFinish`
+indefinitely. On a memory-constrained box, free page cache before capturing, and
+do not leave killed capture processes behind, or later runs will stall rather
+than fail cleanly.
+
+## Open items
+
+Resolved since first writing (see the sections above): primitive-type encoding
+(reg 0x10b0), descriptor `+0x04`/`+0x08`/`+0x0c`/`+0x18`, and how the vertex
+stride and attribute order change with texcoords or a specular colour.
+
+Still open:
+
+- Draw-header bit30 (`0x40000000`), gated on `ctx+0xa4f2`.
+- Register 0x1104 (index 0x41), alternating 0/4 on line-strip/loop draws.
+- Where the vertex-ring **base address** reaches the hardware. The ICD emits only
+  four register indices in total (0x2c, 0x41, 0xa0/0xa1, 0x24/0x25), so the base
+  is bound once at context creation by the server/kernel side.
+- The submit-record `+0x00` discrepancy noted above.
+- The full decode of the region 2 init/state stream (see
+  docs/parhelia-gl-feature-map.md).
+- **Texture capture is still missing.** Every attempt to capture the texture
+  operations failed: the driver could not create the GL context's buffers
+  ("Failed to allocate locked pages"), and this persisted across a page-cache
+  drop, a module reload and a full reboot with 420 MB free and free order-10
+  blocks available in DMA32 — so it is not memory pressure or fragmentation.
+  Even a 2-page request fails. Cause not yet identified; the texture rows in the
+  feature map are therefore uncaptured.
+
+## Unresolved conflicts between sources
+
+Recorded rather than silently resolved, because each side has real evidence and
+picking one arbitrarily would bake a guess into the driver.
+
+**1. Scissor encoding.** The ICD disassembly shows scissor emitted as
+`[2][0x2121a1a0][(f3<<16)|f0][(f1<<16)|f2]` into regs 0x1280/0x1284 with values
+clamped to +/-1024 (guard band). The live capture disagrees: `glScissor(32,32,
+64,64)` appears as a **4-dword pixel rect with Y measured from the bottom**
+(32, 160, 64, 64), and registers 0x1280/0x1284 never appear at all. Most likely
+two distinct paths (guard-band clip vs scissor rect) with only one exercised
+here. Do not implement either as *the* scissor path until one is confirmed on
+hardware.
+
+**2. Quad decomposition.** The ICD contains a CPU quad-decomposition path
+(GL_QUADS -> primcode 0xb, 16-bit index list) gated on `ctx+0xa0e4`. The capture
+shows the DRAW record carrying the raw GL enum **7 = GL_QUADS**, i.e. quads
+reaching the hardware undecomposed. These reconcile if decomposition is
+conditional and was disabled in the captured configuration — plausible, but
+unproven. Only wide lines were observed being CPU-emulated (as 4 parallel
+1-pixel lines).
+
+**3. Registers whose meaning the capture contradicts.** `0x1230` is written 3 by
+`glFogi(FOG_MODE, LINEAR)`, so it is not the depth surface base; `0x1224` is
+written 1 by `glEnable(GL_LIGHTING)`, so it is not the slot-0 texture
+descriptor; `0x1024` carries a blend factor, not glCullFace; `0x10d8` carries a
+two-float line-width/point-size payload, not stencil state. Consequently **every
+0x12xx claim derived from a stream index >= 0x80 should be treated as
+unproven** until re-checked.
+
+## Capturing from user space — what works and what does not
+
+Established while building the tracer, because it constrains every capture
+method used here.
+
+**Direct rendering is what makes the ICD's buffers visible.** When the vendor
+stack is running direct, a GL client maps `/dev/matrox/mtx0` seven times into
+its own address space and `tools/parhelia-glsweep.c` can snapshot those regions.
+When direct rendering is not active the client has **zero** matrox mappings and
+**issues no ioctls at all** — verified with `strace -e trace=open,openat,ioctl`
+and by counting `/dev/matrox` entries in `/proc/PID/maps` and `/proc/PID/fd`.
+All GPU work then happens inside the X server instead, and a sweep run in that
+state produces an empty capture file rather than an obviously broken one.
+
+**So always verify before trusting a capture:**
+
+```
+grep -c matrox /proc/<pid>/maps     # must be 7, not 0
+grep -c '^== OP' <capture>          # must match the harness op count
+```
+
+An extended primitive/format sweep was run in this state and silently produced
+zero operations. Direct rendering did **not** come back from an X restart or a
+module reload; it needed a full reboot followed by starting X.
+
+**LD_PRELOAD interposition of `open`/`open64`/`ioctl`/`mmap`/`mmap64` logged
+nothing** for a GL client, which is consistent with the above: with direct
+rendering off there is no device access to intercept. The tracer
+(`tools/parhelia-mtxtrace.c`) is kept because it is the right instrument once
+direct rendering is confirmed — it is the only way to see the ioctl stream and,
+via its protect/single-step guard, the register writes userspace performs on its
+own BAR1 mapping, which mmiotrace cannot see.
+
+## What one draw costs, measured  [HW]
+
+`tools/parhelia-mtxtrace.c` with `MTXTRACE_BUFS=1` snapshots every mapped buffer
+and dumps what changed at each doorbell ioctl, interleaved with the GL calls that
+caused it. Five `glFinish`-separated triangles
+(`tools/parhelia-drawcount.c`, capture `captures/mtxtrace-5draws.txt`) give an
+exactly repeating signature — one submission per draw, touching three regions:
+
+```
+GL glEnd
+SUBMIT n  region 0x1000-page   changed=4   span=0x0-0x0          serial: 1 dword
+SUBMIT n  vertex ring          changed=60  span=0x2040-0x2078    3 verts x 20 B
+SUBMIT n  command ring         changed=24  span=0x2000-0x2018    6 dwords
+```
+
+and the slot advances by exactly **0x2000 per draw** — 0x2040, 0x4040, 0x6040,
+0x8040, 0xa040 in the vertex ring and 0x2000, 0x4000, … in the command ring.
+This independently confirms both the 0x2000 slot stride and the `slot + 0x40`
+vertex offset derived earlier from the ICD's ring geometry.
+
+**So one untextured triangle costs:** one zero-sized doorbell ioctl, 24 bytes of
+command, 60 bytes of vertex data (3 x the 20-byte `[x,y,r,g,b]` vertex) and one
+serial dword. Nothing else moves.
+
+### Context init dominates a short run
+
+In a client that uploads one texture and draws one textured triangle
+(`captures/mtxtrace-textured-submits.txt`), **17 submissions complete before the
+application's first GL call**, and the largest single command-stream write in
+the whole run — 3372 bytes — happens during that init rather than at any draw.
+A driver bring-up therefore has far more state to reproduce before the first
+triangle than the per-draw traffic suggests.
+
+### Region identity is per-run, not fixed
+
+The mmap offsets differ between runs (`0xc822000` in one capture, `0x7d4000` and
+`0xaf70000` in others) because they are kernel-issued handles, not addresses.
+Identify regions by **size** (0x1000 control pages, 0x22000 command stream,
+0x320000 vertex ring, 0xa8000 command ring, 0x400000 texture heap), never by a
+remembered offset.
+
+## Replay status — partial, and what it proved  [HW]
+
+`tools/parhelia-replay.c` replays a captured frame onto the device without the
+vendor stack. This is the from-scratch procedure's phase-2 exit criterion, and
+it is **not yet met**. What the first version establishes:
+
+**Works.** The ioctl layer replays: `GET_MEMORY_INFO` and the buffer-create
+ioctl both succeed, the returned cookie differs from the recorded one exactly as
+expected, the replayer learns that old-to-new substitution automatically, and
+mmap of the *new* cookie succeeds. Two of the seven regions map correctly and
+423 recorded writes land. The doorbell is accepted.
+
+**Fails, informatively.** Five of seven mappings fail with EINVAL because their
+cookies are stale, and those cookies cannot be recovered from the capture:
+
+- the trace contains only **two** non-doorbell ioctls but **seven** mappings, so
+  five buffers are not created by an observable ioctl at all;
+- searching the recorded buffer data for each stale cookie finds it **only in
+  the MMAP line itself**, never published in any captured region.
+
+So **buffer creation is in-band**: the client requests it through a doorbell
+control-block record (opcode 0x05 per the draw recipe) and the kernel returns
+the cookie somewhere the current tracer does not capture. That is a real
+protocol fact the replay attempt surfaced, and it is why "capture the ioctls and
+replay them" is insufficient for this driver.
+
+**Second attempt (tracer fixed, replay improved).** The tracer now dumps control
+pages **whole** at every doorbell instead of only their changed spans, and that
+worked: 5 of the 7 cookies now appear in the captured page data, and the
+publication site is consistent — **offset +0x28 of a control page, written by
+the kernel right after the doorbell that requested the buffer**. Of the other
+two, one comes from the buffer-create ioctl return and one (`0xe24000`) is
+constant across runs.
+
+The replayer was restructured to apply writes and ring the doorbell inline, then
+read the live cookie rather than replaying the recorded one. It still maps only
+2 of 7, and the reason is now understood and is a **design conflict, not a
+missing fact**: because control pages are dumped whole, the replay writes the
+recorded page back over the live one, **clobbering the kernel-published cookie
+before it can be read**. Replaying only the changed dwords does not help either,
+since kernel-authored writes also show as changes. The capture does not record
+who authored each dword, so the replayer cannot currently separate the client's
+request fields from the kernel's response fields in a shared page.
+
+**The concrete fix**, in order:
+1. ~~Dump full control pages~~ — **done**; the publication site is +0x28.
+2. ~~Read the live cookie instead of the recorded one~~ — **done**, but defeated
+   by the clobber above.
+3. **Record write provenance.** The tracer must mark each dword as
+   client-authored or kernel-authored. It can: snapshot a control page
+   immediately *before* the doorbell ioctl as well as after, so writes appearing
+   only in the after-snapshot are the kernel's and must never be replayed.
+   This is a small change to `dump_submits` and is the remaining work.
+
+Until that lands, treat the submission protocol as **understood but unproven** —
+which is exactly the distinction the procedure draws, and the reason the first
+triangle should not be attributed to a state bug before replay works.

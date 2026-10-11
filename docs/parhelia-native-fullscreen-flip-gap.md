@@ -1,0 +1,7 @@
+# Native fullscreen flip gap in current non-glamor X path
+
+2026-10-05 P690 target X log confirms glamor disabled and native Parhelia DRI2 blit presentation. Current config PageFlip=false. Inspection of patched xorg-server-parhelia/hw/xfree86/drivers/modesetting/dri2.c can_flip unconditionally returnsFALSE withoutglamor. The no-interval ScheduleSwap path immediately calls native blit swap. Consequently changing onlyPageFlip=true cannot enable fullscreen DRI2 flips in the current benchmark stack. Do not run a configuration benchmark and claim that flip optimization was exercised.
+
+The existing swap/exchange implementation calls glamor.egl_exchange_buffers after swappingpixmapprivates. Native fullscreen support needs an actual nativepixmap/framebuffer ownership exchange and scanout-capable backing, with render-fence ordering beforeKMS flip and safe restoration onwindow exit. Removing theglamor guard alone would invoke an unavailablecallback and does not provide native buffer lifecycle.
+
+The vendor-native Present/flip RE already establishes native render/display views sharebytes and fullscreen STARTslot changes follow renderretirement. Existing DRM async_page_flip=true is kernel capability, notproof X swaps useit. CurrentQ3baseline37.9FPS remainsnativeblit; directPresent optimization retained, noisolatedflipgain claimed. Root shouldimplement nativeflip/buffer exchange in a separate patch whileagents addresslargeDRAW/GL2/FAA.

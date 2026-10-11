@@ -1,0 +1,109 @@
+# Peer source and progress inventory — 2026-10-09
+
+The current source trees and latest campaign log supersede the October 8
+handover. This inventory records a filesystem inspection; a worktree or log
+alone does not prove an agent is still running.
+
+## Canonical trees
+
+| Tree | HEAD | Inspection |
+| --- | --- | --- |
+| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `3142d3d` | Grouped record-mask, VS and queued-presentation proof complete; advanced-game floor remains wrong |
+| `src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/drivers/gpu/drm` | `b1b3cf2` | Coherent command backing and ownership comment; behavior matches tested candidate |
+| `xf86-video-parhelia` | `0701f90f` | Vendor record-mask proof and independent varied floor references integrated |
+
+## Peer work remaining to reconcile
+
+Paths below are under `/home/ai/tmp/agents`. Preserve uncommitted work; it
+has not been promoted merely because it exists.
+
+| Worktree | HEAD / branch | Current state and next proof |
+| --- | --- | --- |
+| `m9piglit3-mesa/mesa-26.2.2/src/gallium/drivers/m9x` | `a6e0cb7`, `undef` | Two dirty files: constant folding and undef lowering, plus temporary dumps. Not integrated |
+| `m9unify6-mesa/mesa-26.2.2/src/gallium/drivers/m9x` | `c0c1be2`, `m9fbo9` | Five dirty files completing sRGB constant blending, target masks and non-native draws; default-on change awaits its extended proof |
+| `m9unify-mesa/mesa-26.2.2/src/gallium/drivers/m9x` | `fed13b9`, `m9logic` | Four dirty files in context/draw/native plumbing. Older branch; preserve separately |
+| `m9glperf-drm-wt` | `df0e59a`, `cmdcached` | Clean committed command-BO coherent backing, based on canonical `ca1ee48`. Integrated as `9d854ea`; locked cache A/B flat (map 55→56, subdata 56→55 FPS); retained |
+| `m9fbo5-drm` | `927f76a`, `m9fbo5` | Clean S3TC small-kind validator patch; not in main; previous notes explicitly leave validator admission pending |
+| `m9fbo5-mesa/mesa-26.2.2/src/gallium/drivers/m9x` | `f3769f1` | Clean; record texel-pair fix already integrated as `97845af` |
+| `m9q3c-mesa/mesa-26.2.2/src/gallium/drivers/m9x` | `e75ec3b` | Clean older snapshot; current main has later compiler fixes |
+| `m9unify6-drm` | `0982baa`, `m9unify6-shadow` | Clean; FAA context restoration is integrated but application proof remains open |
+
+The older `wip/m9-gl2-*` trees are clean October 7 snapshots. They are
+useful history, not current integration candidates without comparison to main.
+
+## Latest recorded evidence
+
+[Campaign log](../../campaign/campaign-log.md), through October 9 at 22:47:
+
+- Core Piglit: 284 PASS / 1 FAIL, with one timeout and one warning. The
+  remaining core failure is the documented depth-code rounding difference.
+- The latest execution subset gained 71 passes; the transient not(bvec)
+  regressions were fixed. The preceding undef-index fix gained another 21.
+- A 33-scene glmark2 A/B found no material regression; effect2d 3x3 improved
+  from 88 to 95 FPS. Terrain's blue cast is fixed; a record-consumption
+  speckle probe remains open.
+- FBO subset reached 234 PASS / 4 FAIL. sRGB target support reached 76 PASS /
+  6 FAIL with opt-in; default-on remains pending extended controls.
+- Quake3 GL1 has correct weapon geometry at approximately 50 FPS. GL2's
+  submission stall is fixed, but floor/weapon colour correctness remains open.
+- Full Quake3 FAA remains unqualified. Its latest combined application and
+  context-restoration group was not run; triangle/program probes do not
+  establish complete gameplay support.
+
+The current M9128 target inspection found no Xorg or ioquake3 process.
+Boot `56289a98-ba5e-4df9-9b1a-ca50f2acfd9f`, kernel `7.2.5-t2`, transport
+submitted=completed `0xdb8dff0`, generation 0, queue 0, async 0, wedged 0.
+The promoted module stage identifies DRM `ca1ee48` and build ID
+`c6697c086d2cfd8da0870fadb74a2526be0f9a37`. Target prefix names alone do
+not prove which Mesa revision an application loads; verify the DSO hash.
+
+## October 10 integration and hardware proof
+
+Mesa `67cfae0` gates colour-specific output templates away from float records and resets retry route ownership. `c7196c7` distinguishes interpolation pressure, retries earlier cut choices and bounds the search. Both are committed with production compiler sanitizer/reference controls.
+
+The combined DSO SHA `7ed5a8301348469ba03ea3558e74d738271438ab61969db0efad8fcf21acaee2` rendered ten exact GLSL fixtures on the unchanged boot and promoted DRM `ca1ee48`: floor187 now renders in 16 passes, weapon199 in 5; both have zero pixels differing from llvmpipe by more than 8 byte levels. All eight controls pass the same bound, with facing controls exact. No skipped draws, queue or wedge. [Complete proof](../tests/m9-gl2-fixed-20261010/README.md). Full gameplay remains a separate check.
+
+Command-cache A/B used the same baseline Mesa `a6e0cb7` and candidate module for both modes, once each at 1024x768 / three seconds / vsync off. Map 55→56 FPS and subdata 56→55 FPS are flat within one-run precision. The change is retained; canonical module build is byte-identical to the tested module. All four captures were visually reviewed and target health stayed clean. [Proof and runner caveats](../tests/m9-command-cache-20261009/README.md).
+
+Opt-in sRGB now passes all24 extended GPU phases (live colours, lines and mixed MRT masks) on Mesa `e7efe22`; [complete proof](../tests/m9-srgb-hardware-20261010/README.md). Default remains held for current sRGB/core regression selections.
+
+The prior full-game BO-capacity failure is documented in [historical capacity evidence](../tests/m9-q3-capacity-20261010/README.md). Mesa `e565872` fixes admission from live owners; full configured gameplay now completes387frames at42.0FPS without refused/skipped draws or context loss. Matched software screenshots agree within8 byte levels for99.96%/99.60% of pixels. GPU stays healthy on the unchanged boot. Advanced effects remain disabled; full-feature GL2 is open. [Complete game proof and scope](../tests/m9-q3-game-fixed-20261010/README.md).
+
+Compact floor scheduling now needs9passes/6slots, and all ten images are byte-identical to the preceding successful GPU captures. Search fixes preserve4PASS/20existingFAIL and eliminate all6 introduced timeouts in the selected24 Piglit cases. [Compact/search proof](../tests/m9-compact-search-hardware-20261010/README.md).
+
+## Current next actions
+
+Continue separate FAA handoff, selected coordinate-lane GPU transform and scanout
+ownership tracks. Preserve tested hardware limits. Root alone owns the locked
+target queue; a stalled track switches to another open topic.
+
+All command construction must follow [the capture policy](gpu-capture-replay-policy.md):
+derive addresses, descriptors, extents and timeline fields from live owners.
+
+Current `e565872` sRGB251/core18 controls reproduce76sRGB passes,2failures and4multisample timeouts; core is unchanged with opt-in (16PASS/2same depthprecisionFAIL, archived list has duplicate commands). Short1024x768 glmark check: refract4,terrain3,bump normals121FPS. Rendered scene captures are intact; matrix first-column math passes but two-pass residual fails, narrowing the remaining shader track. [Batch evidence and limitations](../tests/m9-features-hardware-20261010/README.md).
+
+Advanced normal/specular/deluxe-enabled Quake3 is now measured separately: gameplay completes but has recurring record/build refusal and3skipped draws per40frames, with an orange floor quad and corrupt/missing armour model. Timing is excluded, GPU healthy; matched exact software cvars/images preserved. [Advanced-mapping failure evidence](../tests/m9-q3-mapping-20261010/README.md). Canonical Mesa now includes `84230e7` bias ownership, `925d3e7` qualified sRGB default, and `dad5643` range-cache improvement; grouped build/hardware qualification is pending.
+
+Grouped `9906bee` GPU proof: texturebias4/5failed→0/5, defaultunset sRGB24phasesPASS,optoutPASS,ten shaderimagesbyteidentical,selectedPiglit5PASS19FAIL0TIMEOUT(one matrixgain), unique core8PASS1knownFAIL. OrdinaryQ3single40.2FPSvsprior42.0,nearphase~2.05→1.45ms,overallFPSgain notclaimed. Advancedtrace proves6pass14stream prepared layout vs5pass12stream current and orphaned reservation; refresh/transaction fix pending. [Grouped evidence](../tests/m9-grouped-hardware-20261010/README.md).
+
+## October10 01:27 grouped continuation
+
+Mesa3ba6624 is now GPU-qualified; source/rawview/layout fixes and boundedLOD support are retained. All10LOD,5bias,24sRGBphasespass, all15fixturePPMsunchanged, ordinary40.1FPSvs40.2flat. AdvancedQ3 completes387frameswithzero dropped/refused/skipped draws; armourHUDfixed, floororangequadpersists, so itsFPSremainsunqualified. SelectedPiglit5PASS/19FAIL/0TIMEOUT andcore8PASS/1existingFAILunchanged. Boot56289a98…/moduleca1 unchanged, healthyfullyretired. Exactscope/screenshots/runner/hashes: [grouped proof](../tests/m9-layout-lod-hardware-20261010/README.md). Activeagents: finalvendorlow-pairmask, selected-outputinputpruning, aggregationowner/pixel/performancequalification.
+
+## 2026-10-10 02:03 — record masks and actual aggregation qualified
+
+Mesa `3142d3d` passes the same selected 24 shader tests, previously 5 PASS /
+19 FAIL. All five matrix controls and three varied floor fixtures match software
+references. Real four-job aggregation posts retire with exact pixels; gameplay
+also issues two-to-four-job posts. Ordinary Quake3 is 40.4 FPS versus 40.1 FPS,
+flat at single-run precision, and both captures are byte-identical. Advanced
+captures also remain byte-identical to the previous failure: the orange floor
+quad persists, so its printed timing is excluded. Native-input pruning removes
+240 module draws per 40 warm advanced frames; remaining paths are near-plane
+clipping and multipass programs. Bias 5/5, LOD 10/10, sRGB 24/24 and core 8/1
+remain unchanged. The promoted module is restored with aggregation disabled;
+boot unchanged, final transport healthy and retired. [Complete evidence](../tests/m9-mask-aggregate-hardware-20261010/README.md).
+
+Parallel tracks now cover a source-proven FAA state overwrite, coordinate-lane
+vertex admission and the old scanout pin's release before the vblank wait.
+These next candidates have no hardware qualification yet.

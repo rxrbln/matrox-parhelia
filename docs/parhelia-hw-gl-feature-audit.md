@@ -1,0 +1,877 @@
+# Parhelia hardware OpenGL feature implementation audit
+
+Copyright 2026 René Rebe <rene@exactco.de>
+SPDX-License-Identifier: GPL-2.0
+
+Reconciled with code on 2026-10-05: shared Mesa **9369ebc**, shared DRM
+**f288453**; isolated Mesa **1f5318b** (deployed isolated prefix SHA65008177...), outer NIR **e1817b2**, actual DRM
+**0f7d564**. Performance DRM **12d2626** has passed isolated hardware tests
+and was restored afterward. It is not the currently loaded kernel.
+The latest GPU-gap report records exact source, binary and configuration evidence.
+The shared and experimental stacks must not be treated as the same deployment.
+
+This replaces the [September 11 inventory](parhelia-hw-gl-feature-audit-20260911.md).
+Its 64-row percentages and line references describe that old snapshot; they
+are not current coverage figures. Functional GL support, native acceleration,
+and retained hardware proof are separate claims. This inventory is not a
+conformance result.
+
+
+## GPU affine texture link checkpoint: dac942a, 2026-10-04
+
+The isolated gpu-features branch links affine fragment texture coordinates
+into private WARP vertex programs (o3/o4). Fragment-consumed lane masks let
+packed lighting plus raw coordinates share a generic varying without requiring
+unused coordinate lanes to fit the clamped color carrier. Two taps of one
+texture are independently composed. Clipped and rejected native draws retain
+CPU coordinate/varying fixups; original application NIR remains unchanged.
+
+Hardware proof: ten frames per single/two-tap case at 1024x768, FAA=0,
+662592 pixels per frame with zero mismatches, and linked GPU draw markers.
+Additional two-tap 1408-triangle grids pass native, clipped (657024 pixels),
+forced-software and disabled-GPU-multitexture cases. All compiler selftests
+and seven focused Piglit regressions pass. The glmark texture profile shows
+one compiled GPU transform draw/frame, with software tails for clipping.
+
+One short matched texture scene scores 219 before / 227 after; this is a
+ballpark result, not proof of a stable speedup. One new short regression pass:
+Quake3 387 frames / 13.6 seconds / 28.4 FPS; glmark build/shading/bump
+62/24/230 FPS (three-second scenes). Earlier measurements used different
+lengths and are not a matched comparison. No repeated benchmark campaign.
+Future runner defaults to one pass per latest user instruction.
+
+Limits: at most two coordinate units, affine varying expressions, smooth
+interpolation, complete single-block VS outputs. Uniform-dependent coordinates are added by 17f8248 (UBO0, constant offsets).
+Secondary generic color routing, ramps, nonlinear expressions and wider shader
+coverage remain gaps. Native indexed/strided fetch remains unproven. The
+small smooth-point coverage candidate stays preserved on faa-textured and is
+not deployed. This milestone adds no FAA work.
+
+Deployed binary SHA-256:
+`cdf00a996b6509294fb812d539a98db7a9baaf626f861db6e984d3311ddd0e68`.
+Prefix `/root/parhelia-mesa-gpu-features`; DRM/boot unchanged.
+
+
+## Combined uniform and user-plane checkpoint, 2026-10-04
+
+Main GPU feature HEAD57739f6; production implementation54c83b6. Runtime UBO0
+fragment uniforms with constant offsets now drive up to two affine GPU
+texture coordinates (17f8248). Constants are refreshed per draw; same-program
+changing-uniform simulation and hardware oracles pass. Nonlinear expressions,
+more texture units and lookup ramps remain gaps.
+
+54c83b6 preserves GPU transforms when eight affine bounding-box corners prove
+that every enabled user plane leaves the draw unchanged, with a floating-point
+margin. Crossings/outside, separate ClipVertex/ClipDistance, nonaffine positions
+and ambiguous boundaries keep software clipping. This is not native clipping.
+The independent geometry fixture checks thirty1024x768 frames with zero
+mismatches and native plane markers. The combined build additionally passes
+full selftests, ten changing-uniform two-tapgrid frames and ten changing-plane
+fixed-function frames, allFAA0 with zero mismatches. No repeated benchmarks.
+
+Combined deployment /root/parhelia-mesa-gpu-features, binarySHA256
+`04c0f01f7f44b38280ede21b9816f531daf5786642531514d0c10cf72ddd0a57`.
+DRM0f7d564/targetboot unchanged; sharedstack unchanged.
+
+Vendor emulator fixtures establish packet-generation ground truth, not actual
+GPU retirement: registered system-memory indexed DP2 still emits97080001;
+RGB/DXT1/3/5 sampler state differs only in texture format/layout (plus DMA
+addresses); signed slope/units offset emits c178 + mode86/d7 and resets97.
+Native compressed sampling, indexed fetch and full native offset remain open.
+Parallel agents continue these major gaps, serialized by the established
+hardwarelock. All routineperformance checks default to one short run.
+
+## Implemented paths and remaining limits
+
+| Feature family | Current code and limits |
+|---|---|
+| Triangle rasterization, culling, scissor, polygon modes | Implemented. Nontriangle and unfilled modes may use draw-module decomposition. |
+| Points, lines, smoothing and stipple | Native unit primitives plus triangle expansion for wider/textured cases. Point-coordinate and polygon-stipple lowering now exist; native hardware point-size and strip/loop acceleration remain work. |
+| Matrix transform, perspective and viewport | GPU WARP path exists and is preferred; unsupported programs and clipping can fall back to Mesa draw. They are no longer missing features. |
+| Programmable vertex shaders and lighting | WARP compiler, program upload/cache and constant loading exist; generated lighting can run there. Full vendor 12-light-store coverage is not established. |
+| Fragment programs and texenv | Data-flow compiler replaces the old fixed-shape matcher. Combiner-expressible NIR, lowering and preshaders cover many more programs; arbitrary fragment ISA/GLSL execution is not established. Unsupported programs remain a coverage gap. 54d121b adds scalar/vec2/vec3 stores, verified with executable WARP simulation. |
+| Secondary color, fog and texgen | Secondary color is packed; shader lowering can cover fog/texgen expressions. Dedicated vendor fixed-function paths and complete mode coverage remain unproven. |
+| Color/depth/stencil, clears, blending and logic operations | Implemented, including masked/scissored clears, separate blend equations and logic-op lowering. Complete stencil/two-sided-operation coverage still needs targeted hardware validation. |
+| Texture dimensionality and size | 1-D, 2-D, cube and volume resource/view paths exist; cube/volume have measured default paths on P690 and 0528. Maximum 2-D extent is 2048. |
+| Mipmaps, filtering and wrap | Mip chains, trilinear filtering, border/mirrored wrapping and LOD state exist. The original-family LOD-bias issue below remains. |
+| Multitexture | Original family exposes up to four hardware units; LX is limited to two. Coverage depends on compiler lowering and chip capabilities. |
+| Narrow texture formats | Chip-dependent format routes exist; format support must be read from ph_is_format_supported, not the old blanket missing-format list. |
+| S3TC | Original BC1 storage supports 20 measured base shapes covering all 211 opaque nonlightmap Quake3 benchmark candidates. 39,201 raw addresses and 79 added native pixel checks pass; exact app RGBA encoding and bilinear/trilinear repeat filtering are independently verified. Opt-in compressed GL1 reaches 46.2 FPS in the earlier 1024x768 windowed run and 54.1 FPS in a new fullscreen run with performanceDRM12d2626/cache/async scanout; these are distinct configurations, not an isolated speedup comparison. A textured gameplay capture is inspected. Anisotropy2 axis-aligned2:1 minification atLOD1 has vendor/native proof; broader perspective/diagonal footprints remain open. BC2/BC3 allocation/upload and complete mip chains now support six measured 2-D shapes in ad6f680: 64x32, 64x128, 128x32, 128x128, 32x128 and 32x32. All 4,606 captured addresses and 130 native GL checks pass, including alpha, tail updates and mip rebasing; the integrated build also passes. Bilinear LOD1 and trilinear LOD1.5 sampled alpha also pass 24 native checks over 35,840 pixels, including repeat boundaries (25747ef). Other shapes, broader filtering footprints, encoders and layered textures remain open. Native S3TC remains gated by PARHELIA_S3TC. |
+| Transfers, copy/blit, render-to-texture and mixed-size FBOs | Functional paths are implemented, with a substantial native acceleration gap: `ph_blit` uses CPU conversion; equal-size colour `ph_copy_texture_box` waits for async work, downloads shadows, stages texels and uploads the destination. The imported-resource type2-to-type1 linear resolve uses GPU BITBLT. Native equal-format level0 colour/depth copies now pass on exact0528/64x32 tiled owned render allocations in57a7867, including subsequentdraw/sample/readback and outside-box preservation. Main39b0e2e additionally samples owned RGBA8 render storage directly on exact0528/64x32 with matching render/sampler pitch, level0 and up to two physical units in native colour shaders. Three changing1024x768 generations are byte-identical to forced-shadow controls (nearest/linear/nearest); nearest is analytically exact, while both linear paths retain the same maximum5-LSB discrepancy. Blend, CPU alpha/lookup, depth, feedback and other formats remain on the copy path; four-unit coverage and additive ONE/ONE native consumers now pass six distinct-source images (max1LSB), including retained-source lifetime. Production1f5318b is deployed (SHA65008177...); complete CPU/state and shader selftests and unchanged Piglit colour-matrix pass. It has no measured performance claim. Scaling, other layouts/chips and subresource coverage remain open. GL2 profiling identified a costly screen-depth readback; the app now omits it when no effect consumes it. |
+| VRAM eviction and restoration | parhelia_ttm_move is installed; aperture resource/page copies and eviction/restore counters exist. The old patch-only TODO is superseded. |
+| Cursor placement/upload | Cursor uses parhelia_vram_bar_addr and original-family aperture writes. The old direct-flat-BAR claim is superseded; broader placement/display stress remains validation work. |
+| FAA-16x | Implemented and hardware-tested on isolated original-family branch, default off. Textures, ordinary depth/write modes, private depth and stencil preservation work in tested cases. Not merged into shared Mesa/DRM. See below. |
+
+Source entry points: Mesa parhelia_screen.c (caps/formats),
+parhelia_context.c (compiler, draw, state and FAA), parhelia_batch.c and
+reference/p3d_state.c (packets); DRM parhelia_drv.c, parhelia_gem.c,
+parhelia_cursor.c and parhelia_submit.c. Commit references above pin this audit
+without relying on obsolete source line numbers.
+
+Current user priority: implement/test hardware GPU features and optimize
+Quake 3/glmark2 with FAA **off** until further notice. Piglit must also use
+FAA off. Occasional standalone FAA smoke checks are allowed. FAA
+implementation/performance/control work below is deferred. Prioritize major
+hardware gaps and performance; defer small conformance/pixel details. Retain
+correct features, cleanups and optimizations even when benchmark FPS is equal.
+
+## Latest FAA-off hardware checkpoint
+
+11ded06 fixes fast depth-clear state surviving context destruction and owns
+its depth resource across framebuffer unbind. On the original 0528 board,
+three old-build context-owner/scissored-clear pairs all failed the second
+test; all three fixed-build pairs passed. Seven focused shader, lighting,
+texgen and depth-clear Piglit tests then passed, with PARHELIA_FAA=0.
+Concurrent-context cache ownership still needs separate coverage. The isolated
+stack remains deployed; this does not constitute a shared-stack merge.
+
+4aa7fa7 accounts for the existing two-triangle packets when limiting batch
+size. Points and lines keep one primitive per packet; staging, vertex bounds
+and the hardware packet shape are unchanged. At 1024x768 with FAA off, a
+20-second shading comparison reduces draw batches from 92 to 64 and submits
+from 92 to 65 per frame, with 14348 triangles and 258264 vertex dwords in both.
+FPS is 26 versus 27. Three repeats of the four selected five-second scenes
+give shading medians 25 versus 26; Quake 3 medians are 28.5 versus 28.3 FPS,
+so no Quake 3 speedup is claimed. A 1408-triangle analytic mesh passes ten
+frames on native, CPU-control and clipped paths. Large point/line checks also
+pass. Native indexed reuse remains a separate gap.
+
+A smooth-point coverage discrepancy occurs on both old and new builds. The
+zero-coverage discard candidate is retained but incomplete: it currently
+refuses the coverage shader and takes the aliased-disc fallback. It is not in
+the deployed 4aa7fa7 checkpoint. The new fractional-alpha fixture must request
+an alpha framebuffer; that refined check has not run. This pixel-detail work
+is deferred under the user's current priority.
+
+The occasional 1024x768 FAA off/on occlusion smoke passes ten frames per arm
+(228855 interior pixels/frame); the on arm confirms 20 FAA batches and ten
+resolves. Benchmarks and Piglit remain FAA off.
+
+## Feature and bug TODOs
+
+1. **Deferred: FAA performance and application control.** At 1024x768, three matched
+   runs give median normal 28.3 versus FAA 24.5 FPS; linear decoding then
+   gives 24.6 FPS in all three FAA runs. Nine ten-frame analytical cases pass.
+   Main work remains FAA off; the active goal now requests occasional FAA correctness/performance checks. Current Mesa867b45a predecessor457a116 passes ten textured depth-occlusion frames at1024x768 on actual0f7d564. Combined performance-kernel FAA proof remains pending. A suitable explicit
+   GL control is requested but not implemented; current control is
+   PARHELIA_FAA=1. Sample buffers/masks and full MSAA semantics are not exposed.
+   Alpha test, application stencil, partial color masks, logic ops, other
+   target formats and special multipass/primitive paths can hand over to
+   ordinary rendering. Full application-wide FAA coverage is not established.
+   See [FAA RE](parhelia-faa-original-re.md), sections 14.6–14.7, and
+   [retained performance results](../captures/faa-perf-20261004/report.md).
+2. **P690 sampled alpha.** Native companion route stays opt-in because spatial
+   failures remain. Production micro/two-pass/CPU routes work but cost time.
+   See parhelia-p690-q3-sampled-alpha-final-audit.md.
+3. **Original-family LOD bias.** Bias encoding exists, but magnified raw LOD
+   clamps at -4 and the GL LOD-bias test still fails. This is a correctness gap,
+   not a missing LOD-field implementation (parhelia_screen.c comments).
+4. **P690 larger primitive packets.** More than the safe two-primitive default
+   can wedge. Do not turn packet-size experiments into a default merely from
+   vendor similarity. See parhelia-p690-multi-primitive-packet-hang.md.
+5. **Fragment/compiler and glamor coverage.** Main82dcff9 adds bounded generic identity-domain coordinate linking and componentwise vector reciprocal/division/sqrt; native saturated PASS and clipped PLANE proofs pass with zero pixel mismatches. Quake3 GL2 uniform-selected output-alpha discard is implemented in088b5ee;48native cutoff/depth/blend cases pass with preservedRGBA. OuterNIRe1817b2 prevents split colour-vector positions. Default GL2 startup still requests a real five-sampler LIGHTMAP+DELUXE+NORMAL+SPECULAR variant against four hardware units. With explicit normal/specular/deluxe mapping off and cg_shadows=1, basic GL2 startup now passes on hardware after app commits4ec640b/5007a5f defer unused projected-shadow/postprocess shaders until first use. Full original optional shaders are retained and compile normally when requested. Actual1024x768 basic gameplay is visually verified; exhaustive pixel fidelity and full optional lighting remain open. One basic-profile1024x768 windowed timedemo now completes387frames/20.5sec/18.8FPS on actual0f7d564 with main d00d0b2/app e7321f0, clearing the GL2>15 threshold in that profile. App e7321f0 now skips unused screen-depth copy/HDR-depth conversion while retaining depth prepass, MSAA resolve and active SSAO/sunlight consumers; focused native image/profile checks pass. The earlier pre-depth-copy-fix GL2timedemo exceeded90sec without an FPS result; no numerical gain baseline is inferred. Runtime uniform-bounded colour linkage and full RGBA GPU outputs remain major performance work.  0a47bf5 adds GPU direction lookup ramps for the proven single-unit direction-cube route, preserving VS normalization and clipped fallbacks. Native varying, normalized and clipped pixel checks pass. Current remaining transform gaps include secondary
+   generic routing, nonlinear texture coordinates and
+   unsupported shader expressions. dac942a now links up to two affine
+   texture coordinates into GPU vertex programs; clipped draws retain CPU
+   fixups. Single/two-tap pixel and fallback checks pass. c45282b now links a proven
+   bounded generic color varying to WARP o1, including normalized matrix
+   lighting and GPU saturation. Matrix-lighting pixel checks pass for ten
+   frames on native, forced-CPU and clipped paths. Generic1 and unsupported
+   varying domains remain gaps; dac942a proves only fragment-consumed color
+   lanes so unused raw texture coordinates need no clamped-color bound. 4538ca2 enables the affine bounding-box
+   clip gate by default, avoiding repeated CPU position interpretation while
+   retaining GPU transforms; native shading improved from 8 to 27 FPS in
+   diagnostic runs. The latest 20-second run gives 26 FPS at 1024x768.
+   Native shading still submits about three times as many triangles as the
+   CPU route; indexed/strided reuse remains a performance priority.
+   See ../captures/gpu-gaps-20261004/report.md. Reproduce remaining text/tile,
+   FBO readback and unsupported-shader failures against the current compiler;
+   historical reports alone do not establish current failures. Expand lowering
+   where the combiner contract supports it.
+6. **Native acceleration.** Native polygon offset, crossing user clip planes, native point-size and additional topology paths remain work. Owned indexed/strided DMA is implemented behind verified private kernel gates;64-byte subpage packing and mixed ordinary/indexed batching now have native image, source-preservation and matching Quake3 evidence. Ordinary9/10/11-DWORD layouts and owned frames above4096DWORDs remain outside the current mixed contract; a separately gated43/15 extension is in development. Conservative all-inside user-plane GPU acceptance is implemented and verified. Packed 8-bit vertex-colour fetch is default for verified FAA-off0528 fixed-functionRGBA/BGRA8 inputs in1d6ffc0.48nativechecks plus12gradient/BGRA/far-clipping and32RGB-above-alpha cases pass; GPU transforms retained. One Q3run31.6FPS reports~18% fewer vertexDWORDs, without an isolated speedup claim. Float/compiled/current-colour paths retain existing layouts; packedFAA remains experimental. Existing ordinaryFAA textured depth smoke passes after promotion. GPU
+   transforms already exist. Prefer GPU paths; retain correct improvements
+   even if one benchmark shows no immediate gain. See
+   parhelia-polygon-offset-hardware-re.md and
+   parhelia-p690-native-indexed-draw-feasibility.md.
+7. **Kernel geometry validation.** Audit fill/blit destination extents against
+   relocated BO bounds beyond register/relocation validation. The historical
+   claim of an exploitable out-of-bounds write needs a current reproducer;
+   do not treat that claim as fresh test evidence.
+8. **Recovery and display coverage.** No validated general engine-reset path;
+   continue isolated bounded tests. Secondary-head/multimonitor and cursor
+   placement stress need current hardware proof.
+9. **Hardware proof gates.** BC2/BC3 shapes beyond the six verified 2-D chains, compressed filtering beyond the measured bilinear/trilinear cases, complete S3TC filter coverage, GigaColor render/sampling and
+   system-memory texture fetch remain unproven. Keep unsupported/gated rather
+   than equating decoded vendor structures with working Mesa support.
+
+10. **Presentation and submission performance.** Original-family scanout placement, genuine async flips, final framebuffer/controller identity and pixel checks now pass, including generic unreachable FB rejection. Native scanout remains opt-in; actual restored X uses PageFlip=false. Performance kernel977a1e5 and Mesa0fde61f negotiate16384DWORD owned payloads with independent4096DWORD fetch bounds; sync/async dense/sparse pixel checks pass. One fullscreen FAAoff GL1 run32.4FPS reduces submissions80→35/frame. Kernel12d2626 allows opt-in scalar register caching plus adjacent packet packing; host sanitizer contracts, fetch/scanout/rejection and one Q3run pass, omitting177730/191312 eligible state packets across the workflow. Its33.7FPS is not an isolated speedup because app settings differ. Current restored0f7d564 uses the Mesa4096/221 fallback. Fullscreen native-BC1 performance now has a single54.1FPS run at1024x768 with explicitcompression1/nativeS3TC1/aniso0 and Mesa5461138. Cache-default adoption and FAA throughput remain separate checks. Combined-kernel ordinary FAA async textured-depth regression now passes10 frames at1024x768 with228855 interior pixels/frame; packed-FAA stays experimental/off. Preserve completion ordering for CPU access and Present consumers.
+
+The default-off native-offset candidate d6df48e retired safely but failed six of seventeen depth-effect cases on 0528: nonzero slope/units behaved as no offset. Known-good DRM0f7d564 and X were restored. Vendor c178/mode86/d7 captures establish packet generation only; do not enable native GL offset from them. Q3's offset fallback is one draw/eighteen vertices per frame, so major performance work takes precedence.
+
+## Historical reports requiring fresh reproduction
+
+The old NPOT/odd-height bilinear edge discrepancy, scanout LUT-bypass
+candidate, 0528 tile-layout hypothesis, and glamor readback reports remain
+historical leads. Current mip/layout/display changes mean they are neither
+confirmed current bugs nor proven fixed by this audit. Preserve their original
+notes and rerun a focused test before assigning status.
+
+## Evidence boundaries
+
+Occlusion queries have no driver callbacks and no recovered usable hardware
+counter contract; the negative vendor audit is not an implementation recipe
+(parhelia-occlusion-query-re.md). Skinning/palette and displacement remain
+vendor capability/RE leads, not ready implementation tasks. Native sRGB decode
+and framebuffer encode are not established hardware features. No percentage
+completion score is assigned to these unequal and partially validated families.
+
+Compiled GPU lighting input stream5461138 defaults to6DWORD instead of8 within the proved original0528/FAAoff/single-raster-set/RGB scope, retaining all23WARP instructions. Native lighting/clipping/consumed-ST fallback and integrated10frame pixel proof pass. One short1024glmark build51FPS vs earlier33–34 ballpark; no Quake3 gain established. Opt out with PARHELIA_TCL_COMPACT_INPUTS=0.
+
+General affine RGB matrix lowering d00d0b2 collects shared sampled-channel atoms into three native MAD slots. Full selftests, unchanged Piglit colour-matrix, five changing-uniform native cases (327680pixels/zero mismatches/channel error at most2), and four neighbouring dot/swizzle Piglit cases pass. Signed coefficients, offsets, sampled alpha and immutable source textures are covered; unsupported uniform magnitudes remain rejected.
+
+Original inline32 indexed-draw RE checkpoint: fresh Windows writer execution
+proves exact8b0a0005/sixDWORD indices and65535+3 index splitting; this is
+CPU command construction, not GPU retirement. Candidate kernel a934e0d
+(on performance12d2626) adds default-off query36/reloc11 diagnostic with
+synchronous kernel-owned copied vertices, at most6indices, strict bounds
+and stream/primitive/descriptor cleanup. Its build and78 recognizer
+mutation cases pass. Native class3 owned-inline32 retirement/depth interlock now passes three1024x768 scenes: near/far both orders and shared four-vertex rectangle, each zero colour/depth mismatches including subsequent97cleanup draw. Main diagnostic kernelfc378ed remains defaultoff; production97drawing stays unchanged. Repeated native index packets now pass: kernel11fd0fe/fixturee2084e2,24small packets share one4/6vertex stream and match dense144vertex controls in all three1024x768 colour/depth scenes, including97cleanup. Gallium indexed reuse, other fetch layouts and async integration remain open. No native indexed
+capability or performance claim follows from this candidate.
+
+### Indexed reuse preparation (2026-10-05)
+
+Main6a2cb92/42d5b2c adds a bounded owned indexed emitter and a raw FLOAT3
+XYZ/RGB tuple cache. Cache groups preserve triangle order and bit-exact inputs,
+with at most682 owned vertices and942 indices per group. Resource generations,
+source indices, offsets, strides and translation keys invalidate the cache;
+user/volatile data, unsupported formats and ambiguous same-buffer per-element
+strides fall back. The independent CPU oracle passes, including2100-index
+multi-group cases and degenerate triangles. This is preparation only: Gallium
+selection/submission and VBO pixel validation remain pending, and production
+remains39b0e2e. No app performance benefit is claimed yet.
+
+The guarded Gallium candidate now passes a native VBO pipeline proof on the
+query36-enabled temporary kernel. Ten1024x768 frames each check662592 pixels
+with zero error and hashes identical to the dense control. Eight lighting
+frames retain23 GPU instructions, update normal-buffer contents and change
+live matrix uniforms, with ordinary draws interleaved; two final ordinary
+RGBA frames check cleanup. Logs confirm80 successful owned indexed submissions,
+not only selection before potential fallback. The workflow restores actual
+0f7d564/X1920. The guarded Gallium implementation is integrated as553ef26; production remains39b0e2e pending the combined build. No performance claim yet.
+
+Main8289aa9 extends proven direct render sampling to all four physical units
+and retains extra sampler resources across deferred batches. Six1024x768 image
+checks pass over three changing generations, including a pending unit3 partial
+producer and deletion of source attachments/views before readback. Maximum
+channel error is1 against the analytical weighted sum (tolerance3). Distinct
+BO traces confirm all four units consume real render storage. Blend, CPU alpha,
+lookup and depth-sampling gates remain; no performance measurement is claimed.
+
+### Programmable FLOAT4 colour and constant-bank legalization
+
+Main dfc53c6 integrates measured FLOAT4 fetch/export and live per-draw range
+proof behind default-off PARHELIA_TCL_FLOAT4. Native144-case evidence covers
+independent RGBA, all texture-alpha codes, discard, depth/blend and changing
+uniforms that select GPU -> conservative fallback -> GPU without relinking.
+The actual vendor compiler rejects MAD operands using two distinct constant
+vectors; accepted split MUL/ADD and temporary-materialized MAD controls explain
+the earlier zero-output failure. Lowering now materializes the second constant
+vector. Main6eb2921 explicitly rejects mixed FLOAT4/indexed and packed layouts;
+full integrated build, CPU/state and shader selftests pass. Compact RGB and
+packed byte layouts are preserved. Combined native integration and two-ST
+validation are in progress; production remains39b0e2e. No FPS gain is claimed.
+
+Latest combined deployment:1f5318b/SHA65008177... is installed in the isolated
+production prefix. Full merged build and CPU/state+shader suites pass; combined
+single-ST FLOAT4 integration passes144 cases. Main1f5318b admits direct render
+sampling for exactONE/ONE RGB+alpha ADD consumers, leaving other blends on
+fallback. The integrated additive native gate passes six1024x768 images,
+maximum channel error1, with boot unchanged. Previous production39b0e2e notes
+above describe earlier checkpoints. Two-ST uniform-range fallback still loses
+alpha and is under investigation; valid two-ST GPU cases have separate proof.
+
+Two-ST FLOAT4 follow-up:96 valid-range cases pass with a patterned second
+texture and independent UV2, confirming the11-DWORD descriptor and both UV
+inputs. Uniform-range fallback still loses alpha; its failed test is retained
+and complete transition support remains unproven. Native depth sampling also
+remains open: a fresh D24S8 TEXTURE|ZBUFFER vendor fixture returns success from
+creation and both callbacks but emits no sampler descriptor or draw. Callback
+success alone is not evidence of a supported depth-sampler format; D16/D24X8
+and private vendor paths are being investigated before hardware probing.
+
+Async owned indexed candidate proof: a separate default-off kernel gate and
+GETPARAM37 admit the exact0528 owned stream into fence-retained async slots.
+Ten1024x768 frames match the synchronous indexed control with zero analytical
+error and identical hashes. Logs prove80 async submissions with successful
+returns and nonzero fences, with no synchronous fallback. Client vertex-buffer
+reuse, changing uniforms and ordinary draw interleave are covered. Existing
+index/state/bounds validation remains; the workflow restores actual0f7d564/X1920.
+The candidate is not the loaded kernel, and no FPS improvement is inferred.
+
+Occasional FAA regression on deployed1f5318b/known-good0f7d564: ten textured
+occlusion frames at1024x768 pass228855 interior pixel checks per frame, with
+20 FAA draw batches and10 resolves. Packed FAA remains disabled. This checks
+textured/depth correctness after the combined shader and render-sampling
+changes; it is not an FPS or overhead measurement.
+
+2026-10-05 perspective and packed-input checkpoint: main Mesa6ef7404 fixes
+compiled viewport export to carry reciprocal clip W in all four position lanes.
+Vendor control and independent orthographic/perspective cases pass144/144 each;
+96 GPU and48 fallback cases preserve separate UVs, alpha, blend and depth.
+Production deployment remains1f5318b until combined native validation.
+
+Packed one-ST indexed candidate Mesa7191534/kernel92a5f8d passes eight1024x768
+dense/native exact frame hashes and255792 analytical pixels per frame. Logs show
+80 successful async submissions with nonzero fences. The last XY crossing is
+inside the supported hardware guard band and remains native; it does not prove
+software clipping fallback. A separate Z-crossing/rebind test is pending. The
+bounded workflow restored known-good0f7d564 and X1920 without reboot. No FPS gain
+is claimed; this path remains experimental and disabled by default.
+
+Native depth storage and reconstruction diagnostics integrated through737240e:
+650240 depth pixels prove B=low/G=middle/R=high bytes of surface36 storage when
+sampled through colour32. Prescaled three-stage GPU arithmetic resolves high-end
+clipping and demonstrates lower-byte contribution.528320 output pixels match
+exactly and121920 differ by one8-bit level at rounding boundaries. This does not
+prove exact24-bit depth sampling; production CPU depth fallback remains.
+
+Q3 missing-specular-map specialization builds but both full-map and simpler
+specular-enabled startup encounter the varying allocator limit before gameplay:
+more value varyings than colour interpolators and coordinate units. No gameplay
+or performance result is claimed for that app change.
+
+Follow-up packed depth-clipping proof: far-Z frame7 takes two ordinary1408-triangle
+software tails and frame8 returns to ten successful native async submissions.
+Both images match dense controls exactly (507642 analytical pixels per route).
+Main Mesa includes packed implementation/evidence throughbdb93e0; kernel gate
+e2aa290 remains default-off, with known-good0f7d564 restored after testing.
+
+One Q3 packed indexed run at1024x768 fullscreen, uncompressed textures, anisotropy
+enabled and per-submit tracing:387frames/13.2seconds =29.4FPS.12654 actual async
+submissions succeed. This configuration differs from the earlier compressed
+54.1FPS profile and does not establish a gain/regression. No repeated benchmark.
+Submission aggregation is the next performance target; preserve the feature.
+
+Appf519e7f defers both ordinary and constant-white-specular lighting variants
+until actual bind. Full-map gameplay reaches lightmap variant1 (specularMap0),
+whose NIR reads four samplers and19 live value components. It exceeds the proven
+physical carrier budget; the remaining issue is actual gameplay lighting, not
+only eager startup compilation. Diagnostic Mesae0a924c captures rejected NIR.
+Full-map GL2 remains incomplete, including additional nonlinear fragment ALU.
+
+Real completion fences, main Mesaf6d41fe/core48cd2d9: reference-counted kernel
+sequence handles implement poll/finite/infinite waits. Native swaps retain
+frontend throttle=false; explicit native completion requests no longer require
+an unconditional client wait. Duplicate device descriptors retain fence access
+across originating context destruction. Finish hints/CPU resolves still wait;
+sync-file export remains unsupported. No FPS gain is claimed.
+
+Native testing exposed a frontend ordering defect: FenceSync flushed the pipe
+while immediate-mode vertices remained buffered. Core48cd2d9 flushes those
+vertices and uses st_flush to include cached bitmaps. The independent trace
+checker rejects the before log and passes the fixed log: each quad precedes its
+fence, three1024x768 frames have786432 exactRGB pixels each, actualzero-timeout
+ETIME/finitecompletion and shared-context fence lifetime pass. Full driverCPU
+selftests pass. Production Mesa has not yet been updated with these changes.
+
+Mainf5130cb keeps tiny packed draws on normal GPU host aggregation; force-small
+coverage option preserves the indexed feature. No repeated Q3 benchmark. Agent
+larger-indexed-group candidate hit pre-doorbellE2BIG from the224primaryCALL limit;
+packing-aware dispatch/losslesssync-rechunk is pending nativeproof. Depth-shadow
+GPU production candidate remains unpromoted: multigeneration raw comparison has
+severe boundary mismatches, and a subsequent boundedtest timedout. Health
+classification and feedback guards are in progress; this is not a provenhang.
+
+Original0528 raw TEXCOORD native control now validates16384 coordinate pixels
+with max0.0029 RGBerror/A1. Existing compiler PASS already uses TAopcode2, so this
+is coverage proof rather than a newoptimization. VendoremulatorTEXM3x3_COORD
+creation/draw0 and exact emittedTAchain/payload groundtruth is captured inmain
+dfd0f23; matrix-addressing native retirement and full multipasslighting remain
+open.
+
+## 2026-10-05 combined hardware/performance checkpoint
+
+Matching uncompressed Quake3 GL1 1024x768 profile: one combined run reached
+32.0 FPS (387 frames/12.1s), versus earlier 29.4 FPS (387/13.2s).
+Successful native submissions fell from 12654 to 8408; total submissions from
+68–69 to 58–59 per frame. Source362286a/core48cd2d9; retained evidence in
+Mesa4683648. This is a combined-change result, not an isolated attribution.
+The >40 FPS goal in this profile and full GL2 lighting remain open.
+
+The earlier depth-shadow severe boundary errors are resolved in the opt-in
+Z24X8 path: three generations, eighteen consumer images, exact full source
+snapshots. Consumer rounding remains max1 nearest/max2 linear colour levels;
+strict pixel equality is not claimed. Shader comparisons retain CPU conversion.
+D24S8 follow-up has passed producer and source equality checks; final comparison
+proof and integration remain pending. Neither path is promoted by this note.
+
+Original GPU texture-address TEXDP3 arithmetic is now proven using the captured
+vendor helper dimensions/filter/wrap/auxiliary state: five basis cases,
+zero mismatches across15360 RGB components. Agentf529322 integrated asfaee431.
+Spatial interpolation, perspective and matrix chaining remain to be proved;
+this foundation does not implement full GL2 material lighting.
+
+Combined source7e2543f/core48cd2d9 passed one ten-frame textured FAA occlusion
+check at1024x768:228855 interior pixels/frame,20 draw batches,10 resolves,
+depth24/stencil0. Evidence committed inMesad3aa086. Main development stays
+FAA off. Production Mesa remains1f5318b and known-good DRM0f7d564; newer
+features are tested in isolated prefixes. Multi-binding aggregation is underway.
+
+Follow-up: D24S8 integrated Mesa ea8eae4 after exact three-generation
+producer/source and two-filter shadow-comparison proof; bool option now honors
+'=0'. Integrated full build passes. Still opt-in, same raw rounding limits.
+
+Spatially varying TEXDP3 equal-W interpolation passed3072 components, but
+unequal-W diagnostic wedged the engine; known-good reload then timed out
+initializing WARP. Hardware tests held during ATX recovery. Vendor unequal-W
+capture changes input FLOAT4 declaration/stride only; no evidence supports an
+invented TA perspective bit. Resident WARP export/setup versus custom vendor
+VS contract is under investigation; no retry of the failed packet state.
+
+Recovery and diagnostic correction: cold ATX recovery restored known-good0f7d564
+and X:1 1920x1200, boot8d9d7a3b-db70-4d7d-9870-db28b50f0feb. Integrated CPU
+selftests pass (Mesacf766b7). The failed unequal-W fixture used column-major
+matrix element11 in a row-major constant contract, producing out-of-frustum
+vertices instead of unequal W. It therefore does not prove valid perspective
+TA failure. Corrected emitted-matrix semantic checks precede the next proof.
+
+External depth Piglit rotation (Mesaf841c6d, sourceea8eae4/core48cd2d9,
+librarySHA b00e58356d8224942e98d41c82c33d8bb453066a3d7c2a326e37783349af544a):
+fbo-readpixels-depth-formats PASS; fbo-depth-sample-compare fails at link on
+unsupported non-colour shader output (fragment depth), before sampling.
+Fragment-written depth remains a hardware/shader gap; this result does not
+contradict the depth-shadow conversion fixture. FAA off, no version override.
+
+Multi-stream owned indexed aggregation integratedMesa306a22c/kernel493a7d7:
+GET39/reloc12, default-off gates, page-aligned independently owned vertex
+segments, complete state/reset per segment, invariant owned attachments.
+Fallback preflights every segment then extracts old offset-zero streams and
+uses the proven async/sync splitter. Combined full build/CPU tests pass,
+including exact three-stream reconstruction and transactional schema/capacity
+failure (Mesa506dd26). Hardware/source-overwrite/deaggregation proof and any
+performance claim remain pending. Production prefix/module unchanged.
+
+Corrected perspective diagnostic integrated81495c5 with actual emitted-matrix
+and all-vertex clip/frustum checks plus vendor WARP export evidence. Automatic
+approval review rejected its native run because of prior wedge/service risk;
+it has not executed. Host-only shader-depth/vendor RE continues.
+
+## 2026-10-05 aggregation retirement and shader depth identity
+
+Multi-binding aggregation is now natively proven (Mesa74f3405): three routes,
+eight exact full frames/2,046,336 analytic pixels per route, retained source
+ownership across changed textures/MVP/depth, ordinary interleave and re-entry.
+One matching integrated Q3 run (c856c92) reached32.4FPS versus32.0: ballpark
+flat, not a clear speed gain. Native submissions7334 versus8408 (-12.8%);
+11882 owned segments grouped into4246 single/2014 double/688 triple/386 quad
+requests. Page-aligned sourcepool9552100DW includes2629624paddingDW above
+6922476usefulDW. Keep the feature and proven alignment; TWO-ST draw coverage
+is next, based on captured exact8DWORD schema/query40. No repeat benchmark.
+
+Original D16 vendor producer descriptors at three widths plus17 complete
+64KiB native raw snapshots match the measured16-bit render decoder exactly
+(Mesaccb14cb/adb7092). Narrow sampler storage has a different layout, so these
+producer proofs do not authorize source relabeling. Original D16 native depth
+attachment implementation is in isolated testing; CPU sampling remains separate.
+
+Exact unconditional gl_FragDepth=gl_FragCoord.z now preserves raster depth
+(Mesae5a8e16). Twenty-three compiler forms/negative cases plus full CPU suite
+pass; native three-phase1024x768 RGB/depth oracle checks1,481,088 interior
+pixels, including farther occlusion and nearer replacement. General fragment
+depth output remains open. Vendor accepted TEXM3x2DEPTH op0xE/bit28 ratio
+route/math is captured, native precision/order unproved (076544a/7441762).
+
+Correction: earlier root external Piglit candidate claims used LIB=production,
+which preloaded production1f5318b via libGLX_mesa DT_NEEDED before DRI lookup.
+Those results are production evidence only. Candidate-first library order is
+now confirmed by loader trace; corrected external ARBsync timeout-zero,
+repeat-wait and delete allPASS. fbo-depth-sample-compare still fails, now at
+fragment-coordinate colour arithmetic after depth-identity admission. Retained
+proof/loader logs in Mesae5a8e16. Q3/native workflows already used candidate
+library first; their performance and pixel results are unaffected.
+
+## 2026-10-05 two-texture indexing and native D16 attachments
+
+Exact two-ST owned indexing integratedMesab86b71e/kernel f62cf7b behindquery40,
+with explicit opt-in. Hardwaree63c42b proves three routes×eight exact full
+frames/1,924,400 analytic pixels per route, independent ST0/ST1 checkers,
+volatile client/VBO sources, near/far depth, mixed6/8/8 streams and ordinary
+blend interleave/re-entry. Sixteen accepted async requests versus32 lossless
+sync chunks; all returns0/nonzero fences. No general blend-conformance claim.
+
+ONE matching integrated Q3 run (3d6d869) reached31.7FPS versus32.4, ballpark
+flat. Native10808 accepted requests group25778 segments;9552100DW previous
+page pool becomes20900500DW, of which9643004DW useful/11257496DW padding.
+New TWO-ST admission includes many tiny draws (83%under32 triangles). Retain
+full feature/correctness; subpage source alignment and dispatch cost are next.
+Vendor direct-fetch groundtruth now shows subpage source addresses; newquery41
+andreloc13 are reserved for a separately gated64-byte alignment contract,
+keeping oldquery39/reloc12 page requirements unchanged. Native proof pending.
+
+Original D16 attachments integrated5042738, PARHELIA_NATIVE_D16 defaultfalse:
+three1024x768 textured generations exactRGBA, depthmax1/65536, actual16-bit
+resource1572864bytes versus24-bit storage3145728. No newkernelABI needed;
+ownedcpp2 allocation probe gates original0528 only. Fast-Z remains refused
+forD16 untilproven; plane clears useGPU. Direct sampling remains unadvertised.
+Vendor D16→ARGB32 DPS conversion uses RGB565 sampler layout2; fullcompatible
+view/conversion native proof is being derived, not ordinarylayout4 relabeling.
+
+Combinedsourceb86b71e/core48cd2d9/library8a8e8d90... fullCPU suite passes.
+OccasionalFAA textured1024x768 occlusion10frames PASS,228855pixels/frame,
+20drawbatches/10resolves, depth24/stencil0 (4a72b83). NoD16FAA/performanceclaim.
+ProductionMesa1f5318b and known-goodDRM0f7d564 unchanged; targethealthy/restored
+X1920x1200, boot8d9d7a3b-db70-4d7d-9870-db28b50f0feb.
+
+## 2026-10-05 subpage alignment and D16 reconstruction
+
+Mesa0c531ca / DRM b42d0cf add separately gated GET41/reloc13 for64-byte
+source alignment. Existing GET39/reloc12 remains4096-byte aligned even
+with the new gate enabled. Mixed12/13 requests reject before patching.
+Merged kernel128admission/8192capability/762packetmutation cases PASS.
+The agent native campaign retired three routes×eight frames with exact
+control hashes and240550 analytic pixels/frame, including source offset
+0x7c0 (64-byte but not128-byte aligned). Representative three-source pool
+shrinks2696→1800DW; no changed Q3 FPS result yet. Known-good module/X
+restored. Whole-pool fallback homogeneity guard is being completed before
+combined benchmark; hardware proof does not replace malformed-input proof.
+
+D16 compatible layout2 view and three-combiner reconstruction are retained
+in Mesabf7e75f. Full32768 producer pixels exact, source65536bytes unchanged,
+RGB32 control byte-exact, reconstructed normalized depth max1 UNORM8 step.
+Exhaustive rational arithmetic covers65536 stored codes; actual GPU proof
+covers32 boundary codes. Frontend generation/filter/feedback and comparison
+semantics remain open; CPU/GPU quantization equality is not established.
+
+Shader-depth host diagnostic integrated24a7a08/6fa7e79: exact14-instruction
+custom upload provenance, five initialized independent owned BOs, actual
+emitted matrix clip checks, bounded stop-on-first-failure and independent
+read-only depth consumer. Combined build/CPU suite PASS (fafb08a); native
+execution NOT RUN. No general shader-depth cap or normal admission change.
+Corrected unequal-W retry remains pending explicit approval following
+automatic review rejection for previous wedge/service disruption risk.
+
+One combined1024x768 windowed glmark rotation (cf506c9) has texture208FPS
+smoke; buffer shader link fails unsupported fexp2. Printed buffer67FPS,
+zero exit status and score136 are invalid rendering/performance evidence.
+Vendor exp/log and matrix-lighting RE continue; fullGL2 remains incomplete.
+
+## 2026-10-05 one subpage Q3 run and D16 sampler integration
+
+Final whole-pool fallback homogeneity patch ac6d10f rejects mixed12/13
+contracts before extracting any ordinal; combined build/full CPU PASS.
+Hardware proof aa6010e and ONE Q3 run a652a8a are retained. Matching
+1024x768 fullscreen/uncompressed/aniso1/FAA0 Q3 reaches31.8FPS versus31.7:
+ballpark flat. Accepted10808async requests/25778segments remain unchanged.
+Source pool20900500→9681604DW (-53.7%); useful9643004DW, padding11257496→38600
+(-99.66%). Feature retained; submission boundaries/dispatch/presentation are
+next, not another repeated benchmark. All8 merged sanity frames match and
+known0f/X1920/boot restored unchanged.
+
+D16 sampler feature integrated697e46c, combined build/full CPU retained
+f12d721. Both originalD16 and GPUdepthshadow defaultoff. Three generations
+sourcebyteidentity and all18raw imagecases retire; strictCPU/GPU equality
+fails (nearest max1 colour step, linear max2), retained explicitly. Separate
+comparison2filters/full images/source exact, GPUdepthconversion bypassed.
+No default promotion/performance claim. Next texture gap: GPU scaled RGBA8
+blits, currently CPUmapped for scaled cases; vendor grounding underway.
+
+## 2026-10-05 submission attribution
+
+Optional counters e124bae/bf267d9 and frame-report correctionbebf583 change
+no scheduling. Signed native attribution43203fe retains the initial
+shutdown-only missing-output run and corrected100frame snapshots. Both
+eight-frame sanity images exact, known-good0f/X/boot restored. Corrected
+Q3 framebuffernative_shared1/1024x768 measured directly. Stable300→400
+interval:24drains/frame beforeRGB5A1eligibility (13indexed),13indexed→ordinary,
+26ordinary→indexed,2indexedcapacity,3ordinarycapacity,1flushresource and
+1fill→draw. Explicitwait/flush addzero new drains inthis interval; counts
+are attempts, not timing. Diagnostic31.6FPS is attribution evidence only.
+
+Next implementation shares read-only structural/cached rejection checks
+before repack drainage, still runs existing preparation for bookkeeping,
+preserves actualrepack/restore ordering. Mixedordinary/indexed transport
+remains a separate major grammar/ownership feature, not a blind drain removal.
+GPUscaledRGBA8 firstnativecase RGBexact/alpha255incorrect, source/postcopy
+identity preserved; explicit sampledRGBA combiner correction under test.
+Lighting template remains host-only: freshvendor signedT3consumer findings
+require corrected biased output oracle before native execution.
+
+## 2026-10-05 rejected repack scheduling improvement
+
+Integrated7259414 shares structural/cached RGB5A1 eligibility before draining,
+still calls preparation for identical bookkeeping and preserves actual
+repack/restore conditions. Actual-code11case oracle and combinedbuild/fullCPU
+PASS (78ec548). Paired old/new native8frame images match exactly, four actual
+1555 selections each, covering binary/fractional alpha, cache/generation and
+mip rejection. ONE1024fullscreen/uncompressed/aniso1/FAA0 Q3 run32.9FPS
+versus prior diagnostic31.6 (ballpark4%); repackpreflight drains24→0/frame,
+totalasync69–70→59/frame, CPUuploadsubmit12.36–12.47→11.14–11.39ms. Actual
+indexed10808requests unchanged, allret0/nonzero fence, explicitwait/sync/
+fallback0. Known0f/X1920/boot restored. Full signed campaign integration
+pending geometry agent; no repeated control.
+
+Next major batching contract reservedGET42/reloc14 for ordered owned ordinary
+97 plus indexed8b segments, preservingGET41/13 and all older source contracts.
+This is a CPU/parser design stage, not native support. Separate fullGL2
+lighting fixturef97ece6 compiles with mergedpreflight (aeea1cb), native remains
+unexecuted. Scaled GPU RGBA8 paired-pipe candidate passed12native cases
+(nearestexact/linearmax1/sourceunchanged); noninteger resize validation pending.
+
+## 2026-10-05 native signed matrix and GPU scaled blits
+
+Root matrix-only native prooffe326cd uses reviewed fixtured795467/diag
+53a3ff42... underlock60secouter/2secfences, orthographicW1, opcodeA only.
+Ordinary sampledRGBA controlPASS; five signed/bx2/bias/source-generation
+phases63982checkedpixels each/zeroerrors (colour tolerance2), fullD24/stencil
+unchanged, everyword of source+three16MiB helpers unchanged, independent
+readonlydepthconsumerPASS. Actual15instruction uploaded code/entry retained,
+raw fivecolour/fivedepth snapshots fetched. Boot/X unchangedhealthy, no
+module/prefixchanges. Independent offline decode pending; spatialtexture/
+perspective/normalization/specular/deluxe/fullQ3lighting remain open. Previously
+held correctedperspective/depthopcodeE workflows were not executed.
+
+GPUscaledRGBA8 integrated1d70cb9: default-off option, originalownednative
+RGBA8 distinctlevel0BOs/fullsource/inboundsdest; nearest admits provenhalf/
+doubleperaxis, linear admitspositive scales. Twelve nativehalf/doublecases
+pass (nearestexact/linearmax1), fractional333x197linearpass/max2 versusCPU,
+source/exterior/alpha/postsampling preserved. Two firstalpha255 failures
+resolved by normal originalpairedpipe+explicitMOVRGBA; fractionalnearest
+boundaryfailure retained and usesCPUfallback. Unsupportedmasks/flips/scissor/
+crops retainfallback; broadblitcoverage next. Combinedbuild verification pending.
+
+2026-10-05 combined verification update: main c97ff04 build and complete
+target CPU suite pass with matrix/scaled/preflight changes integrated.
+Independent raw matrix checker e3ef04b/evidence350343b passes all five cases
+with exact RGB, 7381 interior and 56491 exterior pixels per phase and all
+65536 D24S8 words unchanged. Scope remains constant texture/orthographic;
+spatial normal reconstruction, normalization and full GL2 lighting are open.
+Corrected FAA test9f43eac passes ten textured depth-occlusion frames at
+1024x768 (228855 interior pixels/frame,20 draw batches,10 resolves). The
+earlier combined run was256x256; d29082f corrects that documentation.
+D16/scaled options off during FAA; main development FAA off. No FPS claim.
+Mixed ordinary/indexed GET42/reloc14 parser and flipped/scissored full-source
+blits remain in agent worktrees, not delivered features.
+
+2026-10-05 follow-up: main2cf971f excludes coordinate-only branches from
+shared-load pass-unit component demand; LOD/unknown uses remain conservative.
+CPU cases prove one/two-component allocation and genuine over-capacity rejection.
+Native5db96be proof passes three shared-XY texture/changing-Z phases at1024x768
+with both colour carriers, zero RGB errors outside2-step tolerance/GL0.
+Flipped/scissored GPU copies integratedd47a002 pass24 native cases; bounded
+cropped blits integrated96f6871 pass16 native cases on isolated agent build,
+nearestexact/linearmax2, fullsource/exterior/alpha/postsample preserved.
+Scaled-blit flag remains off by default; cropped linear enlargement falls back.
+Spatial matrix fixture84f91e7 is host-proven only: automatic review rejected
+its upload and explicit approval is pending; no native spatial claim.
+Vendor scalar WARP f01dc1e fresh EXP/LOG/EXPP/LOGP uploads independently checked;
+original91/92 tuple instructions differ from full scalar expansion. No GPU
+semantic or generic fragment exp/pow claim. FullQ3lighting remains open.
+
+2026-10-05 mixed/presentation update: kernel mixed admission integrateda652542
+and full module build800824a pass, default-off/unloaded. Mesa pure assembly
+foundationb5bd61d and combined proof2db31a9 pass39 focused actual-code cases,
+including lossless227-draw4086DWORD→two bounded replay chunks. Context wiring
+and native mixed ordering/performance remain pending. Benchmark helper0d3612e
+rejects excessive console entries before config/GPU changes; existing matching
+Q3 recipe16entries is within ioq3 limit32, so current32.9FPS is unaffected.
+Corrected restricted GL2 readiness capture reaches q3dm6 gameplay at1024x768.
+Actual presentation is RGBA8→BGRA-X with full-height vertical source flip;
+current blit destination format gate rejects it. First BGRA-X test pixels pass
+via fallback with zero GPUmarkers; no acceleration claim yet. See retained
+campaign/results/depth-sampling-20261005/texture-cropped-q3-gameplay.png/log.
+Normal route vendor70da778 confirms dependent RG and FLOAT4basis/viewW
+translation only; cube normalization and complete Q3 lighting remain open.
+
+2026-10-05 presentation/mixed progress: nearest RGBA8→native BGRX
+presentation integrated0cc211b. ExactRGBidentity/Xzero swizzle admits real
+Mesa frontend copy;4GPUnearest/4linearfallback cases and12pairedimages exact.
+Restricted Q3 gameplay logs ten actual1024x768 GPUpresentation copies.
+Large BGRXlinear prototype retires butmax7error, retainedfailure/fallback;
+existingRGBAlinear remains. GPUcopy already uses asynchronous aggregate/fence
+framework, so no redundant submission route added. ONErestrictedHDR1/toneMap0
+normal/spec/deluxe0 estimate16.8FPS is unmatched prior profile, not fullGL2.
+Combined4902dd4 build/fullCPU passes; no combinedGPU/perf claim.
+Mixed bridge e1af656/firstevidence3185e33 retains nonclaim: automaticindexing
+prevented interleaving. Corrected true5frame request rejects beforedoorbell;
+CPU identifies primitiveprefix2305c→6305c finalstate checker mismatch, fix
+pending. Known-goodmodule/X restored. Full goals/GL1>40/fullGL2>15 remain open.
+
+2026-10-05 mixed batching now native-verified: narrow finalprimitive correction
+de030ba/fullmodule d31d631 admits legitimate2305c→6305c prefixes and retains
+reverse/unknown rejection. Eight genuine5frame mixed requests and ordered
+fallback images/source/depth all pass12845cf/5314d7f. ONE matching1024x768,
+uncompressed, FAAoff GL1 run reaches36.7FPS versus32.9 (~11.6% estimate),
+59→28async/frame,0sync/fallback/explicitwait and unchanged GPUgeometry.
+Integrated evidence3a8ba4e checkerPASS; runtime5314d7f/core48cd2d9 build and
+fullCPU evidence0158235. Known-good0f/X1920/boot unchanged restored.
+Next major admission gaps are ordinary9/10/11 fetch layouts and large owned
+frames; query43/reloc15 reserved for a separate contract, not yet implemented.
+
+GL2 linked-input liveness180cb97/evidence369ffa6 allocates fetch ports after
+unused outputs and inputs are pruned. FullCPU and144native cases pass
+(96GPU/48fallback); corrected10frame gameplay shows155GPUlinked draws and
+10presentation copies after readiness with existing FLOAT4 optin enabled.
+No performance estimate yet for this change. Earlier16.8 remains restricted
+HDR1/basic profile; full normal/specular/deluxe lighting remains incomplete.
+AG-only normal repack upload was specifically rejected by automatic approval
+review; explicit artifact/destination permission pending, no native result.
+Spatial matrix and unequal-W retries remain separately held. No bypass.
+
+2026-10-05 actual installed glmark buffer shaders retained in Mesa1305d58.
+The exponential input is min(dist.xyz*dist.w), not a uniform or plain fog
+coordinate. Independent equal-W triangle counterexample gives correct centre
+intensity1/256 versus1 if evaluated at vertices then interpolated. A genuine
+per-fragment backend is required; VS EXP or broadening CPU fog evaluation
+would not close this feature. Existing buffer printedFPS remains invalid.
+Combined linked-input library accd534a... upload specifically rejected;
+explicit artifact/destination approval pending, no combined benchmark yet.
+
+2026-10-05 vendor normal radius groundtruth integrateddf521a5/1c64ac9.
+Fresh split,scale2,clamp andcorrectedbias variants emit actual13VS and264-byte
+draw payloads; SHAmanifest andindependent65536bytepair checks pass. CMP
+078380aa, signed/saturated subtract126c00500600/01500600 andbiasMAD028381ca
+establish translation only. Undefined-alpha initialprobe has no payload and
+is retainednegative despiteDDRVAL0. No nativeprecision, sqrt/rsq orfinal
+normalization claim. Remaining major GPURGBdomain normalization andwide
+mixed batching are beingimplemented andmust pass their CPU/native gates.
+
+2026-10-05 GPU finiteRGBdomain6972f31 combinedcbcf256 build/fullhostCPU pass.
+Signed/overbrightRGB normalization usesGPU ADD/MUL andexistingFScompensation,
+alphaunchanged/currentuniforms/pendingvertexpublish beforedomainmutation.
+OwnedFS trial refusesdomain growth thatoutgrowscombiner slots. Defaultoff;
+nativequeued-domain/texture/depth/alpha controls pending, no newFPS.
+Kernelordinarywideb81affa/buildproof8f5c797 passes; separate43/15 exactwidths
+6/8/9/10/11 andordinarywholeframe16k, indexed4096 unchanged/old14unchanged.
+Frontend andnativeproof pending. Cube473eb24/c5004b3 exact22/29VS setup is
+MAX/reciprocalpreconditioning, notEXP/RSQ; pervertexscaling changes spatial
+interpolation (independent0.23306componenterror). Fullnormalization remainsopen.
+
+
+## Integrated host checkpoint: normal producer, cube tails and flip fences
+
+Mesa2534810 integrates normal-map AG producer NIR builders: separate
+4(A-.5)^2 and 4(G-.5)^2 scratch planes followed by clamped1-QA-QG.
+Actual compiler/packet evaluation passes256 random fragments per stage;
+combined overlay build and full CPU suite pass. The unsplit polynomial
+correctly refuses the combiner slot budget. GPU execution, scratch precision,
+sqrt, world-normal reconstruction and the full runtime multipass backend
+remain open; this does not enable full Quake3 GL2 lighting.
+
+Vendor full cube mip chains16/32/64 now provide measured tail XY and ownership
+fields before/after emitted draws. Independent storage model and existing
+cleanroom helpers match all43,002 texel offsets exactly, with bounds,
+non-overlap and unused-byte preservation checks. No storage rewrite is needed.
+Native normalization orientation/filtering and dependent sampling remain open.
+
+Kernelcfea2a3 fixes implicit render-fence capture before async-flip promotion.
+Existing original scanout allocation, Mesa/DDX flags and buffer policy were
+already wired. Pending/error render fences now retain the normal nonblocking
+commit worker wait; completed implicit fences retain the immediate flip path.
+Actual-function CPU contract and module build pass. Native queued-render/flip
+pixels, display identity and performance remain unproved.
+
+The matching GL1 timedemo proof checker was rerun:387frames/10.5seconds,
+36.7FPS,1024x768 fullscreen/uncompressed/aniso1/FAAoff. This belongs to the
+isolated mixed candidate; active target remains production1f5318b with restored
+known-good0f driver and1920x1200 desktop. Restricted GL2 remains16.8FPS;
+full normal/specular/deluxe effects have no valid FPS result. New changes
+above are host-only. The pinned wide-domain deployment bundle remains held
+pending explicit user approval after automatic approval-review rejection.
+
+
+Rendering priority follow-up: full glmark2 and Q3GL2 now take precedence.
+Kernel7c70f2b supersedes early stored implicit-fence capture: a temporary
+readiness snapshot preserves normal fresh WRITE-fence capture; an async-only
+late dependency guard rejects unfinished scanout before pin/programming.
+CPU oracle includes a new writer after the early snapshot; module build
+passes. No target deployment or hardware pixel claim.
+Vendor nonlinear controls d719468 verify exact fog tables but no actual
+fragment EXP/LOG/POW draw. Accepted TEXCOORD/dependent-dot matrix capture
+provides a possible glmark2 route, with unit-domain clamp and precision
+constraints still unresolved. Runtime multipass implementation is underway;
+normal/specular/deluxe effects and full glmark2 rendering remain incomplete.
+
+
+Current full-rendering integration checkpoint: Mesa runtime05cbe2f and
+dependent scalar dcec282 now coexist with RG normal producer d3a9666 and
+direct normal-Z helper db882eb. Combined build and CPU suite pass. The
+runtime backend is callable but has no complete full-lightall graph caller.
+Vendor buffer emitter54258b2 independently matches all56 combiner writes;
+resource/code binding and precision remain open. No new target deployment.
+
+Direct normal helper tests distinguish exact RG8 knots from continuous
+bilinear sampling. Texel-center mapping matters; ideal endpoint-aligned
+lookup error does not certify raw normalized dependent coordinates. All-mip
+GPU repacking must preserve original filtering and prove sampler storage.
+The installed79-file glmark shader snapshot80d82ad covers source requirements
+beyond buffer: terrain, refraction, shadow/FragCoord and multi-tap paths.
+Static inventory does not establish scene pass/fail. Full GL2 and complete
+glmark rendering remain unfinished; latest measured36.7GL1/16.8restrictedGL2
+are unchanged. The exact-artifact upload approval holds remain in force.
+
+2026-10-05 fresh deployed FAA regression: original0528 on unchanged boot
+8d9d7a3b-db70-4d7d-9870-db28b50f0feb and known DRM0f7d564 passes ten
+textured depth-occlusion frames at1024x768:228855 interior pixels/frame,
+20 FAA draw batches,10 resolves. Deployed library SHA256
+650081772438ad952eb02f9bdee7bf410651d13088ef989de725a1e01cece283.
+Existing test only, bounded flock/45sec, no upload/module/config changes.
+X and boot preserved. Host log wip/gpu-features/faa-current-deployed-20261005.log.
+This does not validate the newer host-only GL2 commits or measure throughput.
+
+Main Mesa d6a9ce6 integrates07929c0 normal resource caches,f0ca9b5 projective
+NIR links,7ac20e8 owned linked FS,6d3aca3 owned hardware projective VS,
+9ce19b0 per-stage VS binding/restoration,064cd60 repeated-index packing memo,
+and d6a9ce6 seven independent Windows-emulator dependent filter captures.
+Combined build/full CPU suite pass; actual replay and ownership contracts pass.
+Full lightall stage selection, intermediate precision and native coordinates
+remain unproven; no new Q3 FPS measurement or full GL2 admission.
+
+2026-10-05 host integration checkpoint7a52cb4:9ece93a restores pureXY
+window-only expressions before floor/carrier lowering, recognizes real
+load_frag_coord and keys lookup cache by actual framebuffer extents. CPU
+window table generation remains the fallback; GPU nearest sampling consumes
+tables. Installed conditional/function/constant-loop host proofs pass; dynamic
+loops and native full-scene rendering remain open. Exact isolated window
+payload staging was rejected by automatic approval review, pending explicit
+user approval; no upload or GPU run occurred.
+
+ed61b7c links up to four original expressions through one projective varying;
+e4f41fa derives actual SSA predecessor/root sets and deterministic stage order,
+including separate original alpha/discard dependencies. These do not certify
+physical BRDF kernels or intermediate storage precision.7a52cb4 removes
+private-FBO plain submission-flush waits and linear resolves, preserving legacy
+end-of-frame/display/shared/finish/fence-FD behavior. Actual callback oracle
+256 combinations/failures passes. Combined build/full CPU suite and scratch
+replay/vertex ownership contracts pass. Hardware/FPS proof is still pending.
+
+2026-10-05 requested target benchmark: one matching main7a52cb4/core48cd2d9
+run on existing mixed kernel937bd13 yields387frames/10.5sec/**37.0FPS**,
+1024x768 fullscreen/uncompressed/aniso1/FAAoff,vsync0/com_maxfps0.
+Library77b9f83370dd3b2edc936d1c04a0a3348235b9148e0253fd6c00129c13866a2b.
+Compared with prior36.7 this~0.8% difference does not establish a reliable
+isolated gain.8dense image hashes match;6121accepted mixed requests,
+47910ownedframes,28async submits/frame,0sync/fallback,126.8GPUtransformdraws.
+Known0fmodule/X1920x1200 restored, boot unchanged. Retained compressed logs,
+manifest and checker committed main2caf0e3 tests/integration-bench-20261005.
+User now requests finish this agent round then shutdown for P690 swap;
+no further target tests start this round. FullGL2stillunmeasured/restricted16.8.
+
+Host-only followups:dcd7af5/00c9070 retain GPU transforms for uniform depth
+with correct clipped software tail;54b3b05 retains complete GPU triangle
+prefixes before crossing;42f2c30 adds unequal-W BC1 bilinear/trilinear oracle.
+b8923e9 actual P690 vendor range block720cases does not prove native >2draw
+safety.193ad43 refuses alpha-companion perspective/projective draws whose
+stream omits denominators; full alpha remains open. Kernelec20aff rejects
+late attachment base rewrites; full pitch/scissor/destination extent remains
+open. Kernela51792f shares active-output selector for cursor; readiness gates
+remain unchanged, dual-head/reset remain open. These were not in37.0FPSrun.
+
+2026-10-05 round-end: mainf25811d actual original-IR chain construction
+compiles linked producers/final colour+discard, both orientations, derived
+GPU VS, owned source sampler/view copies and scratch, with rollback. It
+refuses missing physical kernels and uncertified storage; no full-lightall
+app admission. Final combined build/full CPU suite and actual constructor/
+replay contracts PASS; local library763c14410d46eb6df7f4e6e5f7006846ca07c7cd95ed5e140672e207a0f15cfb
+not uploaded. All agents stopped. User-authorized normal poweroff executed
+under hardware lock,rc0; target no longer reachable over SSH. Prepared for
+physical P690 swap. Production module/Mesa had been restored before shutdown.
