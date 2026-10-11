@@ -1,0 +1,122 @@
+From 50ed2c423d1c007c0e859dfbf9e00453a5d6e7e0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Fri, 9 Oct 2026 13:26:20 +0200
+Subject: [PATCH] nir/draw: aapoint lowering for shaders with lowered IO
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+nir_lower_aapoint_fs read its coverage input through a shader_in variable
+and scaled alpha only in store_deref, so on a driver taking io_lowered
+NIR the smooth-point coverage was neither read nor applied: smooth points
+came out as squares.  Read the input with load_interpolated_input at its
+location and driver location, record it in inputs_read, and scale the
+alpha component of store_output as well, including stores of a single
+component, as the aaline lowering does since its own lowered-IO fix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ src/gallium/auxiliary/nir/nir_draw_helpers.c | 59 +++++++++++++++-----
+ 1 file changed, 46 insertions(+), 13 deletions(-)
+
+diff --git a/src/gallium/auxiliary/nir/nir_draw_helpers.c b/src/gallium/auxiliary/nir/nir_draw_helpers.c
+index c789867..c944314 100644
+--- a/src/gallium/auxiliary/nir/nir_draw_helpers.c
++++ b/src/gallium/auxiliary/nir/nir_draw_helpers.c
+@@ -328,24 +328,34 @@ nir_lower_aapoint_block(nir_block *block,
+          continue;
+ 
+       nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+-      if (intrin->intrinsic != nir_intrinsic_store_deref)
++      unsigned location, frac, value_src;
++
++      /* Lowered IO stores through store_output, possibly one component. */
++      if (intrin->intrinsic == nir_intrinsic_store_output) {
++         location = nir_intrinsic_io_semantics(intrin).location;
++         frac = nir_intrinsic_component(intrin);
++         value_src = 0;
++      } else if (intrin->intrinsic == nir_intrinsic_store_deref) {
++         nir_variable *var = nir_intrinsic_get_var(intrin, 0);
++         if (var->data.mode != nir_var_shader_out)
++            continue;
++         location = var->data.location;
++         frac = var->data.location_frac;
++         value_src = 1;
++      } else {
+          continue;
+-
+-      nir_variable *var = nir_intrinsic_get_var(intrin, 0);
+-      if (var->data.mode != nir_var_shader_out)
++      }
++      if (location < FRAG_RESULT_DATA0 && location != FRAG_RESULT_COLOR)
+          continue;
+-      if (var->data.location < FRAG_RESULT_DATA0 && var->data.location != FRAG_RESULT_COLOR)
++      if (!((nir_intrinsic_write_mask(intrin) << frac) & BITFIELD_BIT(3)))
+          continue;
+ 
+-      nir_def *out_input = intrin->src[1].ssa;
++      nir_def *out_input = intrin->src[value_src].ssa;
+       b->cursor = nir_before_instr(instr);
+ 
+-      nir_def *tmp = nir_fmul(b, nir_channel(b, out_input, 3), sel);
+-      nir_def *out = nir_vec4(b, nir_channel(b, out_input, 0),
+-                                  nir_channel(b, out_input, 1),
+-                                  nir_channel(b, out_input, 2),
+-                                  tmp);
+-      nir_src_rewrite(&intrin->src[1], out);
++      nir_def *tmp = nir_fmul(b, nir_channel(b, out_input, 3 - frac), sel);
++      nir_def *out = nir_vector_insert_imm(b, out_input, tmp, 3 - frac);
++      nir_src_rewrite(&intrin->src[value_src], out);
+    }
+ 
+ }
+@@ -358,7 +368,20 @@ nir_lower_aapoint_impl(nir_function_impl *impl, lower_aapoint *state,
+    state->b = nir_builder_at(nir_before_block(block));
+ 
+    nir_builder *b = &state->b;
+-   nir_def *aainput = nir_load_var(b, state->input);
++   nir_def *aainput;
++   if (b->shader->info.io_lowered) {
++      const nir_variable *in = state->input;
++      nir_def *bary = nir_load_barycentric_pixel(b, 32,
++                                                 .interp_mode = INTERP_MODE_SMOOTH);
++
++      aainput = nir_load_interpolated_input(b, 4, 32, bary, nir_imm_int(b, 0),
++                                            .base = in->data.driver_location,
++                                            .dest_type = nir_type_float32,
++                                            .io_semantics.location = in->data.location,
++                                            .io_semantics.num_slots = 1);
++   } else {
++      aainput = nir_load_var(b, state->input);
++   }
+ 
+    nir_def *dist = nir_fadd(b, nir_fmul(b, nir_channel(b, aainput, 0), nir_channel(b, aainput, 0)),
+                                 nir_fmul(b, nir_channel(b, aainput, 1), nir_channel(b, aainput, 1)));
+@@ -463,6 +486,14 @@ nir_lower_aapoint_fs(struct nir_shader *shader, int *varying, const nir_alu_type
+          highest_drv_location = var->data.driver_location;
+    }
+ 
++   /* Lowered IO may have no input variables left; its reads are the mask. */
++   if (shader->info.io_lowered && shader->info.inputs_read) {
++      highest_location = MAX2(highest_location,
++                              (int)util_last_bit64(shader->info.inputs_read) - 1);
++      highest_drv_location = MAX2(highest_drv_location,
++                                  (int)util_bitcount64(shader->info.inputs_read) - 1);
++   }
++
+    nir_variable *aapoint_input = nir_variable_create(shader, nir_var_shader_in,
+                                                      glsl_vec4_type(), "aapoint");
+    if (highest_location == -1 || highest_location < VARYING_SLOT_VAR0) {
+@@ -473,6 +504,8 @@ nir_lower_aapoint_fs(struct nir_shader *shader, int *varying, const nir_alu_type
+    aapoint_input->data.driver_location = highest_drv_location + 1;
+ 
+    shader->num_inputs++;
++   if (shader->info.io_lowered)
++      shader->info.inputs_read |= BITFIELD64_BIT(aapoint_input->data.location);
+    *varying = tgsi_get_generic_gl_varying_index(aapoint_input->data.location, true);
+    state.input = aapoint_input;
+ 
+-- 
+2.54.0
+

@@ -1,0 +1,123 @@
+From 7e694655e6ff70ce379736021b89cc90c2946068 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Fri, 2 Oct 2026 13:54:20 +0200
+Subject: [PATCH] gallium/nir: scan lowered fragment shader inputs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+nir_tgsi_scan_shader filled fragment input semantics only from input
+variables, so a shader with lowered IO reported every input as POSITION 0
+with constant interpolation.  The draw module's flatshade stage then copied
+the provoking vertex's position over the others whenever it ran (polygon
+mode, wide or stippled lines) and every such primitive collapsed to a point.
+The semantics and interpolation now come from the load intrinsics.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ src/gallium/auxiliary/nir/nir_to_tgsi_info.c | 75 ++++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+
+diff --git a/src/gallium/auxiliary/nir/nir_to_tgsi_info.c b/src/gallium/auxiliary/nir/nir_to_tgsi_info.c
+index 6addb18..4db1769 100644
+--- a/src/gallium/auxiliary/nir/nir_to_tgsi_info.c
++++ b/src/gallium/auxiliary/nir/nir_to_tgsi_info.c
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright 2017 Advanced Micro Devices, Inc.
++ * Copyright 2026 René Rebe <rene@exactco.de>
+  * All Rights Reserved.
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+@@ -247,6 +248,78 @@ static void scan_instruction(const struct nir_shader *nir,
+    }
+ }
+ 
++/* Lowered fragment inputs have no variables: take their semantics and
++ * interpolation from the load intrinsics, slotted like the outputs below. */
++static void scan_lowered_fs_inputs(const struct nir_shader *nir,
++                                   bool need_texcoord,
++                                   struct tgsi_shader_info *info)
++{
++   const uint64_t read = nir->info.inputs_read;
++
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic != nir_intrinsic_load_input &&
++                intr->intrinsic != nir_intrinsic_load_interpolated_input)
++               continue;
++
++            nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
++            unsigned interp = TGSI_INTERPOLATE_CONSTANT;
++            unsigned loc = TGSI_INTERPOLATE_LOC_CENTER;
++
++            if (intr->intrinsic == nir_intrinsic_load_interpolated_input) {
++               nir_intrinsic_instr *bary =
++                  nir_def_as_intrinsic(intr->src[0].ssa);
++
++               switch (nir_intrinsic_interp_mode(bary)) {
++               case INTERP_MODE_NOPERSPECTIVE:
++                  interp = TGSI_INTERPOLATE_LINEAR;
++                  break;
++               case INTERP_MODE_FLAT:
++                  interp = TGSI_INTERPOLATE_CONSTANT;
++                  break;
++               case INTERP_MODE_NONE:
++                  if (sem.location == VARYING_SLOT_COL0 ||
++                      sem.location == VARYING_SLOT_COL1) {
++                     interp = TGSI_INTERPOLATE_COLOR;
++                     break;
++                  }
++                  FALLTHROUGH;
++               default:
++                  interp = TGSI_INTERPOLATE_PERSPECTIVE;
++                  break;
++               }
++               if (bary->intrinsic == nir_intrinsic_load_barycentric_centroid)
++                  loc = TGSI_INTERPOLATE_LOC_CENTROID;
++               else if (bary->intrinsic == nir_intrinsic_load_barycentric_sample)
++                  loc = TGSI_INTERPOLATE_LOC_SAMPLE;
++            }
++
++            for (unsigned j = 0; j < sem.num_slots; j++) {
++               unsigned location = sem.location + j;
++               unsigned semantic_name, semantic_index;
++
++               if (location >= 64 || !(read & BITFIELD64_BIT(location)))
++                  continue;
++               unsigned i = util_bitcount64(read & BITFIELD64_MASK(location));
++
++               tgsi_get_gl_varying_semantic(location, need_texcoord,
++                                            &semantic_name, &semantic_index);
++               info->input_semantic_name[i] = semantic_name;
++               info->input_semantic_index[i] = semantic_index;
++               info->input_interpolate[i] = interp;
++               info->input_interpolate_loc[i] = loc;
++               if (semantic_name == TGSI_SEMANTIC_PRIMID)
++                  info->uses_primid = true;
++            }
++         }
++      }
++   }
++}
++
+ void nir_tgsi_scan_shader(const struct nir_shader *nir,
+                           struct tgsi_shader_info *info,
+                           bool need_texcoord)
+@@ -409,6 +482,8 @@ void nir_tgsi_scan_shader(const struct nir_shader *nir,
+    info->num_inputs = nir->num_inputs;
+    if (nir->info.io_lowered) {
+       info->num_inputs = util_bitcount64(nir->info.inputs_read);
++      if (nir->info.stage == MESA_SHADER_FRAGMENT)
++         scan_lowered_fs_inputs(nir, need_texcoord, info);
+       if (nir->info.inputs_read_indirectly)
+          info->indirect_files |= 1 << TGSI_FILE_INPUT;
+       info->file_max[TGSI_FILE_INPUT] = info->num_inputs - 1;
+-- 
+2.54.0
+

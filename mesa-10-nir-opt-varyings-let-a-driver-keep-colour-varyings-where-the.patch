@@ -1,0 +1,63 @@
+From 7848ab6d5e0c441118a2785ad1bf7a9d0ff8a4da Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Fri, 2 Oct 2026 23:11:33 +0200
+Subject: [PATCH] nir/opt_varyings: let a driver keep colour varyings where
+ they are
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+nir_opt_varyings compacts COL0/COL1 among themselves: it moves and
+rotates components, so a fragment shader may end up reading the
+secondary colour's RGB from COL0.yzw and the primary alpha from
+COL0.x.  Hardware whose fragment stage reads the two colours as fixed
+RGBA interpolators and can only replicate a channel, never rotate one
+(the Matrox Parhelia combiner), cannot run that.
+
+Add nir_io_dont_compact_color_varyings.  When the consumer sets it,
+colour slots are left out of compaction.  Dead-component elimination
+and the other optimisations still apply.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ src/compiler/nir/nir_opt_varyings.c            | 4 ++++
+ src/compiler/nir/nir_shader_compiler_options.h | 7 +++++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/src/compiler/nir/nir_opt_varyings.c b/src/compiler/nir/nir_opt_varyings.c
+index 0145227..476568f 100644
+--- a/src/compiler/nir/nir_opt_varyings.c
++++ b/src/compiler/nir/nir_opt_varyings.c
+@@ -5629,6 +5629,10 @@ compact_varyings(struct linkage_info *linkage,
+                                            col0, col0 + 15, 0);
+       }
+ 
++      if (linkage->consumer_builder.shader->options->io_options &
++          nir_io_dont_compact_color_varyings)
++         has_colors = false;
++
+       if (has_colors) {
+          unsigned color_channel_rotate = 0;
+ 
+diff --git a/src/compiler/nir/nir_shader_compiler_options.h b/src/compiler/nir/nir_shader_compiler_options.h
+index 8f0e9a7..1f64347 100644
+--- a/src/compiler/nir/nir_shader_compiler_options.h
++++ b/src/compiler/nir/nir_shader_compiler_options.h
+@@ -232,6 +232,13 @@ typedef enum {
+     */
+    nir_io_compact_to_higher_16 = BITFIELD_BIT(13),
+ 
++   /**
++    * Whether colour varyings must keep their components where the shaders
++    * put them.  For hardware whose fragment stage reads COL0/COL1 as fixed
++    * RGBA interpolators and cannot rotate channels.
++    */
++   nir_io_dont_compact_color_varyings = BITFIELD_BIT(14),
++
+    /* Options affecting the GLSL compiler or Gallium are below. */
+ 
+    /**
+-- 
+2.54.0
+

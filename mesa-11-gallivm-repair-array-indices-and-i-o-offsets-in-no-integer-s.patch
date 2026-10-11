@@ -1,0 +1,98 @@
+From 730986bf7042cfb9458b106a146ad36fe50608ff Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Sat, 3 Oct 2026 05:10:29 +0200
+Subject: [PATCH] gallivm: repair array indices and I/O offsets in no-integer
+ shaders
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+For a no_integers shader (the parhelia vertex stage, which draw runs
+through gallivm), lp_build_nir_soa_prepasses() lowers integers to
+floats.  It then casts the UBO sources back to integers, but array deref
+indices and I/O offsets also carry integer contracts.  After
+nir_lower_int_to_float they held float bits, so any variable index into
+a temporary, input or output array addressed garbage.  m[col] read the
+wrong element, dst[index] = ... wrote the wrong one, and the TGSI path
+(DRAW_USE_LLVM=0) segfaulted in fetch_source on the same shaders.
+
+The fixup pass now also casts array deref indices and the offset source
+of every I/O intrinsic back with f2i32.  A constant index becomes an
+integer constant, so paths that need a constant index keep one.
+
+MEASURED on the Parhelia P690, variable-indexing + temp-array-indexing
++ GL 2.0/builtin lists (1486 tests): 73 FAIL -> PASS (vs-temp-*,
+vs-varying-*, vs-temp-array-*-wr), no PASS -> FAIL.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ .../auxiliary/gallivm/lp_bld_nir_lower.c      | 45 ++++++++++++++++++-
+ 1 file changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/auxiliary/gallivm/lp_bld_nir_lower.c b/src/gallium/auxiliary/gallivm/lp_bld_nir_lower.c
+index 01f5dcf..0cb7a20 100644
+--- a/src/gallium/auxiliary/gallivm/lp_bld_nir_lower.c
++++ b/src/gallium/auxiliary/gallivm/lp_bld_nir_lower.c
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright 2026 Pavel Ondračka <pavel.ondracka@gmail.com>
++ * Copyright 2026 René Rebe <rene@exactco.de>
+  * SPDX-License-Identifier: MIT
+  */
+ 
+@@ -145,9 +146,49 @@ no_integer_intrinsic_fixup(nir_builder *b, nir_intrinsic_instr *intr,
+ 
+ }
+ 
++/* Array indices and I/O offsets are integer contracts too: after
++ * nir_lower_int_to_float they hold floats of the index, so a variable index
++ * into a temporary, input or output array addressed float bits. */
++static bool
++no_integer_index_fixup(nir_builder *b, nir_instr *instr, void *data)
++{
++   if (instr->type == nir_instr_type_deref) {
++      nir_deref_instr *deref = nir_instr_as_deref(instr);
++
++      if (deref->deref_type != nir_deref_type_array &&
++          deref->deref_type != nir_deref_type_ptr_as_array)
++         return false;
++      b->cursor = nir_before_instr(instr);
++      /* A constant index stays a constant for the paths that need one. */
++      nir_src_rewrite(&deref->arr.index,
++                      nir_src_is_const(deref->arr.index) ?
++                      nir_imm_intN_t(b, (int64_t)nir_src_as_float(deref->arr.index),
++                                     deref->arr.index.ssa->bit_size) :
++                      nir_f2i32(b, deref->arr.index.ssa));
++      return true;
++   }
++   if (instr->type == nir_instr_type_intrinsic) {
++      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++      nir_src *offset;
++
++      if (intr->intrinsic == nir_intrinsic_load_ubo ||
++          intr->intrinsic == nir_intrinsic_load_ubo_vec4)
++         return no_integer_intrinsic_fixup(b, intr, data);
++      offset = nir_get_io_offset_src(intr);
++      if (!offset || offset->ssa->bit_size != 32)
++         return no_integer_intrinsic_fixup(b, intr, data);
++      b->cursor = nir_before_instr(instr);
++      nir_src_rewrite(offset, nir_src_is_const(*offset) ?
++                      nir_imm_int(b, (int)nir_src_as_float(*offset)) :
++                      nir_f2i32(b, offset->ssa));
++      return true;
++   }
++   return false;
++}
++
+ bool
+ lp_nir_no_integer_intrinsic_fixup(nir_shader *shader)
+ {
+-   return nir_shader_intrinsics_pass(shader, no_integer_intrinsic_fixup,
+-                                     nir_metadata_control_flow, NULL);
++   return nir_shader_instructions_pass(shader, no_integer_index_fixup,
++                                       nir_metadata_control_flow, NULL);
+ }
+-- 
+2.54.0
+

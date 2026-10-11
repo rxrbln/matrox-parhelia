@@ -1,0 +1,51 @@
+From c5db16b0dceb57d73feb90b0ef77812b17a65867 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Fri, 2 Oct 2026 22:55:05 +0200
+Subject: [PATCH] draw: choose the polygon-offset mode per triangle when the
+ faces differ
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+offset_first_tri() picks the fill mode - and so whether to offset - from
+the first triangle's facing and then latches that decision for every later
+triangle until the next flush.  With different front and back polygon
+modes the latched choice is wrong for the other facing, and a zero-area
+first triangle, which the clipper emits as a sliver and the cull stage
+passes on with det 0, has no facing at all and selects the front mode.
+
+Keep deciding per triangle while fill_front differs from fill_back, as the
+unfilled stage already does; equal modes keep the latched fast path.
+
+Measured on the Matrox P690 (parhelia, draw-module rasterisation):
+polygon-mode-offset configs 3 and 4 (front GL_LINE, back GL_FILL) fail ->
+pass; polygon-mode, polygon-offset and gl-1.4-polygon-offset unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ src/gallium/auxiliary/draw/draw_pipe_offset.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/auxiliary/draw/draw_pipe_offset.c b/src/gallium/auxiliary/draw/draw_pipe_offset.c
+index d1ad5ab..55a7d4c 100644
+--- a/src/gallium/auxiliary/draw/draw_pipe_offset.c
++++ b/src/gallium/auxiliary/draw/draw_pipe_offset.c
+@@ -193,8 +193,12 @@ offset_first_tri(struct draw_stage *stage,
+       offset->units = 0.0f;
+    }
+ 
+-   stage->tri = offset_tri;
+-   stage->tri(stage, header);
++   /* Differing front and back modes are chosen per triangle: latching the
++    * first one's decision misapplies it to the other facing, and a zero-area
++    * first triangle (a clipper sliver) has no facing at all. */
++   stage->tri = rast->fill_front == rast->fill_back ? offset_tri :
++                                                       offset_first_tri;
++   offset_tri(stage, header);
+ }
+ 
+ 
+-- 
+2.54.0
+

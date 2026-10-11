@@ -1,0 +1,69 @@
+From: René Rebe <rene@exactco.de>
+Subject: [PATCH] loader/dri3: use a single back buffer on the Matrox P690
+
+The P690 exposes only three proven native render-target origins.  With the
+X front pinned, one colour and one depth BO fit exactly; a second
+asynchronous DRI3 back buffer forces both client BOs through TTM on every
+Present.  Present's idle fence already orders the reuse, so a P690 renderer
+keeps one back buffer, or two while Present flips.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+--- a/src/gallium/frontends/dri/loader_dri3_helper.h
++++ b/src/gallium/frontends/dri/loader_dri3_helper.h
+@@ -130,6 +130,7 @@
+    /* Information about the GPU owning the buffer */
+    bool multiplanes_available;
+    bool prefer_back_buffer_reuse;
++   bool single_back_buffer;
+    struct dri_screen *dri_screen_render_gpu;
+    /* dri_screen_display_gpu holds display GPU in case of prime gpu offloading else
+     * dri_screen_render_gpu and dri_screen_display_gpu is same.
+--- a/src/gallium/frontends/dri/loader_dri3_helper.c
++++ b/src/gallium/frontends/dri/loader_dri3_helper.c
+@@ -278,6 +278,16 @@
+ static void
+ dri3_update_max_num_back(struct loader_dri3_drawable *draw)
+ {
++   if (draw->single_back_buffer) {
++      /* A pixmap Present flipped to is released only when the next flip
++       * completes, so a single back buffer would deadlock: the client waits
++       * for an idle notify that its own next present has to produce.
++       */
++      draw->max_num_back =
++         draw->last_present_mode == XCB_PRESENT_COMPLETE_MODE_FLIP ? 2 : 1;
++      return;
++   }
++
+    switch (draw->last_present_mode) {
+    case XCB_PRESENT_COMPLETE_MODE_FLIP: {
+       if (draw->swap_interval == 0)
+@@ -407,6 +417,16 @@
+    draw->dri_screen_display_gpu = dri_screen_display_gpu;
+    draw->multiplanes_available = multiplanes_available;
+    draw->prefer_back_buffer_reuse = prefer_back_buffer_reuse;
++   /* P690 exposes only three proven native render-target origins.  With the
++    * X front pinned, one colour and one depth BO fit exactly; allocating a
++    * second asynchronous DRI3 back buffer forces both client BOs through TTM
++    * on every Present.  Present's idle fence already provides the ordering
++    * needed to block and safely reuse a single back image.
++    */
++   const char *renderer = dri_screen_render_gpu->base.screen->get_name(
++      dri_screen_render_gpu->base.screen);
++   draw->single_back_buffer = renderer &&
++      !strncmp(renderer, "Matrox P690", strlen("Matrox P690"));
+    draw->queries_buffer_age = false;
+ 
+    draw->have_back = 0;
+@@ -726,6 +746,11 @@
+     */
+    int current_back_id = draw->cur_back;
+    do {
++      /* Completion events processed below can change the present mode, and
++       * with it how many back buffers this drawable may use.
++       */
++      dri3_update_max_num_back(draw);
++
+       /* Find idle buffer with lowest buffer age, or an unallocated slot */
+       for (b = 0; b < max_num; b++) {
+          int id = LOADER_DRI3_BACK_ID((b + current_back_id) % LOADER_DRI3_MAX_BACK);

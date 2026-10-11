@@ -1,0 +1,65 @@
+From 8de5ed4263e6f1af2677e4e6a511d50a90dd8398 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Fri, 2 Oct 2026 22:55:10 +0200
+Subject: [PATCH] mesa: map user-array bits before masking them with the draw's
+ arrays
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+_mesa_get_derived_vao_masks() combined the unmapped VAO masks with the
+mapped @enabled_attribs before it applied the POS/GENERIC0 attribute
+mapping.  Take a compatibility-profile fixed-function draw whose
+position comes from glVertexAttribPointer(0, ...) in client memory
+(ATTRIBUTE_MAP_MODE_GENERIC0).  The mapped mask has POS set and the
+unmapped user mask has GENERIC0 set, so the intersection lost the
+array and the mapping step had nothing to move.  The state tracker
+then took the "no user buffers" fast path and dereferenced the NULL
+BufferObj of that binding in st_update_array_templ().
+
+Classify user and non-zero-divisor arrays in the VAO's own attribute
+space, apply the mapping, then restrict the result to the enabled
+arrays.
+
+Reproduced on the Parhelia driver with an 8-line program
+(glVertexAttribPointer(0/1) user arrays, no program bound,
+glDrawElements); before this change it segfaulted, now it draws.  This
+also fixes piglit depth-tex-modes-glsl when its program does not link
+and the test falls back to fixed function.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ src/mesa/main/arrayobj.h | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/mesa/main/arrayobj.h b/src/mesa/main/arrayobj.h
+index 279d7ec..21ad5f3 100644
+--- a/src/mesa/main/arrayobj.h
++++ b/src/mesa/main/arrayobj.h
+@@ -173,8 +173,11 @@ _mesa_get_derived_vao_masks(const struct gl_context *ctx,
+    const GLbitfield enabled_nonuser = enabled & vao->VertexAttribBufferMask;
+    const GLbitfield enabled_nonzero_divisor = enabled & vao->NonZeroDivisorMask;
+ 
+-   *enabled_user_attribs = ~enabled_nonuser & enabled_attribs;
+-   *nonzero_divisor_attribs = enabled_nonzero_divisor & enabled_attribs;
++   /* Classify in the VAO's own attribute space, map, then restrict to what
++    * the draw enables: masking with the mapped @enabled_attribs first drops
++    * a user array that the mapping moves between POS and GENERIC0. */
++   *enabled_user_attribs = ~enabled_nonuser & enabled;
++   *nonzero_divisor_attribs = enabled_nonzero_divisor;
+ 
+    switch (vao->_AttributeMapMode) {
+    case ATTRIBUTE_MAP_MODE_POSITION:
+@@ -199,6 +202,8 @@ _mesa_get_derived_vao_masks(const struct gl_context *ctx,
+    default:
+       break;
+    }
++   *enabled_user_attribs &= enabled_attribs;
++   *nonzero_divisor_attribs &= enabled_attribs;
+ }
+ 
+ 
+-- 
+2.54.0
+

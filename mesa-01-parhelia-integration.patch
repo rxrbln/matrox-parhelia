@@ -1,0 +1,186 @@
+From: René Rebe <rene@exactco.de>
+Subject: [PATCH] gallium: add the Matrox Parhelia driver
+
+Registers the parhelia Gallium driver (-Dgallium-drivers=parhelia) in
+meson, the pipe loader, and the DRI and DRIL targets.  The driver
+sources themselves, with their DRM UAPI header, are
+src/gallium/drivers/parhelia of this repository.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+--- a/meson.build
++++ b/meson.build
+@@ -169,7 +169,7 @@
+     if ['x86', 'x86_64'].contains(host_machine.cpu_family())
+       gallium_drivers = [
+         'r300', 'r600', 'radeonsi', 'nouveau', 'virgl', 'svga', 'llvmpipe', 'softpipe',
+-        'iris', 'crocus', 'i915', 'zink'
++        'iris', 'crocus', 'i915', 'zink', 'parhelia'
+       ]
+     elif ['aarch64'].contains(host_machine.cpu_family())
+       gallium_drivers = [
+@@ -207,7 +207,7 @@
+    gallium_drivers = [
+      'r300', 'r600', 'radeonsi', 'crocus', 'v3d', 'vc4', 'freedreno', 'etnaviv', 'i915',
+      'nouveau', 'svga', 'tegra', 'virgl', 'lima', 'panfrost', 'llvmpipe', 'softpipe', 'iris',
+-     'zink', 'd3d12', 'asahi', 'rocket', 'ethosu'
++     'zink', 'd3d12', 'asahi', 'rocket', 'ethosu', 'parhelia'
+    ]
+ endif
+ 
+@@ -229,6 +229,7 @@
+ with_gallium_iris = gallium_drivers.contains('iris')
+ with_gallium_i915 = gallium_drivers.contains('i915')
+ with_gallium_sgx = gallium_drivers.contains('sgx')
++with_gallium_parhelia = gallium_drivers.contains('parhelia')
+ with_gallium_svga = gallium_drivers.contains('svga')
+ with_gallium_virgl = gallium_drivers.contains('virgl')
+ with_gallium_lima = gallium_drivers.contains('lima')
+@@ -264,6 +265,7 @@
+   with_gallium_freedreno,
+   with_gallium_lima,
+   with_gallium_panfrost,
++  with_gallium_parhelia,
+   with_gallium_v3d,
+   with_gallium_vc4,
+ ].contains(true)
+--- a/meson.options
++++ b/meson.options
+@@ -86,7 +86,7 @@
+   choices : [
+     'all', 'auto',
+     'asahi', 'crocus', 'd3d12', 'ethosu', 'etnaviv', 'freedreno', 'i915', 'iris',
+-    'sgx',
++    'sgx', 'parhelia',
+     'lima', 'llvmpipe', 'nouveau', 'panfrost', 'r300', 'r600', 'radeonsi',
+     'rocket', 'softpipe', 'svga', 'tegra', 'v3d', 'vc4', 'virgl', 'zink',
+   ],
+@@ -911,6 +911,14 @@
+ )
+ 
+ option(
++  'parhelia-bringup',
++  type : 'boolean',
++  value : false,
++  deprecated : true,
++  description : 'Deprecated: select the Parhelia Gallium driver with -Dgallium-drivers=parhelia'
++)
++
++option(
+   'panfrost-rust',
+   type : 'boolean',
+   value : false,
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -27,6 +27,11 @@
+ inc_gallium_winsys_sw = include_directories('winsys/sw')
+ 
+ subdir('auxiliary')
++if with_gallium_parhelia
++  subdir('drivers/parhelia')
++else
++  driver_parhelia = declare_dependency()
++endif
+ subdir('auxiliary/pipe-loader')
+ subdir('winsys/sw/null')
+ if with_dri
+--- a/src/gallium/auxiliary/pipe-loader/meson.build
++++ b/src/gallium/auxiliary/pipe-loader/meson.build
+@@ -48,6 +48,9 @@
+ if with_gallium_zink
+   renderonly_drivers_c_args += '-DGALLIUM_ZINK'
+ endif
++if with_gallium_parhelia
++  renderonly_drivers_c_args += '-DGALLIUM_PARHELIA'
++endif
+ 
+ libpipe_loader_static = static_library(
+   'pipe_loader_static',
+--- a/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c
++++ b/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c
+@@ -67,6 +67,9 @@
+ static const struct pipe_loader_ops pipe_loader_drm_ops;
+ 
+ static const struct drm_driver_descriptor *driver_descriptors[] = {
++#ifdef GALLIUM_PARHELIA
++   &parhelia_driver_descriptor,
++#endif
+    &i915_driver_descriptor,
+    &sgx_driver_descriptor,
+    &gma500_driver_descriptor,
+--- a/src/gallium/auxiliary/target-helpers/drm_helper.h
++++ b/src/gallium/auxiliary/target-helpers/drm_helper.h
+@@ -24,7 +24,9 @@
+  * whether they're included in the specific gallium target.  The target (dri,
+  * vdpau, etc.) will include this header with the #defines for the specific
+  * drivers it's including, and the disabled drivers will have a descriptor
+- * with a stub create function logging the failure.
++ * with a stub create function logging the failure.  Parhelia is omitted
++ * completely when disabled so it does not enter other drivers' build
++ * artifacts.
+  */
+ 
+ #define DRM_DRIVER_DESCRIPTOR(driver, driconf, driconf_count, ...)      \
+@@ -96,6 +98,17 @@
+ DRM_DRIVER_DESCRIPTOR_STUB(i915)
+ #endif
+ 
++#ifdef GALLIUM_PARHELIA
++#include "parhelia/parhelia_public.h"
++static struct pipe_screen *
++pipe_parhelia_create_screen(int fd, const struct pipe_screen_config *config)
++{
++   struct pipe_screen *screen = parhelia_screen_create(fd, config);
++   return screen ? debug_screen_wrap(screen) : NULL;
++}
++DRM_DRIVER_DESCRIPTOR(parhelia, NULL, 0)
++#endif
++
+ #ifdef GALLIUM_IRIS
+ #include "iris/drm/iris_drm_public.h"
+ 
+--- a/src/gallium/auxiliary/target-helpers/drm_helper_public.h
++++ b/src/gallium/auxiliary/target-helpers/drm_helper_public.h
+@@ -30,5 +30,8 @@
+ extern const struct drm_driver_descriptor lima_driver_descriptor;
+ extern const struct drm_driver_descriptor zink_driver_descriptor;
+ extern const struct drm_driver_descriptor kmsro_driver_descriptor;
++#ifdef GALLIUM_PARHELIA
++extern const struct drm_driver_descriptor parhelia_driver_descriptor;
++#endif
+ 
+ #endif /* _DRM_HELPER_PUBLIC_H */
+--- a/src/gallium/targets/dri/meson.build
++++ b/src/gallium/targets/dri/meson.build
+@@ -61,7 +61,7 @@
+     driver_kmsro, driver_v3d, driver_vc4, driver_freedreno, driver_etnaviv,
+     driver_tegra, driver_i915, driver_sgx, driver_svga, driver_virgl,
+     driver_panfrost, driver_iris, driver_lima, driver_zink, driver_d3d12,
+-    driver_asahi, driver_crocus, driver_rocket, driver_ethosu
++    driver_asahi, driver_crocus, driver_rocket, driver_ethosu, driver_parhelia
+   ],
+   install : true,
+   name_suffix : libname_suffix,
+--- a/src/gallium/targets/dril/dril_target.c
++++ b/src/gallium/targets/dril/dril_target.c
+@@ -633,6 +633,7 @@
+ DEFINE_LOADER_DRM_ENTRYPOINT(i915)
+ DEFINE_LOADER_DRM_ENTRYPOINT(gma500)
+ DEFINE_LOADER_DRM_ENTRYPOINT(sgx)
++DEFINE_LOADER_DRM_ENTRYPOINT(parhelia)
+ DEFINE_LOADER_DRM_ENTRYPOINT(iris)
+ DEFINE_LOADER_DRM_ENTRYPOINT(crocus)
+ DEFINE_LOADER_DRM_ENTRYPOINT(nouveau)
+--- a/src/gallium/targets/dril/meson.build
++++ b/src/gallium/targets/dril/meson.build
+@@ -132,6 +132,10 @@
+   endif
+ endforeach
+ 
++if with_gallium_parhelia
++  dril_drivers += 'parhelia_dri.@0@'.format(libname_suffix)
++endif
++
+ # This only works on Unix-like oses, which is probably fine for dri
+ if prog_ln.found()
+   foreach d : dril_drivers

@@ -1,0 +1,306 @@
+From ff122dbebbbdfd0cec7f8a1a44518d613b944b1f Mon Sep 17 00:00:00 2001
+From: Timothy Arceri <tarceri@itsqueeze.com>
+Date: Wed, 22 Jul 2026 21:16:03 +1000
+Subject: [PATCH] mesa/st: approximate fog distance in the frag shader
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The NV_fog_distance spec says:
+
+   "When the fog distance mode is EYE_PLANE_ABSOLUTE_NV, the fog
+   distance z is approximated by abs(ze) [where ze is the Z component
+   of the fragment's eye position]."
+
+Note it states fragment's eye position. However, currently when the
+distance mode is EYE_PLANE_ABSOLUTE, mesa approximates the fog distance
+by applying abs() to the eye-space Z in the vertex shader, where it is
+then interpolated before arriving in the fragment shader.
+Because abs() is non-linear, for primitives straddling the eye plane
+(e.g. a floor the camera stands on) this over-estimates the distance
+for fragments between the vertices, resulting in complete fogging.
+
+Move the abs() to the fragment shader, putting us in line with the
+spec and the closed drivers.
+
+Closes: https://gitlab.freedesktop.org/mesa/mesa/-/work_items/15407
+Assisted-by: Claude Code (Claude Opus 4.8)
+Acked-by: Emma Anholt <anholt@igalia.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/43180>
+(cherry picked from commit a5ab30520c7b29b519dd1464e8af8b27c9a37cb3)
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ src/mesa/main/ff_fragment_shader.c        | 11 ++++++++++-
+ src/mesa/main/ffvertex_prog.c             | 10 +++++++---
+ src/mesa/main/fog.c                       | 10 ++++++++++
+ src/mesa/main/fog.h                       | 14 ++++++++++++++
+ src/mesa/program/prog_to_nir.c            |  2 +-
+ src/mesa/state_tracker/st_atom_shader.c   |  7 +++++++
+ src/mesa/state_tracker/st_nir.h           |  1 +
+ src/mesa/state_tracker/st_nir_lower_fog.c | 21 ++++++++++++++++++---
+ src/mesa/state_tracker/st_program.c       |  3 ++-
+ src/mesa/state_tracker/st_program.h       |  8 ++++++++
+ 10 files changed, 78 insertions(+), 9 deletions(-)
+
+diff --git a/src/mesa/main/ff_fragment_shader.c b/src/mesa/main/ff_fragment_shader.c
+index 5afed24..be15b08 100644
+--- a/src/mesa/main/ff_fragment_shader.c
++++ b/src/mesa/main/ff_fragment_shader.c
+@@ -30,6 +30,7 @@
+ #include "util/glheader.h"
+ #include "main/context.h"
+ 
++#include "main/fog.h"
+ #include "main/macros.h"
+ #include "main/state.h"
+ #include "main/texenvprogram.h"
+@@ -79,6 +80,7 @@ struct state_key {
+    GLuint nr_enabled_units:4;
+    GLuint separate_specular:1;
+    GLuint fog_mode:2;          /**< FOG_x */
++   GLuint fog_distance_abs:1;  /**< fog coord is abs(Ze) (EYE_PLANE_ABSOLUTE) */
+    GLuint inputs_available:12;
+    GLuint num_draw_buffers:4;
+ 
+@@ -304,6 +306,12 @@ static GLuint make_state_key( struct gl_context *ctx,  struct state_key *key )
+    /* _NEW_FOG */
+    key->fog_mode = ctx->Fog._PackedEnabledMode;
+ 
++   /* The fixed-function vertex program stores the signed eye-space Z in
++    * gl_FogFragCoord; take its absolute value per fragment for the
++    * GL_EYE_PLANE_ABSOLUTE_NV distance mode (the default).
++    */
++   key->fog_distance_abs = _mesa_fog_coord_needs_deferred_abs(ctx);
++
+    /* _NEW_BUFFERS */
+    key->num_draw_buffers = ctx->DrawBuffer->_NumColorDrawBuffers;
+ 
+@@ -964,7 +972,8 @@ create_new_program(struct gl_context *ctx, struct state_key *key,
+    nir_validate_shader(b.shader, "after generating ff-fragment shader");
+ 
+    if (key->fog_mode) {
+-      NIR_PASS(_, b.shader, st_nir_lower_fog, key->fog_mode, p.state_params,
++      NIR_PASS(_, b.shader, st_nir_lower_fog, key->fog_mode,
++               key->fog_distance_abs, p.state_params,
+                ctx->Const.PackedDriverUniformStorage);
+    }
+ 
+diff --git a/src/mesa/main/ffvertex_prog.c b/src/mesa/main/ffvertex_prog.c
+index d4e71a8..4ec5e0c 100644
+--- a/src/mesa/main/ffvertex_prog.c
++++ b/src/mesa/main/ffvertex_prog.c
+@@ -1054,10 +1054,14 @@ static void build_fog( struct tnl_program *p )
+                             nir_trim_vector(p->b, get_eye_position(p), 3));
+       break;
+    case FDM_EYE_PLANE: /* Z = Ze */
+-      fog = get_eye_position_z(p);
+-      break;
+    case FDM_EYE_PLANE_ABS: /* Z = abs(Ze) */
+-      fog = nir_fabs(p->b, get_eye_position_z(p));
++      /* Emit the *signed* eye-space Z.  For the EYE_PLANE_ABS mode the
++       * abs() is applied per-fragment in st_nir_lower_fog() instead of here,
++       * so that it is not baked into the interpolated per-vertex value.
++       * Doing abs() per vertex breaks primitives straddling the eye plane
++       * (e.g. a floor the camera stands on), fully fogging them.  See #15407.
++       */
++      fog = get_eye_position_z(p);
+       break;
+    case FDM_FROM_ARRAY:
+       fog = load_input(p, VERT_ATTRIB_FOG, 1);
+diff --git a/src/mesa/main/fog.c b/src/mesa/main/fog.c
+index 867d6e8..cb5b023 100644
+--- a/src/mesa/main/fog.c
++++ b/src/mesa/main/fog.c
+@@ -192,6 +192,16 @@ invalid_pname:
+ }
+ 
+ 
++bool
++_mesa_fog_coord_needs_deferred_abs(const struct gl_context *ctx)
++{
++   return ctx->VertexProgram._VPMode == VP_MODE_FF &&
++          ctx->Fog.FogCoordinateSource == GL_FRAGMENT_DEPTH_EXT &&
++          ctx->Fog.FogDistanceMode != GL_EYE_PLANE &&
++          ctx->Fog.FogDistanceMode != GL_EYE_RADIAL_NV;
++}
++
++
+ /**********************************************************************/
+ /*****                      Initialization                        *****/
+ /**********************************************************************/
+diff --git a/src/mesa/main/fog.h b/src/mesa/main/fog.h
+index 838175c..92d15b6 100644
+--- a/src/mesa/main/fog.h
++++ b/src/mesa/main/fog.h
+@@ -43,4 +43,18 @@ struct gl_context;
+ 
+ extern void _mesa_init_fog( struct gl_context * ctx );
+ 
++/**
++ * The fixed-function vertex program stores the *signed* eye-space Z in
++ * gl_FogFragCoord and defers the abs() of the GL_EYE_PLANE_ABSOLUTE_NV
++ * distance mode to the fragment stage, so that it is applied per fragment
++ * rather than baked into the interpolated per-vertex value (mesa #15407).
++ *
++ * Returns true when the fog coordinate reaching the fragment stage was
++ * produced that way -- i.e. fixed-function vertex processing feeding the
++ * GL_FRAGMENT_DEPTH / GL_EYE_PLANE_ABSOLUTE_NV fog coordinate -- meaning the
++ * fragment stage must take abs() of gl_FogFragCoord.
++ */
++extern bool
++_mesa_fog_coord_needs_deferred_abs(const struct gl_context *ctx);
++
+ #endif
+diff --git a/src/mesa/program/prog_to_nir.c b/src/mesa/program/prog_to_nir.c
+index c2b0b34..a83d1cb 100644
+--- a/src/mesa/program/prog_to_nir.c
++++ b/src/mesa/program/prog_to_nir.c
+@@ -873,7 +873,7 @@ prog_to_nir(const struct gl_context *ctx, const struct gl_program *prog)
+ 
+    /* Add OPTION ARB_fog_exp code */
+    if (prog->arb.Fog) {
+-      NIR_PASS(_, s, st_nir_lower_fog, prog->arb.Fog, prog->Parameters,
++      NIR_PASS(_, s, st_nir_lower_fog, prog->arb.Fog, false, prog->Parameters,
+                ctx->Const.PackedDriverUniformStorage);
+    }
+ 
+diff --git a/src/mesa/state_tracker/st_atom_shader.c b/src/mesa/state_tracker/st_atom_shader.c
+index 51ce170..b27d2fa 100644
+--- a/src/mesa/state_tracker/st_atom_shader.c
++++ b/src/mesa/state_tracker/st_atom_shader.c
+@@ -37,6 +37,7 @@
+ 
+ 
+ #include "main/mtypes.h"
++#include "main/fog.h"
+ #include "main/framebuffer.h"
+ #include "main/state.h"
+ #include "main/texobj.h"
+@@ -162,6 +163,12 @@ st_update_fp( struct st_context *st )
+       if (fp->ati_fs) {
+          key.fog = st->ctx->Fog._PackedEnabledMode;
+ 
++         /* When the fixed-function vertex program feeds the fog coordinate as
++          * signed eye-space Z, ATI_fragment_shader fog must take abs() of it
++          * per fragment (GL_EYE_PLANE_ABSOLUTE_NV).  See mesa #15407.
++          */
++         key.fog_coord_abs = _mesa_fog_coord_needs_deferred_abs(st->ctx);
++
+          for (unsigned u = 0; u < MAX_NUM_FRAGMENT_REGISTERS_ATI; u++) {
+             key.texture_index[u] = get_texture_index(st->ctx, u);
+          }
+diff --git a/src/mesa/state_tracker/st_nir.h b/src/mesa/state_tracker/st_nir.h
+index 2115030..dbb36a1 100644
+--- a/src/mesa/state_tracker/st_nir.h
++++ b/src/mesa/state_tracker/st_nir.h
+@@ -109,6 +109,7 @@ st_nir_state_variable_create(struct nir_shader *shader,
+                              bool packed_driver_uniform_storage);
+ 
+ bool st_nir_lower_fog(struct nir_shader *s, enum gl_fog_mode fog_mode,
++                      bool fog_coord_abs,
+                       struct gl_program_parameter_list *paramList,
+                       bool packed_driver_uniform_storage);
+ bool st_nir_lower_position_invariant(struct nir_shader *s,
+diff --git a/src/mesa/state_tracker/st_nir_lower_fog.c b/src/mesa/state_tracker/st_nir_lower_fog.c
+index 174a09c..02b9184 100644
+--- a/src/mesa/state_tracker/st_nir_lower_fog.c
++++ b/src/mesa/state_tracker/st_nir_lower_fog.c
+@@ -10,7 +10,7 @@
+ 
+ static nir_def *
+ fog_result(nir_builder *b, nir_def *color, enum gl_fog_mode fog_mode,
+-           struct gl_program_parameter_list *paramList,
++           bool fog_coord_abs, struct gl_program_parameter_list *paramList,
+            bool packed_driver_uniform_storage)
+ {
+    nir_shader *s = b->shader;
+@@ -19,6 +19,18 @@ fog_result(nir_builder *b, nir_def *color, enum gl_fog_mode fog_mode,
+    nir_def *fogc = nir_load_interpolated_input(b, 1, 32, baryc, nir_imm_int(b, 0),
+                                                .io_semantics.location = VARYING_SLOT_FOGC);
+ 
++   /* For the GL_EYE_PLANE_ABSOLUTE_NV distance mode the fog coordinate is
++    * abs(Ze).  The fixed-function vertex program emits the *signed* eye-space
++    * Z into VARYING_SLOT_FOGC and we take the absolute value here, per
++    * fragment.  Applying abs() per vertex would break primitives straddling
++    * the eye plane (e.g. a ground quad the camera stands on): the pre-abs'd
++    * endpoint values are all large, so interpolation over-estimates the
++    * distance for the fragments in between and fogs them completely.  See
++    * mesa issue #15407.
++    */
++   if (fog_coord_abs)
++      fogc = nir_fabs(b, fogc);
++
+    static const gl_state_index16 fog_params_tokens[STATE_LENGTH] = {STATE_FOG_PARAMS_OPTIMIZED};
+    static const gl_state_index16 fog_color_tokens[STATE_LENGTH] = {STATE_FOG_COLOR};
+ 
+@@ -79,6 +91,7 @@ fog_result(nir_builder *b, nir_def *color, enum gl_fog_mode fog_mode,
+ 
+ struct lower_fog_state {
+    enum gl_fog_mode fog_mode;
++   bool fog_coord_abs;
+    struct gl_program_parameter_list *paramList;
+    bool packed_driver_uniform_storage;
+ };
+@@ -103,7 +116,8 @@ st_nir_lower_fog_instr(nir_builder *b, nir_instr *instr, void *_state)
+    nir_def *color = intr->src[0].ssa;
+    color = nir_resize_vector(b, color, 4);
+ 
+-   nir_def *fog = fog_result(b, color, state->fog_mode, state->paramList,
++   nir_def *fog = fog_result(b, color, state->fog_mode, state->fog_coord_abs,
++                             state->paramList,
+                              state->packed_driver_uniform_storage);
+ 
+    /* retain the non-fog-blended alpha value for color */
+@@ -116,7 +130,7 @@ st_nir_lower_fog_instr(nir_builder *b, nir_instr *instr, void *_state)
+ }
+ 
+ bool
+-st_nir_lower_fog(nir_shader *s, enum gl_fog_mode fog_mode,
++st_nir_lower_fog(nir_shader *s, enum gl_fog_mode fog_mode, bool fog_coord_abs,
+                  struct gl_program_parameter_list *paramList,
+                  bool packed_driver_uniform_storage)
+ {
+@@ -124,6 +138,7 @@ st_nir_lower_fog(nir_shader *s, enum gl_fog_mode fog_mode,
+ 
+    struct lower_fog_state state = {
+       .fog_mode = fog_mode,
++      .fog_coord_abs = fog_coord_abs,
+       .paramList = paramList,
+       .packed_driver_uniform_storage = packed_driver_uniform_storage,
+    };
+diff --git a/src/mesa/state_tracker/st_program.c b/src/mesa/state_tracker/st_program.c
+index e582b06..98c14b8 100644
+--- a/src/mesa/state_tracker/st_program.c
++++ b/src/mesa/state_tracker/st_program.c
+@@ -1080,7 +1080,8 @@ st_create_fp_variant(struct st_context *st,
+ 
+    if (fp->ati_fs) {
+       if (key->fog) {
+-         NIR_PASS(_, state.ir.nir, st_nir_lower_fog, key->fog, fp->Parameters,
++         NIR_PASS(_, state.ir.nir, st_nir_lower_fog, key->fog,
++                  key->fog_coord_abs, fp->Parameters,
+                   st->ctx->Const.PackedDriverUniformStorage);
+       }
+ 
+diff --git a/src/mesa/state_tracker/st_program.h b/src/mesa/state_tracker/st_program.h
+index 7f71205..f7f60b3 100644
+--- a/src/mesa/state_tracker/st_program.h
++++ b/src/mesa/state_tracker/st_program.h
+@@ -265,6 +265,14 @@ struct st_fp_variant_key
+    /** needed for ATI_fragment_shader */
+    GLuint fog:2;
+ 
++   /**
++    * ATI_fragment_shader fog: the fog coordinate is fed by the fixed-function
++    * vertex program as signed eye-space Z and must have abs() applied per
++    * fragment (GL_EYE_PLANE_ABSOLUTE_NV distance mode).  See mesa #15407 and
++    * _mesa_fog_coord_needs_deferred_abs().
++    */
++   GLuint fog_coord_abs:1;
++
+    /** for OpenGL 1.0 on modern hardware */
+    GLuint lower_two_sided_color:1;
+ 
+-- 
+2.54.0
+

@@ -1,0 +1,75 @@
+From 52b3c5b5f946dbcaa6678064d15066db815276e6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Sat, 3 Oct 2026 06:05:21 +0200
+Subject: [PATCH] gallivm: keep constant deref indices the no-integer lowering
+ left alone
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up to "repair array indices and I/O offsets in no-integer
+shaders".  nir_lower_int_to_float converts only the constants that
+nir_gather_types() typed as integers.  A constant that only a deref
+reads keeps its integer payload, and reading it as a float turned
+index 1 into 0.  An array constructor such as Foo[2](Foo(100),
+Foo(200)) then wrote both elements to element 0.
+
+A constant index at or above 0x3f800000 (the float 1.0) is read as a
+float, anything below as the integer it already is; no real index
+reaches that range.
+
+MEASURED on the Parhelia P690: vs-deref-literal-array-of-structs and
+out-parameter-indexing vs-inout-index-inout-{mat2-col, mat2-col-array,
+vec4-array} back to PASS; vs-temp-mat2-col-rd still PASS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ .../auxiliary/gallivm/lp_bld_nir_lower.c        | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/auxiliary/gallivm/lp_bld_nir_lower.c b/src/gallium/auxiliary/gallivm/lp_bld_nir_lower.c
+index 0cb7a20..f39d3fe 100644
+--- a/src/gallium/auxiliary/gallivm/lp_bld_nir_lower.c
++++ b/src/gallium/auxiliary/gallivm/lp_bld_nir_lower.c
+@@ -146,6 +146,19 @@ no_integer_intrinsic_fixup(nir_builder *b, nir_intrinsic_instr *intr,
+ 
+ }
+ 
++/* A constant index: nir_lower_int_to_float converts only constants that
++ * nir_gather_types() typed as integers, and a constant only a deref reads
++ * stays an integer.  No real index reaches 0x3f800000, the float 1.0. */
++static int64_t
++no_integer_const_index(nir_src src)
++{
++   const uint64_t u = nir_src_as_uint(src);
++
++   if (src.ssa->bit_size == 32 && u >= 0x3f800000u)
++      return (int64_t)nir_src_as_float(src);
++   return (int64_t)u;
++}
++
+ /* Array indices and I/O offsets are integer contracts too: after
+  * nir_lower_int_to_float they hold floats of the index, so a variable index
+  * into a temporary, input or output array addressed float bits. */
+@@ -162,7 +175,7 @@ no_integer_index_fixup(nir_builder *b, nir_instr *instr, void *data)
+       /* A constant index stays a constant for the paths that need one. */
+       nir_src_rewrite(&deref->arr.index,
+                       nir_src_is_const(deref->arr.index) ?
+-                      nir_imm_intN_t(b, (int64_t)nir_src_as_float(deref->arr.index),
++                      nir_imm_intN_t(b, no_integer_const_index(deref->arr.index),
+                                      deref->arr.index.ssa->bit_size) :
+                       nir_f2i32(b, deref->arr.index.ssa));
+       return true;
+@@ -179,7 +192,7 @@ no_integer_index_fixup(nir_builder *b, nir_instr *instr, void *data)
+          return no_integer_intrinsic_fixup(b, intr, data);
+       b->cursor = nir_before_instr(instr);
+       nir_src_rewrite(offset, nir_src_is_const(*offset) ?
+-                      nir_imm_int(b, (int)nir_src_as_float(*offset)) :
++                      nir_imm_int(b, (int)no_integer_const_index(*offset)) :
+                       nir_f2i32(b, offset->ssa));
+       return true;
+    }
+-- 
+2.54.0
+

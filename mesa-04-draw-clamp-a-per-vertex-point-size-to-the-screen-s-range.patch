@@ -1,0 +1,61 @@
+From 899254b7d3695e85cfb6ac051e55cba6389c1732 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Fri, 2 Oct 2026 14:12:52 +0200
+Subject: [PATCH] draw: clamp a per-vertex point size to the screen's range
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+GL clamps the point size a vertex shader writes to the implementation's
+range, and nothing on the draw module path did: gl_PointSize = 0.001 drew
+nothing (vs-point_size-zero) instead of a one-pixel point.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ src/gallium/auxiliary/draw/draw_pipe_wide_point.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/auxiliary/draw/draw_pipe_wide_point.c b/src/gallium/auxiliary/draw/draw_pipe_wide_point.c
+index 55d5ca4..7000309 100644
+--- a/src/gallium/auxiliary/draw/draw_pipe_wide_point.c
++++ b/src/gallium/auxiliary/draw/draw_pipe_wide_point.c
+@@ -1,6 +1,7 @@
+ /**************************************************************************
+  *
+  * Copyright 2007 VMware, Inc.
++ * Copyright 2026 René Rebe <rene@exactco.de>
+  * All Rights Reserved.
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+@@ -67,6 +68,7 @@ struct widepoint_stage {
+    struct draw_stage stage;  /**< base class */
+ 
+    float half_point_size;
++   float min_point_size, max_point_size;
+ 
+    float xbias;
+    float ybias;
+@@ -146,7 +148,9 @@ widepoint_point(struct draw_stage *stage,
+ 
+    /* point size is either per-vertex or fixed size */
+    if (wide->psize_slot >= 0) {
+-      half_size = header->v[0]->data[wide->psize_slot][0];
++      /* A shader-written size is clamped to the range the screen states. */
++      half_size = CLAMP(header->v[0]->data[wide->psize_slot][0],
++                        wide->min_point_size, wide->max_point_size);
+       half_size *= 0.5f;
+    }
+    else {
+@@ -205,6 +209,8 @@ widepoint_first_point(struct draw_stage *stage,
+    void *r;
+ 
+    wide->half_point_size = 0.5f * rast->point_size;
++   wide->min_point_size = pipe->screen->caps.min_point_size;
++   wide->max_point_size = pipe->screen->caps.max_point_size;
+    wide->xbias = 0.0;
+    wide->ybias = 0.0;
+ 
+-- 
+2.54.0
+

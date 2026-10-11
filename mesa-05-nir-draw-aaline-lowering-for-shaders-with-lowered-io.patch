@@ -1,0 +1,124 @@
+From ccd05932bf1aeb44d3145ab2d65bfdd1693e3f76 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Fri, 2 Oct 2026 14:17:27 +0200
+Subject: [PATCH] nir/draw: aaline lowering for shaders with lowered IO
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+nir_lower_aaline_fs only rewrote store_deref and read its coverage input
+through a variable, so on a driver with lowered IO the draw module's smooth
+line shader came out unchanged and every smooth line was drawn opaque.  The
+pass now also rewrites store_output, reads the coverage varying with
+load_interpolated_input and records it in inputs_read, placing it above the
+inputs the read mask names.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ src/gallium/auxiliary/nir/nir_draw_helpers.c | 55 ++++++++++++++++----
+ 1 file changed, 45 insertions(+), 10 deletions(-)
+
+diff --git a/src/gallium/auxiliary/nir/nir_draw_helpers.c b/src/gallium/auxiliary/nir/nir_draw_helpers.c
+index b2d7376..c789867 100644
+--- a/src/gallium/auxiliary/nir/nir_draw_helpers.c
++++ b/src/gallium/auxiliary/nir/nir_draw_helpers.c
+@@ -1,6 +1,7 @@
+ /**************************************************************************
+  *
+  * Copyright 2019 Red Hat.
++ * Copyright 2026 René Rebe <rene@exactco.de>
+  * All Rights Reserved.
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+@@ -176,21 +177,45 @@ lower_aaline_instr(nir_builder *b, nir_instr *instr, void *data)
+       return false;
+ 
+    nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+-   if (intrin->intrinsic != nir_intrinsic_store_deref)
+-      return false;
+-
+-   nir_variable *var = nir_intrinsic_get_var(intrin, 0);
+-   if (var->data.mode != nir_var_shader_out)
++   unsigned location, frac, value_src;
++
++   /* Lowered IO stores through store_output and reads through intrinsics. */
++   if (intrin->intrinsic == nir_intrinsic_store_output) {
++      location = nir_intrinsic_io_semantics(intrin).location;
++      frac = nir_intrinsic_component(intrin);
++      value_src = 0;
++   } else if (intrin->intrinsic == nir_intrinsic_store_deref) {
++      nir_variable *var = nir_intrinsic_get_var(intrin, 0);
++      if (var->data.mode != nir_var_shader_out)
++         return false;
++      location = var->data.location;
++      frac = var->data.location_frac;
++      value_src = 1;
++   } else {
+       return false;
+-   if (var->data.location < FRAG_RESULT_DATA0 && var->data.location != FRAG_RESULT_COLOR)
++   }
++   if (location < FRAG_RESULT_DATA0 && location != FRAG_RESULT_COLOR)
+       return false;
+-   uint32_t mask = nir_intrinsic_write_mask(intrin) << var->data.location_frac;
++   uint32_t mask = nir_intrinsic_write_mask(intrin) << frac;
+    if (!(mask & BITFIELD_BIT(3)))
+       return false;
+ 
+-   nir_def *out_input = intrin->src[1].ssa;
++   nir_def *out_input = intrin->src[value_src].ssa;
+    b->cursor = nir_before_instr(instr);
+-   nir_def *lw = nir_load_var(b, state->line_width_input);
++   nir_def *lw;
++   if (b->shader->info.io_lowered) {
++      const nir_variable *in = state->line_width_input;
++      nir_def *bary = nir_load_barycentric_pixel(b, 32,
++                                                 .interp_mode = INTERP_MODE_SMOOTH);
++
++      lw = nir_load_interpolated_input(b, 4, 32, bary, nir_imm_int(b, 0),
++                                       .base = in->data.driver_location,
++                                       .dest_type = nir_type_float32,
++                                       .io_semantics.location = in->data.location,
++                                       .io_semantics.num_slots = 1);
++   } else {
++      lw = nir_load_var(b, state->line_width_input);
++   }
+    nir_def *len = nir_channel(b, lw, 3);
+    len = nir_fadd_imm(b, nir_fmul_imm(b, len, 2.0), -1.0);
+    nir_def *tmp = nir_fsat(b, nir_fadd(b, nir_channels(b, lw, 0xa),
+@@ -237,7 +262,7 @@ lower_aaline_instr(nir_builder *b, nir_instr *instr, void *data)
+ 
+    nir_def *out = nir_vector_insert_imm(b, out_input, tmp,
+                                         out_input->num_components - 1);
+-   nir_src_rewrite(&intrin->src[1], out);
++   nir_src_rewrite(&intrin->src[value_src], out);
+    return true;
+ }
+ 
+@@ -260,6 +285,14 @@ nir_lower_aaline_fs(struct nir_shader *shader, int *varying,
+          highest_drv_location = var->data.driver_location;
+    }
+ 
++   /* Lowered IO may have no input variables left; its reads are the mask. */
++   if (shader->info.io_lowered && shader->info.inputs_read) {
++      highest_location = MAX2(highest_location,
++                              (int)util_last_bit64(shader->info.inputs_read) - 1);
++      highest_drv_location = MAX2(highest_drv_location,
++                                  (int)util_bitcount64(shader->info.inputs_read) - 1);
++   }
++
+    nir_variable *line_width = nir_variable_create(shader, nir_var_shader_in,
+                                                   glsl_vec4_type(), "aaline");
+    if (highest_location == -1 || highest_location < VARYING_SLOT_VAR0) {
+@@ -270,6 +303,8 @@ nir_lower_aaline_fs(struct nir_shader *shader, int *varying,
+      line_width->data.driver_location = highest_drv_location + 1;
+    }
+    shader->num_inputs++;
++   if (shader->info.io_lowered)
++      shader->info.inputs_read |= BITFIELD64_BIT(line_width->data.location);
+    *varying = tgsi_get_generic_gl_varying_index(line_width->data.location, true);
+    state.line_width_input = line_width;
+ 
+-- 
+2.54.0
+

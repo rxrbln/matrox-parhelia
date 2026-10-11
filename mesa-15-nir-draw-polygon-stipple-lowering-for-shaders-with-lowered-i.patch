@@ -1,0 +1,69 @@
+From d7c585c161e754916f74e54485ad17cd377a3349 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Fri, 9 Oct 2026 11:21:11 +0200
+Subject: [PATCH] nir/draw: polygon stipple lowering for shaders with lowered
+ IO
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+nir_lower_pstipple_fs read the window position through a shader_in
+variable, which a driver taking io_lowered NIR never lowers.  Read it as
+load_input of VARYING_SLOT_POS instead, at the base an existing read uses
+or one past the inputs read, and record it in inputs_read, as the aaline
+lowering already does for its coverage input.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ src/gallium/auxiliary/nir/nir_draw_helpers.c | 31 ++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/src/gallium/auxiliary/nir/nir_draw_helpers.c b/src/gallium/auxiliary/nir/nir_draw_helpers.c
+index c944314..789abe4 100644
+--- a/src/gallium/auxiliary/nir/nir_draw_helpers.c
++++ b/src/gallium/auxiliary/nir/nir_draw_helpers.c
+@@ -48,9 +48,40 @@ typedef struct {
+    nir_alu_type bool_type;
+ } lower_pstipple;
+ 
++/* The input base an existing read of the window position uses, or the next
++ * free one when nothing reads it yet. */
++static unsigned
++frag_coord_base(nir_shader *shader)
++{
++   nir_foreach_function_impl(impl, shader) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if ((intr->intrinsic == nir_intrinsic_load_input ||
++                 intr->intrinsic == nir_intrinsic_load_interpolated_input) &&
++                nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_POS)
++               return nir_intrinsic_base(intr);
++         }
++      }
++   }
++   return util_bitcount64(shader->info.inputs_read & ~VARYING_BIT_POS);
++}
++
+ static nir_def *
+ load_frag_coord(nir_builder *b)
+ {
++   if (b->shader->info.io_lowered) {
++      unsigned base = frag_coord_base(b->shader);
++
++      b->shader->info.inputs_read |= VARYING_BIT_POS;
++      return nir_load_input(b, 4, 32, nir_imm_int(b, 0), .base = base,
++                            .dest_type = nir_type_float32,
++                            .io_semantics.location = VARYING_SLOT_POS,
++                            .io_semantics.num_slots = 1);
++   }
++
+    nir_variable *pos = nir_get_variable_with_location(b->shader, nir_var_shader_in,
+                                                       VARYING_SLOT_POS, glsl_vec4_type());
+    pos->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
+-- 
+2.54.0
+

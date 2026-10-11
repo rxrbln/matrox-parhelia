@@ -1,0 +1,266 @@
+From: René Rebe <rene@exactco.de>
+Subject: [PATCH] drm: hook up the Matrox Parhelia driver
+
+Adds the parhelia driver to the DRM Kconfig and Makefile and the shared
+matrox_common KMS helper header that the driver includes.  The driver
+sources themselves are driver/gpu/drm/parhelia of this repository, copied
+to drivers/gpu/drm/parhelia.
+
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+diff -Nru a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -423,6 +423,7 @@
+ source "drivers/gpu/drm/panel/Kconfig"
+ source "drivers/gpu/drm/panfrost/Kconfig"
+ source "drivers/gpu/drm/panthor/Kconfig"
++source "drivers/gpu/drm/parhelia/Kconfig"
+ source "drivers/gpu/drm/pl111/Kconfig"
+ source "drivers/gpu/drm/qxl/Kconfig"
+ source "drivers/gpu/drm/radeon/Kconfig"
+diff -Nru a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -198,6 +198,7 @@
+ obj-$(CONFIG_DRM_FFB)   += ffb/
+ obj-$(CONFIG_DRM_KMB_DISPLAY)  += kmb/
+ obj-$(CONFIG_DRM_MGAG200) += mgag200/
++obj-$(CONFIG_DRM_PARHELIA) += parhelia/
+ obj-$(CONFIG_DRM_V3D)  += v3d/
+ obj-$(CONFIG_DRM_VC4)  += vc4/
+ obj-$(CONFIG_DRM_SIS)   += sis/
+diff -Nru a/drivers/gpu/drm/matrox_common/matrox_kms_common.h b/drivers/gpu/drm/matrox_common/matrox_kms_common.h
+--- a/drivers/gpu/drm/matrox_common/matrox_kms_common.h
++++ b/drivers/gpu/drm/matrox_common/matrox_kms_common.h
+@@ -0,0 +1,230 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright 2026 René Rebe <rene@exactco.de> */
++#ifndef __MATROX_KMS_COMMON_H__
++#define __MATROX_KMS_COMMON_H__
++
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_color_mgmt.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_gem_vram_helper.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_simple_kms_helper.h>
++#include <drm/drm_vblank.h>
++
++/* Architecture-neutral pieces shared by the Parhelia and Phoenix modules.
++ * Register locations, surface formats, output routing, and clock programming
++ * remain in their respective drivers.
++ */
++struct matrox_kms_irq {
++	void *cookie;
++	u32 (*read)(void *cookie, u32 reg);
++	void (*write)(void *cookie, u32 reg, u32 value);
++	u32 raw_reg;
++	u32 ack_reg;
++	u32 mask_reg;
++	u32 owned_mask;
++	u32 vblank_mask;
++};
++
++static const struct drm_connector_funcs matrox_kms_connector_funcs = {
++	.reset = drm_atomic_helper_connector_reset,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.destroy = drm_connector_cleanup,
++	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
++};
++
++static inline enum drm_mode_status
++matrox_kms_mode_geometry_valid(const struct drm_display_mode *mode,
++				 unsigned int max_width,
++				 unsigned int max_height,
++				 unsigned int min_clock,
++				 unsigned int max_clock)
++{
++	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
++		return MODE_NO_INTERLACE;
++	if (mode->hdisplay < 320 || mode->vdisplay < 200 ||
++	    mode->hdisplay > max_width || mode->vdisplay > max_height)
++		return MODE_BAD;
++	if (mode->clock < min_clock || mode->clock > max_clock)
++		return MODE_CLOCK_RANGE;
++	return MODE_OK;
++}
++
++static inline int
++matrox_kms_plane_geometry_check(const struct drm_plane_state *plane_state,
++				  const struct drm_crtc_state *crtc_state)
++{
++	const struct drm_framebuffer *fb = plane_state->fb;
++
++	if (!fb)
++		return 0;
++	if (!plane_state->crtc || !crtc_state->enable)
++		return -EINVAL;
++	if (plane_state->crtc_x || plane_state->crtc_y ||
++	    plane_state->src_x || plane_state->src_y ||
++	    plane_state->crtc_w != crtc_state->mode.hdisplay ||
++	    plane_state->crtc_h != crtc_state->mode.vdisplay ||
++	    plane_state->src_w != plane_state->crtc_w << 16 ||
++	    plane_state->src_h != plane_state->crtc_h << 16 ||
++	    plane_state->crtc_w > fb->width ||
++	    plane_state->crtc_h > fb->height)
++		return -EINVAL;
++	return 0;
++}
++
++static inline int
++matrox_kms_vram_offset(struct drm_gem_object *gem, u32 alignment,
++			 u32 limit, u32 *address)
++{
++	s64 offset = drm_gem_vram_offset(drm_gem_vram_of_gem(gem));
++
++	if (offset < 0)
++		return offset;
++	if (offset > limit || !IS_ALIGNED(offset, alignment))
++		return -ERANGE;
++	*address = offset;
++	return 0;
++}
++
++static inline void
++matrox_kms_write_lut(void *cookie,
++			void (*write)(void *cookie, u32 reg, u32 value),
++			u32 index_reg, u32 red_reg, u32 green_reg, u32 blue_reg,
++			u32 latch, bool index_each_entry,
++			const struct drm_property_blob *blob)
++{
++	const struct drm_color_lut *lut = blob ? blob->data : NULL;
++	unsigned int i;
++
++	for (i = 0; i < 256; i++) {
++		u16 red = lut ? lut[i].red : i * 257;
++		u16 green = lut ? lut[i].green : i * 257;
++		u16 blue = lut ? lut[i].blue : i * 257;
++
++		if (!i || index_each_entry)
++			write(cookie, index_reg, i);
++		write(cookie, red_reg, red & 0xffc0);
++		write(cookie, green_reg, green & 0xffc0);
++		write(cookie, blue_reg, (blue & 0xffc0) | latch);
++	}
++}
++
++static inline void
++matrox_kms_arm_event(struct drm_simple_display_pipe *pipe)
++{
++	struct drm_pending_vblank_event *event;
++
++	spin_lock_irq(&pipe->crtc.dev->event_lock);
++	event = pipe->crtc.state->event;
++	pipe->crtc.state->event = NULL;
++	if (event) {
++		if (!drm_crtc_vblank_get(&pipe->crtc))
++			drm_crtc_arm_vblank_event(&pipe->crtc, event);
++		else
++			drm_crtc_send_vblank_event(&pipe->crtc, event);
++	}
++	spin_unlock_irq(&pipe->crtc.dev->event_lock);
++}
++
++typedef void (*matrox_kms_pipe_update_fn)(struct drm_simple_display_pipe *pipe,
++					    struct drm_plane_state *old_state);
++typedef void (*matrox_kms_gamma_fn)(struct drm_simple_display_pipe *pipe,
++				      const struct drm_property_blob *blob);
++typedef void (*matrox_kms_disable_fn)(struct drm_simple_display_pipe *pipe);
++
++static inline void
++matrox_kms_pipe_update(struct drm_simple_display_pipe *pipe,
++			 struct drm_plane_state *old_state,
++			 matrox_kms_pipe_update_fn update,
++			 matrox_kms_gamma_fn load_gamma)
++{
++	if (pipe->plane.state->fb && pipe->crtc.state->active) {
++		/* Publish CPU writes before selecting an updated scanout BO. */
++		wmb();
++		update(pipe, old_state);
++	}
++	if (load_gamma && pipe->crtc.state->color_mgmt_changed)
++		load_gamma(pipe, pipe->crtc.state->gamma_lut);
++	matrox_kms_arm_event(pipe);
++}
++
++static inline void
++matrox_kms_pipe_disable(struct drm_simple_display_pipe *pipe,
++			  matrox_kms_disable_fn disable)
++{
++	drm_crtc_vblank_off(&pipe->crtc);
++	if (disable)
++		disable(pipe);
++}
++
++/* Scanout pins persist through the commit and the following vblank.
++ * begin/end_fb_access are temporary CPU mappings, and end_fb_access runs
++ * before the old framebuffer can retire. The VRAM helper also imports the
++ * real render dma_resv fence, which a custom prepare_fb must preserve. */
++static inline int
++matrox_kms_pipe_prepare_fb(struct drm_simple_display_pipe *pipe,
++				struct drm_plane_state *plane_state)
++{
++	return drm_gem_vram_plane_helper_prepare_fb(&pipe->plane, plane_state);
++}
++
++static inline void
++matrox_kms_pipe_cleanup_fb(struct drm_simple_display_pipe *pipe,
++			      struct drm_plane_state *plane_state)
++{
++	drm_gem_vram_plane_helper_cleanup_fb(&pipe->plane, plane_state);
++}
++
++static inline int matrox_kms_enable_vblank(const struct matrox_kms_irq *irq)
++{
++	u32 mask;
++
++	irq->write(irq->cookie, irq->ack_reg, irq->vblank_mask);
++	mask = irq->read(irq->cookie, irq->mask_reg) | irq->vblank_mask;
++	irq->write(irq->cookie, irq->mask_reg, mask);
++	return 0;
++}
++
++static inline void matrox_kms_disable_vblank(const struct matrox_kms_irq *irq)
++{
++	u32 mask = irq->read(irq->cookie, irq->mask_reg);
++
++	irq->write(irq->cookie, irq->mask_reg, mask & ~irq->vblank_mask);
++	irq->write(irq->cookie, irq->ack_reg, irq->vblank_mask);
++}
++
++static inline u32 matrox_kms_active_irq(const struct matrox_kms_irq *irq)
++{
++	u32 raw = irq->read(irq->cookie, irq->raw_reg);
++	u32 mask = irq->read(irq->cookie, irq->mask_reg);
++
++	if (raw == U32_MAX || mask == U32_MAX)
++		return 0;
++	return raw & mask & irq->owned_mask;
++}
++
++static inline int matrox_kms_fb_dirty(struct drm_framebuffer *fb,
++					struct drm_file *file,
++					unsigned int flags,
++					unsigned int color,
++					struct drm_clip_rect *clips,
++					unsigned int num_clips)
++{
++	/* DIRTYFB publishes WC stores into the framebuffer scanned by hardware. */
++	wmb();
++	return 0;
++}
++
++static const struct drm_framebuffer_funcs matrox_kms_fb_funcs __maybe_unused = {
++	.destroy = drm_gem_fb_destroy,
++	.create_handle = drm_gem_fb_create_handle,
++	.dirty = matrox_kms_fb_dirty,
++};
++
++#endif

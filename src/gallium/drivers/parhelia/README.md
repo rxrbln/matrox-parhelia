@@ -3,12 +3,7 @@
 This is a native Gallium DRM driver. The normal Mesa DRI build exports the
 Parhelia screen through the DRM pipe loader and installs the `parhelia_dri`
 megadriver link.
-Enable with `-Dgallium-drivers=parhelia,softpipe`. `parhelia-drm-test --selftest` checks
-framing, relocation coverage, draw ranges and tiled-address round trips without
-hardware. `--clear /dev/dri/card0` poisons a GEM target and verifies two GPU
-fills against all 65536 pixels. `--render /dev/dri/card0` runs those health
-checks, submits one triangle and verifies detiled GEM readback; both hardware
-tests require the Parhelia kernel driver and access to its DRM render node.
+Enable with `-Dgallium-drivers=parhelia,softpipe`.
 
 `reference/` preserves the supplied `xf86-video-parhelia/src/parhelia3d` builder,
 state, clear, indexing, tiling and header files with their original GPL-2.0 attribution.

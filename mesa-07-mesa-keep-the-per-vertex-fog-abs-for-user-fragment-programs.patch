@@ -1,0 +1,82 @@
+From 3ceb09e12225e2a299f3d0912190a1e5dc4b7ff8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Fri, 2 Oct 2026 16:40:47 +0200
+Subject: [PATCH] mesa: keep the per-vertex fog abs() for user fragment
+ programs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Since the fog distance abs() moved to the fragment stage (#15407), the
+fixed-function vertex program emits the signed eye Z for
+GL_EYE_PLANE_ABSOLUTE_NV, but only st_nir_lower_fog() of the texenv and
+ATI fragment programs takes abs() of it.  An ARB fragment program with
+OPTION ARB_fog_linear and a GLSL shader reading gl_FogFragCoord behind
+fixed-function vertex processing got the signed Ze: on llvmpipe a white quad at
+Ze = -20 with linear fog 0..40 stayed unfogged (ARB) or read 0 (GLSL)
+instead of 0.5.  Emit abs(Ze) per vertex for those, as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ src/mesa/main/ffvertex_prog.c | 24 ++++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/src/mesa/main/ffvertex_prog.c b/src/mesa/main/ffvertex_prog.c
+index 4ec5e0c..67082af 100644
+--- a/src/mesa/main/ffvertex_prog.c
++++ b/src/mesa/main/ffvertex_prog.c
+@@ -1,6 +1,7 @@
+ /**************************************************************************
+  *
+  * Copyright 2007 VMware, Inc.
++ * Copyright 2026 René Rebe <rene@exactco.de>
+  * All Rights Reserved.
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+@@ -237,10 +238,17 @@ static void make_state_key( struct gl_context *ctx, struct state_key *key )
+       key->rescale_normals = 1;
+ 
+    /* Only distinguish fog parameters if we actually need */
+-   if (key->fragprog_inputs_read & VARYING_BIT_FOGC)
++   if (key->fragprog_inputs_read & VARYING_BIT_FOGC) {
+       key->fog_distance_mode =
+          translate_fog_distance_mode(ctx->Fog.FogCoordinateSource,
+                                      ctx->Fog.FogDistanceMode);
++      /* Only st_nir_lower_fog() of the texenv and ATI programs takes abs()
++       * per fragment; ARB and GLSL fragment programs read the varying as is.
++       */
++      if (key->fog_distance_mode == FDM_EYE_PLANE_ABS &&
++          (fp == ctx->FragmentProgram._TexEnvProgram || fp->ati_fs))
++         key->fog_distance_mode = FDM_EYE_PLANE;
++   }
+ 
+    if (ctx->Point._Attenuated)
+       key->point_attenuated = 1;
+@@ -1053,16 +1061,16 @@ static void build_fog( struct tnl_program *p )
+       fog = nir_fast_length(p->b,
+                             nir_trim_vector(p->b, get_eye_position(p), 3));
+       break;
+-   case FDM_EYE_PLANE: /* Z = Ze */
+-   case FDM_EYE_PLANE_ABS: /* Z = abs(Ze) */
+-      /* Emit the *signed* eye-space Z.  For the EYE_PLANE_ABS mode the
+-       * abs() is applied per-fragment in st_nir_lower_fog() instead of here,
+-       * so that it is not baked into the interpolated per-vertex value.
+-       * Doing abs() per vertex breaks primitives straddling the eye plane
+-       * (e.g. a floor the camera stands on), fully fogging them.  See #15407.
++   case FDM_EYE_PLANE:
++      /* Z = Ze, also for EYE_PLANE_ABS when the fragment stage takes abs()
++       * per fragment: per vertex it over-fogs primitives straddling the eye
++       * plane (e.g. a floor the camera stands on).  See #15407.
+        */
+       fog = get_eye_position_z(p);
+       break;
++   case FDM_EYE_PLANE_ABS: /* Z = abs(Ze) for user fragment programs */
++      fog = nir_fabs(p->b, get_eye_position_z(p));
++      break;
+    case FDM_FROM_ARRAY:
+       fog = load_input(p, VERT_ATTRIB_FOG, 1);
+       break;
+-- 
+2.54.0
+
