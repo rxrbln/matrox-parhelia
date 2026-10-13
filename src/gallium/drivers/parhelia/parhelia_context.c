@@ -8114,6 +8114,55 @@ ph_tcl_clip_chunk(struct ph_context *ctx, const struct ph_tcl_run *r,
    return true;
 }
 
+/* An integer whose signed order is the order of the float @bits (NaN aside):
+ * min/max without float compares, which carry a trap barrier each on Alpha. */
+static inline int32_t
+ph_float_order_key(uint32_t bits)
+{
+   return (int32_t)(bits & 0x80000000u ? bits ^ 0x7fffffffu : bits);
+}
+
+static inline float
+ph_float_from_order_key(int32_t key)
+{
+   const uint32_t k = (uint32_t)key;
+
+   return uif(k & 0x80000000u ? k ^ 0x7fffffffu : k);
+}
+
+/* Min/max of @comps float components over vertices [lo, hi]; false if any is
+ * NaN, which makes the box unusable. */
+static bool
+ph_tcl_box_scan(const uint8_t *base, unsigned stride, unsigned lo,
+                unsigned hi, unsigned comps, float lo_out[3], float hi_out[3])
+{
+   int32_t kmin[3] = { INT32_MAX, INT32_MAX, INT32_MAX };
+   int32_t kmax[3] = { INT32_MIN, INT32_MIN, INT32_MIN };
+   uint32_t nan = 0;
+
+   for (unsigned v = lo; v <= hi; v++) {
+      const uint8_t *src = base + (size_t)v * stride;
+
+      for (unsigned c = 0; c < comps; c++) {
+         uint32_t bits;
+         int32_t key;
+
+         memcpy(&bits, src + c * 4, 4);
+         nan |= (bits & 0x7fffffffu) > 0x7f800000u;
+         key = ph_float_order_key(bits);
+         kmin[c] = key < kmin[c] ? key : kmin[c];
+         kmax[c] = key > kmax[c] ? key : kmax[c];
+      }
+   }
+   if (nan)
+      return false;
+   for (unsigned c = 0; c < 3; c++) {
+      lo_out[c] = c < comps ? ph_float_from_order_key(kmin[c]) : 0.0f;
+      hi_out[c] = c < comps ? ph_float_from_order_key(kmax[c]) : 0.0f;
+   }
+   return true;
+}
+
 /* The object-space box of the positions a draw references: from the
  * buffer's cache while its contents are unchanged, else one min/max pass
  * over the referenced vertex range. */
@@ -8169,22 +8218,8 @@ ph_tcl_position_box(struct ph_context *ctx, const uint32_t *elts, unsigned n,
          }
       }
    }
-   lo_out[0] = lo_out[1] = lo_out[2] = INFINITY;
-   hi_out[0] = hi_out[1] = hi_out[2] = -INFINITY;
-   if (comps == 2)
-      lo_out[2] = hi_out[2] = 0.0f;
-   for (unsigned v = lo; v <= hi; v++) {
-      float p[3];
-
-      memcpy(p, map + offset + (size_t)v * stride, comps * sizeof(float));
-      for (unsigned c = 0; c < comps; c++) {
-         /* NaN fails both compares and keeps the box unusable. */
-         if (!(p[c] >= lo_out[c]))
-            lo_out[c] = isnan(p[c]) ? NAN : p[c];
-         if (!(p[c] <= hi_out[c]))
-            hi_out[c] = isnan(p[c]) ? NAN : p[c];
-      }
-   }
+   if (!ph_tcl_box_scan(map + offset, stride, lo, hi, comps, lo_out, hi_out))
+      return false;
    if (res && !res->data_volatile) {
       struct ph_vertex_bounds *b = NULL;
 
@@ -8643,22 +8678,60 @@ ph_unorm8_bits_init(void)
       ph_unorm8_bits[i] = fui(ubyte_to_float(i));
 }
 
+/* Element-major: one specialised loop per element, so the per-vertex work is
+ * the copy alone. */
 static void
 ph_tcl_fetch_run(const struct ph_tcl_fetch *f, const uint32_t *elts,
                  unsigned count, float *dst, unsigned dpv)
 {
-   for (unsigned v = 0; v < count; v++, dst += dpv)
-      for (unsigned i = 0; i < f->count; i++) {
-         const uint8_t *src = f->e[i].src + (size_t)elts[v] * f->e[i].stride;
-         uint32_t *d = (uint32_t *)(dst + f->e[i].out);
+   for (unsigned i = 0; i < f->count; i++) {
+      const uint8_t *base = f->e[i].src;
+      const size_t stride = f->e[i].stride;
+      uint32_t *d = (uint32_t *)dst + f->e[i].out;
 
-         if (f->e[i].unorm8)
-            for (unsigned c = 0; c < f->e[i].comps; c++)
-               d[c] = ph_unorm8_bits[src[c]];
-         else
-            for (unsigned c = 0; c < f->e[i].comps; c++)
-               d[c] = ((const uint32_t *)src)[c];
+      if (f->e[i].unorm8) {
+         for (unsigned v = 0; v < count; v++, d += dpv) {
+            const uint8_t *s = base + elts[v] * stride;
+
+            d[0] = ph_unorm8_bits[s[0]];
+            d[1] = ph_unorm8_bits[s[1]];
+            if (f->e[i].comps > 2)
+               d[2] = ph_unorm8_bits[s[2]];
+            if (f->e[i].comps > 3)
+               d[3] = ph_unorm8_bits[s[3]];
+         }
+         continue;
       }
+      switch (f->e[i].comps) {
+      case 2:
+         for (unsigned v = 0; v < count; v++, d += dpv) {
+            const uint32_t *s = (const uint32_t *)(base + elts[v] * stride);
+
+            d[0] = s[0];
+            d[1] = s[1];
+         }
+         break;
+      case 3:
+         for (unsigned v = 0; v < count; v++, d += dpv) {
+            const uint32_t *s = (const uint32_t *)(base + elts[v] * stride);
+
+            d[0] = s[0];
+            d[1] = s[1];
+            d[2] = s[2];
+         }
+         break;
+      default:
+         for (unsigned v = 0; v < count; v++, d += dpv) {
+            const uint32_t *s = (const uint32_t *)(base + elts[v] * stride);
+
+            d[0] = s[0];
+            d[1] = s[1];
+            d[2] = s[2];
+            d[3] = s[3];
+         }
+         break;
+      }
+   }
 }
 
 /* Fill the object-space vertex stream for one draw and, when every vertex
