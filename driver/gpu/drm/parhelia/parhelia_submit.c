@@ -1505,16 +1505,30 @@ static int parhelia_validate_reglist(struct parhelia_device *pdev,
 		u32 tag = cmd[pos++];
 		unsigned int slot;
 
+		/* four plain state writes: nothing to check or track */
+		if (length - pos >= 4 &&
+		    !(parhelia_reg_class[tag & 0xff] |
+		      parhelia_reg_class[(tag >> 8) & 0xff] |
+		      parhelia_reg_class[(tag >> 16) & 0xff] |
+		      parhelia_reg_class[tag >> 24])) {
+			pos += 4;
+			continue;
+		}
 		for (slot = 0; slot < 4; slot++) {
 			u32 index = (tag >> (slot * 8)) & 0xff;
+			u8 class = parhelia_reg_class[index];
 			u32 value;
 
-			if (index == 0x21)
+			if (class == PARHELIA_REG_END)
 				break;
 			if (pos >= length)
 				return -EINVAL;
+			if (class == PARHELIA_REG_STATE) {
+				pos++;
+				continue;
+			}
 			value = cmd[pos];
-			switch (parhelia_reg_class[index]) {
+			switch (class) {
 			case PARHELIA_REG_INVALID:
 				return -EINVAL;
 			case PARHELIA_REG_KERNEL:
