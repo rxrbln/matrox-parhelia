@@ -2301,6 +2301,158 @@ out_free:
    return ret;
 }
 
+/* Registers whose repeated value can go: not a compaction barrier, not the
+ * banked window at 0x11c0, not the 2-D drawing file at 0x1300 (its 0x1380
+ * aliases fire, e.g. the fill strips refired by DSTXY and LEN). */
+static const bool *
+repeat_droppable(void)
+{
+   static bool table[256];
+   static bool built;
+
+   if (!built) {
+      for (unsigned i = 0; i < 0xc0; i++)
+         table[i] = i != 0x20 && i != 0x21 && !(i >= 0x70 && i <= 0x7f) &&
+                    !compact_reg_barrier(i);
+      built = true;
+   }
+   return table;
+}
+
+/* Forget what a verbatim register list writes; all of it when the pad
+ * selector makes its framing unknown. */
+static void
+forget_reglist(const uint32_t *cmd, unsigned length, bool *known)
+{
+   for (unsigned pos = 1; pos < length;) {
+      uint32_t tag = cmd[pos++];
+
+      for (unsigned s = 0; s < 4 && pos < length; s++, tag >>= 8) {
+         if ((tag & 0xff) == 0x21)
+            break;
+         if ((tag & 0xff) == 0x20) {
+            memset(known, 0, 256 * sizeof(*known));
+            return;
+         }
+         known[tag & 0xff] = false;
+         pos++;
+      }
+   }
+}
+
+int
+parhelia_batch_drop_repeats(struct parhelia_batch *dst,
+                            const struct parhelia_batch *src,
+                            unsigned *dropped)
+{
+   const bool *droppable = repeat_droppable();
+   uint32_t shadow[256];
+   bool known[256] = { false };
+   bool referenced[PH_BATCH_PACKETS] = { false };
+   unsigned packet_map[PH_BATCH_PACKETS];
+   unsigned writes_dropped = 0;
+
+   if (!dst || !src || dst == src || src->command_count > PH_BATCH_DWORDS ||
+       src->packet_count > PH_BATCH_PACKETS ||
+       src->reloc_count > PH_BATCH_RELOCS)
+      return -EINVAL;
+   for (unsigned r = 0; r < src->reloc_count; r++) {
+      if (src->relocs[r].packet >= src->packet_count)
+         return -EINVAL;
+      referenced[src->relocs[r].packet] = true;
+   }
+   dst->command_count = dst->packet_count = 0;
+   for (unsigned i = 0; i < src->packet_count; i++) {
+      const struct drm_parhelia_packet *packet = &src->packets[i];
+      const unsigned length = packet->length;
+      const uint32_t *cmd = src->commands + packet->offset;
+      uint32_t *out = dst->commands + dst->command_count;
+      unsigned n = 1, packet_dropped = 0;
+      bool plain = false;
+
+      if (packet->offset > src->command_count ||
+          length > src->command_count - packet->offset)
+         return -EINVAL;
+      packet_map[i] = dst->packet_count;
+      if (length >= 2 && !referenced[i] && !(cmd[0] & 0xffff0000u) &&
+          (cmd[0] & 0xffffu) + 2u == length) {
+         uint32_t tag_out = 0x21212121u;
+         unsigned pos = 1, tag_pos = 0, slot = 4;
+
+         plain = true;
+         while (plain && pos < length) {
+            uint32_t tag = cmd[pos++];
+
+            for (unsigned s = 0; s < 4; s++, tag >>= 8) {
+               const unsigned index = tag & 0xff;
+               uint32_t value;
+
+               if (index == 0x21)
+                  break;
+               if (index == 0x20 || pos == length) {
+                  plain = false;
+                  break;
+               }
+               value = cmd[pos++];
+               if (droppable[index] && known[index] &&
+                   shadow[index] == value) {
+                  packet_dropped++;
+                  continue;
+               }
+               shadow[index] = value;
+               known[index] = true;
+               if (slot == 4) {
+                  if (tag_pos)
+                     out[tag_pos] = tag_out;
+                  tag_out = 0x21212121u;
+                  tag_pos = n++;
+                  slot = 0;
+               }
+               tag_out = (tag_out & ~(0xffu << (slot * 8))) |
+                         index << (slot * 8);
+               slot++;
+               out[n++] = value;
+            }
+         }
+         /* the pad selector's framing is not ours to rewrite */
+         if (plain) {
+            if (tag_pos)
+               out[tag_pos] = tag_out;
+            writes_dropped += packet_dropped;
+            if (n == 1)
+               continue;
+            out[0] = (cmd[0] & 0xffff0000u) | (n - 2);
+            dst->packets[dst->packet_count++] = (struct drm_parhelia_packet) {
+               .offset = dst->command_count, .length = n };
+            dst->command_count += n;
+            continue;
+         }
+      }
+      /* verbatim; what it writes is no longer known */
+      if (referenced[i] && length && !(cmd[0] >> 24))
+         forget_reglist(cmd, length, known);
+      else if (!length || !(cmd[0] >> 24))
+         memset(known, 0, sizeof(known));
+      else if (length && (cmd[0] >> 24) != 0x97 && (cmd[0] >> 24) != 0x8f &&
+               (cmd[0] >> 24) != 0x9f &&
+               /* block-file loads: no MMIO register */
+               (cmd[0] >> 24) != 0x41)
+         memset(known, 0, sizeof(known));
+      memcpy(out, cmd, length * sizeof(cmd[0]));
+      dst->packets[dst->packet_count++] = (struct drm_parhelia_packet) {
+         .offset = dst->command_count, .length = length };
+      dst->command_count += length;
+   }
+   dst->reloc_count = src->reloc_count;
+   for (unsigned r = 0; r < src->reloc_count; r++) {
+      dst->relocs[r] = src->relocs[r];
+      dst->relocs[r].packet = packet_map[src->relocs[r].packet];
+   }
+   if (dropped)
+      *dropped = writes_dropped;
+   return 0;
+}
+
 int
 parhelia_wait_fence(int fd, uint32_t fence, int64_t timeout_ns,
                     uint32_t *completed)

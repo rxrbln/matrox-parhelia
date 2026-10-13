@@ -531,6 +531,9 @@ struct ph_context {
    unsigned deindex_cap;
    uint32_t *tcl_seq;
    unsigned tcl_seq_cap;
+   /* a submit without its repeated plain register writes */
+   bool drop_repeats;
+   struct parhelia_batch *repeat_batch;
    /* A smooth line's coverage rides in the colour's alpha: the staged
     * triangles carry their final colour and bypass the fragment program. */
    bool line_coverage;
@@ -735,6 +738,7 @@ struct ph_context {
       unsigned frames, batches, draw_batches, triangles, submits, clears;
       unsigned draw_packets;
       unsigned waits, stage_evictions;
+      uint64_t repeats_dropped;
       uint64_t vertex_dwords, in_place_dwords, clear_pixels, wait_ns, start_ns;
       unsigned kind_count[PH_STAT_KINDS];
       uint64_t kind_ns[PH_STAT_KINDS];
@@ -985,6 +989,9 @@ ph_stats_frame(struct ph_context *ctx)
               ctx->stat.in_place_dwords / n, ctx->stat.stage_evictions / n,
               ctx->stat.clears / n, ctx->stat.clear_pixels / n / 1e6,
               ctx->stat.waits / n, ctx->stat.wait_ns / n / 1e6);
+   if (ctx->stat.start_ns && ctx->drop_repeats)
+      fprintf(stderr, "parhelia stats/frame: %.0f repeated register writes dropped\n",
+              ctx->stat.repeats_dropped / n);
    if (ctx->stat.start_ns && (ctx->tcl_draws || ctx->tcl_fallbacks ||
                               ctx->tcl_reason[PH_TCL_NO_PRIMITIVE] ||
                               ctx->tcl_reason[PH_TCL_NO_FIXUP]))
@@ -1340,6 +1347,16 @@ ph_submit_batch_now(struct ph_context *ctx, struct parhelia_batch *batch,
    uint64_t start;
    int ret;
 
+   if (ctx->drop_repeats &&
+       (ctx->repeat_batch ||
+        (ctx->repeat_batch = MALLOC(sizeof(*ctx->repeat_batch))))) {
+      unsigned dropped;
+
+      if (!parhelia_batch_drop_repeats(ctx->repeat_batch, batch, &dropped)) {
+         batch = ctx->repeat_batch;
+         ctx->stat.repeats_dropped += dropped;
+      }
+   }
    if (ph_env("PARHELIA_DUMP_BATCHES"))
       ph_dump_batch(batch, vertices, vertex_dwords);
 
@@ -16194,6 +16211,9 @@ ph_destroy_context(struct pipe_context *p)
       translate_cache_destroy(ctx->tcl_cache);
    free(ctx->tcl_elts);
    free(ctx->tcl_clip_copy);
+   free(ctx->deindex);
+   free(ctx->tcl_seq);
+   FREE(ctx->repeat_batch);
    FREE(ctx->pending_vertex_store);
    parhelia_state_cache_destroy(ctx->state_cache);
    free(ctx->vs_const);
@@ -16330,6 +16350,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->packed_colour_fetch =
       ph_lx_family(ph_screen(screen)->chip_id) &&
       debug_get_bool_option("PARHELIA_PACKED_COLOUR", true);
+   ctx->drop_repeats = debug_get_bool_option("PARHELIA_DROP_REPEATS", false);
    ctx->viewport.scale[0] = ctx->viewport.scale[1] = 1.0f;
    ctx->async_submit = ph_screen(screen)->async_submit;
    ctx->stats_sync = getenv("PARHELIA_STATS") &&

@@ -286,6 +286,12 @@ int parhelia_batch_append_stateful_limited(
  * stream.  It neither drops nor caches any state write. */
 int parhelia_batch_compact_reglists(struct parhelia_batch *dst,
                                     const struct parhelia_batch *src);
+/* Copy @src without register-list writes that repeat a value the same
+ * stream already wrote to a plain state register; packets left empty go,
+ * relocated packets stay byte-exact. */
+int parhelia_batch_drop_repeats(struct parhelia_batch *dst,
+                                const struct parhelia_batch *src,
+                                unsigned *dropped);
 int parhelia_wait_fence(int fd, uint32_t fence, int64_t timeout_ns,
                         uint32_t *completed);
 /* Convert normal draw relocations to a bounded CREATE_VERTEX class-3 DMA
