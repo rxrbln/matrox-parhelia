@@ -592,6 +592,8 @@ struct ph_context {
     * while a ring is mapped, else in pending_vertex_store. */
    uint32_t *pending_vertices;
    uint32_t *pending_vertex_store;
+   /* built state prefixes, reused while a state repeats */
+   struct parhelia_state_cache *state_cache;
    int pending_ring_slot;        /* -1: not in the ring */
    uint32_t pending_ring_fence;  /* last submit that read the slot */
    unsigned pending_vertex_dwords;
@@ -4239,8 +4241,10 @@ ph_batch_primitives_units(struct ph_context *ctx, struct parhelia_batch *batch,
    else if (state->warp_entry == ctx->warp_passthrough &&
             state->prim == P3D_TRIANGLES && group >= 2)
       ctx->restore_after_transform = false;
-   return parhelia_batch_state_run_units(batch, colour_handle, depth_handle,
-                                         handles, state, primitives * per_prim);
+   return parhelia_batch_state_run_units_cached(ctx->state_cache, batch,
+                                                colour_handle, depth_handle,
+                                                handles, state,
+                                                primitives * per_prim);
 }
 
 static int
@@ -15570,6 +15574,7 @@ ph_destroy_context(struct pipe_context *p)
    free(ctx->tcl_elts);
    free(ctx->tcl_clip_copy);
    FREE(ctx->pending_vertex_store);
+   parhelia_state_cache_destroy(ctx->state_cache);
    free(ctx->vs_const);
    free(ctx->vs_const_pending);
    free(ctx->fs_const_snap);
@@ -15627,6 +15632,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    }
    ctx->pending_vertices = ctx->pending_vertex_store;
    ctx->pending_ring_slot = -1;
+   ctx->state_cache = parhelia_state_cache_create();
    /* All zero, like the state tracker's own initial copy: it only calls
     * set_scissor_states for a rectangle that differs from that copy. */
    ctx->base.screen = screen;
@@ -15861,6 +15867,7 @@ fail:
    if (ctx->draw)
       draw_destroy(ctx->draw);
    FREE(ctx->pending_vertex_store);
+   parhelia_state_cache_destroy(ctx->state_cache);
    FREE(ctx);
    return NULL;
 }

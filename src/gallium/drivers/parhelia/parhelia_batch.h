@@ -188,6 +188,18 @@ int parhelia_batch_state_run_units(struct parhelia_batch *batch,
                                    const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS],
                                    const struct p3d_state *state,
                                    unsigned vertices);
+/* A cache of built state prefixes (see parhelia_batch.c); the cached variant
+ * is byte-identical to parhelia_batch_state_run_units(). */
+struct parhelia_state_cache;
+struct parhelia_state_cache *parhelia_state_cache_create(void);
+void parhelia_state_cache_destroy(struct parhelia_state_cache *cache);
+int parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
+                                          struct parhelia_batch *batch,
+                                          uint32_t colour_handle,
+                                          uint32_t depth_handle,
+                                          const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS],
+                                          const struct p3d_state *state,
+                                          unsigned vertices);
 int parhelia_batch_submit(int fd, const struct parhelia_batch *batch,
                          const void *vertices, unsigned vertex_dwords,
                          uint32_t *fence);

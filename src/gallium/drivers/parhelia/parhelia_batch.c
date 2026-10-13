@@ -5,6 +5,7 @@
  */
 #include <errno.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -989,6 +990,458 @@ parhelia_batch_state_run_units(struct parhelia_batch *batch,
    return batch_state(batch, colour_handle, depth_handle, texture_handles,
                       state, packet_count(state->prim, per_packet, vertices),
                       vertices);
+}
+
+/* The state prefix of a batch - everything before its draw packets, after
+ * compaction - depends only on the state and the objects it names, and
+ * ioquake3 re-emits a few hundred distinct states per frame.  Build each
+ * once: a hit copies the prefix and appends the draw packets and their
+ * DRAW relocations exactly as batch_finish() does.  The key is the state
+ * with every pointer replaced by the data it points at, compared in full. */
+struct state_cache_entry {
+   uint64_t hash;
+   uint8_t *key;
+   size_t key_len;
+   uint32_t *commands;
+   struct drm_parhelia_packet *packets;
+   struct drm_parhelia_reloc *relocs;
+   unsigned command_count, packet_count, reloc_count;
+   int mvp_offset;               /* the matrix's dwords in commands, or -1 */
+};
+
+struct parhelia_state_cache {
+   struct state_cache_entry **slots;
+   unsigned cap, count;
+   uint8_t *key;                 /* the key being looked up */
+   size_t key_len, key_cap;
+   bool verify;
+   unsigned long hits, misses;
+};
+
+/* Entries before the cache is flushed and refilled. */
+#define STATE_CACHE_MAX_ENTRIES 4096u
+
+struct parhelia_state_cache *
+parhelia_state_cache_create(void)
+{
+   struct parhelia_state_cache *c = calloc(1, sizeof(*c));
+   const char *verify = getenv("PARHELIA_STATE_CACHE_VERIFY");
+
+   if (c)
+      c->verify = verify && strcmp(verify, "0");
+   return c;
+}
+
+static void
+state_cache_entry_free(struct state_cache_entry *e)
+{
+   if (!e)
+      return;
+   free(e->key);
+   free(e->commands);
+   free(e->packets);
+   free(e->relocs);
+   free(e);
+}
+
+static void
+state_cache_flush(struct parhelia_state_cache *c)
+{
+   for (unsigned i = 0; i < c->cap; i++) {
+      state_cache_entry_free(c->slots[i]);
+      c->slots[i] = NULL;
+   }
+   c->count = 0;
+}
+
+void
+parhelia_state_cache_destroy(struct parhelia_state_cache *c)
+{
+   if (!c)
+      return;
+   if (c->verify)
+      fprintf(stderr, "parhelia: state cache %lu hits, %lu misses, %u entries\n",
+              c->hits, c->misses, c->count);
+   state_cache_flush(c);
+   free(c->slots);
+   free(c->key);
+   free(c);
+}
+
+static bool
+state_key_put(struct parhelia_state_cache *c, const void *data, size_t len)
+{
+   if (c->key_len + len > c->key_cap) {
+      size_t cap = c->key_cap ? c->key_cap : 1024;
+      uint8_t *grown;
+
+      while (cap < c->key_len + len)
+         cap *= 2;
+      grown = realloc(c->key, cap);
+      if (!grown)
+         return false;
+      c->key = grown;
+      c->key_cap = cap;
+   }
+   memcpy(c->key + c->key_len, data, len);
+   c->key_len += len;
+   return true;
+}
+
+static bool
+state_key_texture(struct parhelia_state_cache *c, const struct p3d_texture *t)
+{
+   struct p3d_texture copy;
+   const uint8_t present = !!t;
+
+   if (!state_key_put(c, &present, 1))
+      return false;
+   if (!t)
+      return true;
+   copy = *t;
+   copy.aux = NULL;
+   return state_key_put(c, &copy, sizeof(copy)) &&
+          (!t->aux || state_key_put(c, t->aux, 5 * sizeof(uint32_t)));
+}
+
+static bool
+state_key_floats(struct parhelia_state_cache *c, const float *v, size_t n)
+{
+   const uint8_t present = !!v;
+
+   return state_key_put(c, &present, 1) &&
+          (!v || state_key_put(c, v, n * sizeof(float)));
+}
+
+/* The fixed-function matrix reaches the stream only verbatim, as c0..c3 of
+ * the constant group's first load (p3d_emit_constant_group()), so it stays
+ * out of the key and is written into the cached prefix instead. */
+static bool
+state_mvp_patchable(const struct p3d_state *st)
+{
+   const unsigned mask = st->const_mask ? st->const_mask : 7u;
+
+   return st->mvp && (mask & 1u) &&
+          !(st->vs_const && st->vs_const_vec4s && st->vs_const_vec4s <= 63);
+}
+
+static bool
+state_key_build(struct parhelia_state_cache *c, const struct p3d_state *input,
+                uint32_t colour_handle, uint32_t depth_handle,
+                const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS])
+{
+   struct p3d_state s = *input;
+   const uint8_t fog = !!input->fog_table, comb = !!input->comb;
+
+   s.fence = 0;
+   s.fog_table = NULL;
+   s.mvp = s.vs_const = s.aux_const = NULL;
+   s.comb = NULL;
+   s.tex = s.tex1 = s.tex2 = s.tex3 = NULL;
+   c->key_len = 0;
+   return state_key_put(c, &s, sizeof(s)) &&
+          state_key_put(c, &colour_handle, sizeof(colour_handle)) &&
+          state_key_put(c, &depth_handle, sizeof(depth_handle)) &&
+          state_key_put(c, texture_handles,
+                        P3D_MAX_TEXTURE_UNITS * sizeof(uint32_t)) &&
+          state_key_put(c, &fog, 1) &&
+          (!fog || state_key_put(c, input->fog_table, 64 * sizeof(uint32_t))) &&
+          (state_mvp_patchable(input) ?
+           state_key_put(c, &(const uint8_t){ 2 }, 1) :
+           state_key_floats(c, input->mvp, 16)) &&
+          state_key_floats(c, input->vs_const, input->vs_const_vec4s * 4u) &&
+          state_key_floats(c, input->aux_const, input->aux_const_vec4s * 4u) &&
+          state_key_put(c, &comb, 1) &&
+          (!comb || (state_key_put(c, &input->comb->count,
+                                   sizeof(input->comb->count)) &&
+                     state_key_put(c, input->comb->inst,
+                                   (input->comb->count <
+                                    P3D_COMB_MAX_INSTRUCTIONS ?
+                                    input->comb->count :
+                                    P3D_COMB_MAX_INSTRUCTIONS) *
+                                   sizeof(input->comb->inst[0])))) &&
+          state_key_texture(c, input->tex) &&
+          state_key_texture(c, input->tex1) &&
+          state_key_texture(c, input->tex2) &&
+          state_key_texture(c, input->tex3);
+}
+
+static uint64_t
+state_key_hash(const uint8_t *key, size_t len)
+{
+   uint64_t h = 0x9e3779b97f4a7c15ull ^ len;
+   size_t i = 0;
+
+   for (; i + 8 <= len; i += 8) {
+      uint64_t w;
+
+      memcpy(&w, key + i, 8);
+      h = (h ^ w) * 0xff51afd7ed558ccdull;
+      h ^= h >> 32;
+   }
+   for (; i < len; i++)
+      h = (h ^ key[i]) * 0x100000001b3ull;
+   return h ^ (h >> 29);
+}
+
+static struct state_cache_entry **
+state_cache_find(struct parhelia_state_cache *c, uint64_t hash)
+{
+   unsigned i = (unsigned)hash & (c->cap - 1);
+
+   while (c->slots[i]) {
+      struct state_cache_entry *e = c->slots[i];
+
+      if (e->hash == hash && e->key_len == c->key_len &&
+          !memcmp(e->key, c->key, c->key_len))
+         return &c->slots[i];
+      i = (i + 1) & (c->cap - 1);
+   }
+   return &c->slots[i];
+}
+
+static bool
+state_cache_grow(struct parhelia_state_cache *c)
+{
+   unsigned cap = c->cap ? c->cap * 2 : 256;
+   struct state_cache_entry **old = c->slots;
+   unsigned old_cap = c->cap;
+
+   c->slots = calloc(cap, sizeof(*c->slots));
+   if (!c->slots) {
+      c->slots = old;
+      return false;
+   }
+   c->cap = cap;
+   for (unsigned i = 0; i < old_cap; i++) {
+      unsigned j;
+
+      if (!old[i])
+         continue;
+      j = (unsigned)old[i]->hash & (cap - 1);
+      while (c->slots[j])
+         j = (j + 1) & (cap - 1);
+      c->slots[j] = old[i];
+   }
+   free(old);
+   return true;
+}
+
+/* The prefix of a freshly built batch: its packets before the first draw,
+ * provided the rest is exactly @draws DRAW-relocated draw packets. */
+static struct state_cache_entry *
+state_cache_capture(const struct parhelia_batch *batch, unsigned draws)
+{
+   struct state_cache_entry *e;
+   unsigned first, relocs = 0;
+
+   if (!draws || batch->packet_count < draws)
+      return NULL;
+   first = batch->packet_count - draws;
+   for (unsigned i = first; i < batch->packet_count; i++)
+      if (batch->packets[i].length != 3 ||
+          (batch->commands[batch->packets[i].offset] >> 24) != 0x97 ||
+          batch->packets[i].offset != batch->packets[first].offset + 3 * (i - first))
+         return NULL;
+   if (batch->packets[first].offset + 3 * draws != batch->command_count)
+      return NULL;
+   while (relocs < batch->reloc_count && batch->relocs[relocs].packet < first)
+      relocs++;
+   if (batch->reloc_count - relocs != draws)
+      return NULL;
+   for (unsigned i = relocs; i < batch->reloc_count; i++)
+      if (batch->relocs[i].type != PARHELIA_RELOC_DRAW ||
+          batch->relocs[i].packet != first + (i - relocs))
+         return NULL;
+   e = calloc(1, sizeof(*e));
+   if (!e)
+      return NULL;
+   e->command_count = batch->packets[first].offset;
+   e->packet_count = first;
+   e->reloc_count = relocs;
+   e->commands = malloc((e->command_count + 1) * sizeof(uint32_t));
+   e->packets = malloc((first + 1) * sizeof(*e->packets));
+   e->relocs = malloc((relocs + 1) * sizeof(*e->relocs));
+   if (!e->commands || !e->packets || !e->relocs) {
+      state_cache_entry_free(e);
+      return NULL;
+   }
+   memcpy(e->commands, batch->commands, e->command_count * sizeof(uint32_t));
+   memcpy(e->packets, batch->packets, first * sizeof(*e->packets));
+   memcpy(e->relocs, batch->relocs, relocs * sizeof(*e->relocs));
+   e->mvp_offset = -1;
+   return e;
+}
+
+/* The one constant load at slot 0 holding @mvp verbatim, or -1. */
+static int
+state_cache_find_mvp(const struct state_cache_entry *e, const float *mvp)
+{
+   int found = -1;
+
+   for (unsigned i = 0; i < e->packet_count; i++) {
+      const uint32_t *cmd = e->commands + e->packets[i].offset;
+      unsigned pos = 0;
+
+      if ((cmd[0] >> 24) != 0x41)
+         continue;
+      while (pos + 5 <= e->packets[i].length) {
+         const unsigned words = (cmd[pos] & 0xffff) + 2;
+
+         if (words > e->packets[i].length - pos)
+            return -1;
+         if (cmd[pos + 2] == 0 && cmd[pos + 1] >= 4 &&
+             !memcmp(&cmd[pos + 5], mvp, 16 * sizeof(float))) {
+            if (found >= 0)
+               return -1;
+            found = (int)(e->packets[i].offset + pos + 5);
+         }
+         pos += words;
+      }
+   }
+   return found;
+}
+
+/* The cached prefix plus the draw packets batch_finish() would emit. */
+static int
+state_cache_replay(struct parhelia_batch *batch,
+                   const struct state_cache_entry *e,
+                   const struct p3d_state *state, unsigned draws,
+                   unsigned per_packet, unsigned vertices)
+{
+   const uint32_t header = 0x97000000u |
+                           (((state->dw_per_vertex - 1) & 0x3f) << 17) | 1u;
+   unsigned consumed = 0;
+
+   if (e->command_count + 3 * draws > PH_BATCH_DWORDS ||
+       e->packet_count + draws > PH_BATCH_PACKETS ||
+       e->reloc_count + draws > PH_BATCH_RELOCS)
+      return -E2BIG;
+   memcpy(batch->commands, e->commands, e->command_count * sizeof(uint32_t));
+   if (e->mvp_offset >= 0)
+      memcpy(batch->commands + e->mvp_offset, state->mvp, 16 * sizeof(float));
+   memcpy(batch->packets, e->packets, e->packet_count * sizeof(*e->packets));
+   memcpy(batch->relocs, e->relocs, e->reloc_count * sizeof(*e->relocs));
+   batch->command_count = e->command_count;
+   batch->packet_count = e->packet_count;
+   batch->reloc_count = e->reloc_count;
+   for (unsigned k = 0; k < draws; k++) {
+      const unsigned run = packet_run(state->prim, per_packet,
+                                      vertices - consumed);
+      uint32_t *cmd = batch->commands + batch->command_count;
+
+      cmd[0] = header;
+      cmd[1] = 0;
+      cmd[2] = 0;
+      batch->packets[batch->packet_count] = (struct drm_parhelia_packet) {
+         .offset = batch->command_count, .length = 3,
+      };
+      batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
+         .packet = batch->packet_count,
+         .dword = consumed * state->dw_per_vertex * 4,
+         .delta = run * state->dw_per_vertex * 4,
+         .type = PARHELIA_RELOC_DRAW,
+      };
+      batch->packet_count++;
+      batch->command_count += 3;
+      consumed += run;
+   }
+   return 0;
+}
+
+int
+parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
+                                      struct parhelia_batch *batch,
+                                      uint32_t colour_handle,
+                                      uint32_t depth_handle,
+                                      const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS],
+                                      const struct p3d_state *state,
+                                      unsigned vertices)
+{
+   struct state_cache_entry **slot, *e;
+   unsigned per_packet, draws;
+   uint64_t hash;
+   int ret;
+
+   if (!cache || !state || state->bound_ranges)
+      return parhelia_batch_state_run_units(batch, colour_handle, depth_handle,
+                                            texture_handles, state, vertices);
+   per_packet = state->vertices_per_packet ? state->vertices_per_packet :
+                p3d_vertices_per_primitive(state->prim);
+   if (!per_packet || !vertices || !state->dw_per_vertex)
+      return -EINVAL;
+   draws = packet_count(state->prim, per_packet, vertices);
+   if ((cache->count + 1) * 2 > cache->cap && !state_cache_grow(cache))
+      return parhelia_batch_state_run_units(batch, colour_handle, depth_handle,
+                                            texture_handles, state, vertices);
+   if (!state_key_build(cache, state, colour_handle, depth_handle,
+                        texture_handles))
+      return parhelia_batch_state_run_units(batch, colour_handle, depth_handle,
+                                            texture_handles, state, vertices);
+   hash = state_key_hash(cache->key, cache->key_len);
+   slot = state_cache_find(cache, hash);
+   if (cache->verify && !((cache->hits + cache->misses + 1) % 20000))
+      fprintf(stderr, "parhelia: state cache %lu hits, %lu misses, %u entries\n",
+              cache->hits, cache->misses, cache->count);
+   if (*slot) {
+      cache->hits++;
+      ret = state_cache_replay(batch, *slot, state, draws, per_packet,
+                               vertices);
+      if (ret || !cache->verify)
+         return ret;
+      /* PARHELIA_STATE_CACHE_VERIFY=1: rebuild and compare every hit */
+      {
+         struct parhelia_batch *check = malloc(sizeof(*check));
+
+         if (check &&
+             !parhelia_batch_state_run_units(check, colour_handle,
+                                             depth_handle, texture_handles,
+                                             state, vertices) &&
+             (check->command_count != batch->command_count ||
+              check->packet_count != batch->packet_count ||
+              check->reloc_count != batch->reloc_count ||
+              memcmp(check->commands, batch->commands,
+                     batch->command_count * sizeof(uint32_t)) ||
+              memcmp(check->packets, batch->packets,
+                     batch->packet_count * sizeof(batch->packets[0])) ||
+              memcmp(check->relocs, batch->relocs,
+                     batch->reloc_count * sizeof(batch->relocs[0]))))
+            fprintf(stderr, "parhelia: state cache mismatch after %lu hits\n",
+                    cache->hits);
+         free(check);
+      }
+      return 0;
+   }
+   cache->misses++;
+   ret = parhelia_batch_state_run_units(batch, colour_handle, depth_handle,
+                                        texture_handles, state, vertices);
+   if (ret)
+      return ret;
+   if (cache->count >= STATE_CACHE_MAX_ENTRIES) {
+      state_cache_flush(cache);
+      slot = state_cache_find(cache, hash);
+   }
+   e = state_cache_capture(batch, draws);
+   if (!e)
+      return 0;
+   if (state_mvp_patchable(state)) {
+      e->mvp_offset = state_cache_find_mvp(e, state->mvp);
+      if (e->mvp_offset < 0) {
+         state_cache_entry_free(e);
+         return 0;
+      }
+   }
+   e->hash = hash;
+   e->key = malloc(cache->key_len);
+   if (!e->key) {
+      state_cache_entry_free(e);
+      return 0;
+   }
+   memcpy(e->key, cache->key, cache->key_len);
+   e->key_len = cache->key_len;
+   *slot = e;
+   cache->count++;
+   return 0;
 }
 
 int
