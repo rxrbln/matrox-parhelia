@@ -16208,12 +16208,18 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
     * shape.  parhelia-p690-multi-primitive-packet-hang.md carries the bisect,
     * the two vendor candidates that were tested and refuted, and what is
     * still unexplained. */
+   /* The original family takes the vendor's eight triangles per packet:
+    * its captures carry 24-vertex packets throughout
+    * (parhelia-p690-multi-primitive-packets-re.md section 5). */
+   const bool lx = ph_lx_family(ph_screen(screen)->chip_id);
+
    ph_unorm8_bits_init();
    ctx->prims_per_packet =
-      debug_get_num_option("PARHELIA_PRIMS_PER_PACKET", 2);
+      debug_get_num_option("PARHELIA_PRIMS_PER_PACKET", lx ? 2 : 8);
    if (ctx->prims_per_packet < 1)
       ctx->prims_per_packet = 1;
-   if (ctx->prims_per_packet > 2 && !ph_env("PARHELIA_PRIMS_PER_PACKET_UNSAFE")) {
+   if (lx && ctx->prims_per_packet > 2 &&
+       !ph_env("PARHELIA_PRIMS_PER_PACKET_UNSAFE")) {
       fprintf(stderr,
               "parhelia: %u primitives per packet wedges this chip; using 2. "
               "Set PARHELIA_PRIMS_PER_PACKET_UNSAFE=1 to measure it anyway.\n",
