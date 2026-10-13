@@ -8371,10 +8371,11 @@ ph_tcl_box_scan(const uint8_t *base, unsigned stride, unsigned lo,
 
 /* The object-space box of the positions a draw references: from the
  * buffer's cache while its contents are unchanged, else one min/max pass
- * over the referenced vertex range. */
+ * over the referenced vertex range.  A buffer the cache cannot hold is
+ * scanned only with @scan_uncached; the fetch can bound it on the way. */
 static bool
 ph_tcl_position_box(struct ph_context *ctx, const uint32_t *elts, unsigned n,
-                    float lo_out[3], float hi_out[3])
+                    bool scan_uncached, float lo_out[3], float hi_out[3])
 {
    const struct pipe_vertex_element *e;
    const struct pipe_vertex_buffer *vb;
@@ -8401,7 +8402,7 @@ ph_tcl_position_box(struct ph_context *ctx, const uint32_t *elts, unsigned n,
       res = ph_resource(vb->buffer.resource);
       map = res->malloc_data;
    }
-   if (!map)
+   if (!map || (!scan_uncached && (!res || res->data_volatile)))
       return false;
    offset = vb->buffer_offset + e->src_offset;
    stride = e->src_stride;
@@ -8532,6 +8533,11 @@ struct ph_tcl_layout {
 DEBUG_GET_ONCE_BOOL_OPTION(tcl_rgba, "PARHELIA_TCL_RGBA", false)
 DEBUG_GET_ONCE_BOOL_OPTION(tcl_box, "PARHELIA_TCL_BOX", true)
 DEBUG_GET_ONCE_BOOL_OPTION(tcl_clip, "PARHELIA_TCL_CLIP", true)
+/* Bounding positions in the fetch costs more than the separate scan on nano
+ * (11.21 -> 11.37 ms CPU/frame in ioquake3): it sees every index, the scan
+ * every referenced vertex once.  Kept for hosts where the second pass over
+ * the positions costs more than the arithmetic. */
+DEBUG_GET_ONCE_BOOL_OPTION(tcl_fused_box, "PARHELIA_TCL_FUSED_BOX", false)
 
 static bool
 ph_tcl_no(struct ph_context *ctx, enum ph_tcl_reason reason)
@@ -8825,8 +8831,15 @@ ph_tcl_software_tail(struct ph_context *ctx, const uint32_t *elts,
  * straight into the stream.  The generic translate runs every element through
  * format callbacks, which costs more than the copy on a slow CPU; the result
  * is the same, byte for byte. */
+/* Order keys of the positions a fetch copied (ph_float_order_key). */
+struct ph_tcl_box {
+   int32_t lo[3], hi[3];
+   uint32_t nan;
+};
+
 struct ph_tcl_fetch {
    unsigned count;
+   int box_elem;                   /* the position element, or -1 */
    struct {
       const uint8_t *src;          /* buffer start plus element offset */
       unsigned stride;
@@ -8843,6 +8856,7 @@ ph_tcl_fetch_init(struct ph_tcl_fetch *f, const struct translate_key *key,
                   const uint8_t *const *maps, const unsigned *strides)
 {
    f->count = 0;
+   f->box_elem = -1;
    for (unsigned i = 0; i < key->nr_elements; i++) {
       const struct translate_element *el = &key->element[i];
       const uint8_t *src = maps[el->input_buffer] + el->input_offset;
@@ -8873,9 +8887,46 @@ ph_tcl_fetch_init(struct ph_tcl_fetch *f, const struct translate_key *key,
       f->e[f->count].comps = out;
       f->e[f->count].unorm8 = unorm8;
       f->e[f->count].packed = false;
+      /* the position: object-space x,y,z at dword 0 */
+      if (!el->output_offset && out == 3 && !unorm8 && f->box_elem < 0)
+         f->box_elem = f->count;
       f->count++;
    }
    return true;
+}
+
+/* The position copy, bounding what it copies on the way. */
+static void
+ph_tcl_fetch_position_box(const uint8_t *base, size_t stride,
+                          const uint32_t *elts, unsigned count, uint32_t *d,
+                          unsigned dpv, struct ph_tcl_box *box)
+{
+   int32_t lo0 = box->lo[0], lo1 = box->lo[1], lo2 = box->lo[2];
+   int32_t hi0 = box->hi[0], hi1 = box->hi[1], hi2 = box->hi[2];
+   uint32_t nan = box->nan;
+
+   for (unsigned v = 0; v < count; v++, d += dpv) {
+      const uint32_t *s = (const uint32_t *)(base + elts[v] * stride);
+      const uint32_t x = s[0], y = s[1], z = s[2];
+      const int32_t kx = ph_float_order_key(x), ky = ph_float_order_key(y);
+      const int32_t kz = ph_float_order_key(z);
+
+      d[0] = x;
+      d[1] = y;
+      d[2] = z;
+      nan |= ((x & 0x7fffffffu) > 0x7f800000u) |
+             ((y & 0x7fffffffu) > 0x7f800000u) |
+             ((z & 0x7fffffffu) > 0x7f800000u);
+      lo0 = kx < lo0 ? kx : lo0;
+      hi0 = kx > hi0 ? kx : hi0;
+      lo1 = ky < lo1 ? ky : lo1;
+      hi1 = ky > hi1 ? ky : hi1;
+      lo2 = kz < lo2 ? kz : lo2;
+      hi2 = kz > hi2 ? kz : hi2;
+   }
+   box->lo[0] = lo0; box->lo[1] = lo1; box->lo[2] = lo2;
+   box->hi[0] = hi0; box->hi[1] = hi1; box->hi[2] = hi2;
+   box->nan = nan;
 }
 
 /* The bits of ubyte_to_float() for every byte: on Alpha each float
@@ -8893,12 +8944,18 @@ ph_unorm8_bits_init(void)
  * the copy alone. */
 static void
 ph_tcl_fetch_elements(const struct ph_tcl_fetch *f, const uint32_t *elts,
-                      unsigned count, uint32_t *dst, unsigned dpv)
+                      unsigned count, uint32_t *dst, unsigned dpv,
+                      struct ph_tcl_box *box)
 {
    for (unsigned i = 0; i < f->count; i++) {
       const uint8_t *base = f->e[i].src;
       const size_t stride = f->e[i].stride;
       uint32_t *d = dst + f->e[i].out;
+
+      if (box && (int)i == f->box_elem) {
+         ph_tcl_fetch_position_box(base, stride, elts, count, d, dpv, box);
+         continue;
+      }
 
       if (f->e[i].packed) {
          const uint32_t alpha = f->e[i].alpha;
@@ -8963,11 +9020,12 @@ ph_tcl_fetch_elements(const struct ph_tcl_fetch *f, const uint32_t *elts,
 
 static void
 ph_tcl_fetch_run(const struct ph_tcl_fetch *f, const uint32_t *elts,
-                 unsigned count, float *dst, unsigned dpv)
+                 unsigned count, float *dst, unsigned dpv,
+                 struct ph_tcl_box *box)
 {
    for (unsigned b = 0; b < count; b += PH_TCL_FETCH_BLOCK)
       ph_tcl_fetch_elements(f, elts + b, MIN2(count - b, PH_TCL_FETCH_BLOCK),
-                            (uint32_t *)dst + (size_t)b * dpv, dpv);
+                            (uint32_t *)dst + (size_t)b * dpv, dpv, box);
 }
 
 /* Fill the object-space vertex stream for one draw and, when every vertex
@@ -8988,7 +9046,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    unsigned vs_const_vec4s = 0;
    uint32_t entry = 0;
    float mvp[16];
-   bool box_fits;
+   bool box_fits, fused_box, chunks_fit = true;
 
    ctx->tcl_last_reason = PH_TCL_NO_DRAW_SHAPE;
    if (info->primitive_restart || info->instance_count != 1 ||
@@ -9160,12 +9218,19 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
       /* The vendor tests every vertex.  A box inside the volume implies
        * every vertex is, and clears 113 of 125 ioquake3 draws per frame on
        * the Alpha (6.9 -> 7.2 fps); PARHELIA_TCL_BOX=0 tests each vertex. */
-      box_fits = debug_get_option_tcl_box() &&
+      const bool box = debug_get_option_tcl_box() &&
                  (!slice || (slice->affine && ctx->vs->pos_input >= 0 &&
                              ctx->vs->pos_input < 32 &&
-                             slice->input_mask == 1u << ctx->vs->pos_input)) &&
-                 ph_tcl_position_box(ctx, elts, ntri * 3, lo, hi) &&
+                             slice->input_mask == 1u << ctx->vs->pos_input));
+
+      /* A buffer the box cache cannot hold is bounded chunk by chunk while
+       * the fixed-function fetch copies its positions. */
+      fused_box = box && debug_get_option_tcl_fused_box() && !lay.program &&
+                  fetch.count && fetch.box_elem >= 0;
+      box_fits = box &&
+                 ph_tcl_position_box(ctx, elts, ntri * 3, !fused_box, lo, hi) &&
                  ph_tcl_box_fits(ctx, mvp, slice, lo, hi);
+      fused_box &= !box_fits;
       if (box_fits)
          ctx->tcl_box_draws++;
       else if (lay.program && ctx->vs->pos_slice)
@@ -9192,8 +9257,15 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
       ctx->packed_colour = lay.packed_colour;
       chunk = MIN2(ntri - done, space - ctx->triangles);
       dst = &ctx->vertices[ctx->triangles * 3 * lay.dpv];
+      struct ph_tcl_box cbox = {
+         .lo = { INT32_MAX, INT32_MAX, INT32_MAX },
+         .hi = { INT32_MIN, INT32_MIN, INT32_MIN },
+      };
+      bool chunk_fits = box_fits;
+
       if (fetch.count)
-         ph_tcl_fetch_run(&fetch, elts + done * 3, chunk * 3, dst, lay.dpv);
+         ph_tcl_fetch_run(&fetch, elts + done * 3, chunk * 3, dst, lay.dpv,
+                          fused_box ? &cbox : NULL);
       else
          translate->run_elts(translate, elts + done * 3, chunk * 3, 0, 0,
                              dst);
@@ -9213,7 +9285,17 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
                c[3] = have ? constant[3] : 1.0f;
          }
       }
-      if (!box_fits && !ph_tcl_vertices_fit(ctx, dst, chunk * 3, lay.dpv)) {
+      if (fused_box && !cbox.nan) {
+         float lo[3], hi[3];
+
+         for (unsigned c = 0; c < 3; c++) {
+            lo[c] = ph_float_from_order_key(cbox.lo[c]);
+            hi[c] = ph_float_from_order_key(cbox.hi[c]);
+         }
+         chunk_fits = ph_tcl_box_fits(ctx, mvp, NULL, lo, hi);
+      }
+      chunks_fit &= chunk_fits;
+      if (!chunk_fits && !ph_tcl_vertices_fit(ctx, dst, chunk * 3, lay.dpv)) {
          /* A fixed-function transform clips the crossing triangles itself. */
          if (!lay.program && lay.dpv <= PH_TCL_MAX_DPV &&
              debug_get_option_tcl_clip()) {
@@ -9255,6 +9337,8 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
       ctx->triangles += chunk;
       done += chunk;
    }
+   if (fused_box && chunks_fit)
+      ctx->tcl_box_draws++;
    return true;
 fallback:
    ctx->tcl_fallbacks++;
