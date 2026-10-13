@@ -442,6 +442,11 @@ module_param(vram_vertex, bool, 0400);
 MODULE_PARM_DESC(vram_vertex,
 		 "Enable hardware-tested dedicated DMA32 P690 vertex buffers (default true)");
 
+static bool parhelia_vertex_objects(const struct parhelia_device *pdev)
+{
+	return vram_vertex && pdev->pdev->device == PARHELIA_P690;
+}
+
 static bool trace_vram_reloc;
 module_param(trace_vram_reloc, bool, 0400);
 MODULE_PARM_DESC(trace_vram_reloc,
@@ -3543,7 +3548,7 @@ int parhelia_create_vertex_ioctl(struct drm_device *drm, void *data,
 	u32 handle;
 	int ret;
 
-	if (pdev->pdev->device != PARHELIA_P690 || !vram_vertex)
+	if (!parhelia_vertex_objects(pdev))
 		return -EOPNOTSUPP;
 	if (!args->size || args->size > PARHELIA_VERTEX_BO_MAX_SIZE ||
 	    args->flags || args->handle || args->mmap_offset)
@@ -3636,6 +3641,9 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		args->value = pdev->warp_user_cpu ?
 			PARHELIA_WARP_USER_IMAGE_INSTRUCTIONS : 0;
 		break;
+	case PARHELIA_PARAM_DRAW_RANGES:
+		args->value = parhelia_vertex_objects(pdev);
+		break;
 	case PARHELIA_PARAM_WARP_PROGRAM_SLOTS:
 		args->value = pdev->warp_user_cpu ?
 			PARHELIA_WARP_USER_FILE_SLOTS : 0;
@@ -3653,7 +3661,7 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		args->value = pdev->chip->texture_pipe_mode;
 		break;
 	case PARHELIA_PARAM_VRAM_VERTEX:
-		args->value = pdev->pdev->device == PARHELIA_P690 && vram_vertex;
+		args->value = parhelia_vertex_objects(pdev);
 		break;
 	case PARHELIA_PARAM_NATIVE_INDEXED:
 		/* This is never a normal rendering feature yet.  It is exposed solely
@@ -4088,6 +4096,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	bool *draw_relocated, *call_boundaries;
 	bool host_vertex_draw = false;
 	bool vertex_object_draw = false;
+	u32 draw_ranges = 0, draw_ranges_bus = 0;
 	bool async = args->flags & PARHELIA_SUBMIT_ASYNC;
 	u32 i, end = 0, fence, dma_tag, primary_words, waited, opening_slot;
 	u32 boundary_packet = 0, boundary_count = 0, call_boundary_count = 0;
@@ -4400,15 +4409,49 @@ retry_slot:
 			host_vertex_draw = true;
 			continue;
 		}
+		if (reloc->type == PARHELIA_RELOC_DRAW_RANGES) {
+			struct parhelia_vertex_bo *vertex_bo;
+			u32 range_end, bus_end;
+
+			if (!parhelia_vertex_objects(pdev) || draw_ranges ||
+			    host_vertex_draw || vertex_object_draw ||
+			    args->vertex_dwords || reloc->packet ||
+			    !reloc->dword || ((reloc->dword | reloc->delta) & 3) ||
+			    check_add_overflow(reloc->delta, reloc->dword, &range_end)) {
+				ret = -EINVAL;
+				goto out_unpin;
+			}
+			objects[i] = drm_gem_object_lookup(file, reloc->handle);
+			if (!objects[i]) {
+				ret = -ENOENT;
+				goto out_unpin;
+			}
+			vertex_bo = parhelia_vertex_bo_lookup(pdev, file, objects[i]);
+			if (!vertex_bo) {
+				ret = -EACCES;
+				goto out_unpin;
+			}
+			if (range_end > vertex_bo->dma.base.size ||
+			    check_add_overflow(lower_32_bits(vertex_bo->dma.dma_addr),
+					       reloc->delta, &draw_ranges_bus) ||
+			    check_add_overflow(draw_ranges_bus, reloc->dword, &bus_end)) {
+				ret = -EINVAL;
+				goto out_unpin;
+			}
+			/* The draw packets are relocated in the opcode pass below. */
+			draw_ranges = reloc->dword;
+			vertex_object_draw = true;
+			continue;
+		}
 		if (reloc->type == PARHELIA_RELOC_DRAW_VRAM) {
 			struct parhelia_vertex_bo *vertex_bo;
 			u32 range_end, bus_start, bus_end;
 
-			if (pdev->pdev->device != PARHELIA_P690) {
+			if (!parhelia_vertex_objects(pdev)) {
 				ret = -EOPNOTSUPP;
 				goto out_unpin;
 			}
-			if (host_vertex_draw || args->vertex_dwords ||
+			if (host_vertex_draw || args->vertex_dwords || draw_ranges ||
 			    (packet_cmd[0] >> 24) != 0x97 || draw_relocated[reloc->packet] ||
 			    (reloc->dword & 3) || !reloc->delta || (reloc->delta & 3) ||
 			    reloc->delta > PARHELIA_MAX_DRAW_DWORDS * sizeof(u32) ||
@@ -4712,6 +4755,20 @@ retry_slot:
 		    !bound_range.stream_seen) {
 			ret = -EINVAL;
 			goto out_unpin;
+		}
+		if (opcode == 0x97 && draw_ranges) {
+			u32 *cmd = commands + packets[i].offset;
+			u32 begin = cmd[1], end = cmd[2];
+
+			if (((begin | end) & 3) || end <= begin ||
+			    end - begin > PARHELIA_MAX_DRAW_DWORDS * sizeof(u32) ||
+			    end > draw_ranges) {
+				ret = -EINVAL;
+				goto out_unpin;
+			}
+			cmd[1] = draw_ranges_bus + begin;
+			cmd[2] = draw_ranges_bus + end;
+			draw_relocated[i] = true;
 		}
 		if (opcode == 0x97 && !draw_relocated[i]) {
 			ret = -EINVAL;
