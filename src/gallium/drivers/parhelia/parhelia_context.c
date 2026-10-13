@@ -1024,6 +1024,21 @@ ph_destroy_vertex_ring(struct ph_context *ctx)
 /* A failed optional allocation must never make the known-good DMA32 path
  * unavailable. CREATE_VERTEX is a P690 capability query, not a chip-id
  * guess, and a client only starts using it after mmap succeeds. */
+/* CREATE_VERTEX has a 1 MiB allocation ABI on supported kernels.  A
+ * deeper async queue cannot enlarge that allocation; retain complete slots. */
+static unsigned
+ph_vertex_ring_slot_count(unsigned async_slots, uint64_t slot_bytes)
+{
+   unsigned wanted = async_slots > PH_VRAM_VERTEX_LEGACY_SLOTS &&
+                     async_slots <= PH_VRAM_VERTEX_SLOTS_MAX ?
+                     async_slots - 1 : PH_VRAM_VERTEX_LEGACY_SLOTS;
+   const uint64_t max_bytes = UINT64_C(1) << 20;
+
+   if (!slot_bytes || slot_bytes > max_bytes)
+      return 0;
+   return MIN2(wanted, max_bytes / slot_bytes);
+}
+
 static void
 ph_create_vertex_ring(struct ph_context *ctx)
 {
@@ -1039,12 +1054,11 @@ ph_create_vertex_ring(struct ph_context *ctx)
    parhelia_batch_negotiate_limits(screen->kernel_max_packets, true,
                                    &mapped_limits);
    slot_bytes = (uint64_t)mapped_limits.vertex_dwords * sizeof(uint32_t);
-   /* Keep one kernel request slot free.  Filling all eight moves throttling
-    * into the kernel's coarse queue-full wait; seven subranges instead wait
-    * for the exact oldest fence only when this userspace ring wraps. */
-   slot_count = screen->async_slots > PH_VRAM_VERTEX_LEGACY_SLOTS &&
-                screen->async_slots <= PH_VRAM_VERTEX_SLOTS_MAX ?
-                screen->async_slots - 1 : PH_VRAM_VERTEX_LEGACY_SLOTS;
+   /* Leave queue headroom, and keep the mapped allocation inside the
+    * CREATE_VERTEX ABI even when a kernel reports sixteen async slots. */
+   slot_count = ph_vertex_ring_slot_count(screen->async_slots, slot_bytes);
+   if (!slot_count)
+      return;
    create.size = slot_count * slot_bytes;
    if (!screen->vram_vertex ||
        ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_VERTEX, &create))
