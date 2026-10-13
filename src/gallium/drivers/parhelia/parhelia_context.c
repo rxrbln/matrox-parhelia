@@ -8370,6 +8370,78 @@ ph_tcl_software_tail(struct ph_context *ctx, const uint32_t *elts,
    draw_set_indexes(ctx->draw, NULL, 0, 0);
 }
 
+/* The fixed-function inputs - float vectors and RGBA8 colours - copied
+ * straight into the stream.  The generic translate runs every element through
+ * format callbacks, which costs more than the copy on a slow CPU; the result
+ * is the same, byte for byte. */
+struct ph_tcl_fetch {
+   unsigned count;
+   struct {
+      const uint8_t *src;          /* buffer start plus element offset */
+      unsigned stride;
+      unsigned out;                /* output dword */
+      unsigned comps;
+      bool unorm8;
+   } e[PIPE_MAX_ATTRIBS];
+};
+
+static bool
+ph_tcl_fetch_init(struct ph_tcl_fetch *f, const struct translate_key *key,
+                  const uint8_t *const *maps, const unsigned *strides)
+{
+   f->count = 0;
+   for (unsigned i = 0; i < key->nr_elements; i++) {
+      const struct translate_element *el = &key->element[i];
+      const uint8_t *src = maps[el->input_buffer] + el->input_offset;
+      unsigned in, out;
+      bool unorm8 = false;
+
+      switch (el->output_format) {
+      case PIPE_FORMAT_R32G32B32A32_FLOAT: out = 4; break;
+      case PIPE_FORMAT_R32G32B32_FLOAT: out = 3; break;
+      case PIPE_FORMAT_R32G32_FLOAT: out = 2; break;
+      default: return false;
+      }
+      switch (el->input_format) {
+      case PIPE_FORMAT_R32G32B32A32_FLOAT: in = 4; break;
+      case PIPE_FORMAT_R32G32B32_FLOAT: in = 3; break;
+      case PIPE_FORMAT_R32G32_FLOAT: in = 2; break;
+      case PIPE_FORMAT_R8G8B8A8_UNORM: in = 4; unorm8 = true; break;
+      default: return false;
+      }
+      /* Missing components take defaults; an unaligned float load traps. */
+      if (el->type != TRANSLATE_ELEMENT_NORMAL || in < out ||
+          el->output_offset % 4 ||
+          (!unorm8 && (((uintptr_t)src | strides[el->input_buffer]) & 3)))
+         return false;
+      f->e[f->count].src = src;
+      f->e[f->count].stride = strides[el->input_buffer];
+      f->e[f->count].out = el->output_offset / 4;
+      f->e[f->count].comps = out;
+      f->e[f->count].unorm8 = unorm8;
+      f->count++;
+   }
+   return true;
+}
+
+static void
+ph_tcl_fetch_run(const struct ph_tcl_fetch *f, const uint32_t *elts,
+                 unsigned count, float *dst, unsigned dpv)
+{
+   for (unsigned v = 0; v < count; v++, dst += dpv)
+      for (unsigned i = 0; i < f->count; i++) {
+         const uint8_t *src = f->e[i].src + (size_t)elts[v] * f->e[i].stride;
+         float *d = dst + f->e[i].out;
+
+         if (f->e[i].unorm8)
+            for (unsigned c = 0; c < f->e[i].comps; c++)
+               d[c] = ubyte_to_float(src[c]);
+         else
+            for (unsigned c = 0; c < f->e[i].comps; c++)
+               d[c] = ((const float *)src)[c];
+      }
+}
+
 /* Fill the object-space vertex stream for one draw and, when every vertex
  * lands inside the hardware clip volume, keep it for a transforming batch.
  * Returns false when the caller must use the software pipeline instead. */
@@ -8379,7 +8451,10 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
 {
    struct ph_tcl_layout lay;
    struct translate_key key = {0};
-   struct translate *translate;
+   struct translate *translate = NULL;
+   struct ph_tcl_fetch fetch;
+   const uint8_t *maps[PIPE_MAX_ATTRIBS];
+   unsigned strides[PIPE_MAX_ATTRIBS];
    uint32_t *elts = NULL;
    unsigned ntri, done = 0, limit;
    unsigned vs_const_vec4s = 0;
@@ -8462,9 +8537,6 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
       if (!ctx->tcl_cache)
          goto fallback;
    }
-   translate = translate_cache_find(ctx->tcl_cache, &key);
-   if (!translate)
-      goto fallback;
    for (unsigned i = 0; i < key.nr_elements; i++) {
       unsigned b = key.element[i].input_buffer;
       const struct pipe_vertex_buffer *vb = &ctx->draw->pt.vertex_buffer[b];
@@ -8472,14 +8544,25 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
                            (vb->buffer.resource ?
                             ph_resource(vb->buffer.resource)->malloc_data :
                             NULL);
-      unsigned stride = 0;
 
       if (!map)
          goto fallback;
+      maps[b] = map + vb->buffer_offset;
+      strides[b] = 0;
       for (unsigned e = 0; e < ctx->velems->count; e++)
          if (ctx->velems->elem[e].vertex_buffer_index == b)
-            stride = ctx->velems->elem[e].src_stride;
-      translate->set_buffer(translate, b, map + vb->buffer_offset, stride, ~0u);
+            strides[b] = ctx->velems->elem[e].src_stride;
+   }
+   if (!ph_tcl_fetch_init(&fetch, &key, maps, strides)) {
+      fetch.count = 0;
+      translate = translate_cache_find(ctx->tcl_cache, &key);
+      if (!translate)
+         goto fallback;
+      for (unsigned i = 0; i < key.nr_elements; i++) {
+         unsigned b = key.element[i].input_buffer;
+
+         translate->set_buffer(translate, b, maps[b], strides[b], ~0u);
+      }
    }
 
    /* Mixed primitive kinds keep their order, and a batch carrying
@@ -8557,7 +8640,11 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
       ctx->colour_alpha = lay.colour_alpha;
       chunk = MIN2(ntri - done, space - ctx->triangles);
       dst = &ctx->vertices[ctx->triangles * 3 * lay.dpv];
-      translate->run_elts(translate, elts + done * 3, chunk * 3, 0, 0, dst);
+      if (fetch.count)
+         ph_tcl_fetch_run(&fetch, elts + done * 3, chunk * 3, dst, lay.dpv);
+      else
+         translate->run_elts(translate, elts + done * 3, chunk * 3, 0, 0,
+                             dst);
       if (lay.program ?
              !(ctx->vs->prog.input_mask & (1u << P3D_WARP_V_COLOUR)) :
              ctx->vs->colour_input < 0) {
