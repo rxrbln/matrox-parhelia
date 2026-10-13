@@ -685,7 +685,12 @@ struct ph_context {
    /* The widest packet has XY, Z, RGB and two ST sets: ten dwords per vertex.
     * Keep the CPU staging buffer sized for that form even though simpler
     * draws use five, six, or seven dwords. */
-   float vertices[PH_BATCH_MAX_DRAWS * 3 * 10];
+   float vertex_store[PH_BATCH_MAX_DRAWS * 3 * 10];
+   /* Where the current batch is staged: the aggregate's tail in its ring
+    * slot when a ring is mapped (it is submitted from there, no copy),
+    * else vertex_store.  stage_room is the ring slot's room, 0 otherwise. */
+   float *vertices;
+   unsigned stage_room;
    /* The fallback P690 path packs each logical texture stage for its serial
     * draw.  Proven one-pass MODULATE uses vertices[] directly. */
    float packed_vertices[PH_BATCH_MAX_DRAWS * 3 * 8];
@@ -716,8 +721,8 @@ struct ph_context {
    struct {
       unsigned frames, batches, draw_batches, triangles, submits, clears;
       unsigned draw_packets;
-      unsigned waits;
-      uint64_t vertex_dwords, clear_pixels, wait_ns, start_ns;
+      unsigned waits, stage_evictions;
+      uint64_t vertex_dwords, in_place_dwords, clear_pixels, wait_ns, start_ns;
       unsigned kind_count[PH_STAT_KINDS];
       uint64_t kind_ns[PH_STAT_KINDS];
       double kind_pixels[PH_STAT_KINDS];
@@ -898,6 +903,8 @@ ph_pending_vertex_limit(const struct ph_context *ctx)
 static inline unsigned
 ph_logical_vertex_limit(const struct ph_context *ctx)
 {
+   if (ctx->stage_room)
+      return ctx->stage_room;
    /* CREATE_VERTEX relocates every triangle range independently, so the
     * logical stream may fill one negotiated ring slot while every hardware
     * fetch remains only 3 * dwords-per-vertex. */
@@ -957,11 +964,12 @@ ph_stats_frame(struct ph_context *ctx)
    now = ph_now_ns();
    if (ctx->stat.start_ns)
       fprintf(stderr,
-              "parhelia stats/frame: %.2f ms, %.0f batches (%.0f draw), %.0f triangles, %.0f draw packets, %.0f submits, %.0f vertex dwords, %.1f clears (%.2f Mpixel), %.1f waits %.2f ms\n",
+              "parhelia stats/frame: %.2f ms, %.0f batches (%.0f draw), %.0f triangles, %.0f draw packets, %.0f submits, %.0f vertex dwords (%.0f staged in place, %.1f moved out), %.1f clears (%.2f Mpixel), %.1f waits %.2f ms\n",
               (now - ctx->stat.start_ns) / n / 1e6, ctx->stat.batches / n,
               ctx->stat.draw_batches / n, ctx->stat.triangles / n,
               ctx->stat.draw_packets / n,
               ctx->stat.submits / n, ctx->stat.vertex_dwords / n,
+              ctx->stat.in_place_dwords / n, ctx->stat.stage_evictions / n,
               ctx->stat.clears / n, ctx->stat.clear_pixels / n / 1e6,
               ctx->stat.waits / n, ctx->stat.wait_ns / n / 1e6);
    if (ctx->stat.start_ns && (ctx->tcl_draws || ctx->tcl_fallbacks ||
@@ -1040,6 +1048,8 @@ ph_destroy_vertex_ring(struct ph_context *ctx)
    ctx->vram_vertices = NULL;
    ctx->pending_vertices = ctx->pending_vertex_store;
    ctx->pending_ring_slot = -1;
+   ctx->vertices = ctx->vertex_store;
+   ctx->stage_room = 0;
    ctx->vram_vertex_size = 0;
    ctx->vram_vertex_handle = 0;
    ctx->vram_vertex_slot_count = 0;
@@ -1347,7 +1357,7 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
  * submitted from: wait for that slot's previous reader once, when the first
  * vertices arrive, instead of copying the whole aggregate at submit. */
 static int
-ph_pending_ring_acquire(struct ph_context *ctx)
+ph_pending_ring_acquire(struct ph_context *ctx, bool block)
 {
    unsigned slot;
 
@@ -1356,8 +1366,21 @@ ph_pending_ring_acquire(struct ph_context *ctx)
        ph_pending_vertex_limit(ctx) > ctx->vram_vertex_slot_dwords)
       return 0;
    slot = ctx->vram_vertex_slot;
+   /* a drain inside a batch's submission leaves that batch staged in the
+    * slot just released, until it is appended */
+   if (ctx->stage_room && (ctx->triangles || ctx->points || ctx->lines) &&
+       (const uint32_t *)ctx->vertices >=
+          (const uint32_t *)ctx->vram_vertices +
+          (size_t)slot * ctx->vram_vertex_slot_dwords &&
+       (const uint32_t *)ctx->vertices <
+          (const uint32_t *)ctx->vram_vertices +
+          (size_t)(slot + 1) * ctx->vram_vertex_slot_dwords)
+      slot = ctx->vram_vertex_slot = (slot + 1) % ctx->vram_vertex_slot_count;
    if (ctx->vram_vertex_fence[slot]) {
-      int ret = ph_wait_fence_counted(ctx, ctx->vram_vertex_fence[slot]);
+      int ret = block ?
+         ph_wait_fence_counted(ctx, ctx->vram_vertex_fence[slot]) :
+         parhelia_wait_fence(ph_screen(ctx->base.screen)->fd,
+                             ctx->vram_vertex_fence[slot], 0, NULL);
 
       if (ret)
          return ret;
@@ -1383,6 +1406,57 @@ ph_pending_ring_release(struct ph_context *ctx)
    }
    ctx->pending_ring_slot = -1;
    ctx->pending_vertices = ctx->pending_vertex_store;
+}
+
+/* Less room than this left in a ring slot drains the aggregate before the
+ * next batch is staged, rather than staging it in a sliver. */
+#define PH_STAGE_MIN_DWORDS 2048u
+
+DEBUG_GET_ONCE_BOOL_OPTION(stage_ring, "PARHELIA_STAGE_RING", true)
+
+/* Point the staging buffer at the aggregate's tail in its ring slot, so a
+ * batch's vertices are written where they are submitted from; without a
+ * ring, or while the next slot is still being read, at the private store.
+ * Only while nothing is staged. */
+static void
+ph_stage_at_ring_tail(struct ph_context *ctx)
+{
+   unsigned left;
+
+   if (ctx->triangles || ctx->points || ctx->lines)
+      return;
+   ctx->vertices = ctx->vertex_store;
+   ctx->stage_room = 0;
+   if (!ctx->vram_vertex_enabled || !ctx->async_submit ||
+       !ctx->aggregate_batches || !ctx->aggregate_state_stream ||
+       !debug_get_option_stage_ring() || ph_pending_ring_acquire(ctx, false) ||
+       ctx->pending_ring_slot < 0)
+      return;
+   left = ctx->vram_vertex_slot_dwords - ctx->pending_vertex_dwords;
+   if (left < PH_STAGE_MIN_DWORDS) {
+      /* the drain stages the next batch at the start of a fresh slot */
+      ph_drain_batch(ctx);
+      return;
+   }
+   ctx->vertices = (float *)(ctx->pending_vertices + ctx->pending_vertex_dwords);
+   /* a staged batch must fit the store if it has to be moved out */
+   ctx->stage_room = MIN2(left, ARRAY_SIZE(ctx->vertex_store));
+}
+
+/* Another batch is appended while one is staged at the aggregate's tail:
+ * move the staged one out of its way. */
+static void
+ph_stage_evict(struct ph_context *ctx, const void *vertices)
+{
+   if (!ctx->stage_room || !(ctx->triangles || ctx->points || ctx->lines) ||
+       ((const float *)vertices >= ctx->vertices &&
+        (const float *)vertices < ctx->vertices + ctx->stage_room))
+      return;
+   memcpy(ctx->vertex_store, ctx->vertices,
+          ctx->stage_room * sizeof(ctx->vertex_store[0]));
+   ctx->vertices = ctx->vertex_store;
+   ctx->stage_room = 0;
+   ctx->stat.stage_evictions++;
 }
 
 static int
@@ -1723,6 +1797,8 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
    ctx->pending_mark_count = 0;
    if (ret)
       ctx->submit_error = ret;
+   else
+      ph_stage_at_ring_tail(ctx);
    return ret;
 }
 
@@ -1797,6 +1873,11 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
     * internal fence boundary supported by the current kernel ABI. */
    if (!ctx->aggregate_batches)
       return ph_submit_batch_now(ctx, batch, vertices, vertex_dwords);
+   if (vertex_dwords)
+      ph_stage_evict(ctx, vertices);
+   if (vertex_dwords && (const float *)vertices == ctx->vertices &&
+       ctx->stage_room)
+      ctx->stat.in_place_dwords += vertex_dwords;
 
    if (ctx->aggregate_state_stream &&
        ctx->pending_mark_count >= ctx->batch_limits.packets) {
@@ -1853,7 +1934,7 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
       if (ret)
          return ret;
    }
-   if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx)))
+   if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx, true)))
       return ret;
    ret = ctx->aggregate_state_stream ?
       ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
@@ -1871,7 +1952,7 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
       ret = ph_drain_batch(ctx);
       if (ret)
          return ret;
-      if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx)))
+      if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx, true)))
          return ret;
       ret = ctx->aggregate_state_stream ?
          ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
@@ -1901,6 +1982,8 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
    ph_record_pending_write(ctx, r0);
    ph_record_pending_write(ctx, r1);
    ph_reference_pending_resources(ctx, resources);
+   /* re-point staging past what was just appended */
+   ph_stage_at_ring_tail(ctx);
    return 0;
 }
 
@@ -4470,6 +4553,7 @@ out:
    } else {
       ctx->lines = 0;
    }
+   ph_stage_at_ring_tail(ctx);
 }
 
 /* The pass-through for an RGBA colour: warp_textured without its o3 move
@@ -4775,7 +4859,7 @@ ph_extra_unit(struct ph_context *ctx, unsigned u, uint32_t *handle,
 }
 
 static void
-ph_submit_vertices(struct ph_context *ctx)
+ph_submit_vertices_staged(struct ph_context *ctx)
 {
    struct parhelia_batch *batch = &ctx->build_batch;
    struct p3d_state state = {0};
@@ -5530,6 +5614,13 @@ out:
 	ctx->transform = false;
 	ctx->warp_program_entry = 0;
 	ctx->vs_const_vec4s = 0;
+}
+
+static void
+ph_submit_vertices(struct ph_context *ctx)
+{
+   ph_submit_vertices_staged(ctx);
+   ph_stage_at_ring_tail(ctx);
 }
 
 static float
@@ -15632,6 +15723,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    (void)flags;
    if (!ctx)
       return NULL;
+   ctx->vertices = ctx->vertex_store;
    ctx->pending_vertex_store = MALLOC(PH_BATCH_VERTEX_DWORDS * sizeof(uint32_t));
    if (!ctx->pending_vertex_store) {
       FREE(ctx);
@@ -15860,6 +15952,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
 	   goto fail;
 	ph_create_vertex_ring(ctx);
 	ph_prime_warp(ctx);
+	ph_stage_at_ring_tail(ctx);
    if (ctx->aggregate_batches && ph_env("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: aggregation limits commands=%u vertices=%u packets=%u relocs=%u kernel_packets=%u dma_ring=%u\n",

@@ -1793,8 +1793,9 @@ parhelia_batch_append_limited(struct parhelia_batch *dst,
       if (src->relocs[i].type == PARHELIA_RELOC_DRAW)
          dst->relocs[dst->reloc_count + i].dword += vertex_base * 4;
    }
-   if (src_vertex_dwords)
-      memcpy(dst_vertices + vertex_base, src_vertices,
+   /* the caller may have staged the vertices in place already */
+   if (src_vertex_dwords && src_vertices != dst_vertices + vertex_base)
+      memmove(dst_vertices + vertex_base, src_vertices,
              src_vertex_dwords * sizeof(dst_vertices[0]));
    dst->command_count += src->command_count;
    dst->packet_count += src->packet_count;
