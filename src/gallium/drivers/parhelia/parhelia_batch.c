@@ -284,6 +284,25 @@ compact_state_packets_enabled(void)
    return enabled;
 }
 
+static int compact_transform = -1;
+
+void
+parhelia_batch_set_compact_transform(bool enable)
+{
+   compact_transform = enable;
+}
+
+static bool
+compact_transform_packets(void)
+{
+   if (compact_transform < 0) {
+      const char *value = getenv("PARHELIA_COMPACT_TRANSFORM");
+
+      compact_transform = !value || strcmp(value, "0");
+   }
+   return compact_transform;
+}
+
 static int batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
                         const struct p3d_reloc *calls, uint32_t colour_handle,
                         uint32_t depth_handle,
@@ -966,10 +985,10 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
                       triangle_count, state.dw_per_vertex, state.prim,
                       per_packet, vertices, !!state.bound_ranges,
                       state.indexed_vertices);
-   /* Q3 reaches this builder with already transformed window-space vertices.
-    * Keep the constant-loader/WARP-transform packet cadence outside the first
-    * hardware experiment; its exact CALL grouping has separate selftests. */
-   if (!ret && !state.transform && compact_state_packets_enabled())
+   /* Transform batches compact too (PARHELIA_COMPACT_TRANSFORM=0 keeps
+    * their exact packet cadence for diagnosis). */
+   if (!ret && (!state.transform || compact_transform_packets()) &&
+       compact_state_packets_enabled())
       ret = parhelia_batch_compact_reglists(batch, batch);
    return ret;
 }
