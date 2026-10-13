@@ -652,6 +652,8 @@ struct parhelia_device {
 	u64 fence_context;
 	u32 next_dma_tag;
 	struct parhelia_submit_stats submit_stats;
+	/* One reusable submit call plan instead of a zeroed allocation each. */
+	struct parhelia_call_plan *plan_cache;
 	struct parhelia_reg_shadow reg_shadow;
 	u64 reg_shadow_submits;
 	u64 reg_shadow_packets;

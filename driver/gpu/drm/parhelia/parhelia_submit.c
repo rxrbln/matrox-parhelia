@@ -3925,6 +3925,22 @@ static int parhelia_submit_check(const struct drm_parhelia_submit *args)
 /* Runs a checked request whose arrays are kernel copies; it frees them.
  * @kernel_objects, when set, supplies the VRAM reloc targets in place of
  * @file's handles. */
+/* Every field of a submit plan is written before it is read: the counters by
+ * parhelia_plan_calls*(), stage_modes for each packet by the validation loop. */
+static struct parhelia_call_plan *parhelia_plan_get(struct parhelia_device *pdev)
+{
+	struct parhelia_call_plan *plan = xchg(&pdev->plan_cache, NULL);
+
+	return plan ? plan : kvmalloc_obj(*plan, GFP_KERNEL);
+}
+
+static void parhelia_plan_put(struct parhelia_device *pdev,
+			      struct parhelia_call_plan *plan)
+{
+	if (plan && cmpxchg(&pdev->plan_cache, NULL, plan))
+		kvfree(plan);
+}
+
 static int parhelia_submit_run(struct parhelia_device *pdev,
 			       struct drm_file *file,
 			       struct drm_parhelia_submit *args,
@@ -3981,7 +3997,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	defer_packet_packing = coalesce_primary && !trace_submit && !full_sync &&
 		!post_draw_wb && (pack_draw_packets || generic_packet_packing);
 
-	plan = kvzalloc_obj(*plan, GFP_KERNEL);
+	plan = parhelia_plan_get(pdev);
 	if (!plan) {
 		ret = -ENOMEM;
 		goto out_commands;
@@ -5069,7 +5085,7 @@ out_relocs:
 out_commands:
 	kvfree(relocs);
 	kfree(shadow_txn);
-	kvfree(plan);
+	parhelia_plan_put(pdev, plan);
 	kvfree(commands);
 	kvfree(packets);
 	return ret;
@@ -5820,6 +5836,7 @@ void parhelia_submit_fini(struct parhelia_device *pdev)
 	u32 i;
 
 	cancel_delayed_work_sync(&pdev->retire_work);
+	kvfree(xchg(&pdev->plan_cache, NULL));
 	parhelia_submit_lock(pdev);
 	pdev->wedged = true;
 	parhelia_state_shadow_invalidate(pdev, "submit teardown");
