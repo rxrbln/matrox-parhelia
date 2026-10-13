@@ -44,6 +44,7 @@ struct parhelia_screen {
    bool texture_upload;
    bool native_rt_classes;
    bool render_transfer;
+   bool draw_ranges;
    /* Native 8- and 16-bit sampler storage, and native S3TC.  Both stay
     * gated until they retire on this silicon. */
    bool narrow_formats;

@@ -186,6 +186,8 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_WARP_PROGRAM_INSTRUCTIONS	31
 /* WARP program slots this file may hold at once. */
 #define PARHELIA_PARAM_WARP_PROGRAM_SLOTS	32
+/* PARHELIA_RELOC_DRAW_RANGES is accepted. */
+#define PARHELIA_PARAM_DRAW_RANGES	33
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
 /* Retired unsafe generic packing capability; kernels report zero. */
@@ -268,6 +270,13 @@ struct drm_parhelia_packet {
  * packet in a later logical state section and all other fields must be zero.
  * It emits no synchronization; it only prevents packets on opposite sides
  * from sharing a secondary CALL when boundary-aware packing is requested.
+ *
+ * PARHELIA_RELOC_DRAW_RANGES relocates every 0x97 packet of the request at
+ * once.  @handle is a CREATE_VERTEX allocation, @delta the byte offset of
+ * the request's vertices in it and @dword their byte size; @packet must be
+ * zero.  Each 0x97 packet carries its byte range relative to @delta in its
+ * two operands instead of a relocation of its own.  It cannot be combined
+ * with PARHELIA_RELOC_DRAW or PARHELIA_RELOC_DRAW_VRAM.
  */
 struct drm_parhelia_reloc {
 	__u32 packet;
@@ -289,6 +298,7 @@ struct drm_parhelia_reloc {
 #define PARHELIA_RELOC_RANGE_STREAM_VRAM	8u
 #define PARHELIA_RELOC_BATCH_BOUNDARY	9u
 #define PARHELIA_RELOC_CALL_BOUNDARY	10u
+#define PARHELIA_RELOC_DRAW_RANGES	11u
 
 /*
  * Submit a sequence of header-ful secondary packets.

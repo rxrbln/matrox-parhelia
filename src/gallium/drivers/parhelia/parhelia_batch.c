@@ -2373,6 +2373,66 @@ parhelia_batch_submit_vram_async(int fd, const struct parhelia_batch *batch,
 }
 
 int
+parhelia_batch_submit_ranges_async(
+   int fd, struct parhelia_batch *batch, uint32_t vertex_handle,
+   uint32_t vertex_offset, unsigned vertex_dwords, bool call_boundaries,
+   uint32_t *fence)
+{
+   struct drm_parhelia_reloc relocs[PH_BATCH_RELOCS + 1];
+   struct drm_parhelia_submit submit;
+   uint64_t bytes = (uint64_t)vertex_dwords * sizeof(uint32_t);
+   unsigned reloc_count = 0;
+
+   if (!batch || !fence || batch->reloc_count > PH_BATCH_RELOCS ||
+       !vertex_handle || !vertex_dwords || (vertex_offset & 3) ||
+       bytes > UINT32_MAX || vertex_offset > UINT32_MAX - bytes)
+      return -EINVAL;
+   for (unsigned i = 0; i < batch->reloc_count; i++) {
+      const struct drm_parhelia_reloc *src = &batch->relocs[i];
+      uint32_t *cmd;
+
+      if (src->type == PARHELIA_RELOC_RANGE_STREAM_VRAM)
+         return -ENOTSUP;
+      if (src->type == PARHELIA_RELOC_CALL_BOUNDARY && !call_boundaries)
+         continue;
+      if (src->type != PARHELIA_RELOC_DRAW) {
+         relocs[reloc_count++] = *src;
+         continue;
+      }
+      if (src->handle || (src->dword & 3) || !src->delta ||
+          (src->delta & 3) ||
+          src->delta > PH_BATCH_MAX_DRAW_DWORDS * sizeof(uint32_t) ||
+          (uint64_t)src->dword + src->delta > bytes ||
+          src->packet >= batch->packet_count ||
+          batch->packets[src->packet].length != 3)
+         return -EINVAL;
+      cmd = batch->commands + batch->packets[src->packet].offset;
+      cmd[1] = src->dword;
+      cmd[2] = src->dword + src->delta;
+   }
+   relocs[reloc_count++] = (struct drm_parhelia_reloc) {
+      .dword = (uint32_t)bytes,
+      .handle = vertex_handle,
+      .delta = vertex_offset,
+      .type = PARHELIA_RELOC_DRAW_RANGES,
+   };
+   submit = (struct drm_parhelia_submit) {
+      .commands = (uintptr_t)batch->commands,
+      .packets = (uintptr_t)batch->packets,
+      .relocs = (uintptr_t)relocs,
+      .command_dwords = batch->command_count,
+      .packet_count = batch->packet_count,
+      .reloc_count = reloc_count,
+      .flags = PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC |
+               (call_boundaries ? PARHELIA_SUBMIT_CALL_BOUNDARIES : 0),
+   };
+   if (ioctl(fd, DRM_IOCTL_PARHELIA_SUBMIT, &submit))
+      return -errno;
+   *fence = submit.fence;
+   return 0;
+}
+
+int
 parhelia_batch_submit_vram_async_bounded(
    int fd, const struct parhelia_batch *batch, uint32_t vertex_handle,
    uint32_t vertex_offset, unsigned vertex_dwords, uint32_t *fence)

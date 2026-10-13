@@ -1189,7 +1189,7 @@ ph_batch_has_full_boundary(const struct parhelia_batch *batch)
 
 static int
 ph_submit_batch_now_untimed(struct ph_context *ctx,
-                            const struct parhelia_batch *batch,
+                            struct parhelia_batch *batch,
                             const void *vertices, unsigned vertex_dwords);
 
 static void
@@ -1319,7 +1319,7 @@ ph_hang_write(void)
 }
 
 static int
-ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
+ph_submit_batch_now(struct ph_context *ctx, struct parhelia_batch *batch,
                     const void *vertices, unsigned vertex_dwords)
 {
    uint64_t start;
@@ -1461,7 +1461,7 @@ ph_stage_evict(struct ph_context *ctx, const void *vertices)
 
 static int
 ph_submit_batch_now_untimed(struct ph_context *ctx,
-                            const struct parhelia_batch *batch,
+                            struct parhelia_batch *batch,
                             const void *vertices, unsigned vertex_dwords)
 {
    struct parhelia_screen *screen = ph_screen(ctx->base.screen);
@@ -1496,13 +1496,18 @@ ph_submit_batch_now_untimed(struct ph_context *ctx,
          memcpy((uint8_t *)ctx->vram_vertices + offset, vertices, bytes);
       }
       __sync_synchronize();
-      ret = boundary_aware ?
-         parhelia_batch_submit_vram_async_bounded(
+      ret = screen->draw_ranges ?
+         parhelia_batch_submit_ranges_async(
             screen->fd, batch, ctx->vram_vertex_handle, offset,
-            vertex_dwords, &ctx->fence) :
-         parhelia_batch_submit_vram_async(
-            screen->fd, batch, ctx->vram_vertex_handle, offset,
-            vertex_dwords, &ctx->fence);
+            vertex_dwords, boundary_aware, &ctx->fence) : -ENOTSUP;
+      if (ret == -ENOTSUP)
+         ret = boundary_aware ?
+            parhelia_batch_submit_vram_async_bounded(
+               screen->fd, batch, ctx->vram_vertex_handle, offset,
+               vertex_dwords, &ctx->fence) :
+            parhelia_batch_submit_vram_async(
+               screen->fd, batch, ctx->vram_vertex_handle, offset,
+               vertex_dwords, &ctx->fence);
       if (!ret) {
          if (in_ring) {
             ctx->pending_ring_fence = ctx->fence;
@@ -1853,7 +1858,7 @@ ph_append_state_stream(struct ph_context *ctx,
 }
 
 static int
-ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
+ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
                 const void *vertices, unsigned vertex_dwords,
                 struct parhelia_resource *r0, struct parhelia_resource *r1,
                 struct parhelia_resource *r2, struct parhelia_resource *r3)

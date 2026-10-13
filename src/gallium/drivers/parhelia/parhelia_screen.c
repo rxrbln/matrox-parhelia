@@ -1686,6 +1686,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param render_transfer = {
       .param = PARHELIA_PARAM_RENDER_TRANSFER,
    };
+   struct drm_parhelia_get_param draw_ranges = {
+      .param = PARHELIA_PARAM_DRAW_RANGES,
+   };
    struct drm_parhelia_get_param max_packets = {
       .param = PARHELIA_PARAM_MAX_PACKETS,
    };
@@ -1763,6 +1766,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->render_transfer =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &render_transfer) &&
       render_transfer.value == 1;
+   s->draw_ranges = s->async_submit &&
+      debug_get_bool_option("PARHELIA_DRAW_RANGES", true) &&
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &draw_ranges) &&
+      draw_ranges.value == 1;
    /* Native 8- and 16-bit sampler storage is on where its texel order has
     * been measured: parhelia-drm-test --texture-format-probe reproduces every
     * texel of L8, A1R5G5B5, R5G6B5 and A4R4G4B4 over two tile rows and two
