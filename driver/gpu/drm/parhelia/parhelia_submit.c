@@ -1392,6 +1392,7 @@ enum parhelia_reg_class {
 	PARHELIA_REG_WARP_ENTRY,
 	PARHELIA_REG_DESC_BURST,	/* rebind tracking */
 	PARHELIA_REG_DESC_ATTR,
+	PARHELIA_REG_DWGCTL,		/* restored by the terminal drain */
 };
 
 static const u8 parhelia_reg_class[256] = {
@@ -1404,6 +1405,7 @@ static const u8 parhelia_reg_class[256] = {
 	[0x28] = PARHELIA_REG_KERNEL, [0x29] = PARHELIA_REG_KERNEL,
 	[0xaf] = PARHELIA_REG_KERNEL,
 	[0x2d] = PARHELIA_REG_DESC_BURST, [0x2e] = PARHELIA_REG_DESC_ATTR,
+	[0xc0] = PARHELIA_REG_DWGCTL,
 	/* The WARP entry (0x1100, 0x1104) is a class-3 instruction-fetch
 	 * address.  A client that may write it freely can point the vertex
 	 * engine at arbitrary system memory and have the resulting program
@@ -1447,6 +1449,14 @@ struct parhelia_rebind {
 	bool colour, descriptors;
 };
 
+/* What the validation pass collects on its way through the request. */
+struct parhelia_validate_state {
+	struct parhelia_rebind *rb;	/* P690 only */
+	u32 packet;
+	u32 dwgctl, dwgctl_packet;
+	bool dwgctl_seen;
+};
+
 static void parhelia_rebind_apply(struct parhelia_device *pdev, u32 *commands,
 				  const struct parhelia_entry_bind *bind)
 {
@@ -1466,8 +1476,9 @@ static void parhelia_rebind_apply(struct parhelia_device *pdev, u32 *commands,
 static int parhelia_validate_reglist(struct parhelia_device *pdev,
 				     struct drm_file *file, u32 *commands,
 				     u32 offset, u32 length,
-				     struct parhelia_rebind *rb)
+				     struct parhelia_validate_state *vs)
 {
+	struct parhelia_rebind *rb = vs->rb;
 	const u32 *cmd = commands + offset;
 	u32 pos = 1;
 
@@ -1516,6 +1527,11 @@ static int parhelia_validate_reglist(struct parhelia_device *pdev,
 				if (rb && value && ((value >> 16) & 0xf) == 5)
 					rb->colour = true;
 				break;
+			case PARHELIA_REG_DWGCTL:
+				vs->dwgctl = value;
+				vs->dwgctl_packet = vs->packet;
+				vs->dwgctl_seen = true;
+				break;
 			}
 			pos++;
 		}
@@ -1539,7 +1555,7 @@ static void parhelia_rebind_draw(struct parhelia_rebind *rb)
 static int parhelia_validate_packet(struct parhelia_device *pdev,
 				    struct drm_file *file, u32 *cmd,
 				    const struct drm_parhelia_packet *packet,
-				    struct parhelia_rebind *rb)
+				    struct parhelia_validate_state *vs)
 {
 	u32 header, words;
 
@@ -1555,11 +1571,11 @@ static int parhelia_validate_packet(struct parhelia_device *pdev,
 	switch (header >> 24) {
 	case 0x00:
 		return parhelia_validate_reglist(pdev, file, cmd, packet->offset,
-						 words, rb);
+						 words, vs);
 	case 0x97:
 		if (words != 3)
 			return -EINVAL;
-		parhelia_rebind_draw(rb);
+		parhelia_rebind_draw(vs->rb);
 		return 0;
 	case 0x8f:
 		/* Exact shapes used by the fixed six-vertex depth-interlock
@@ -4087,7 +4103,8 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	struct parhelia_shadow_txn *shadow_txn = NULL;
 	struct parhelia_root_probe_trace *root_probe = NULL;
 	struct parhelia_file_waiter file_waiter = { .file = file };
-	struct parhelia_rebind rebind_state, *rebind = NULL;
+	struct parhelia_rebind rebind_state;
+	struct parhelia_validate_state validate = { };
 	u32 *primary;
 	void *vertex_cpu = pdev->vertex_cpu;
 	dma_addr_t vertex_bus = pdev->vertex_bus;
@@ -4159,7 +4176,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 			.multitex = parhelia_warp_entry(pdev,
 					PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY),
 		};
-		rebind = &rebind_state;
+		validate.rb = &rebind_state;
 	}
 	for (i = 0; i < args->packet_count; i++) {
 		if (packets[i].offset != end ||
@@ -4169,8 +4186,9 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 			ret = -EINVAL;
 			goto out_relocs;
 		}
+		validate.packet = i;
 		ret = parhelia_validate_packet(pdev, file, commands, &packets[i],
-					       rebind);
+					       &validate);
 		if (ret) {
 			goto out_relocs;
 		}
@@ -4181,8 +4199,8 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 		ret = -EINVAL;
 		goto out_relocs;
 	}
-	if (rebind)
-		parhelia_rebind_apply(pdev, commands, &rebind->bind);
+	if (validate.rb)
+		parhelia_rebind_apply(pdev, commands, &validate.rb->bind);
 	ret = parhelia_collect_call_boundaries(relocs, args->reloc_count,
 					       args->packet_count, generic_packet_packing,
 					       call_boundaries, &call_boundary_count);
@@ -4846,15 +4864,20 @@ retry_slot:
 		goto out_unpin;
 	}
 	{
-		u32 dwgctl = parhelia_read(pdev, PARHELIA_R_DWGCTL);
+		/* The last DWGCTL the request writes, from the validation pass;
+		 * the register only when it writes none. */
+		u32 last = validate.dwgctl_seen ? validate.dwgctl :
+			   parhelia_read(pdev, PARHELIA_R_DWGCTL);
 
 		for (i = 0; i < plan->sync_sections; i++) {
-			u32 range_begin = i ? boundary_packet : 0;
-			u32 range_end = i + 1 < plan->sync_sections ?
-				boundary_packet : args->packet_count;
+			u32 dwgctl = last;
 
-			dwgctl = parhelia_batch_dwgctl_range(commands, packets,
-				range_begin, range_end, dwgctl);
+			/* a first section ending before the last write rescans */
+			if (i + 1 < plan->sync_sections && validate.dwgctl_seen &&
+			    validate.dwgctl_packet >= boundary_packet)
+				dwgctl = parhelia_batch_dwgctl_range(commands,
+					packets, 0, boundary_packet,
+					parhelia_read(pdev, PARHELIA_R_DWGCTL));
 			parhelia_emit_fences(blocks, args->packet_count + i * 3,
 				fence, fence + fence_step, dwgctl);
 			fence += fence_step;
