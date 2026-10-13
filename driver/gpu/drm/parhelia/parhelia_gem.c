@@ -239,7 +239,7 @@ void parhelia_host_aperture_init(struct parhelia_device *pdev)
 	 * coordinate it publishes (mtx_drv.so .text+0x74bdd, +0x74cc9).
 	 * Without them the top descriptor shadowed all the others: the bank
 	 * appears to decode the largest coordinate not above the access. */
-	pdev->aperture_coord_base = lower_32_bits(pci_resource_start(pdev->pdev, 0)) &
+	pdev->aperture_coord_base = lower_32_bits(pci_bus_address(pdev->pdev, 0)) &
 				    GENMASK(27, 25);
 	INIT_LIST_HEAD(&pdev->host_view_lru);
 	INIT_LIST_HEAD(&pdev->host_view_dead);
@@ -1078,6 +1078,19 @@ parhelia_host_view_create_locked(struct parhelia_device *pdev,
 	return view;
 }
 
+/* CPU physical address of BAR0 for user mappings. */
+static phys_addr_t parhelia_vram_cpu_phys(struct parhelia_device *pdev)
+{
+#ifdef CONFIG_ALPHA
+	struct pci_controller *hose = pdev->pdev->sysdata;
+
+	/* Alpha CPUs reach PCI memory through the hose's dense space. */
+	return pci_bus_address(pdev->pdev, 0) + hose->dense_mem_base;
+#else
+	return pci_resource_start(pdev->pdev, 0);
+#endif
+}
+
 /* Insert the view's pages from the faulting one to the end of view or VMA. */
 static vm_fault_t parhelia_host_view_insert(struct vm_fault *vmf,
 					    struct parhelia_host_view *view,
@@ -1091,7 +1104,7 @@ static vm_fault_t parhelia_host_view_insert(struct vm_fault *vmf,
 	unsigned long pfn;
 	vm_fault_t ret = VM_FAULT_NOPAGE;
 
-	pfn = (pci_resource_start(pdev->pdev, 0) + view->mapping.node.start +
+	pfn = (parhelia_vram_cpu_phys(pdev) + view->mapping.node.start +
 	       ((u64)page << PAGE_SHIFT) - view_offset) >> PAGE_SHIFT;
 	/* a vmapped view stays off the eviction list */
 	if (!view->vmap_count)
