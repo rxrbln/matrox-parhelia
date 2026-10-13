@@ -2543,7 +2543,7 @@ parhelia_batch_mode7_screen_test(struct parhelia_batch *batch,
    if (!batch || !colour_handle || !width || !height ||
        width > pitch || (pitch & 63) || pitch > 0x3fff || height > 0xffff ||
        vertex_dwords != 5 || vertex_count != 4 || (vertex_offset & 3) ||
-       (index_offset & 3) || index_count != 6 ||
+       (index_offset & 3) || (index_count != 3 && index_count != 6) ||
        vertex_offset > UINT32_MAX - vertex_count * vertex_dwords * 4 ||
        index_offset < vertex_offset + vertex_count * vertex_dwords * 4)
       return -EINVAL;
