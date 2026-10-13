@@ -109,13 +109,17 @@ struct parhelia_resource {
    bool linear_is_dumb;
    bool tiled_dirty;
    bool linear_dirty;
-   /* The original RGBA image remains in linear_map while a binary-alpha
-    * source-over draw temporarily uses the native A1R5G5B5 tiled image. */
-   bool rgb5a1_packed;
+   /* A binary-alpha RGBA texture's A1R5G5B5 companion for the vendor's
+    * source-over route, built once per content generation in its own
+    * object, so the texture itself is never repacked in place. */
    bool rgb5a1_checked;
    bool rgb5a1_eligible;
    uint64_t rgb5a1_checked_generation;
-   uint64_t rgb5a1_packed_generation;
+   uint32_t rgb5a1_handle;
+   uint8_t *rgb5a1_map;
+   uint64_t rgb5a1_generation;
+   /* The texture's own CREATE_RENDER request, for same-shaped companions. */
+   uint32_t create_width, create_height, create_cpp, create_flags;
    /* Increment after any CPU-visible image write.  Predicate caches use this
     * instead of dirty flags because uploads may update both representations. */
    uint64_t content_generation;

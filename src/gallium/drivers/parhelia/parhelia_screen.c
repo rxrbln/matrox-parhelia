@@ -564,7 +564,6 @@ ph_resource_upload_tiled(struct parhelia_resource *r)
       return;
    r->upload_dirty |= r->upload_texture;
    r->linear_dirty = false;
-   r->rgb5a1_packed = false;
 }
 
 int
@@ -1131,6 +1130,10 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    }
    r->handle = create.handle;
    r->handle_owned = true;
+   r->create_width = create.width;
+   r->create_height = create.height;
+   r->create_cpp = create.cpp;
+   r->create_flags = create.flags;
    r->size = create.size;
    /* The DRM allocation ABI reports byte pitch, while the recovered surface
     * descriptor and p3d_tile_offset_layout() both consume pitch in pixels. */
@@ -1508,6 +1511,12 @@ ph_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *pres)
       struct drm_gem_close close = {.handle = r->alpha_rgb_handle};
       ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &close);
    }
+   if (r->rgb5a1_handle) {
+      struct drm_gem_close close = {.handle = r->rgb5a1_handle};
+      ioctl(ph_screen(pscreen)->fd, DRM_IOCTL_GEM_CLOSE, &close);
+   }
+   if (r->rgb5a1_map)
+      align_free(r->rgb5a1_map);
    if (r->upload_texture)
       align_free(r->linear_map);
    else if (r->linear_map)

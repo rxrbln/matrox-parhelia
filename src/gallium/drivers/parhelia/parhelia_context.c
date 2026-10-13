@@ -256,8 +256,8 @@ static unsigned ph_sampler_tiled_pitch(unsigned width);
 static unsigned ph_sampler_storage_pitch(struct pipe_screen *screen,
                                          unsigned width, unsigned cpp);
 static unsigned ph_texture_cpp(enum pipe_format format);
-static bool ph_prepare_rgb5a1(struct parhelia_resource *texture);
-static void ph_restore_rgba_tiled(struct parhelia_resource *texture);
+static bool ph_prepare_rgb5a1(struct ph_context *ctx,
+                              struct parhelia_resource *texture);
 static int ph_prepare_alpha_companions(struct ph_context *ctx,
                                        struct parhelia_resource *texture,
                                        const struct pipe_sampler_state *sampler,
@@ -905,7 +905,13 @@ ph_logical_vertex_limit(const struct ph_context *ctx)
                                      PH_BATCH_LEGACY_DWORDS;
 }
 
-static int ph_drain_batch(struct ph_context *ctx);
+static int ph_drain_batch_at(struct ph_context *ctx, unsigned line);
+/* PARHELIA_TRACE_DRAIN=1 counts aggregate drains per call site. */
+#define ph_drain_batch(ctx) ph_drain_batch_at((ctx), __LINE__)
+static struct {
+   unsigned *count;
+   unsigned cap;
+} ph_drain_sites;
 
 static uint64_t
 ph_now_ns(void)
@@ -942,6 +948,12 @@ ph_stats_frame(struct ph_context *ctx)
 
    if (!ctx->stats || ++ctx->stat.frames < 100)
       return;
+   for (unsigned l = 0; l < ph_drain_sites.cap; l++)
+      if (ph_drain_sites.count[l]) {
+         fprintf(stderr, "parhelia: drains/frame from line %u: %.1f\n", l,
+                 ph_drain_sites.count[l] / 100.0);
+         ph_drain_sites.count[l] = 0;
+      }
    now = ph_now_ns();
    if (ctx->stat.start_ns)
       fprintf(stderr,
@@ -1646,7 +1658,7 @@ out:
 }
 
 static int
-ph_drain_batch(struct ph_context *ctx)
+ph_drain_batch_at(struct ph_context *ctx, unsigned line)
 {
    unsigned packed_calls = 0;
    bool packed_calls_valid;
@@ -1654,6 +1666,21 @@ ph_drain_batch(struct ph_context *ctx)
 
    if (!ctx->pending_batch.packet_count)
       return 0;
+   if (ph_env("PARHELIA_TRACE_DRAIN")) {
+      if (line >= ph_drain_sites.cap) {
+         unsigned cap = line * 2 + 1;
+         unsigned *grown = realloc(ph_drain_sites.count, cap * sizeof(*grown));
+
+         if (grown) {
+            memset(grown + ph_drain_sites.cap, 0,
+                   (cap - ph_drain_sites.cap) * sizeof(*grown));
+            ph_drain_sites.count = grown;
+            ph_drain_sites.cap = cap;
+         }
+      }
+      if (line < ph_drain_sites.cap)
+         ph_drain_sites.count[line]++;
+   }
    packed_calls_valid = !parhelia_batch_packed_call_count(
       &ctx->pending_batch, 0, ctx->pending_batch.packet_count,
       ctx->pack_adjacent_packets, &packed_calls);
@@ -3337,8 +3364,6 @@ ph_use_cpu_alpha_cutout(struct ph_context *ctx, bool textured,
    /* Stage selection needs the same logical tiled image that submission will
     * sample.  Texture uploads are CPU copies into the mapped resource, so
     * making it current here emits no GPU work or synchronization. */
-   if (texture->rgb5a1_packed)
-      ph_restore_rgba_tiled(texture);
    ph_resource_upload_tiled(texture);
    if (ctx->cpu_cutout_hash_resource != texture ||
        ctx->cpu_cutout_hash_handle != texture->handle ||
@@ -3452,8 +3477,6 @@ ph_use_rgb_alpha_two_pass(struct ph_context *ctx, bool textured,
    /* Retain the native-image signature through repeated primitives.  Image
     * generation changes even when an upload updates both backing maps and
     * clears the ordinary dirty flags. */
-   if (texture->rgb5a1_packed)
-      ph_restore_rgba_tiled(texture);
    ph_resource_upload_tiled(texture);
 
    /* A target without destination alpha has nothing to preserve.  The two
@@ -4726,8 +4749,6 @@ ph_extra_unit(struct ph_context *ctx, unsigned u, uint32_t *handle,
    if (!r->upload_texture || !r->handle || r->mip.slices ||
        r->base.width0 > 0x3fff || ph_resource_upload_texture(r))
       return false;
-   if (r->rgb5a1_packed)
-      ph_restore_rgba_tiled(r);
    mipped = ph_use_mips(r, sampler, ctx->sampler_views[u]);
    memset(tex, 0, sizeof(*tex));
    tex->width = r->base.width0;
@@ -4924,21 +4945,11 @@ ph_submit_vertices(struct ph_context *ctx)
        blend->rgb_dst_factor == PIPE_BLENDFACTOR_INV_SRC_ALPHA &&
        blend->alpha_src_factor == PIPE_BLENDFACTOR_SRC_ALPHA &&
        blend->alpha_dst_factor == PIPE_BLENDFACTOR_INV_SRC_ALPHA) {
-      if (ctx->aggregate_batches && !texture->rgb5a1_packed &&
-          ph_drain_batch(ctx))
+      rgb5a1_texture = ph_prepare_rgb5a1(ctx, texture);
+      if (ctx->submit_error)
          goto out;
-      rgb5a1_texture = ph_prepare_rgb5a1(texture);
-   }
-   if (ctx->aggregate_batches && texture && !rgb5a1_texture &&
-       texture->rgb5a1_packed &&
-       ph_drain_batch(ctx))
-      goto out;
-   if (texture && !rgb5a1_texture)
-      ph_restore_rgba_tiled(texture);
-   if (texture1 && texture1 != texture && texture1->rgb5a1_packed) {
-      if (ctx->aggregate_batches && ph_drain_batch(ctx))
-         goto out;
-      ph_restore_rgba_tiled(texture1);
+      if (rgb5a1_texture)
+         texture_handle = texture->rgb5a1_handle;
    }
    if (texture && texture->upload_texture &&
        (ret = ph_resource_upload_texture(texture))) {
@@ -14399,11 +14410,6 @@ ph_copy_texture_box(struct ph_context *ctx,
    if (!staging)
       return false;
 
-   /* A prior source-alpha draw may have repacked the native shadow as
-    * A1R5G5B5.  Restore the complete ordinary image before applying a
-    * potentially partial 32-bit copy. */
-   if (dr->rgb5a1_packed)
-      ph_restore_rgba_tiled(dr);
 
    for (int y = 0; y < height; y++) {
       const int sy = src_box->y + (src_box->height < 0 ? -1 - y : y);
@@ -14889,22 +14895,27 @@ ph_sampler_storage_pitch(struct pipe_screen *pscreen, unsigned width,
 }
 
 /* Q3's retained vendor path deliberately changes its binary-alpha atlas from
- * RGBA client pixels into A1R5G5B5 storage for SRC_ALPHA source-over.  Keep a
- * four-byte linear shadow for all ordinary uses and build the native sampler
- * image only for that fixed-function draw family. */
+ * RGBA client pixels into A1R5G5B5 storage for SRC_ALPHA source-over.  The
+ * packed image lives in a companion object of the texture's own shape, built
+ * once per content generation: repacking the texture in place and restoring
+ * it for its ordinary uses drained the batch queue ~21 times per ioquake3
+ * frame and re-uploaded the texture each time. */
 static bool
-ph_prepare_rgb5a1(struct parhelia_resource *texture)
+ph_prepare_rgb5a1(struct ph_context *ctx, struct parhelia_resource *texture)
 {
-   const unsigned pitch = ph_sampler_tiled_pitch(texture->base.width0);
+   struct parhelia_screen *screen;
+   struct drm_parhelia_upload_render upload;
+   const unsigned pitch = texture ? ph_sampler_tiled_pitch(texture->base.width0) : 0;
    const uint8_t *src;
 
    if (!texture || texture->base.format != PIPE_FORMAT_R8G8B8A8_UNORM ||
-       !texture->map || !texture->linear_map || texture->base.last_level)
+       !texture->map || !texture->linear_map || texture->base.last_level ||
+       !texture->upload_texture)
       return false;
-   if (texture->rgb5a1_packed &&
-       texture->rgb5a1_packed_generation == texture->content_generation)
+   if (texture->rgb5a1_handle &&
+       texture->rgb5a1_generation == texture->content_generation)
       return true;
-   texture->rgb5a1_packed = false;
+   screen = ph_screen(texture->base.screen);
    src = texture->linear_map;
    if (!texture->rgb5a1_checked ||
        texture->rgb5a1_checked_generation != texture->content_generation) {
@@ -14927,10 +14938,34 @@ ph_prepare_rgb5a1(struct parhelia_resource *texture)
    /* The two-byte order must fit the four-byte image's storage. */
    for (unsigned y = 0; y < texture->base.height0; y++)
       for (unsigned x = 0; x < texture->base.width0; x++)
-         if (p3d_texture_tile_offset_chip(x, y, pitch, 2,
-                ph_screen(texture->base.screen)->chip_id,
-                texture->tile_layout) + 2 > texture->size)
+         if (p3d_texture_tile_offset_chip(x, y, pitch, 2, screen->chip_id,
+                                          texture->tile_layout) + 2 >
+             texture->size)
             return false;
+   if (texture->rgb5a1_handle) {
+      /* An older companion may still be named by batched draws; the kernel
+       * orders UPLOAD_RENDER after submitted work only. */
+      if (ph_drain_batch(ctx))
+         return false;
+   } else {
+      struct drm_parhelia_create_render create = {
+         .width = texture->create_width, .height = texture->create_height,
+         .cpp = texture->create_cpp, .flags = texture->create_flags,
+      };
+
+      if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &create))
+         return false;
+      texture->rgb5a1_map = create.size == texture->size ?
+                            align_malloc(texture->size, 64) : NULL;
+      if (!texture->rgb5a1_map) {
+         struct drm_gem_close close = {.handle = create.handle};
+
+         ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close);
+         return false;
+      }
+      memset(texture->rgb5a1_map, 0, texture->size);
+      texture->rgb5a1_handle = create.handle;
+   }
    for (unsigned y = 0; y < texture->base.height0; y++)
       for (unsigned x = 0; x < texture->base.width0; x++) {
          const uint8_t *p = src + (size_t)y * texture->linear_stride + x * 4;
@@ -14941,41 +14976,21 @@ ph_prepare_rgb5a1(struct parhelia_resource *texture)
           * the repack must write the order this chip really reads there: the
           * generic vendor order put the high y bits of a small image where
           * the address unit never looks, drawing its top half only. */
-         uint8_t *dst = (uint8_t *)texture->map +
-            p3d_texture_tile_offset_chip(x, y, pitch, 2,
-                                         ph_screen(texture->base.screen)->chip_id,
-                                         texture->tile_layout);
-         memcpy(dst, &value, sizeof(value));
+         memcpy(texture->rgb5a1_map +
+                   p3d_texture_tile_offset_chip(x, y, pitch, 2,
+                                                screen->chip_id,
+                                                texture->tile_layout),
+                &value, sizeof(value));
       }
-   __sync_synchronize();
-   texture->rgb5a1_packed = true;
-   texture->rgb5a1_packed_generation = texture->content_generation;
-   texture->upload_dirty |= texture->upload_texture;
+   upload = (struct drm_parhelia_upload_render) {
+      .data = (uintptr_t)texture->rgb5a1_map,
+      .size = texture->size,
+      .handle = texture->rgb5a1_handle,
+   };
+   if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_UPLOAD_RENDER, &upload))
+      return false;
+   texture->rgb5a1_generation = texture->content_generation;
    return true;
-}
-
-static void
-ph_restore_rgba_tiled(struct parhelia_resource *texture)
-{
-   if (!texture || !texture->rgb5a1_packed || !texture->map ||
-       !texture->linear_map)
-      return;
-   if (texture->rgb5a1_packed_generation != texture->content_generation) {
-      /* A later writer has already replaced the packed image.  Do not copy
-       * the older linear shadow back over that newer content. */
-      texture->rgb5a1_packed = false;
-      return;
-   }
-   for (unsigned y = 0; y < texture->base.height0; y++)
-      for (unsigned x = 0; x < texture->base.width0; x++)
-         memcpy((uint8_t *)texture->map +
-                   ph_mip_texel_offset_cpp(&texture->mip, 0, x, y,
-                                           false, 4),
-                (uint8_t *)texture->linear_map +
-                   (size_t)y * texture->linear_stride + x * 4, 4);
-   __sync_synchronize();
-   texture->rgb5a1_packed = false;
-   texture->upload_dirty |= texture->upload_texture;
 }
 
 static void
@@ -15426,10 +15441,6 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
    }
    if (texture && t->base.level < ph_resource_mip_levels(r) && t->staging &&
        (transfer->usage & PIPE_MAP_WRITE)) {
-      /* Do not apply a partial RGBA update over the temporary 16-bit packed
-       * image.  Rebuild the complete ordinary native shadow first. */
-      if (r->rgb5a1_packed)
-         ph_restore_rgba_tiled(r);
       /* A shadowed image reaches VRAM through the shadow upload; its linear
        * companion is then refreshed by the GPU resolve blit instead of a
        * second CPU copy over the bus. */
@@ -15480,10 +15491,6 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
        */
       r->tiled_dirty = r->map && !r->linear_map;
       r->linear_dirty = r->linear_map && !r->map;
-      /* The write replaced the native A1R5G5B5 scratch representation with
-       * the resource's ordinary RGBA pixels.  A later binary-alpha draw may
-       * reclassify/repack it under the new content generation. */
-      r->rgb5a1_packed = false;
       r->upload_dirty |= r->upload_texture;
       r->content_generation++;
       r->mip_defined |= BITFIELD_BIT(transfer->level);
