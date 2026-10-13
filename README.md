@@ -34,7 +34,7 @@ The patches are made against the T2 SDE package trees (Linux 7.2 and Mesa
 - `mesa-02-loader-dri3-single-back-buffer-on-p690.patch`: one DRI3 back
   buffer on the P690, whose render-target origins fit only one colour and
   one depth buffer next to the pinned X front.
-- `mesa-03` … `mesa-15`: generic Gallium, NIR and Mesa fixes (lowered-IO
+- `mesa-03` … `mesa-16`: generic Gallium, NIR and Mesa fixes (lowered-IO
   aaline/aapoint/stipple lowering, fog, polygon offset, wide points,
   no-integer gallivm lowering and others). Each keeps its original commit
   message.

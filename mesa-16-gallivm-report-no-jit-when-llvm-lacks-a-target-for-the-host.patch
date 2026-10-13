@@ -1,0 +1,168 @@
+From 4c7ea9c4de8eb6b9910afd5557dfe3cd24f953bd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ren=C3=A9=20Rebe?= <rene@exactco.de>
+Date: Tue, 13 Oct 2026 10:45:05 +0200
+Subject: [PATCH] gallivm: report no JIT when LLVM lacks a target for the host
+ CPU
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A Mesa built with LLVM for its AMD drivers can run on a CPU LLVM has no
+backend for, such as Alpha.  lp_build_init() still claimed gallivm, so
+draw created its LLVM context; the ORC JIT's construction then failed
+target lookup in ExitOnErr and exited the application ("No available
+targets are compatible with triple").  Every client of a driver using
+draw (here parhelia) died in context creation.
+
+lp_build_have_jit_target() looks the JIT triple up in the target registry;
+lp_build_init() fails without a target, and draw_get_option_use_llvm()
+requires lp_build_init(), so draw interprets and its caps agree.
+
+Measured on DEC Alpha EV56 with T2's Mesa 26.2.4 configuration plus
+parhelia: glxinfo exited 1 before, now reports the Parhelia (GL 2.0) and
+glxgears runs at 43 fps without DRAW_USE_LLVM=0; softpipe unaffected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: René Rebe <rene@exactco.de>
+---
+ src/gallium/auxiliary/draw/draw_context.c     |  4 +++-
+ src/gallium/auxiliary/gallivm/lp_bld_init.c   |  3 +++
+ .../auxiliary/gallivm/lp_bld_init_orc.cpp     |  3 +++
+ src/gallium/auxiliary/gallivm/lp_bld_misc.cpp | 21 +++++++++++++++++++
+ src/gallium/auxiliary/gallivm/lp_bld_misc.h   |  4 ++++
+ 5 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/auxiliary/draw/draw_context.c b/src/gallium/auxiliary/draw/draw_context.c
+index cb0b73b..f5a9c4e 100644
+--- a/src/gallium/auxiliary/draw/draw_context.c
++++ b/src/gallium/auxiliary/draw/draw_context.c
+@@ -1,6 +1,7 @@
+ /**************************************************************************
+  *
+  * Copyright 2007 VMware, Inc.
++ * Copyright 2026 René Rebe <rene@exactco.de>
+  * All Rights Reserved.
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+@@ -57,7 +58,8 @@ bool
+ draw_get_option_use_llvm(void)
+ {
+ #if DRAW_LLVM_AVAILABLE
+-   return debug_get_bool_option("DRAW_USE_LLVM", true);
++   /* without a JIT target for this CPU draw interprets */
++   return debug_get_bool_option("DRAW_USE_LLVM", true) && lp_build_init();
+ #else
+    return false;
+ #endif
+diff --git a/src/gallium/auxiliary/gallivm/lp_bld_init.c b/src/gallium/auxiliary/gallivm/lp_bld_init.c
+index f5b6110..af3423b 100644
+--- a/src/gallium/auxiliary/gallivm/lp_bld_init.c
++++ b/src/gallium/auxiliary/gallivm/lp_bld_init.c
+@@ -1,6 +1,7 @@
+ /**************************************************************************
+  *
+  * Copyright 2009 VMware, Inc.
++ * Copyright 2026 René Rebe <rene@exactco.de>
+  * All Rights Reserved.
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+@@ -320,6 +321,8 @@ lp_build_init(void)
+    lp_init_env_options();
+ 
+    lp_set_target_options();
++   if (!lp_build_have_jit_target())
++      return false;
+ 
+    lp_bld_ppc_disable_denorms();
+ 
+diff --git a/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp b/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
+index 7c81571..f7646bc 100644
+--- a/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
++++ b/src/gallium/auxiliary/gallivm/lp_bld_init_orc.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (c) 2022 Alex Fan <alex.fan.q@gmail.com>
++ * Copyright 2026 René Rebe <rene@exactco.de>
+  * SPDX-License-Identifier: MIT
+  */
+ 
+@@ -540,6 +541,8 @@ llvm::orc::JITTargetMachineBuilder LPJit::create_jtdb() {
+ bool
+ lp_build_init(void)
+ {
++   if (!lp_build_have_jit_target())
++      return false;
+    (void)LPJit::get_instance();
+    return true;
+ }
+diff --git a/src/gallium/auxiliary/gallivm/lp_bld_misc.cpp b/src/gallium/auxiliary/gallivm/lp_bld_misc.cpp
+index 47fd45e..e7cce98 100644
+--- a/src/gallium/auxiliary/gallivm/lp_bld_misc.cpp
++++ b/src/gallium/auxiliary/gallivm/lp_bld_misc.cpp
+@@ -1,6 +1,7 @@
+ /**************************************************************************
+  *
+  * Copyright 2010 VMware, Inc.
++ * Copyright 2026 René Rebe <rene@exactco.de>
+  * All Rights Reserved.
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+@@ -46,6 +47,7 @@
+ #include <llvm-c/Core.h>
+ #include <llvm-c/Support.h>
+ #include <llvm-c/ExecutionEngine.h>
++#include <llvm-c/TargetMachine.h>
+ #include <llvm/Target/TargetOptions.h>
+ #include <llvm/ExecutionEngine/ExecutionEngine.h>
+ #include <llvm/Analysis/TargetLibraryInfo.h>
+@@ -152,6 +154,25 @@ lp_set_target_options(void)
+    call_once(&init_native_targets_once_flag, lp_bld_init_native_targets);
+ }
+ 
++/* LLVM may lack a backend for the host CPU (e.g. Alpha): then there is no JIT,
++ * and the ORC JIT's construction would exit the process. */
++extern "C" bool
++lp_build_have_jit_target(void)
++{
++   static int have = -1;
++
++   if (have < 0) {
++      LLVMTargetRef target;
++      char *error = NULL;
++
++      lp_set_target_options();
++      have = !LLVMGetTargetFromTriple(lp_build_jit_triple().c_str(), &target,
++                                      &error);
++      LLVMDisposeMessage(error);
++   }
++   return have;
++}
++
+ extern "C"
+ LLVMTargetLibraryInfoRef
+ gallivm_create_target_library_info(const char *triple)
+diff --git a/src/gallium/auxiliary/gallivm/lp_bld_misc.h b/src/gallium/auxiliary/gallivm/lp_bld_misc.h
+index 6562f3c..0792680 100644
+--- a/src/gallium/auxiliary/gallivm/lp_bld_misc.h
++++ b/src/gallium/auxiliary/gallivm/lp_bld_misc.h
+@@ -1,6 +1,7 @@
+ /**************************************************************************
+  *
+  * Copyright 2012 VMware, Inc.
++ * Copyright 2026 René Rebe <rene@exactco.de>
+  * All Rights Reserved.
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+@@ -64,6 +65,9 @@ gallivm_dispose_target_library_info(LLVMTargetLibraryInfoRef library_info);
+ extern void
+ lp_set_target_options(void);
+ 
++extern bool
++lp_build_have_jit_target(void);
++
+ extern void
+ lp_bld_init_native_targets();
+ 
+-- 
+2.54.0
+
