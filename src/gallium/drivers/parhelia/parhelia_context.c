@@ -568,6 +568,9 @@ struct ph_context {
    uint64_t tcl_reason_verts[PH_TCL_REASONS];
    uint64_t tcl_verts, tcl_clip_verts;
    unsigned tcl_clip_why[4];	/* w <= 0, guard band, near, far */
+   unsigned tcl_clipped_tris;   /* clipped on the CPU, kept transforming */
+   float *tcl_clip_copy;
+   unsigned tcl_clip_cap;
    enum ph_tcl_reason tcl_last_reason;
    unsigned tcl_program_draws;
    unsigned tcl_box_draws;      /* cleared by the position box, no per-vertex test */
@@ -951,9 +954,10 @@ ph_stats_frame(struct ph_context *ctx)
               ctx->tcl_box_draws / n, ctx->tcl_slice_draws / n,
               ctx->tcl_fallbacks / n, ctx->tcl_clip_fallbacks / n);
    if (ctx->stat.start_ns && (ctx->tcl_draws || ctx->tcl_clip_fallbacks))
-      fprintf(stderr, "  hardware transform: %.0f vertices; software clipper "
-              "tails: %.0f vertices (w<=0 %.1f, guard band %.1f, near %.1f, "
-              "far %.1f)\n", ctx->tcl_verts / n, ctx->tcl_clip_verts / n,
+      fprintf(stderr, "  hardware transform: %.0f vertices, %.1f triangles "
+              "clipped; software clipper tails: %.0f vertices (w<=0 %.1f, "
+              "guard band %.1f, near %.1f, far %.1f)\n", ctx->tcl_verts / n,
+              ctx->tcl_clipped_tris / n, ctx->tcl_clip_verts / n,
               ctx->tcl_clip_why[0] / n, ctx->tcl_clip_why[1] / n,
               ctx->tcl_clip_why[2] / n, ctx->tcl_clip_why[3] / n);
    for (unsigned r = 0; ctx->stat.start_ns && r < PH_TCL_REASONS; r++)
@@ -965,6 +969,7 @@ ph_stats_frame(struct ph_context *ctx)
    memset(ctx->tcl_reason_verts, 0, sizeof(ctx->tcl_reason_verts));
    memset(ctx->tcl_clip_why, 0, sizeof(ctx->tcl_clip_why));
    ctx->tcl_verts = ctx->tcl_clip_verts = 0;
+   ctx->tcl_clipped_tris = 0;
    ctx->tcl_draws = ctx->tcl_fallbacks = ctx->tcl_clip_fallbacks = 0;
    ctx->tcl_program_draws = ctx->tcl_box_draws = ctx->tcl_slice_draws = 0;
    for (unsigned k = 0; ctx->stats_sync && k < PH_STAT_KINDS; k++)
@@ -7922,6 +7927,193 @@ ph_tcl_vertices_fit(struct ph_context *ctx, const float *vertices,
    return true;
 }
 
+/* The planes a clipped vertex has to stay inside: w > 0, near, far and the
+ * x and y bounds, each pulled in by a hair so rounding in the transform never
+ * puts a clipped vertex outside.  The transform is linear, so clipping in clip
+ * space and interpolating the object-space vertex with the same parameter
+ * gives exactly the clipped point. */
+#define PH_TCL_CLIP_PLANES 7
+#define PH_TCL_CLIP_MAX (3 + PH_TCL_CLIP_PLANES)
+#define PH_TCL_MAX_DPV 11
+
+/* A clipped triangle is cut at the viewport plus this many pixels, not at
+ * the guard band: clipped vertices on the guard band edge (window x 8160)
+ * stalled the 0528 engine, and GL only asks for |x|, |y| <= w. */
+#define PH_TCL_CLIP_MARGIN 16.0f
+
+struct ph_tcl_run {
+   unsigned dpv, limit, vs_const_vec4s;
+   uint32_t entry;
+   bool colour_alpha;
+   float gx, gy;                /* guard band: triangles inside stay whole */
+   float cx, cy;                /* the clipper's x and y planes */
+};
+
+static float
+ph_tcl_plane_distance(unsigned plane, const float c[4], float gx, float gy)
+{
+   const float in = 1.0f - 1.0f / 65536.0f;
+
+   switch (plane) {
+   case 0: return c[3] - 2e-6f;
+   case 1: return c[2] + in * c[3];
+   case 2: return in * c[3] - c[2];
+   case 3: return in * gx * c[3] - c[0];
+   case 4: return in * gx * c[3] + c[0];
+   case 5: return in * gy * c[3] - c[1];
+   default: return in * gy * c[3] + c[1];
+   }
+}
+
+static void
+ph_tcl_clip_coords(const float *m, const float *p, float c[4])
+{
+   for (unsigned r = 0; r < 4; r++)
+      c[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] +
+             m[r * 4 + 3];
+}
+
+/* Append one object-space triangle to the transforming batch, publishing a
+ * full batch first; a submit clears the batch's program state. */
+static bool
+ph_tcl_append_tri(struct ph_context *ctx, const struct ph_tcl_run *r,
+                  const float *a, const float *b, const float *c)
+{
+   const unsigned room = ph_logical_vertex_limit(ctx) / (3 * r->dpv);
+   float *dst;
+
+   if (ctx->triangles >= MIN2(r->limit, room)) {
+      ph_submit_vertices(ctx);
+      if (ctx->submit_error)
+         return false;
+   }
+   ctx->transform = true;
+   ctx->warp_program_entry = r->entry;
+   ctx->vs_const_vec4s = r->vs_const_vec4s;
+   ctx->colour_alpha = r->colour_alpha;
+   dst = &ctx->vertices[ctx->triangles * 3 * r->dpv];
+   memcpy(dst, a, r->dpv * sizeof(float));
+   memcpy(dst + r->dpv, b, r->dpv * sizeof(float));
+   memcpy(dst + 2 * r->dpv, c, r->dpv * sizeof(float));
+   ctx->triangles++;
+   return true;
+}
+
+/* Sutherland-Hodgman against the transform's planes; the intersection is
+ * always taken from the inside vertex, so an edge two triangles share is cut
+ * at the same point in both. */
+static bool
+ph_tcl_clip_tri(struct ph_context *ctx, const struct ph_tcl_run *r,
+                const float *const tri[3])
+{
+   float vert[2][PH_TCL_CLIP_MAX][PH_TCL_MAX_DPV];
+   float clip[2][PH_TCL_CLIP_MAX][4];
+   unsigned n = 3, cur = 0;
+
+   for (unsigned i = 0; i < 3; i++) {
+      memcpy(vert[0][i], tri[i], r->dpv * sizeof(float));
+      ph_tcl_clip_coords(ctx->mvp, tri[i], clip[0][i]);
+   }
+   for (unsigned plane = 0; plane < PH_TCL_CLIP_PLANES; plane++) {
+      const unsigned nxt = cur ^ 1;
+      unsigned m = 0;
+
+      for (unsigned i = 0; i < n; i++) {
+         const unsigned j = i + 1 < n ? i + 1 : 0;
+         const float di = ph_tcl_plane_distance(plane, clip[cur][i],
+                                                r->cx, r->cy);
+         const float dj = ph_tcl_plane_distance(plane, clip[cur][j],
+                                                r->cx, r->cy);
+
+         if (di >= 0.0f) {
+            memcpy(vert[nxt][m], vert[cur][i], r->dpv * sizeof(float));
+            memcpy(clip[nxt][m], clip[cur][i], sizeof(clip[0][0]));
+            m++;
+         }
+         /* a vertex on the plane is its own intersection */
+         if ((di > 0.0f && dj < 0.0f) || (di < 0.0f && dj > 0.0f)) {
+            const unsigned in = di >= 0.0f ? i : j, out = in == i ? j : i;
+            const float din = in == i ? di : dj, dout = in == i ? dj : di;
+            const float t = din / (din - dout);
+
+            for (unsigned k = 0; k < r->dpv; k++)
+               vert[nxt][m][k] = vert[cur][in][k] +
+                                 t * (vert[cur][out][k] - vert[cur][in][k]);
+            for (unsigned k = 0; k < 4; k++)
+               clip[nxt][m][k] = clip[cur][in][k] +
+                                 t * (clip[cur][out][k] - clip[cur][in][k]);
+            m++;
+         }
+      }
+      n = m;
+      cur = nxt;
+      if (n < 3)
+         return true;
+   }
+   ctx->tcl_clipped_tris++;
+   if (ph_env("PARHELIA_TRACE_TCL_CLIP")) {
+      fprintf(stderr, "parhelia clip:");
+      for (unsigned i = 0; i < 3; i++) {
+         float c[4];
+
+         ph_tcl_clip_coords(ctx->mvp, tri[i], c);
+         fprintf(stderr, " (%g %g %g %g)", c[0], c[1], c[2], c[3]);
+      }
+      fprintf(stderr, " ->");
+      for (unsigned i = 0; i < n; i++)
+         fprintf(stderr, " (%g %g %g %g)", clip[cur][i][0], clip[cur][i][1],
+                 clip[cur][i][2], clip[cur][i][3]);
+      fprintf(stderr, "\n");
+   }
+   for (unsigned k = 1; k + 1 < n; k++)
+      if (!ph_tcl_append_tri(ctx, r, vert[cur][0], vert[cur][k],
+                             vert[cur][k + 1]))
+         return false;
+   return true;
+}
+
+/* A fixed-function chunk with vertices outside the transform's planes: keep
+ * the triangles that fit as they are and clip the others, all on the
+ * hardware transform. */
+static bool
+ph_tcl_clip_chunk(struct ph_context *ctx, const struct ph_tcl_run *r,
+                  const float *staged, unsigned ntri)
+{
+   const unsigned bytes = ntri * 3 * r->dpv * sizeof(float);
+   float *copy;
+
+   /* the staged chunk is overwritten by what gets appended */
+   if (ctx->tcl_clip_cap < bytes) {
+      float *grown = realloc(ctx->tcl_clip_copy, bytes);
+
+      if (!grown)
+         return false;
+      ctx->tcl_clip_copy = grown;
+      ctx->tcl_clip_cap = bytes;
+   }
+   copy = ctx->tcl_clip_copy;
+   memcpy(copy, staged, bytes);
+   for (unsigned t = 0; t < ntri; t++) {
+      const float *tri[3];
+      bool inside = true;
+
+      for (unsigned v = 0; v < 3; v++) {
+         float c[4];
+
+         tri[v] = copy + (t * 3 + v) * r->dpv;
+         ph_tcl_clip_coords(ctx->mvp, tri[v], c);
+         if (!(c[3] > 1e-6f) || !(fabsf(c[0]) <= r->gx * c[3]) ||
+             !(fabsf(c[1]) <= r->gy * c[3]) || !(c[2] >= -c[3]) ||
+             !(c[2] <= c[3]))
+            inside = false;
+      }
+      if (!(inside ? ph_tcl_append_tri(ctx, r, tri[0], tri[1], tri[2]) :
+                     ph_tcl_clip_tri(ctx, r, tri)))
+         return false;
+   }
+   return true;
+}
+
 /* The object-space box of the positions a draw references: from the
  * buffer's cache while its contents are unchanged, else one min/max pass
  * over the referenced vertex range. */
@@ -8097,6 +8289,7 @@ struct ph_tcl_layout {
  * clip planes, and polygon offset has no place in the WARP program. */
 DEBUG_GET_ONCE_BOOL_OPTION(tcl_rgba, "PARHELIA_TCL_RGBA", false)
 DEBUG_GET_ONCE_BOOL_OPTION(tcl_box, "PARHELIA_TCL_BOX", true)
+DEBUG_GET_ONCE_BOOL_OPTION(tcl_clip, "PARHELIA_TCL_CLIP", true)
 
 static bool
 ph_tcl_no(struct ph_context *ctx, enum ph_tcl_reason reason)
@@ -8689,6 +8882,33 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
          }
       }
       if (!box_fits && !ph_tcl_vertices_fit(ctx, dst, chunk * 3, lay.dpv)) {
+         /* A fixed-function transform clips the crossing triangles itself. */
+         if (!lay.program && lay.dpv <= PH_TCL_MAX_DPV &&
+             debug_get_option_tcl_clip()) {
+            const struct ph_tcl_run run = {
+               .dpv = lay.dpv, .limit = limit,
+               .vs_const_vec4s = vs_const_vec4s, .entry = entry,
+               .colour_alpha = lay.colour_alpha,
+               .gx = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[0])) /
+                     MAX2(fabsf(ctx->viewport.scale[0]), 1e-6f),
+               .gy = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[1])) /
+                     MAX2(fabsf(ctx->viewport.scale[1]), 1e-6f),
+               .cx = 1.0f + PH_TCL_CLIP_MARGIN /
+                     MAX2(fabsf(ctx->viewport.scale[0]), 1e-6f),
+               .cy = 1.0f + PH_TCL_CLIP_MARGIN /
+                     MAX2(fabsf(ctx->viewport.scale[1]), 1e-6f),
+            };
+
+            /* only the copy's allocation fails before appending anything */
+            if (run.gx > run.cx && run.gy > run.cy &&
+                (ph_tcl_clip_chunk(ctx, &run, dst, chunk) ||
+                 ctx->submit_error)) {
+               if (ctx->submit_error)
+                  return true;
+               done += chunk;
+               continue;
+            }
+         }
          /* Publish what already fitted, then let the software clipper own
           * the rest of this draw. */
          if (ctx->triangles)
@@ -15208,6 +15428,7 @@ ph_destroy_context(struct pipe_context *p)
    if (ctx->tcl_cache)
       translate_cache_destroy(ctx->tcl_cache);
    free(ctx->tcl_elts);
+   free(ctx->tcl_clip_copy);
    free(ctx->vs_const);
    free(ctx->vs_const_pending);
    free(ctx->fs_const_snap);
