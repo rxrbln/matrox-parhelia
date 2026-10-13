@@ -8284,7 +8284,7 @@ ph_packed_colour_lerp(uint32_t a, uint32_t b, float t)
  * at the same point in both. */
 static bool
 ph_tcl_clip_tri(struct ph_context *ctx, const struct ph_tcl_run *r,
-                const float *const tri[3])
+                const float *const tri[3], const float tri_clip[3][4])
 {
    float vert[2][PH_TCL_CLIP_MAX][PH_TCL_MAX_DPV];
    float clip[2][PH_TCL_CLIP_MAX][4];
@@ -8292,7 +8292,7 @@ ph_tcl_clip_tri(struct ph_context *ctx, const struct ph_tcl_run *r,
 
    for (unsigned i = 0; i < 3; i++) {
       memcpy(vert[0][i], tri[i], r->dpv * sizeof(float));
-      ph_tcl_clip_coords(ctx->mvp, tri[i], clip[0][i]);
+      memcpy(clip[0][i], tri_clip[i], sizeof(clip[0][i]));
    }
    for (unsigned plane = 0; plane < PH_TCL_CLIP_PLANES; plane++) {
       const unsigned nxt = cur ^ 1;
@@ -8378,20 +8378,27 @@ ph_tcl_clip_chunk(struct ph_context *ctx, const struct ph_tcl_run *r,
    memcpy(copy, staged, bytes);
    for (unsigned t = 0; t < ntri; t++) {
       const float *tri[3];
-      bool inside = true;
+      float c[3][4];
+      bool inside = true, outside = false;
 
       for (unsigned v = 0; v < 3; v++) {
-         float c[4];
-
          tri[v] = copy + (t * 3 + v) * r->dpv;
-         ph_tcl_clip_coords(ctx->mvp, tri[v], c);
-         if (!(c[3] > 1e-6f) || !(fabsf(c[0]) <= r->gx * c[3]) ||
-             !(fabsf(c[1]) <= r->gy * c[3]) || !(c[2] >= -c[3]) ||
-             !(c[2] <= c[3]))
+         ph_tcl_clip_coords(ctx->mvp, tri[v], c[v]);
+         if (!(c[v][3] > 1e-6f) || !(fabsf(c[v][0]) <= r->gx * c[v][3]) ||
+             !(fabsf(c[v][1]) <= r->gy * c[v][3]) || !(c[v][2] >= -c[v][3]) ||
+             !(c[v][2] <= c[v][3]))
             inside = false;
       }
+      /* all three outside one plane: the clipper keeps nothing of it */
+      for (unsigned plane = 0; !inside && !outside &&
+                               plane < PH_TCL_CLIP_PLANES; plane++)
+         outside = ph_tcl_plane_distance(plane, c[0], r->cx, r->cy) < 0.0f &&
+                   ph_tcl_plane_distance(plane, c[1], r->cx, r->cy) < 0.0f &&
+                   ph_tcl_plane_distance(plane, c[2], r->cx, r->cy) < 0.0f;
+      if (outside)
+         continue;
       if (!(inside ? ph_tcl_append_tri(ctx, r, tri[0], tri[1], tri[2]) :
-                     ph_tcl_clip_tri(ctx, r, tri)))
+                     ph_tcl_clip_tri(ctx, r, tri, (const float (*)[4])c)))
          return false;
    }
    return true;
