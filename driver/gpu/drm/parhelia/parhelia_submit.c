@@ -2510,17 +2510,37 @@ static void parhelia_vertex_object_free(struct drm_gem_object *gem)
 		container_of(to_drm_gem_dma_obj(gem), struct parhelia_vertex_bo, dma);
 
 	if (entry->dma.vaddr)
-		dma_free_wc(drm_dev_dma_dev(gem->dev), gem->size,
-			    entry->dma.vaddr, entry->dma.dma_addr);
+		dma_free_coherent(drm_dev_dma_dev(gem->dev), gem->size,
+				  entry->dma.vaddr, entry->dma.dma_addr);
 	drm_gem_object_release(gem);
 	kfree(entry);
+}
+
+/* Vertex objects are coherent memory mapped cacheable: the client stages
+ * vertices into them in place with strided writes, which a write-combining
+ * map would turn into partial line writes, and reads clipped triangles
+ * back.  The engine's class-3 fetch snoops, as it does for the kernel's own
+ * coherent vertex slots. */
+static int parhelia_vertex_object_mmap(struct drm_gem_object *gem,
+				       struct vm_area_struct *vma)
+{
+	struct drm_gem_dma_object *dma = to_drm_gem_dma_obj(gem);
+	int ret;
+
+	vma->vm_pgoff -= drm_vma_node_start(&gem->vma_node);
+	vm_flags_mod(vma, VM_DONTDUMP | VM_DONTEXPAND, VM_PFNMAP);
+	ret = dma_mmap_coherent(drm_dev_dma_dev(gem->dev), vma, dma->vaddr,
+				dma->dma_addr, vma->vm_end - vma->vm_start);
+	if (ret)
+		drm_gem_vm_close(vma);
+	return ret;
 }
 
 static const struct drm_gem_object_funcs parhelia_vertex_object_funcs = {
 	.free = parhelia_vertex_object_free,
 	.print_info = drm_gem_dma_object_print_info,
 	.vmap = drm_gem_dma_object_vmap,
-	.mmap = drm_gem_dma_object_mmap,
+	.mmap = parhelia_vertex_object_mmap,
 	.vm_ops = &drm_gem_dma_vm_ops,
 };
 
@@ -2540,9 +2560,9 @@ parhelia_vertex_bo_create(struct drm_device *drm, size_t size)
 	ret = drm_gem_create_mmap_offset(&entry->dma.base);
 	if (ret)
 		goto out_put;
-	entry->dma.vaddr = dma_alloc_wc(drm_dev_dma_dev(drm), size,
-					&entry->dma.dma_addr,
-					GFP_KERNEL | __GFP_NOWARN);
+	entry->dma.vaddr = dma_alloc_coherent(drm_dev_dma_dev(drm), size,
+					      &entry->dma.dma_addr,
+					      GFP_KERNEL | __GFP_NOWARN);
 	if (!entry->dma.vaddr) {
 		ret = -ENOMEM;
 		goto out_put;
