@@ -8082,6 +8082,7 @@ struct ph_tcl_layout {
  * alpha work-arounds own the vertex layout, the software clipper owns user
  * clip planes, and polygon offset has no place in the WARP program. */
 DEBUG_GET_ONCE_BOOL_OPTION(tcl_rgba, "PARHELIA_TCL_RGBA", false)
+DEBUG_GET_ONCE_BOOL_OPTION(tcl_box, "PARHELIA_TCL_BOX", true)
 
 static bool
 ph_tcl_no(struct ph_context *ctx, enum ph_tcl_reason reason)
@@ -8424,6 +8425,17 @@ ph_tcl_fetch_init(struct ph_tcl_fetch *f, const struct translate_key *key,
    return true;
 }
 
+/* The bits of ubyte_to_float() for every byte: on Alpha each float
+ * arithmetic instruction carries a trap barrier, a table load none. */
+static uint32_t ph_unorm8_bits[256];
+
+static void
+ph_unorm8_bits_init(void)
+{
+   for (unsigned i = 0; i < 256; i++)
+      ph_unorm8_bits[i] = fui(ubyte_to_float(i));
+}
+
 static void
 ph_tcl_fetch_run(const struct ph_tcl_fetch *f, const uint32_t *elts,
                  unsigned count, float *dst, unsigned dpv)
@@ -8431,14 +8443,14 @@ ph_tcl_fetch_run(const struct ph_tcl_fetch *f, const uint32_t *elts,
    for (unsigned v = 0; v < count; v++, dst += dpv)
       for (unsigned i = 0; i < f->count; i++) {
          const uint8_t *src = f->e[i].src + (size_t)elts[v] * f->e[i].stride;
-         float *d = dst + f->e[i].out;
+         uint32_t *d = (uint32_t *)(dst + f->e[i].out);
 
          if (f->e[i].unorm8)
             for (unsigned c = 0; c < f->e[i].comps; c++)
-               d[c] = ubyte_to_float(src[c]);
+               d[c] = ph_unorm8_bits[src[c]];
          else
             for (unsigned c = 0; c < f->e[i].comps; c++)
-               d[c] = ((const float *)src)[c];
+               d[c] = ((const uint32_t *)src)[c];
       }
 }
 
@@ -8607,9 +8619,10 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
 
       /* An affine position slice that reads only the position input is
        * bounded by its corners just like a matrix product. */
-      /* PARHELIA_TCL_BOX=1: the vendor tests every vertex; the box is a
-       * deviation that stays opt-in until it is measured to pay. */
-      box_fits = ph_env("PARHELIA_TCL_BOX") &&
+      /* The vendor tests every vertex.  A box inside the volume implies
+       * every vertex is, and clears 113 of 125 ioquake3 draws per frame on
+       * the Alpha (6.9 -> 7.2 fps); PARHELIA_TCL_BOX=0 tests each vertex. */
+      box_fits = debug_get_option_tcl_box() &&
                  (!slice || (slice->affine && ctx->vs->pos_input >= 0 &&
                              ctx->vs->pos_input < 32 &&
                              slice->input_mask == 1u << ctx->vs->pos_input)) &&
@@ -15334,6 +15347,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
     * shape.  parhelia-p690-multi-primitive-packet-hang.md carries the bisect,
     * the two vendor candidates that were tested and refuted, and what is
     * still unexplained. */
+   ph_unorm8_bits_init();
    ctx->prims_per_packet =
       debug_get_num_option("PARHELIA_PRIMS_PER_PACKET", 2);
    if (ctx->prims_per_packet < 1)
