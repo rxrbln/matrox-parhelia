@@ -8859,13 +8859,13 @@ ph_unorm8_bits_init(void)
 /* Element-major: one specialised loop per element, so the per-vertex work is
  * the copy alone. */
 static void
-ph_tcl_fetch_run(const struct ph_tcl_fetch *f, const uint32_t *elts,
-                 unsigned count, float *dst, unsigned dpv)
+ph_tcl_fetch_elements(const struct ph_tcl_fetch *f, const uint32_t *elts,
+                      unsigned count, uint32_t *dst, unsigned dpv)
 {
    for (unsigned i = 0; i < f->count; i++) {
       const uint8_t *base = f->e[i].src;
       const size_t stride = f->e[i].stride;
-      uint32_t *d = (uint32_t *)dst + f->e[i].out;
+      uint32_t *d = dst + f->e[i].out;
 
       if (f->e[i].unorm8) {
          for (unsigned v = 0; v < count; v++, d += dpv) {
@@ -8910,6 +8910,19 @@ ph_tcl_fetch_run(const struct ph_tcl_fetch *f, const uint32_t *elts,
          break;
       }
    }
+}
+
+/* Vertices per element-major block: the block's output stays cached between
+ * its element passes even on an 8 KB first-level cache. */
+#define PH_TCL_FETCH_BLOCK 48u
+
+static void
+ph_tcl_fetch_run(const struct ph_tcl_fetch *f, const uint32_t *elts,
+                 unsigned count, float *dst, unsigned dpv)
+{
+   for (unsigned b = 0; b < count; b += PH_TCL_FETCH_BLOCK)
+      ph_tcl_fetch_elements(f, elts + b, MIN2(count - b, PH_TCL_FETCH_BLOCK),
+                            (uint32_t *)dst + (size_t)b * dpv, dpv);
 }
 
 /* Fill the object-space vertex stream for one draw and, when every vertex
