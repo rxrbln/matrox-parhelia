@@ -2242,6 +2242,20 @@ static void parhelia_retire_locked(struct parhelia_device *pdev)
 			READ_ONCE(((u32 *)pdev->writeback_cpu)[8]),
 			parhelia_read(pdev, 0x1300), parhelia_read(pdev, 0x0908),
 			parhelia_read(pdev, 0x0924));
+		/* Which queued request the fetcher stopped in, by primary dword. */
+		dev_err(&pdev->pdev->dev, "primary get %u put %u dwords at %#llx\n",
+			pdev->primary_get, pdev->primary_put,
+			(unsigned long long)pdev->async_primary_bus);
+		for (i = 0; i < PARHELIA_ASYNC_SLOTS; i++) {
+			slot = &pdev->slots[i];
+			if (slot->state == PARHELIA_SLOT_QUEUED)
+				dev_err(&pdev->pdev->dev,
+					"queued fence %08x tag %08x primary %u-%u calls %u age %u ms\n",
+					slot->fence, slot->dma_tag, slot->primary_begin,
+					slot->primary_end, slot->call_count,
+					jiffies_to_msecs(jiffies - slot->submitted));
+		}
+		slot = oldest;
 		pdev->wedged = true;
 		parhelia_state_shadow_invalidate(pdev, "asynchronous submit timeout");
 		pci_clear_master(pdev->pdev);
