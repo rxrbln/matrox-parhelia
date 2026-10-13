@@ -1864,6 +1864,18 @@ static int parhelia_slot_fence_init(struct parhelia_device *pdev,
 	return 0;
 }
 
+/* Whether relocation @i is the first to name its pinned object (trace only). */
+static bool parhelia_first_pinned(struct drm_gem_object **objects,
+				  struct drm_gem_vram_object **pinned, u32 i)
+{
+	u32 j;
+
+	for (j = 0; j < i; j++)
+		if (objects[j] == objects[i] && pinned[j])
+			return false;
+	return true;
+}
+
 /* Every render relocation is conservatively a write dependency until a
  * complete state-usage table can distinguish sampled inputs.  Lock one
  * reservation at a time so this remains usable as an external module: the
@@ -1880,7 +1892,8 @@ static int parhelia_slot_attach_fence(struct parhelia_submit_slot *slot,
 		struct drm_gem_object *obj = objects[i];
 		u32 j;
 
-		if (!obj)
+		/* a ring names its vertex object in every draw packet */
+		if (!obj || (i && objects[i - 1] == obj))
 			continue;
 		for (j = 0; j < i; j++)
 			if (objects[j] == obj)
@@ -3967,6 +3980,9 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	struct parhelia_submit_stats *stats = &pdev->submit_stats;
 	struct drm_gem_object **objects = NULL;
 	struct drm_gem_vram_object **pinned = NULL;
+	struct drm_gem_object *vertex_obj = NULL;
+	struct parhelia_vertex_bo *vertex_cached = NULL;
+	u32 vertex_handle = 0;
 	struct parhelia_call_plan *plan;
 	struct parhelia_submit_slot *async_slot = NULL;
 	struct parhelia_dma_block *blocks = pdev->dma_blocks;
@@ -3986,7 +4002,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	bool host_vertex_draw = false;
 	bool vertex_object_draw = false;
 	bool async = args->flags & PARHELIA_SUBMIT_ASYNC;
-	u32 i, j, end = 0, fence, dma_tag, primary_words, waited, opening_slot;
+	u32 i, end = 0, fence, dma_tag, primary_words, waited, opening_slot;
 	u32 boundary_packet = 0, boundary_count = 0, call_boundary_count = 0;
 	u32 call_words = trace_submit ? 8 : PARHELIA_CALL_DWORDS;
 	u32 prefix_words = full_sync ? 3 : 0;
@@ -4302,15 +4318,27 @@ retry_slot:
 				ret = -EINVAL;
 				goto out_unpin;
 			}
-			objects[i] = drm_gem_object_lookup(file, reloc->handle);
-			if (!objects[i]) {
-				ret = -ENOENT;
-				goto out_unpin;
-			}
-			vertex_bo = parhelia_vertex_bo_lookup(pdev, file, objects[i]);
-			if (!vertex_bo) {
-				ret = -EACCES;
-				goto out_unpin;
+			/* A ring names one vertex object in every draw packet:
+			 * reference it again rather than looking up its handle. */
+			if (vertex_obj && reloc->handle == vertex_handle) {
+				objects[i] = vertex_obj;
+				drm_gem_object_get(objects[i]);
+				vertex_bo = vertex_cached;
+			} else {
+				objects[i] = drm_gem_object_lookup(file, reloc->handle);
+				if (!objects[i]) {
+					ret = -ENOENT;
+					goto out_unpin;
+				}
+				vertex_bo = parhelia_vertex_bo_lookup(pdev, file,
+								      objects[i]);
+				if (!vertex_bo) {
+					ret = -EACCES;
+					goto out_unpin;
+				}
+				vertex_obj = objects[i];
+				vertex_handle = reloc->handle;
+				vertex_cached = vertex_bo;
 			}
 			/* CREATE_VERTEX owns a stable DMA32 allocation.  The GEM lookup held
 			 * by this request prevents its bus address from being freed before
@@ -4518,18 +4546,14 @@ retry_slot:
 		/* A Q3 state batch names a colour target and texture repeatedly.
 		 * parhelia_pin_reloc_targets() kept one GEM reference for every
 		 * relocation so the existing cleanup stays simple, but only one
-		 * TTM pin per unique object; j == i still marks that first
-		 * occurrence for the trace below. */
-		for (j = 0; j < i; j++)
-			if (objects[j] == objects[i] && pinned[j])
-				break;
+		 * TTM pin per unique object, at its first occurrence. */
 		ret = parhelia_vram_gpu_addr(pdev,
 				drm_gem_vram_of_gem(objects[i]), reloc->delta,
 				objects[i]->size - reloc->delta,
 				&packet_cmd[reloc->dword]);
 		if (ret)
 			goto out_unpin;
-		if (trace_vram_reloc && j == i) {
+		if (trace_vram_reloc && parhelia_first_pinned(objects, pinned, i)) {
 			struct parhelia_bo *pbo = to_parhelia_bo(objects[i]);
 			u32 target_reg = 0, bar_addr = 0;
 			s64 node = drm_gem_vram_offset(&pbo->gbo);
