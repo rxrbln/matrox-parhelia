@@ -588,7 +588,12 @@ struct ph_context {
    /* Reused per-draw builder storage keeps the expanded aggregate command
     * allocation off the hot draw-call stack. */
    struct parhelia_batch build_batch;
-   uint32_t pending_vertices[PH_BATCH_VERTEX_DWORDS];
+   /* The aggregate's vertices: in the ring slot it will be submitted from
+    * while a ring is mapped, else in pending_vertex_store. */
+   uint32_t *pending_vertices;
+   uint32_t *pending_vertex_store;
+   int pending_ring_slot;        /* -1: not in the ring */
+   uint32_t pending_ring_fence;  /* last submit that read the slot */
    unsigned pending_vertex_dwords;
    struct parhelia_batch_limits batch_limits;
    unsigned pending_submit_count;
@@ -1019,6 +1024,8 @@ ph_destroy_vertex_ring(struct ph_context *ctx)
       ioctl(ph_screen(ctx->base.screen)->fd, DRM_IOCTL_GEM_CLOSE, &close);
    }
    ctx->vram_vertices = NULL;
+   ctx->pending_vertices = ctx->pending_vertex_store;
+   ctx->pending_ring_slot = -1;
    ctx->vram_vertex_size = 0;
    ctx->vram_vertex_handle = 0;
    ctx->vram_vertex_slot_count = 0;
@@ -1322,6 +1329,48 @@ ph_submit_batch_now(struct ph_context *ctx, const struct parhelia_batch *batch,
    return ret;
 }
 
+/* The aggregate's vertices are written straight into the ring slot they are
+ * submitted from: wait for that slot's previous reader once, when the first
+ * vertices arrive, instead of copying the whole aggregate at submit. */
+static int
+ph_pending_ring_acquire(struct ph_context *ctx)
+{
+   unsigned slot;
+
+   if (ctx->pending_ring_slot >= 0 || ctx->pending_vertex_dwords ||
+       !ctx->vram_vertex_enabled || !ctx->async_submit ||
+       ph_pending_vertex_limit(ctx) > ctx->vram_vertex_slot_dwords)
+      return 0;
+   slot = ctx->vram_vertex_slot;
+   if (ctx->vram_vertex_fence[slot]) {
+      int ret = ph_wait_fence_counted(ctx, ctx->vram_vertex_fence[slot]);
+
+      if (ret)
+         return ret;
+      ctx->vram_vertex_fence[slot] = 0;
+   }
+   ctx->pending_vertices = (uint32_t *)ctx->vram_vertices +
+                           (size_t)slot * ctx->vram_vertex_slot_dwords;
+   ctx->pending_ring_slot = slot;
+   ctx->pending_ring_fence = 0;
+   return 0;
+}
+
+/* After the aggregate's submits the slot stays busy until the last one. */
+static void
+ph_pending_ring_release(struct ph_context *ctx)
+{
+   if (ctx->pending_ring_slot < 0)
+      return;
+   if (ctx->pending_ring_fence) {
+      ctx->vram_vertex_fence[ctx->pending_ring_slot] = ctx->pending_ring_fence;
+      ctx->vram_vertex_slot = (ctx->pending_ring_slot + 1) %
+                              ctx->vram_vertex_slot_count;
+   }
+   ctx->pending_ring_slot = -1;
+   ctx->pending_vertices = ctx->pending_vertex_store;
+}
+
 static int
 ph_submit_batch_now_untimed(struct ph_context *ctx,
                             const struct parhelia_batch *batch,
@@ -1338,17 +1387,26 @@ ph_submit_batch_now_untimed(struct ph_context *ctx,
    if (vertices && vertex_dwords && ctx->async_submit &&
        ctx->vram_vertex_enabled &&
        bytes <= (uint64_t)ctx->vram_vertex_slot_dwords * sizeof(uint32_t)) {
+      /* An aggregate staged in its ring slot is submitted in place. */
+      const bool in_ring = ctx->pending_ring_slot >= 0 &&
+         (const uint32_t *)vertices >= ctx->pending_vertices &&
+         (const uint32_t *)vertices + vertex_dwords <=
+            ctx->pending_vertices + ctx->vram_vertex_slot_dwords;
       unsigned slot = ctx->vram_vertex_slot;
-      uint64_t offset = (uint64_t)slot * ctx->vram_vertex_slot_dwords *
-                        sizeof(uint32_t);
+      uint64_t offset = in_ring ?
+         (uint64_t)((const uint8_t *)vertices -
+                    (const uint8_t *)ctx->vram_vertices) :
+         (uint64_t)slot * ctx->vram_vertex_slot_dwords * sizeof(uint32_t);
 
-      if (ctx->vram_vertex_fence[slot]) {
-         ret = ph_wait_fence_counted(ctx, ctx->vram_vertex_fence[slot]);
-         if (ret)
-            return ret;
-         ctx->vram_vertex_fence[slot] = 0;
+      if (!in_ring) {
+         if (ctx->vram_vertex_fence[slot]) {
+            ret = ph_wait_fence_counted(ctx, ctx->vram_vertex_fence[slot]);
+            if (ret)
+               return ret;
+            ctx->vram_vertex_fence[slot] = 0;
+         }
+         memcpy((uint8_t *)ctx->vram_vertices + offset, vertices, bytes);
       }
-      memcpy((uint8_t *)ctx->vram_vertices + offset, vertices, bytes);
       __sync_synchronize();
       ret = boundary_aware ?
          parhelia_batch_submit_vram_async_bounded(
@@ -1358,8 +1416,12 @@ ph_submit_batch_now_untimed(struct ph_context *ctx,
             screen->fd, batch, ctx->vram_vertex_handle, offset,
             vertex_dwords, &ctx->fence);
       if (!ret) {
-         ctx->vram_vertex_fence[slot] = ctx->fence;
-         ctx->vram_vertex_slot = (slot + 1) % ctx->vram_vertex_slot_count;
+         if (in_ring) {
+            ctx->pending_ring_fence = ctx->fence;
+         } else {
+            ctx->vram_vertex_fence[slot] = ctx->fence;
+            ctx->vram_vertex_slot = (slot + 1) % ctx->vram_vertex_slot_count;
+         }
          ctx->async_pending = true;
          return 0;
       }
@@ -1393,7 +1455,7 @@ ph_submit_batch_now_untimed(struct ph_context *ctx,
             return ret;
          ctx->vram_vertex_fence[0] = 0;
       }
-      memcpy(ctx->vram_vertices, vertices, bytes);
+      memmove(ctx->vram_vertices, vertices, bytes);
       /* The map can be write-combined. Finish the CPU store before the ioctl
        * arms class-3 fetching; the kernel's fence then makes reuse safe. */
       __sync_synchronize();
@@ -1622,6 +1684,7 @@ ph_drain_batch(struct ph_context *ctx)
        ctx->pending_mark_count > 1)
       ret = ph_submit_state_stream_groups(ctx);
    ph_release_pending_resources(ctx);
+   ph_pending_ring_release(ctx);
    ctx->pending_batch.command_count = 0;
    ctx->pending_batch.packet_count = 0;
    ctx->pending_batch.reloc_count = 0;
@@ -1761,6 +1824,8 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
       if (ret)
          return ret;
    }
+   if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx)))
+      return ret;
    ret = ctx->aggregate_state_stream ?
       ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
       ctx->aggregate_state_batches ?
@@ -1776,6 +1841,8 @@ ph_submit_batch(struct ph_context *ctx, const struct parhelia_batch *batch,
        ctx->pending_batch.packet_count) {
       ret = ph_drain_batch(ctx);
       if (ret)
+         return ret;
+      if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx)))
          return ret;
       ret = ctx->aggregate_state_stream ?
          ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
@@ -15502,6 +15569,7 @@ ph_destroy_context(struct pipe_context *p)
       translate_cache_destroy(ctx->tcl_cache);
    free(ctx->tcl_elts);
    free(ctx->tcl_clip_copy);
+   FREE(ctx->pending_vertex_store);
    free(ctx->vs_const);
    free(ctx->vs_const_pending);
    free(ctx->fs_const_snap);
@@ -15552,6 +15620,13 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    (void)flags;
    if (!ctx)
       return NULL;
+   ctx->pending_vertex_store = MALLOC(PH_BATCH_VERTEX_DWORDS * sizeof(uint32_t));
+   if (!ctx->pending_vertex_store) {
+      FREE(ctx);
+      return NULL;
+   }
+   ctx->pending_vertices = ctx->pending_vertex_store;
+   ctx->pending_ring_slot = -1;
    /* All zero, like the state tracker's own initial copy: it only calls
     * set_scissor_states for a rectangle that differs from that copy. */
    ctx->base.screen = screen;
@@ -15785,6 +15860,7 @@ fail:
 	ph_destroy_vertex_ring(ctx);
    if (ctx->draw)
       draw_destroy(ctx->draw);
+   FREE(ctx->pending_vertex_store);
    FREE(ctx);
    return NULL;
 }
