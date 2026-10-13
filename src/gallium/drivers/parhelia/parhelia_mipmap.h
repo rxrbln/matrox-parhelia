@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define PH_MAX_MIP_LEVELS 12
 
@@ -72,6 +73,8 @@ struct ph_mip_layout {
    unsigned cpp;
    /* Bytes per 4x4 block when the storage is S3TC; zero otherwise. */
    unsigned block_bytes;
+   /* Levels the texture unit addresses as stored; 0 when all of them. */
+   unsigned sampled_levels;
    /* The measured P690 8/16-bit tile order backs this chain. */
    bool p690_narrow;
    bool tiled;
@@ -100,31 +103,96 @@ ph_mip_next_pot(unsigned value)
    return result;
 }
 
-/* S3TC storage is macro-tiled: one macrotile is 8x4 S3TC blocks, that is
- * 32x16 logical texels and 32 blocks, and macrotiles are row-major over a
- * pitch given in logical texels.  Recovered from the Linux uploader mtx2799
- * at .text+0x20720; see docs/parhelia-mesa-s3tc-implementation.md. */
+/* S3TC storage is tiled like the uncompressed texture order: 64x32-texel
+ * tiles of 512-byte units 32 texels wide (8x8 DXT1 blocks or 8x4 DXT3/5
+ * blocks, blocks row-major inside a unit), units left-right then top-down
+ * inside a tile.  Tile rows advance by pitch/64 tiles - at a 32-texel pitch
+ * two rows share one tile - and every odd tile row swaps the unit columns
+ * (texel x bit 5 ^ texel y bit 5).  Measured on the P690 with
+ * parhelia-drm-test --texture-dxt-probe PROBE_LINEAR=1 PROBE_MAP=1. */
 static inline size_t
 ph_dxt_block_offset(unsigned pitch, unsigned bx, unsigned by,
                     unsigned block_bytes)
 {
-   const unsigned macro = (by >> 2) * (pitch >> 5) + (bx >> 3);
+   const unsigned unit_rows = 512u / (8u * block_bytes);
+   const unsigned tile_bytes = 1024u * (8u / unit_rows);
+   const unsigned ty = by >> 3;
+   const size_t tile = ((size_t)ty * pitch >> 6) + (bx >> 4);
+   const unsigned ux = ((bx >> 3) & 1u) ^ (ty & 1u);
+   const unsigned uy = (by & 7u) / unit_rows;
 
-   return (size_t)macro * (32u * block_bytes) +
-          (size_t)(by & 3u) * (8u * block_bytes) +
+   return tile * tile_bytes + (uy * 2u + ux) * 512u +
+          (size_t)(by % unit_rows) * (8u * block_bytes) +
           (size_t)(bx & 7u) * block_bytes;
 }
 
-/* A compressed level reserves 32 texel columns and, per mtx625
- * .text+0x5b8c0, 32 rows up to a height of 32 and 64 rows above it. */
+/* Bytes a compressed level of @pitch texels and @height rows occupies: its
+ * 32-row bands of tiles (see ph_dxt_block_offset), two bands sharing a tile
+ * at a 32-texel pitch. */
 static inline size_t
-ph_dxt_level_size(unsigned width, unsigned height, unsigned block_bytes)
+ph_dxt_level_size(unsigned pitch, unsigned height, unsigned block_bytes)
 {
-   const unsigned rows = height <= 32 ? 32u : 64u;
-   const unsigned align = block_bytes == 8 ? 0x200u : 0x400u;
+   const unsigned tile_bytes = block_bytes == 8 ? 1024u : 2048u;
+   const size_t bands = (height + 31) / 32;
 
-   return ph_mip_align((ph_mip_align(width, 32) / 4) *
-                       (ph_mip_align(height, rows) / 4) * block_bytes, align);
+   return ((bands * pitch + 63) >> 6) * tile_bytes;
+}
+
+/* A compressed chain as the P690's texture unit derives it from the base
+ * (parhelia-drm-test --texture-dxt-probe PROBE_LEVELS=1 PROBE_LINEAR=1, both
+ * block sizes, 16x16 to 512x512 and 8:1 rectangles: exact).  A
+ * non-power-of-two base is addressed exactly at the next power-of-two pitch,
+ * but its chain packs levels by the unit columns they use, which is not
+ * measured yet: such a chain is stored here and sampled at level 0 only.  Levels follow one
+ * another, each at pitch max(32, next power of two of its width).  The first
+ * level no larger than 16x16 starts the tail 512 bytes into the previous
+ * level's tile (texel x 32), or at 0 as the base; the levels after it sit at
+ * texels (+16,0), (+24,0), (+16,+8) and (+24,+8) of the tail level. */
+static inline void
+ph_dxt_layout_init(struct ph_mip_layout *mip, unsigned width, unsigned height,
+                   unsigned levels, unsigned block_bytes)
+{
+   static const unsigned tail_x[] = { 0, 16, 24, 16, 24 };
+   static const unsigned tail_y[] = { 0, 0, 0, 8, 8 };
+   const unsigned tile_bytes = block_bytes == 8 ? 1024u : 2048u;
+   size_t offset = 0, end = 0;
+   int tail = -1;
+
+   /* over the generic layout of the same image: only its levels change */
+   memset(mip->level, 0, sizeof(mip->level));
+   mip->levels = levels;
+   mip->block_bytes = block_bytes;
+   mip->sampled_levels = (width & (width - 1)) || (height & (height - 1)) ?
+                         1 : 0;
+   for (unsigned l = 0; l < levels; l++) {
+      struct ph_mip_level *lv = &mip->level[l];
+      const unsigned w = width >> l ? width >> l : 1;
+      const unsigned h = height >> l ? height >> l : 1;
+
+      lv->width = w;
+      lv->height = h;
+      lv->pitch = ph_mip_next_pot(w) > 32 ? ph_mip_next_pot(w) : 32;
+      if (tail < 0 && w <= 16 && h <= 16) {
+         tail = l;
+         lv->offset = l ? mip->level[l - 1].offset + 512u : 0;
+         if (!l)
+            end = tile_bytes;
+      } else if (tail >= 0) {
+         const unsigned k = l - tail < 4u ? l - tail : 4u;
+
+         lv->offset = mip->level[tail].offset +
+                      tail_y[k] / 4 * (8u * block_bytes) +
+                      tail_x[k] / 4 * block_bytes;
+         lv->tail_x = tail_x[k];
+         lv->tail_y = tail_y[k];
+      } else {
+         lv->offset = offset;
+         lv->bytes = ph_dxt_level_size(lv->pitch, h, block_bytes);
+         offset += lv->bytes;
+         end = offset;
+      }
+   }
+   mip->size = end;
 }
 
 /* Bytes a tiled level of @rows rows occupies, that is where the hardware puts

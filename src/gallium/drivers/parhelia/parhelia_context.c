@@ -234,6 +234,7 @@ struct ph_transfer {
    struct pipe_transfer base;
    void *staging;
    void *wide;      /* a widened format's 32-bit texels, see ph_format_widened */
+   bool blocks;     /* the host blocks of a decoded S3TC image */
 };
 
 /* A sampler view plus, for a first level the hardware cannot use as its
@@ -2768,7 +2769,9 @@ ph_view_first_level(const struct parhelia_resource *texture,
 {
    unsigned first = view ? view->u.tex.first_level : 0;
 
+   /* a compressed chain is derived from its base by the unit */
    if (!first || first >= ph_resource_mip_levels(texture) ||
+       texture->mip.block_bytes ||
        texture->mip.level[first].pitch < 64 ||
        /* a 64x32 tail level inside its tile is no base the unit can name */
        (texture->mip.native_64x32 &&
@@ -2784,6 +2787,9 @@ ph_view_mip_levels(const struct parhelia_resource *texture,
 {
    unsigned levels = ph_resource_mip_levels(texture);
    unsigned first = ph_view_first_level(texture, view), last;
+
+   if (texture->mip.sampled_levels)
+      levels = MIN2(levels, texture->mip.sampled_levels);
 
    if (!view || !levels || view->u.tex.first_level != first)
       return 1;
@@ -12153,6 +12159,11 @@ ph_create_sampler_view(struct pipe_context *p, struct pipe_resource *texture,
    view->base.reference.count = 1;
    view->base.texture = NULL;
    view->base.context = p;
+   /* a decoded S3TC image is sampled from its B8G8R8A8 twin */
+   if (ph_resource(texture)->decoded) {
+      texture = ph_resource(texture)->decoded;
+      view->base.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+   }
    pipe_resource_reference(&view->base.texture, texture);
    return &view->base;
 }
@@ -14661,6 +14672,10 @@ ph_copy_texture_box(struct ph_context *ctx,
    const int dwidth = abs(dst_width);
    const int dheight = abs(dst_height);
    const unsigned cpp = util_format_get_blocksize(src->format);
+
+   /* decoded S3TC images have no storage of their own to copy */
+   if (sr->decoded || dr->decoded)
+      return false;
    const int dst_x0 = dst_width < 0 ? dstx - width : dstx;
    const int dst_y0 = dst_height < 0 ? dsty - height : dsty;
    unsigned src_w, src_h, dst_w, dst_h;
@@ -14885,8 +14900,13 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
    float *pixels = NULL, *row = NULL;
    uint32_t *zsrc = NULL, *zrow = NULL;
    uint8_t *ssrc = NULL, *srow = NULL;
+   /* a compressed source is decoded a block-aligned rectangle at a time */
+   const bool src_blocks = util_format_is_compressed(sf);
+   struct pipe_box mb;
    bool ok = false;
 
+   if (util_format_is_compressed(df))
+      return false;
    if (zs) {
       if (!util_format_is_depth_or_stencil(sf) ||
           !util_format_is_depth_or_stencil(df))
@@ -14913,8 +14933,20 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
       return true;
    if (!ph_clip_box(&db, info->dst.resource, info->dst.level, &dcb))
       return true;
+   mb = scb;
+   if (src_blocks) {
+      const int bw = util_format_get_blockwidth(sf);
+      const int bh = util_format_get_blockheight(sf);
+      const int lw = u_minify(info->src.resource->width0, info->src.level);
+      const int lh = u_minify(info->src.resource->height0, info->src.level);
+
+      mb.x = scb.x / bw * bw;
+      mb.y = scb.y / bh * bh;
+      mb.width = MIN2((scb.x + scb.width + bw - 1) / bw * bw, lw) - mb.x;
+      mb.height = MIN2((scb.y + scb.height + bh - 1) / bh * bh, lh) - mb.y;
+   }
    src = p->texture_map(p, info->src.resource, info->src.level,
-                        PIPE_MAP_READ, &scb, &st);
+                        PIPE_MAP_READ, &mb, &st);
    dst = p->texture_map(p, info->dst.resource, info->dst.level,
                         PIPE_MAP_WRITE | (keep ? PIPE_MAP_READ : 0), &dcb,
                         &dt);
@@ -14939,7 +14971,24 @@ ph_blit_cpu(struct pipe_context *p, const struct pipe_blit_info *info)
       const uint8_t *slice = src + (size_t)l * st->layer_stride;
       uint8_t *dslice = dst + (size_t)l * dt->layer_stride;
 
-      for (int y = 0; y < scb.height; y++) {
+      if (src_blocks) {
+         /* the unpacker writes whole blocks, also past an edge level's size */
+         const unsigned aw = align(mb.width, util_format_get_blockwidth(sf));
+         const unsigned ah = align(mb.height, util_format_get_blockheight(sf));
+         float *all = MALLOC((size_t)aw * ah * 4 * sizeof(float));
+
+         if (!all)
+            goto out;
+         util_format_unpack_rgba_rect(sf, all, aw * 4 * sizeof(float),
+                                      slice, st->stride, mb.width, mb.height);
+         for (int y = 0; y < scb.height; y++)
+            memcpy(pixels + (size_t)y * scb.width * 4,
+                   all + ((size_t)(scb.y - mb.y + y) * aw +
+                          (scb.x - mb.x)) * 4,
+                   (size_t)scb.width * 4 * sizeof(float));
+         FREE(all);
+      }
+      for (int y = 0; y < scb.height && !src_blocks; y++) {
          const uint8_t *in = slice + (size_t)y * st->stride;
 
          if (!zs) {
@@ -15446,21 +15495,22 @@ ph_texel_walk_init(struct ph_texel_walk *w, const struct parhelia_resource *r,
                                                   r->base.width0, cpp);
 }
 
-/* Move the S3TC blocks of @box between a block-linear staging image and the
- * macrotiled hardware image.  Block rows of the staging image are @stride
- * bytes apart; the hardware address comes from ph_dxt_block_offset(). */
+/* Move the S3TC blocks of @box of @level between a block-linear staging
+ * image and the tiled hardware image.  Block rows of the staging image are
+ * @stride bytes apart; the hardware address comes from ph_dxt_block_offset()
+ * inside the level. */
 static void
-ph_copy_blocks(struct parhelia_resource *r, void *staging, unsigned stride,
-               const struct pipe_box *box, bool to_gpu)
+ph_copy_blocks(struct parhelia_resource *r, unsigned level, void *staging,
+               unsigned stride, const struct pipe_box *box, bool to_gpu)
 {
    const unsigned block = r->mip.block_bytes;
-   const unsigned pitch = r->mip.level[0].pitch;
+   const unsigned pitch = r->mip.level[level].pitch;
    const unsigned bw = (box->width + 3) / 4, bh = (box->height + 3) / 4;
 
    for (unsigned j = 0; j < bh; j++)
       for (unsigned i = 0; i < bw; i++) {
          uint8_t *host = (uint8_t *)staging + (size_t)j * stride + i * block;
-         uint8_t *gpu = (uint8_t *)r->map +
+         uint8_t *gpu = (uint8_t *)r->map + r->mip.level[level].offset +
             ph_dxt_block_offset(pitch, box->x / 4 + i, box->y / 4 + j, block);
 
          if (to_gpu)
@@ -15536,7 +15586,8 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
     * stride counts block bytes.  Gallium already requires the origin to be
     * block-aligned unless it is the image edge. */
    if (r->mip.block_bytes) {
-      if (level || !r->map || box->x < 0 || box->y < 0 ||
+      if (level >= ph_resource_mip_levels(r) || !r->map ||
+          box->x < 0 || box->y < 0 ||
           (box->x & 3) || (box->y & 3) ||
           (unsigned)box->x + (unsigned)box->width > image_width ||
           (unsigned)box->y + (unsigned)box->height > image_height) {
@@ -15559,8 +15610,8 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
             return NULL;
          }
       }
-      if ((usage & PIPE_MAP_READ) && (r->mip_defined & BITFIELD_BIT(0)))
-         ph_copy_blocks(r, t->staging, t->base.stride, box, false);
+      if ((usage & PIPE_MAP_READ) && (r->mip_defined & BITFIELD_BIT(level)))
+         ph_copy_blocks(r, level, t->staging, t->base.stride, box, false);
       *out = &t->base;
       return t->staging;
    }
@@ -15724,11 +15775,12 @@ ph_unmap(struct pipe_context *p, struct pipe_transfer *transfer, bool texture)
    }
    if (texture && r->mip.block_bytes && t->staging && r->map) {
       if (transfer->usage & PIPE_MAP_WRITE) {
-         ph_copy_blocks(r, t->staging, transfer->stride, &transfer->box, true);
+         ph_copy_blocks(r, transfer->level, t->staging, transfer->stride,
+                        &transfer->box, true);
          __sync_synchronize();
          r->upload_dirty |= r->upload_texture;
          r->content_generation++;
-         r->mip_defined |= BITFIELD_BIT(0);
+         r->mip_defined |= BITFIELD_BIT(transfer->level);
       }
       FREE(t->staging);
       FREE(t);
@@ -15813,10 +15865,117 @@ static void *ph_buffer_map(struct pipe_context *p, struct pipe_resource *r,
                            unsigned l, unsigned u, const struct pipe_box *b,
                            struct pipe_transfer **t)
 { return ph_map(p, r, l, u, b, t, false); }
+/* A decoded S3TC image's transfer: its host blocks of the box. */
+static void *
+ph_map_blocks(struct parhelia_resource *r, unsigned level, unsigned usage,
+              const struct pipe_box *box, struct pipe_transfer **out)
+{
+   const enum pipe_format format = r->base.format;
+   const unsigned block = util_format_get_blocksize(format);
+   const unsigned layers = MAX2(r->base.array_size, r->base.depth0);
+   const unsigned level_stride =
+      util_format_get_stride(format, u_minify(r->base.width0, level));
+   struct ph_transfer *t;
+
+   if (box->x < 0 || box->y < 0 || box->z < 0 || (box->x & 3) ||
+       (box->y & 3) || box->z + box->depth > (int)layers || box->depth < 1 ||
+       !(t = CALLOC_STRUCT(ph_transfer)))
+      return NULL;
+   t->base.resource = NULL;
+   pipe_resource_reference(&t->base.resource, &r->base);
+   t->base.level = level;
+   t->base.usage = usage;
+   t->base.box = *box;
+   t->base.stride = util_format_get_stride(format, box->width);
+   t->base.layer_stride = (uintptr_t)t->base.stride *
+                          util_format_get_nblocksy(format, box->height);
+   t->blocks = true;
+   t->staging = CALLOC(box->depth, t->base.layer_stride);
+   if (!t->staging) {
+      pipe_resource_reference(&t->base.resource, NULL);
+      FREE(t);
+      return NULL;
+   }
+   for (int z = 0; (usage & PIPE_MAP_READ) && z < box->depth; z++) {
+      const uint8_t *src = r->blocks[level * layers + box->z + z];
+
+      for (unsigned j = 0; src && j < util_format_get_nblocksy(format,
+                                                               box->height);
+           j++)
+         memcpy((uint8_t *)t->staging + z * t->base.layer_stride +
+                   j * t->base.stride,
+                src + (size_t)(box->y / 4 + j) * level_stride +
+                   box->x / 4 * block,
+                t->base.stride);
+   }
+   *out = &t->base;
+   return t->staging;
+}
+
+/* Store the written blocks and decode them into the B8G8R8A8 twin. */
+static void
+ph_unmap_blocks(struct pipe_context *p, struct ph_transfer *t)
+{
+   struct parhelia_resource *r = ph_resource(t->base.resource);
+   const enum pipe_format format = r->base.format;
+   const struct pipe_box *box = &t->base.box;
+   const unsigned level = t->base.level;
+   const unsigned layers = MAX2(r->base.array_size, r->base.depth0);
+   const unsigned lw = u_minify(r->base.width0, level);
+   const unsigned lh = u_minify(r->base.height0, level);
+   const unsigned level_stride = util_format_get_stride(format, lw);
+   const unsigned rows = util_format_get_nblocksy(format, box->height);
+   /* the unpacker writes whole blocks, also past an edge level's size */
+   const unsigned aw = align(box->width, 4), ah = rows * 4;
+   uint8_t *texels = (t->base.usage & PIPE_MAP_WRITE) ?
+                     MALLOC((size_t)aw * ah * 4) : NULL;
+
+   for (int z = 0; texels && z < box->depth; z++) {
+      uint8_t **level_blocks = &r->blocks[level * layers + box->z + z];
+      const uint8_t *src = (const uint8_t *)t->staging +
+                           z * t->base.layer_stride;
+      struct pipe_box dst = { .x = box->x, .y = box->y, .z = box->z + z,
+                              .width = MIN2(box->width, (int)lw - box->x),
+                              .height = MIN2(box->height, (int)lh - box->y),
+                              .depth = 1 };
+
+      if (!*level_blocks)
+         *level_blocks = CALLOC(util_format_get_nblocksy(format, lh),
+                                level_stride);
+      if (!*level_blocks)
+         break;
+      for (unsigned j = 0; j < rows; j++)
+         memcpy(*level_blocks + (size_t)(box->y / 4 + j) * level_stride +
+                   box->x / 4 * util_format_get_blocksize(format),
+                src + j * t->base.stride, t->base.stride);
+      util_format_unpack_rgba_8unorm_rect(format, texels, aw * 4, src,
+                                          t->base.stride, box->width,
+                                          box->height);
+      /* R, G, B, A to the twin's B, G, R, A */
+      for (size_t n = 0; n < (size_t)aw * ah; n++) {
+         const uint8_t red = texels[n * 4];
+
+         texels[n * 4] = texels[n * 4 + 2];
+         texels[n * 4 + 2] = red;
+      }
+      if (dst.width > 0 && dst.height > 0)
+         p->texture_subdata(p, r->decoded, level, PIPE_MAP_WRITE, &dst,
+                            texels, aw * 4, 0);
+   }
+   FREE(texels);
+   FREE(t->staging);
+   pipe_resource_reference(&t->base.resource, NULL);
+   FREE(t);
+}
+
 static void *ph_texture_map(struct pipe_context *p, struct pipe_resource *r,
                             unsigned l, unsigned u, const struct pipe_box *b,
                             struct pipe_transfer **t)
-{ return ph_map(p, r, l, u, b, t, true); }
+{
+   if (ph_resource(r)->decoded)
+      return ph_map_blocks(ph_resource(r), l, u, b, t);
+   return ph_map(p, r, l, u, b, t, true);
+}
 static void ph_buffer_unmap(struct pipe_context *p, struct pipe_transfer *t)
 {
    if (t->usage & PIPE_MAP_WRITE)
@@ -15824,7 +15983,12 @@ static void ph_buffer_unmap(struct pipe_context *p, struct pipe_transfer *t)
    ph_unmap(p, t, false);
 }
 static void ph_texture_unmap(struct pipe_context *p, struct pipe_transfer *t)
-{ ph_unmap(p, t, true); }
+{
+   if (((struct ph_transfer *)t)->blocks)
+      ph_unmap_blocks(p, (struct ph_transfer *)t);
+   else
+      ph_unmap(p, t, true);
+}
 
 static void
 ph_destroy_context(struct pipe_context *p)

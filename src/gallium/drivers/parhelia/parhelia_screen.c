@@ -387,13 +387,16 @@ ph_format_supported(struct pipe_screen *s, enum pipe_format format,
          case PIPE_FORMAT_DXT1_RGBA:
          case PIPE_FORMAT_DXT3_RGBA:
          case PIPE_FORMAT_DXT5_RGBA:
-            /* Native S3TC, sampler-only.  The recovered uploader rounds the
-             * macrotile row to align(width,32) while the descriptor pitch
-             * helper uses the next power of two; those agree only for a
-             * power-of-two width, so non-power-of-two compressed storage
-             * stays off until it is measured. */
+            /* Native S3TC, sampler-only: block order, mip chain and NPOT
+             * bases measured with parhelia-drm-test --texture-dxt-probe
+             * (see ph_dxt_layout_init()).  Other targets sample a decoded
+             * twin (parhelia_resource.decoded): Mesa takes S3TC for every
+             * target once 2-D has it. */
             supported = ph_screen(s)->s3tc &&
-                        target == PIPE_TEXTURE_2D &&
+                        (target == PIPE_TEXTURE_2D ||
+                         ph_format_supported(s, PIPE_FORMAT_B8G8R8A8_UNORM,
+                                             target, samples, storage_samples,
+                                             PIPE_BIND_SAMPLER_VIEW)) &&
                         (bind & PIPE_BIND_SAMPLER_VIEW) &&
                         !(bind & (PIPE_BIND_RENDER_TARGET |
                                   PIPE_BIND_DEPTH_STENCIL |
@@ -859,20 +862,13 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    if (!ph_mip_layout_init_cpp(&r->mip, templ->width0, templ->height0,
                                mip_levels, true, p690_native_texture32, cpp))
       PH_CREATE_FAIL();
-   /* A compressed image is stored as 4x4 blocks in 32x16-texel macrotiles.
+   /* A compressed image is stored as 4x4 blocks in 64x32-texel tiles.
     * Its level pitch stays a texel count; only the byte size differs. */
    if (block_bytes) {
-      /* The vendor uploader rounds the macrotile row to align(width,32)
-       * while the descriptor pitch is the next power of two; they agree only
-       * for a power-of-two width. */
-      if ((templ->width0 & (templ->width0 - 1)) ||
-          (templ->height0 & (templ->height0 - 1)))
-         PH_CREATE_FAIL();
-      r->mip.block_bytes = block_bytes;
-      r->mip.level[0].pitch = MAX2(32u, ph_mip_next_pot(templ->width0));
-      r->mip.size = ph_mip_align(ph_dxt_level_size(templ->width0,
-                                                   templ->height0,
-                                                   block_bytes),
+      ph_dxt_layout_init(&r->mip, templ->width0, templ->height0,
+                         MIN2(templ->last_level + 1, PH_MAX_MIP_LEVELS),
+                         block_bytes);
+      r->mip.size = ph_mip_align(r->mip.size,
                                  block_bytes == 8 ? 0x800u : 0x1000u);
    }
    /* The 8/16-bit order addresses 64x32-texel tiles but takes its pitch from
@@ -1299,6 +1295,32 @@ fail:
 static struct pipe_resource *
 ph_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *templ)
 {
+   const bool npot = (templ->width0 & (templ->width0 - 1)) ||
+                     (templ->height0 & (templ->height0 - 1));
+
+   if (util_format_is_s3tc(templ->format) &&
+       (templ->target != PIPE_TEXTURE_2D || (npot && templ->last_level))) {
+      struct parhelia_resource *r = CALLOC_STRUCT(parhelia_resource);
+      struct pipe_resource decoded = *templ;
+
+      if (!r)
+         return NULL;
+      decoded.format = PIPE_FORMAT_B8G8R8A8_UNORM;
+      r->base = *templ;
+      pipe_reference_init(&r->base.reference, 1);
+      r->base.screen = pscreen;
+      r->decoded = ph_resource_create_class(pscreen, &decoded, false);
+      r->blocks = CALLOC((templ->last_level + 1) *
+                         MAX2(templ->array_size, templ->depth0),
+                         sizeof(*r->blocks));
+      if (!r->decoded || !r->blocks) {
+         pipe_resource_reference(&r->decoded, NULL);
+         FREE(r->blocks);
+         FREE(r);
+         return NULL;
+      }
+      return &r->base;
+   }
    return ph_resource_create_class(pscreen, templ, false);
 }
 
@@ -1497,6 +1519,18 @@ static void
 ph_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *pres)
 {
    struct parhelia_resource *r = ph_resource(pres);
+
+   if (r->decoded) {
+      const unsigned n = (pres->last_level + 1) *
+                         MAX2(pres->array_size, pres->depth0);
+
+      for (unsigned i = 0; i < n; i++)
+         FREE(r->blocks[i]);
+      FREE(r->blocks);
+      pipe_resource_reference(&r->decoded, NULL);
+      FREE(r);
+      return;
+   }
 
    free(r->bounds);
    /* Nothing can consume an outstanding hardware depth clear once the surface
@@ -1773,12 +1807,16 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    /* Native 8- and 16-bit sampler storage is on where its texel order has
     * been measured: parhelia-drm-test --texture-format-probe reproduces every
     * texel of L8, A1R5G5B5, R5G6B5 and A4R4G4B4 over two tile rows and two
-    * tile columns on the P690.  PARHELIA_NO_NARROW_FORMATS=1 opts out.
-    * Native S3TC is implemented but has not retired on hardware. */
+    * tile columns on the P690.  PARHELIA_NO_NARROW_FORMATS=1 opts out. */
    s->narrow_formats = s->texture_upload &&
       p3d_texture_uses_p690_narrow(s->chip_id, s->tile_layout, 2) &&
       !ph_env("PARHELIA_NO_NARROW_FORMATS");
-   s->s3tc = s->texture_upload && ph_env("PARHELIA_S3TC");
+   /* S3TC block order, chain and NPOT bases are measured on the LX family
+    * (--texture-dxt-probe); the original family takes it on request until
+    * measured there.  PARHELIA_NO_S3TC=1 opts out. */
+   s->s3tc = s->texture_upload && !ph_env("PARHELIA_NO_S3TC") &&
+             ((s->chip_id >= 0x2537 && s->chip_id <= 0x2539) ||
+              ph_env("PARHELIA_S3TC"));
    /* Volume and cube-map targets need the native 32-bit texture order, whose
     * storage tile carries the volume slice interleave, and the address unit's
     * three-coordinate mode.  Both are measured: --texture-volume-probe

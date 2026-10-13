@@ -45,12 +45,12 @@ struct parhelia_screen {
    bool native_rt_classes;
    bool render_transfer;
    bool draw_ranges;
-   /* Native 8- and 16-bit sampler storage, and native S3TC.  Both stay
-    * gated until they retire on this silicon. */
+   /* Native 8- and 16-bit sampler storage. */
    bool narrow_formats;
    /* Native R5G6B5 colour and D16 depth render targets: the measured 128x16
     * tile order plus a kernel that allocates two bytes per pixel. */
    bool narrow_targets;
+   /* Native S3TC, see ph_dxt_layout_init(). */
    bool s3tc;
    /* Volume and cube-map sampler targets: the texture-address unit's
     * three-coordinate mode plus the measured slice addressing.  The two are
@@ -77,6 +77,12 @@ struct ph_vertex_bounds {
 
 struct parhelia_resource {
    struct pipe_resource base;
+   /* An S3TC image the texture unit cannot address natively (not 2-D, or
+    * a chain of a non-power-of-two base): sampled from this decoded
+    * B8G8R8A8 twin, its blocks kept host-side per level and layer for the
+    * transfers.  Such a resource has no storage of its own. */
+   struct pipe_resource *decoded;
+   uint8_t **blocks;
    uint32_t handle;
    bool handle_owned;
    uint64_t size, mmap_offset;
