@@ -1739,26 +1739,34 @@ static int parhelia_vram_placement_static_selftest(void)
 
 /* The public helper only pins plane framebuffers. Render relocations need
  * the same TTM operation, held until the synchronous batch fence retires. */
-int parhelia_vram_pin(struct drm_gem_vram_object *bo)
+int parhelia_vram_pin_locked(struct drm_gem_vram_object *bo)
 {
 	struct parhelia_device *pdev = to_parhelia(bo->bo.base.dev);
 	struct ttm_operation_ctx ctx = { false, false };
 	int ret;
 
-	ret = ttm_bo_reserve(&bo->bo, true, false, NULL);
-	if (ret)
-		return ret;
+	dma_resv_assert_held(bo->bo.base.resv);
 	if (!bo->bo.pin_count) {
 		ret = parhelia_vram_placement(bo, pdev->vram_size,
 			pdev->pdev->device == PARHELIA_P690);
 		if (ret)
-			goto out;
+			return ret;
 		ret = ttm_bo_validate(&bo->bo, &bo->placement, &ctx);
 		if (ret)
-			goto out;
+			return ret;
 	}
 	ttm_bo_pin(&bo->bo);
-out:
+	return 0;
+}
+
+int parhelia_vram_pin(struct drm_gem_vram_object *bo)
+{
+	int ret;
+
+	ret = ttm_bo_reserve(&bo->bo, true, false, NULL);
+	if (ret)
+		return ret;
+	ret = parhelia_vram_pin_locked(bo);
 	ttm_bo_unreserve(&bo->bo);
 	return ret;
 }

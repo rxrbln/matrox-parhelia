@@ -3,6 +3,8 @@
 config DRM_PARHELIA
 	tristate "Matrox Parhelia"
 	depends on DRM && PCI
+	select DRM_CLIENT_SELECTION
+	select DRM_TTM_HELPER
 	select DRM_GEM_VRAM_HELPER
 	select DRM_GEM_DMA_HELPER
 	select I2C

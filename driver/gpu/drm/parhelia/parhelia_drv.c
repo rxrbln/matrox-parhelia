@@ -7,8 +7,10 @@
 #include <linux/pci.h>
 #include <linux/sizes.h>
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_fbdev_ttm.h>
 #include <drm/drm_gem_vram_helper.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_managed.h>
@@ -307,6 +309,7 @@ static const struct drm_driver parhelia_driver = {
 	.debugfs_init = parhelia_debugfs_init,
 	.dumb_create = parhelia_traced_dumb_create,
 	.dumb_map_offset = parhelia_traced_dumb_map_offset,
+	DRM_FBDEV_TTM_DRIVER_OPS,
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,
 	.major = 1,
@@ -604,6 +607,8 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	}
 
 	pci_set_drvdata(pci, drm);
+	/* fbdev console on a shadow, blitted into a dumb buffer's host view */
+	drm_client_setup(drm, NULL);
 	return 0;
 }
 

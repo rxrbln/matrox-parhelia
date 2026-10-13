@@ -839,6 +839,7 @@ void parhelia_submit_fini(struct parhelia_device *pdev);
 bool parhelia_submit_quiesce(struct parhelia_device *pdev);
 int parhelia_submit_init(struct parhelia_device *pdev);
 int parhelia_window_places_init(struct parhelia_device *pdev);
+int parhelia_vram_pin_locked(struct drm_gem_vram_object *bo);
 int parhelia_vram_pin(struct drm_gem_vram_object *bo);
 int parhelia_vram_pin_new(struct parhelia_device *pdev,
 			  struct drm_gem_vram_object *bo);

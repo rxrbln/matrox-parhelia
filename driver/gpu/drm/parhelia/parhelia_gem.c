@@ -1013,9 +1013,21 @@ parhelia_host_view_find_locked(struct parhelia_bo *bo, u64 offset)
 	return NULL;
 }
 
+/* A view of the whole CPU mapping, as kernel vmap needs it. */
+static struct parhelia_host_view *
+parhelia_host_view_find_whole_locked(struct parhelia_bo *bo)
+{
+	struct parhelia_host_view *view;
+
+	list_for_each_entry(view, &bo->host_views, bo_link)
+		if (!view->offset && view->size >= parhelia_host_view_extent(bo))
+			return view;
+	return NULL;
+}
+
 static struct parhelia_host_view *
 parhelia_host_view_create_locked(struct parhelia_device *pdev,
-				 struct parhelia_bo *bo, u64 offset)
+				 struct parhelia_bo *bo, u64 offset, bool whole)
 {
 	struct parhelia_host_view *view;
 	u32 surface, ctrl, dims, first_row = 0, rows = 0;
@@ -1027,7 +1039,8 @@ parhelia_host_view_create_locked(struct parhelia_device *pdev,
 	if (!view)
 		return ERR_PTR(-ENOMEM);
 	if (bo->host_view) {
-		u32 band = parhelia_host_view_rows(bo), format;
+		u32 band = whole ? bo->alloc_height : parhelia_host_view_rows(bo);
+		u32 format;
 
 		first_row = rounddown((u32)(offset / bo->host_pitch), band);
 		rows = min(band, bo->alloc_height - first_row);
@@ -1080,7 +1093,9 @@ static vm_fault_t parhelia_host_view_insert(struct vm_fault *vmf,
 
 	pfn = (pci_resource_start(pdev->pdev, 0) + view->mapping.node.start +
 	       ((u64)page << PAGE_SHIFT) - view_offset) >> PAGE_SHIFT;
-	list_move_tail(&view->lru_link, &pdev->host_view_lru);
+	/* a vmapped view stays off the eviction list */
+	if (!view->vmap_count)
+		list_move_tail(&view->lru_link, &pdev->host_view_lru);
 	for (; page < view_end && address < vma->vm_end;
 	     page++, pfn++, address += PAGE_SIZE) {
 		ret = vmf_insert_pfn_prot(vma, address, pfn, vma->vm_page_prot);
@@ -1146,7 +1161,7 @@ static vm_fault_t parhelia_host_view_fault(struct vm_fault *vmf)
 	mutex_lock(&pdev->aperture_lock);
 	view = parhelia_host_view_find_locked(bo, offset);
 	if (!view)
-		view = parhelia_host_view_create_locked(pdev, bo, offset);
+		view = parhelia_host_view_create_locked(pdev, bo, offset, false);
 	ret = IS_ERR(view) ? parhelia_host_view_errno(PTR_ERR(view)) :
 			     parhelia_host_view_insert(vmf, view, page);
 	mutex_unlock(&pdev->aperture_lock);
@@ -1219,8 +1234,9 @@ static void parhelia_view_object_free(struct drm_gem_object *gem)
 		parhelia_raw_object_free(gem);
 }
 
-/* Kernel access (the cursor upload) to an object small enough for one view:
- * the view stays bound and off the eviction list until vunmap. */
+/* Kernel access (cursor upload, fbdev damage blit) through one view of the
+ * whole object, beside any mmap bands; it stays bound and off the eviction
+ * list until vunmap.  Objects beyond the aperture window get -E2BIG. */
 static int parhelia_view_object_vmap(struct drm_gem_object *gem,
 				     struct iosys_map *map)
 {
@@ -1229,35 +1245,43 @@ static int parhelia_view_object_vmap(struct drm_gem_object *gem,
 	struct parhelia_host_view *view;
 	int ret;
 
-	if (bo->host_size > PARHELIA_HOST_VIEW_WHOLE)
-		return -E2BIG;
 	if (pdev->submit_owner == current)
 		return -EBUSY;
-	ret = parhelia_vram_pin(&bo->gbo);
+	ret = parhelia_vram_pin_locked(&bo->gbo);
 	if (ret)
 		return ret;
-	ret = parhelia_submit_idle_lock(pdev);
-	if (ret) {
-		parhelia_vram_unpin(&bo->gbo);
-		return ret;
-	}
 	mutex_lock(&pdev->aperture_lock);
-	view = parhelia_host_view_find_locked(bo, 0);
-	if (!view)
-		view = parhelia_host_view_create_locked(pdev, bo, 0);
-	if (IS_ERR(view)) {
-		ret = PTR_ERR(view);
-	} else {
-		if (!view->vmap_count++)
-			list_del_init(&view->lru_link);
-		iosys_map_set_vaddr_iomem(map, (u8 __iomem *)pdev->vram +
-					  view->mapping.node.start);
-	}
+	view = parhelia_host_view_find_whole_locked(bo);
+	if (view && !view->vmap_count++)
+		list_del_init(&view->lru_link);
 	mutex_unlock(&pdev->aperture_lock);
-	parhelia_submit_unlock(pdev);
-	if (ret)
-		parhelia_vram_unpin(&bo->gbo);
-	return ret;
+	if (!view) {
+		/* Binding parks the engine, and submits take reservations under
+		 * submit_lock: drop the caller's, the pin keeps the placement. */
+		dma_resv_unlock(gem->resv);
+		ret = parhelia_submit_idle_lock(pdev);
+		if (!ret) {
+			mutex_lock(&pdev->aperture_lock);
+			view = parhelia_host_view_find_whole_locked(bo);
+			if (!view)
+				view = parhelia_host_view_create_locked(pdev, bo,
+									0, true);
+			if (IS_ERR(view))
+				ret = PTR_ERR(view);
+			else if (!view->vmap_count++)
+				list_del_init(&view->lru_link);
+			mutex_unlock(&pdev->aperture_lock);
+			parhelia_submit_unlock(pdev);
+		}
+		dma_resv_lock(gem->resv, NULL);
+	}
+	if (ret) {
+		ttm_bo_unpin(&bo->gbo.bo);
+		return ret;
+	}
+	iosys_map_set_vaddr_iomem(map, (u8 __iomem *)pdev->vram +
+				  view->mapping.node.start);
+	return 0;
 }
 
 static void parhelia_view_object_vunmap(struct drm_gem_object *gem,
@@ -1268,12 +1292,12 @@ static void parhelia_view_object_vunmap(struct drm_gem_object *gem,
 	struct parhelia_host_view *view;
 
 	mutex_lock(&pdev->aperture_lock);
-	view = parhelia_host_view_find_locked(bo, 0);
+	view = parhelia_host_view_find_whole_locked(bo);
 	if (view && view->vmap_count && !--view->vmap_count)
 		list_add_tail(&view->lru_link, &pdev->host_view_lru);
 	mutex_unlock(&pdev->aperture_lock);
 	iosys_map_clear(map);
-	parhelia_vram_unpin(&bo->gbo);
+	ttm_bo_unpin(&bo->gbo.bo);
 }
 
 static const struct drm_gem_object_funcs parhelia_view_object_funcs = {
