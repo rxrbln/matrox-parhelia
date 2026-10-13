@@ -1864,6 +1864,38 @@ static int parhelia_slot_fence_init(struct parhelia_device *pdev,
 	return 0;
 }
 
+/* The last few distinct objects of a relocation list, checked before a full
+ * scan: a ring's batches name the same colour, depth and texture objects
+ * over and over among hundreds of draw relocations. */
+#define PARHELIA_RECENT_OBJECTS 4
+
+struct parhelia_recent_objects {
+	struct drm_gem_object *obj[PARHELIA_RECENT_OBJECTS];
+	u32 index[PARHELIA_RECENT_OBJECTS];
+	unsigned int next;
+};
+
+static bool parhelia_recent_find(const struct parhelia_recent_objects *r,
+				 const struct drm_gem_object *obj, u32 *index)
+{
+	unsigned int k;
+
+	for (k = 0; k < PARHELIA_RECENT_OBJECTS; k++)
+		if (r->obj[k] == obj) {
+			*index = r->index[k];
+			return true;
+		}
+	return false;
+}
+
+static void parhelia_recent_add(struct parhelia_recent_objects *r,
+				struct drm_gem_object *obj, u32 index)
+{
+	r->obj[r->next] = obj;
+	r->index[r->next] = index;
+	r->next = (r->next + 1) % PARHELIA_RECENT_OBJECTS;
+}
+
 /* Whether relocation @i is the first to name its pinned object (trace only). */
 static bool parhelia_first_pinned(struct drm_gem_object **objects,
 				  struct drm_gem_vram_object **pinned, u32 i)
@@ -1888,16 +1920,18 @@ static int parhelia_slot_attach_fence(struct parhelia_submit_slot *slot,
 	u32 i;
 	int ret = 0;
 
+	struct parhelia_recent_objects recent = { };
+
 	for (i = 0; i < count; i++) {
 		struct drm_gem_object *obj = objects[i];
 		u32 j;
 
-		/* a ring names its vertex object in every draw packet */
-		if (!obj || (i && objects[i - 1] == obj))
+		if (!obj || parhelia_recent_find(&recent, obj, &j))
 			continue;
 		for (j = 0; j < i; j++)
 			if (objects[j] == obj)
 				break;
+		parhelia_recent_add(&recent, obj, j);
 		if (j != i)
 			continue;
 		ret = dma_resv_lock_interruptible(obj->resv, NULL);
@@ -3840,6 +3874,7 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 				      struct drm_gem_vram_object **pinned)
 {
 	struct drm_gem_object *colour = NULL, *depth = NULL, *last_colour = NULL;
+	struct parhelia_recent_objects recent = { };
 	u32 i, j, reg;
 	int ret;
 
@@ -3879,9 +3914,13 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 	for (i = 0; i < count; i++) {
 		if (!objects[i] || (depth && objects[i] == depth))
 			continue;
+		/* only first occurrences are pinned, so a recent hit is one */
+		if (parhelia_recent_find(&recent, objects[i], &j))
+			continue;
 		for (j = 0; j < i; j++)
 			if (objects[j] == objects[i] && pinned[j])
 				break;
+		parhelia_recent_add(&recent, objects[i], j);
 		if (j < i)
 			continue;
 		ret = parhelia_vram_pin(drm_gem_vram_of_gem(objects[i]));
@@ -4319,10 +4358,9 @@ retry_slot:
 				goto out_unpin;
 			}
 			/* A ring names one vertex object in every draw packet:
-			 * reference it again rather than looking up its handle. */
+			 * the first relocation's reference keeps it alive for the
+			 * whole request, a repeat neither looks it up nor holds it. */
 			if (vertex_obj && reloc->handle == vertex_handle) {
-				objects[i] = vertex_obj;
-				drm_gem_object_get(objects[i]);
 				vertex_bo = vertex_cached;
 			} else {
 				objects[i] = drm_gem_object_lookup(file, reloc->handle);
