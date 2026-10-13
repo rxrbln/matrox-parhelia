@@ -393,6 +393,20 @@ static bool full_sync;
 module_param(full_sync, bool, 0400);
 MODULE_PARM_DESC(full_sync, "Compare vendor primary-ring 307/004/707 flush with prior writeback arm");
 
+/* Completed fence as the engine reports it in the status page: every armed
+ * 0x12bc tag (bit 0 set) is written to offset 0x10, and with replay fences
+ * the register takes that tag + 8 in the same packet; full-sync drains end
+ * on an armed tag.  Polling host memory keeps fence waits off the bus the
+ * engine fetches from.  Until the first armed tag lands, read the register. */
+static u32 parhelia_fence_completed(struct parhelia_device *pdev)
+{
+	u32 tag = READ_ONCE(((u32 *)pdev->writeback_cpu)[4]);
+
+	if (!tag)
+		return parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE) & ~7u;
+	return (tag & ~7u) + (replay_fences && !full_sync ? 8 : 0);
+}
+
 static bool post_draw_wb;
 module_param(post_draw_wb, bool, 0400);
 MODULE_PARM_DESC(post_draw_wb, "Emit the captured post-draw writeback before EOB and flush");
@@ -2240,7 +2254,7 @@ out:
  * vblank-only and are not guessed as render completion interrupts. */
 static void parhelia_retire_locked(struct parhelia_device *pdev)
 {
-	u32 done = parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE) & ~7u;
+	u32 done = parhelia_fence_completed(pdev);
 	struct parhelia_submit_slot *oldest = NULL;
 	u32 i;
 
@@ -3344,7 +3358,7 @@ static int parhelia_wait_fence(struct parhelia_device *pdev, u32 fence)
 	unsigned int waited;
 
 	for (waited = 0; waited < PARHELIA_FENCE_TIMEOUT_US; waited++) {
-		if ((s32)((parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE) & ~7u) -
+		if ((s32)(parhelia_fence_completed(pdev) -
 			  (fence & ~7u)) >= 0)
 			return 0;
 		udelay(1);
@@ -5842,7 +5856,7 @@ static bool parhelia_fence_done_or_wedged(struct parhelia_device *pdev,
 					  u32 fence)
 {
 	return READ_ONCE(pdev->wedged) ||
-		(s32)((parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE) & ~7u) - fence) >= 0;
+		(s32)(parhelia_fence_completed(pdev) - fence) >= 0;
 }
 
 int parhelia_wait_fence_ioctl(struct drm_device *drm, void *data,
@@ -5858,7 +5872,7 @@ int parhelia_wait_fence_ioctl(struct drm_device *drm, void *data,
 
 	if (args->flags || args->pad || args->timeout_ns < -1)
 		return -EINVAL;
-	args->completed = parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE) & ~7u;
+	args->completed = parhelia_fence_completed(pdev);
 	parhelia_submit_lock(pdev);
 	parhelia_retire_locked(pdev);
 	issued = parhelia_fence_is_issued_locked(pdev, args->fence);
@@ -5903,7 +5917,7 @@ accounted:
 		atomic64_add(ktime_get_ns() - wait_begin,
 			     &pdev->submit_stats.fence_wait_ns);
 done:
-	args->completed = parhelia_read(pdev, PARHELIA_MMIO_FENCE_DONE) & ~7u;
+	args->completed = parhelia_fence_completed(pdev);
 	return READ_ONCE(pdev->wedged) ? -EIO : 0;
 }
 
