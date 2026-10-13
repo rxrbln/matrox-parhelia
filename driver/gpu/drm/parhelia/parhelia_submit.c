@@ -1393,9 +1393,16 @@ enum parhelia_reg_class {
 	PARHELIA_REG_DESC_BURST,	/* rebind tracking */
 	PARHELIA_REG_DESC_ATTR,
 	PARHELIA_REG_DWGCTL,		/* restored by the terminal drain */
+	PARHELIA_REG_STREAM0,		/* indexed draws: direct-fetch state */
+	PARHELIA_REG_STRIDE01,
+	PARHELIA_REG_VTX_LIMIT,
+	PARHELIA_REG_VTX_FLOOR,
 };
 
 static const u8 parhelia_reg_class[256] = {
+	[0x00] = PARHELIA_REG_STREAM0,
+	[0x10] = PARHELIA_REG_STRIDE01,
+	[0x18] = PARHELIA_REG_VTX_LIMIT, [0x19] = PARHELIA_REG_VTX_FLOOR,
 	[0x21] = PARHELIA_REG_END,
 	/* DMA addresses and the global sync counter are kernel-owned.
 	 * Render-node clients only provide state values and relocatable
@@ -1450,11 +1457,23 @@ struct parhelia_rebind {
 };
 
 /* What the validation pass collects on its way through the request. */
+/* The direct-fetch state an indexed (0x9f) packet draws with. */
+struct parhelia_indexed_draw {
+	u32 packet;
+	u32 stream0, stream0_pos;	/* raw base operand and its dword */
+	u32 stride, limit, floor;
+	u32 extent;			/* bytes the descriptors read per vertex */
+	bool stream0_seen, other_stream;
+};
+
 struct parhelia_validate_state {
 	struct parhelia_rebind *rb;	/* P690 only */
-	u32 packet;
+	u32 packet, packet_count;
 	u32 dwgctl, dwgctl_packet;
 	bool dwgctl_seen;
+	struct parhelia_indexed_draw fetch;	/* current direct-fetch state */
+	struct parhelia_indexed_draw *indexed;	/* one per 0x9f packet */
+	u32 indexed_count;
 };
 
 static void parhelia_rebind_apply(struct parhelia_device *pdev, u32 *commands,
@@ -1522,10 +1541,33 @@ static int parhelia_validate_reglist(struct parhelia_device *pdev,
 					rb->colour = false;
 					rb->descriptors = true;
 				}
+				vs->fetch.extent = 0;
+				vs->fetch.other_stream = false;
 				break;
 			case PARHELIA_REG_DESC_ATTR:
 				if (rb && value && ((value >> 16) & 0xf) == 5)
 					rb->colour = true;
+				if (value) {
+					u32 extent = ((value >> 4) & 0xff) * 4 +
+						     hweight8((value >> 22) & 0xf) * 4;
+
+					vs->fetch.other_stream |= !!(value & 7);
+					vs->fetch.extent = max(vs->fetch.extent, extent);
+				}
+				break;
+			case PARHELIA_REG_STREAM0:
+				vs->fetch.stream0 = value;
+				vs->fetch.stream0_pos = offset + pos;
+				vs->fetch.stream0_seen = true;
+				break;
+			case PARHELIA_REG_STRIDE01:
+				vs->fetch.stride = value & 0xffff;
+				break;
+			case PARHELIA_REG_VTX_LIMIT:
+				vs->fetch.limit = value;
+				break;
+			case PARHELIA_REG_VTX_FLOOR:
+				vs->fetch.floor = value;
 				break;
 			case PARHELIA_REG_DWGCTL:
 				vs->dwgctl = value;
@@ -1550,6 +1592,65 @@ static void parhelia_rebind_draw(struct parhelia_rebind *rb)
 		rb->bind.colour = true;
 	else
 		rb->bind.no_colour = true;
+}
+
+/* Triangles one indexed (0x9f) packet may draw: the P690's direct fetch
+ * takes one primitive per packet (a two-triangle packet draws wrongly, and
+ * stalled the engine on 2026-09-10); not yet measured elsewhere. */
+static u32 parhelia_indexed_triangles(const struct parhelia_device *pdev)
+{
+	return parhelia_vertex_objects(pdev) &&
+	       pdev->pdev->device == PARHELIA_P690 ? 1 : 0;
+}
+
+/* Relocate an indexed packet drawing from the submit's vertex range.  Its
+ * operands are the byte range of its indices inside the vertex range; they
+ * are checked against the direct-fetch state the packet draws with, copied
+ * to kernel memory the client cannot reach and the packet pointed there.
+ * The stream base operand of that state becomes the range's bus address. */
+static int parhelia_relocate_indexed(struct parhelia_device *pdev,
+				     u32 *commands, u32 *cmd,
+				     const struct parhelia_indexed_draw *d,
+				     const u8 *range_cpu, u32 range_bytes,
+				     u32 range_bus, u32 *index_cpu,
+				     u32 index_bus, u32 *index_used,
+				     u32 *stream0_patched)
+{
+	const u32 begin = cmd[1], end = cmd[2];
+	u32 base, count, i;
+
+	if (((begin | end) & 3) || end <= begin || end > range_bytes ||
+	    (end - begin) % 12 ||
+	    (end - begin) / 12 > parhelia_indexed_triangles(pdev))
+		return -EINVAL;
+	if (!d->stream0_seen || (d->stream0 & 3) != 3 || d->other_stream ||
+	    !d->stride || d->extent > d->stride || !d->limit ||
+	    d->floor >= d->limit)
+		return -EINVAL;
+	base = d->stream0 & ~3u;
+	if (base >= range_bytes ||
+	    (u64)base + (u64)d->limit * d->stride > range_bytes)
+		return -EINVAL;
+	count = (end - begin) / 4;
+	if (count > PARHELIA_VERTEX_DWORDS - *index_used)
+		return -E2BIG;
+	for (i = 0; i < count; i++) {
+		const u32 ordinal = READ_ONCE(((const u32 *)(range_cpu + begin))[i]);
+
+		if (ordinal < d->floor || ordinal >= d->limit)
+			return -EINVAL;
+		index_cpu[*index_used + i] = ordinal;
+	}
+	/* an untagged start and a class-3 tagged exclusive end */
+	cmd[1] = index_bus + *index_used * 4;
+	cmd[2] = (index_bus + (*index_used + count) * 4) | 3;
+	*index_used += count;
+	/* the state's base write serves every packet up to the next one */
+	if (d->stream0_pos != *stream0_patched) {
+		commands[d->stream0_pos] = (range_bus + base) | 3;
+		*stream0_patched = d->stream0_pos;
+	}
+	return 0;
 }
 
 static int parhelia_validate_packet(struct parhelia_device *pdev,
@@ -1592,11 +1693,21 @@ static int parhelia_validate_packet(struct parhelia_device *pdev,
 			(!cmd[packet->offset + 1] &&
 			 cmd[packet->offset + 2] == 6)) ? 0 : -EINVAL;
 	case 0x9f:
-		/* Mode 7 is structurally a three-dword, zero-address packet.  The
-		 * submit path keeps it unavailable until its index source is copied
-		 * to immutable kernel-owned backing. */
-		return words == 3 && header == 0x9f000001u && !cmd[packet->offset + 1] &&
-		       !cmd[packet->offset + 2] ? 0 : -EINVAL;
+		/* Mode 7 is structurally a three-dword packet.  Its operands are
+		 * checked and relocated with the direct-fetch state recorded here,
+		 * once the relocations name the vertex range. */
+		if (words != 3 || header != 0x9f000001u)
+			return -EINVAL;
+		if (!vs->indexed) {
+			vs->indexed = kvmalloc_array(vs->packet_count,
+						     sizeof(*vs->indexed),
+						     GFP_KERNEL);
+			if (!vs->indexed)
+				return -ENOMEM;
+		}
+		vs->fetch.packet = vs->packet;
+		vs->indexed[vs->indexed_count++] = vs->fetch;
+		return 0;
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -3660,6 +3771,9 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 	case PARHELIA_PARAM_DRAW_RANGES:
 		args->value = parhelia_vertex_objects(pdev);
 		break;
+	case PARHELIA_PARAM_INDEXED_DRAWS:
+		args->value = parhelia_indexed_triangles(pdev);
+		break;
 	case PARHELIA_PARAM_WARP_PROGRAM_SLOTS:
 		args->value = pdev->warp_user_cpu ?
 			PARHELIA_WARP_USER_FILE_SLOTS : 0;
@@ -4114,6 +4228,8 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	bool host_vertex_draw = false;
 	bool vertex_object_draw = false;
 	u32 draw_ranges = 0, draw_ranges_bus = 0;
+	const u8 *draw_ranges_cpu = NULL;
+	u32 index_used = 0, indexed_next = 0, stream0_patched = U32_MAX;
 	bool async = args->flags & PARHELIA_SUBMIT_ASYNC;
 	u32 i, end = 0, fence, dma_tag, primary_words, waited, opening_slot;
 	u32 boundary_packet = 0, boundary_count = 0, call_boundary_count = 0;
@@ -4187,6 +4303,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 			goto out_relocs;
 		}
 		validate.packet = i;
+		validate.packet_count = args->packet_count;
 		ret = parhelia_validate_packet(pdev, file, commands, &packets[i],
 					       &validate);
 		if (ret) {
@@ -4458,6 +4575,7 @@ retry_slot:
 			}
 			/* The draw packets are relocated in the opcode pass below. */
 			draw_ranges = reloc->dword;
+			draw_ranges_cpu = (const u8 *)vertex_bo->dma.vaddr + reloc->delta;
 			vertex_object_draw = true;
 			continue;
 		}
@@ -4764,10 +4882,23 @@ retry_slot:
 		u32 opcode = commands[packets[i].offset] >> 24;
 
 		/* A 0x9f packet is admitted only after the paired stream/index
-		 * relocations snapshot and patch it above. */
+		 * relocations snapshot and patch it above, or as an indexed draw
+		 * from the submit's vertex range. */
 		if (opcode == 0x9f && !mode7.index_seen) {
-			ret = -EINVAL;
-			goto out_unpin;
+			if (!draw_ranges || indexed_next >= validate.indexed_count ||
+			    validate.indexed[indexed_next].packet != i) {
+				ret = -EINVAL;
+				goto out_unpin;
+			}
+			ret = parhelia_relocate_indexed(pdev, commands,
+					commands + packets[i].offset,
+					&validate.indexed[indexed_next++],
+					draw_ranges_cpu, draw_ranges,
+					draw_ranges_bus, vertex_cpu,
+					lower_32_bits(vertex_bus), &index_used,
+					&stream0_patched);
+			if (ret)
+				goto out_unpin;
 		}
 		if (opcode == 0x8f && !mode3.stream_seen &&
 		    !bound_range.stream_seen) {
@@ -5295,6 +5426,7 @@ out_relocs:
 	kfree(pinned);
 	kfree(call_boundaries);
 	kfree(draw_relocated);
+	kvfree(validate.indexed);
 	kvfree(relocs);
 	relocs = NULL;
 out_commands:
