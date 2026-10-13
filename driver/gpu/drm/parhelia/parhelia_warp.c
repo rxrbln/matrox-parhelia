@@ -268,7 +268,7 @@ static const u32 warp_replace[] = {
 
 /* warp_textured and warp_textured_multitex for streams without a colour
  * fetch; the submit validator binds them in their place (see
- * parhelia_rebind_no_colour()). */
+ * struct parhelia_entry_bind). */
 static const u32 warp_textured_no_colour[] = {
 	0x00083e00, 0x00440000, 0xb89a2249,
 	0x00087ebf, 0x00440200, 0xb8adb649,

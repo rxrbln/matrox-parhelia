@@ -842,14 +842,20 @@ copy_one:
 static u32 parhelia_copy_packet_span(u32 *dst, const u32 *commands,
 		const struct drm_parhelia_packet *packets, u32 first, u32 count)
 {
-	u32 i, words = 0;
+	u32 i, run, words = 0;
 
 	/* Copy each individually validated packet. This never relies on gaps in a
-	 * caller-provided offset table containing harmless command data. */
-	for (i = 0; i < count; i++) {
-		memcpy(dst + words, commands + packets[first + i].offset,
-		       packets[first + i].length * sizeof(*commands));
-		words += packets[first + i].length;
+	 * caller-provided offset table containing harmless command data; packets
+	 * that adjoin are copied as one run. */
+	for (i = 0; i < count; i += run) {
+		u32 offset = packets[first + i].offset;
+		u32 length = packets[first + i].length;
+
+		for (run = 1; i + run < count &&
+		     packets[first + i + run].offset == offset + length; run++)
+			length += packets[first + i + run].length;
+		memcpy(dst + words, commands + offset, length * sizeof(*commands));
+		words += length;
 	}
 	return words;
 }
@@ -1357,62 +1363,48 @@ static void parhelia_shadow_commit(struct parhelia_device *pdev,
 	txn->active = false;
 }
 
+/* What a register-list index may carry, one lookup per written register. */
+enum parhelia_reg_class {
+	PARHELIA_REG_STATE,
+	PARHELIA_REG_END,		/* 0x21 pads the tag */
+	PARHELIA_REG_INVALID,
+	PARHELIA_REG_KERNEL,
+	PARHELIA_REG_VRAM,
+	PARHELIA_REG_WARP_ENTRY,
+	PARHELIA_REG_DESC_BURST,	/* rebind tracking */
+	PARHELIA_REG_DESC_ATTR,
+};
+
+static const u8 parhelia_reg_class[256] = {
+	[0x21] = PARHELIA_REG_END,
+	/* DMA addresses and the global sync counter are kernel-owned.
+	 * Render-node clients only provide state values and relocatable
+	 * VRAM operands; primary-ring and writeback addresses remain
+	 * entirely kernel-owned. */
+	[0x24] = PARHELIA_REG_KERNEL, [0x25] = PARHELIA_REG_KERNEL,
+	[0x28] = PARHELIA_REG_KERNEL, [0x29] = PARHELIA_REG_KERNEL,
+	[0xaf] = PARHELIA_REG_KERNEL,
+	[0x2d] = PARHELIA_REG_DESC_BURST, [0x2e] = PARHELIA_REG_DESC_ATTR,
+	/* The WARP entry (0x1100, 0x1104) is a class-3 instruction-fetch
+	 * address.  A client that may write it freely can point the vertex
+	 * engine at arbitrary system memory and have the resulting program
+	 * write the surface-base block, so only entries this kernel handed out
+	 * are accepted.  See docs/parhelia-p690-warp-isa-re.md section 9.3. */
+	[0x40] = PARHELIA_REG_WARP_ENTRY, [0x41] = PARHELIA_REG_WARP_ENTRY,
+	/* Texture base and the four colour/depth surface base slots. */
+	[0x77] = PARHELIA_REG_VRAM,
+	[0x88] = PARHELIA_REG_VRAM, [0x8a] = PARHELIA_REG_VRAM,
+	[0x8c] = PARHELIA_REG_VRAM, [0x8e] = PARHELIA_REG_VRAM,
+	/* 0x138c (index e3) is the documented 2D fill extent/trigger used by
+	 * p3d_emit_clear; it lies above the WARP state window.  The remaining
+	 * high indices are rejected. */
+	[0xe0 ... 0xe2] = PARHELIA_REG_INVALID,
+	[0xe4 ... 0xff] = PARHELIA_REG_INVALID,
+};
+
 static bool parhelia_vram_register(u32 index)
 {
-	/* Texture base and the four colour/depth surface base slots. */
-	return index == 0x77 || (index >= 0x88 && index <= 0x8e && !(index & 1));
-}
-
-/* The WARP entry is a class-3 instruction-fetch address.  A client that may
- * write it freely can point the vertex engine at arbitrary system memory and
- * have the resulting program write the surface-base block, so only entries
- * this kernel handed out are accepted.  See
- * docs/parhelia-p690-warp-isa-re.md section 9.3. */
-static bool parhelia_warp_entry_register(u32 index)
-{
-	return index == 0x40 || index == 0x41;	/* 0x1100, 0x1104 */
-}
-
-static int parhelia_validate_reglist(struct parhelia_device *pdev,
-				     struct drm_file *file,
-				     const u32 *cmd, u32 length)
-{
-	u32 pos = 1;
-
-	while (pos < length) {
-		u32 tag = cmd[pos++];
-		unsigned int slot;
-
-		for (slot = 0; slot < 4; slot++) {
-			u32 index = (tag >> (slot * 8)) & 0xff;
-
-			if (index == 0x21)
-				break;
-			/* 0x138c (index e3) is the documented 2D fill extent/
-			 * trigger used by p3d_emit_clear; it lies above the WARP
-			 * state window. Keep the remaining high indices rejected.
-			 */
-			if ((index > 0xdf && index != 0xe3) || pos >= length)
-				return -EINVAL;
-			/* DMA addresses and the global sync counter are kernel-owned.
-			 * Render-node clients only provide state values and relocatable
-			 * VRAM operands; primary-ring and writeback addresses remain
-			 * entirely kernel-owned.
-			 */
-			if (index == 0x24 || index == 0x25 || index == 0x28 ||
-			    index == 0x29 || index == 0xaf)
-				return -EACCES;
-			/* This operand must be populated by a GEM relocation. */
-			if (parhelia_vram_register(index) && cmd[pos])
-				return -EACCES;
-			if (parhelia_warp_entry_register(index) &&
-			    !parhelia_warp_entry_allowed(pdev, file, cmd[pos]))
-				return -EACCES;
-			pos++;
-		}
-	}
-
-	return pos == length ? 0 : -EINVAL;
+	return parhelia_reg_class[index] == PARHELIA_REG_VRAM;
 }
 
 /* A stream whose descriptors fetch no colour (attribute kind 5) leaves WARP
@@ -1422,12 +1414,18 @@ static int parhelia_validate_reglist(struct parhelia_device *pdev,
  * entry is one of them and whose descriptor burst has no colour, rewrite the
  * entry writes that bound it to the no-colour variant, unless the same
  * entry writes also serve a draw that does fetch a colour.  Entries bound in
- * an earlier submit are left as they are. */
+ * an earlier submit are left as they are.  Tracked by the validation pass. */
 struct parhelia_entry_bind {
 	u32 pos[2];
 	u32 count;
 	u32 entry;
 	bool no_colour, colour;
+};
+
+struct parhelia_rebind {
+	struct parhelia_entry_bind bind;
+	u32 textured, multitex;
+	bool colour, descriptors;
 };
 
 static void parhelia_rebind_apply(struct parhelia_device *pdev, u32 *commands,
@@ -1446,71 +1444,83 @@ static void parhelia_rebind_apply(struct parhelia_device *pdev, u32 *commands,
 		commands[bind->pos[i]] = to;
 }
 
-static void parhelia_rebind_no_colour(struct parhelia_device *pdev,
-				      u32 *commands,
-				      const struct drm_parhelia_packet *packets,
-				      u32 packet_count)
+static int parhelia_validate_reglist(struct parhelia_device *pdev,
+				     struct drm_file *file, u32 *commands,
+				     u32 offset, u32 length,
+				     struct parhelia_rebind *rb)
 {
-	const u32 textured = parhelia_warp_entry(pdev, PARHELIA_WARP_TEXTURED_ENTRY);
-	const u32 multitex = parhelia_warp_entry(pdev,
-					PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY);
-	struct parhelia_entry_bind bind = { };
-	bool colour = false, descriptors = false;
-	u32 i;
+	const u32 *cmd = commands + offset;
+	u32 pos = 1;
 
-	if (pdev->pdev->device != PARHELIA_P690)
-		return;
-	for (i = 0; i < packet_count; i++) {
-		const u32 *cmd = commands + packets[i].offset;
-		u32 length = packets[i].length, pos = 1;
+	while (pos < length) {
+		u32 tag = cmd[pos++];
+		unsigned int slot;
 
-		if ((cmd[0] >> 24) == 0x97) {
-			if (descriptors && (bind.entry == textured ||
-					    bind.entry == multitex)) {
-				if (colour)
-					bind.colour = true;
-				else
-					bind.no_colour = true;
-			}
-			continue;
-		}
-		if ((cmd[0] >> 24) != 0x00)
-			continue;
-		while (pos < length) {
-			u32 tag = cmd[pos++];
-			unsigned int slot;
+		for (slot = 0; slot < 4; slot++) {
+			u32 index = (tag >> (slot * 8)) & 0xff;
+			u32 value;
 
-			for (slot = 0; slot < 4 && pos < length; slot++) {
-				u32 index = (tag >> (slot * 8)) & 0xff;
-				u32 value;
-
-				if (index == 0x21)
+			if (index == 0x21)
+				break;
+			if (pos >= length)
+				return -EINVAL;
+			value = cmd[pos];
+			switch (parhelia_reg_class[index]) {
+			case PARHELIA_REG_INVALID:
+				return -EINVAL;
+			case PARHELIA_REG_KERNEL:
+				return -EACCES;
+			case PARHELIA_REG_VRAM:
+				/* This operand must be populated by a GEM relocation. */
+				if (value)
+					return -EACCES;
+				break;
+			case PARHELIA_REG_WARP_ENTRY:
+				if (!parhelia_warp_entry_allowed(pdev, file, value))
+					return -EACCES;
+				if (!rb)
 					break;
-				value = cmd[pos];
-				if (index == 0x40 || index == 0x41) {
-					if (value != bind.entry || bind.count >= 2) {
-						parhelia_rebind_apply(pdev, commands, &bind);
-						bind = (struct parhelia_entry_bind){
-							.entry = value };
-					}
-					bind.pos[bind.count++] = packets[i].offset + pos;
-				} else if (index == 0x2d) {
-					colour = false;
-					descriptors = true;
-				} else if (index == 0x2e && value &&
-					   ((value >> 16) & 0xf) == 5) {
-					colour = true;
+				if (value != rb->bind.entry || rb->bind.count >= 2) {
+					parhelia_rebind_apply(pdev, commands, &rb->bind);
+					rb->bind = (struct parhelia_entry_bind){
+						.entry = value };
 				}
-				pos++;
+				rb->bind.pos[rb->bind.count++] = offset + pos;
+				break;
+			case PARHELIA_REG_DESC_BURST:
+				if (rb) {
+					rb->colour = false;
+					rb->descriptors = true;
+				}
+				break;
+			case PARHELIA_REG_DESC_ATTR:
+				if (rb && value && ((value >> 16) & 0xf) == 5)
+					rb->colour = true;
+				break;
 			}
+			pos++;
 		}
 	}
-	parhelia_rebind_apply(pdev, commands, &bind);
+
+	return pos == length ? 0 : -EINVAL;
+}
+
+/* A draw packet: note whether its bound textured entry has a colour fetch. */
+static void parhelia_rebind_draw(struct parhelia_rebind *rb)
+{
+	if (!rb || !rb->descriptors || (rb->bind.entry != rb->textured &&
+					 rb->bind.entry != rb->multitex))
+		return;
+	if (rb->colour)
+		rb->bind.colour = true;
+	else
+		rb->bind.no_colour = true;
 }
 
 static int parhelia_validate_packet(struct parhelia_device *pdev,
-				    struct drm_file *file, const u32 *cmd,
-				    const struct drm_parhelia_packet *packet)
+				    struct drm_file *file, u32 *cmd,
+				    const struct drm_parhelia_packet *packet,
+				    struct parhelia_rebind *rb)
 {
 	u32 header, words;
 
@@ -1525,10 +1535,13 @@ static int parhelia_validate_packet(struct parhelia_device *pdev,
 
 	switch (header >> 24) {
 	case 0x00:
-		return parhelia_validate_reglist(pdev, file, &cmd[packet->offset],
-						 words);
+		return parhelia_validate_reglist(pdev, file, cmd, packet->offset,
+						 words, rb);
 	case 0x97:
-		return words == 3 ? 0 : -EINVAL;
+		if (words != 3)
+			return -EINVAL;
+		parhelia_rebind_draw(rb);
+		return 0;
 	case 0x8f:
 		/* Exact shapes used by the fixed six-vertex depth-interlock
 		 * diagnostic.  These operands are ordinals, not addresses. */
@@ -4052,6 +4065,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	struct parhelia_shadow_txn *shadow_txn = NULL;
 	struct parhelia_root_probe_trace *root_probe = NULL;
 	struct parhelia_file_waiter file_waiter = { .file = file };
+	struct parhelia_rebind rebind_state, *rebind = NULL;
 	u32 *primary;
 	void *vertex_cpu = pdev->vertex_cpu;
 	dma_addr_t vertex_bus = pdev->vertex_bus;
@@ -4115,6 +4129,15 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	if (ret)
 		goto out_relocs;
 
+	if (pdev->pdev->device == PARHELIA_P690) {
+		rebind_state = (struct parhelia_rebind){
+			.textured = parhelia_warp_entry(pdev,
+					PARHELIA_WARP_TEXTURED_ENTRY),
+			.multitex = parhelia_warp_entry(pdev,
+					PARHELIA_WARP_TEXTURED_MULTITEX_ENTRY),
+		};
+		rebind = &rebind_state;
+	}
 	for (i = 0; i < args->packet_count; i++) {
 		if (packets[i].offset != end ||
 		    check_add_overflow(end, packets[i].length, &end) ||
@@ -4123,7 +4146,8 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 			ret = -EINVAL;
 			goto out_relocs;
 		}
-		ret = parhelia_validate_packet(pdev, file, commands, &packets[i]);
+		ret = parhelia_validate_packet(pdev, file, commands, &packets[i],
+					       rebind);
 		if (ret) {
 			goto out_relocs;
 		}
@@ -4134,7 +4158,8 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 		ret = -EINVAL;
 		goto out_relocs;
 	}
-	parhelia_rebind_no_colour(pdev, commands, packets, args->packet_count);
+	if (rebind)
+		parhelia_rebind_apply(pdev, commands, &rebind->bind);
 	ret = parhelia_collect_call_boundaries(relocs, args->reloc_count,
 					       args->packet_count, generic_packet_packing,
 					       call_boundaries, &call_boundary_count);
