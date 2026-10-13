@@ -20,6 +20,11 @@
 #define PH_BATCH_MAX_DRAWS (PH_BATCH_PACKETS - PH_BATCH_STATE_PACKET_RESERVE)
 /* Vertices one draw packet may consume; the vendor's own packets hold 24. */
 #define PH_BATCH_MAX_PACKET_VERTICES 64u
+/* Mesa-private relocation: the stream 0 base operand (@dword) of an indexed
+ * batch's direct-fetch state, @delta bytes into its vertex stream.  It is
+ * rebased like a DRAW range and written as an offset | 3 before a
+ * PARHELIA_RELOC_DRAW_RANGES submit; it never reaches the kernel. */
+#define PH_RELOC_STREAM_BASE 0x100u
 #define PH_BATCH_RELOCS (PH_BATCH_PACKETS + 4)
 /* The P690 primary ring has 224 CALL slots.  A normal submission consumes
  * three of them for its opening, EOB and terminal drain blocks. */

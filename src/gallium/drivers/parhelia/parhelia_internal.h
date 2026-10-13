@@ -45,6 +45,8 @@ struct parhelia_screen {
    bool native_rt_classes;
    bool render_transfer;
    bool draw_ranges;
+   /* Triangles per indexed (0x9f) packet, 0 without indexed draws. */
+   unsigned indexed_tris;
    /* Native 8- and 16-bit sampler storage. */
    bool narrow_formats;
    /* Native R5G6B5 colour and D16 depth render targets: the measured 128x16

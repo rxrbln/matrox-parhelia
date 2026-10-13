@@ -1499,14 +1499,13 @@ p3d_emit_draws(struct p3d_cs *cs, const struct p3d_state *st, unsigned nprim)
 	}
 }
 
-/* P690 mode 3 consumes ordinal ranges from a bound stream.  Live Z24 tests
- * establish that interlock occurs at the packet boundary, not between two
- * ranges carried by one packet, so keep exactly one triangle in every 0x8f.
- * Re-emit the complete direct-fetch snapshot and descriptors in the order
- * used by the passing isolated comparison. */
-void
-p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
-		      unsigned nprim)
+/* The vendor's direct-fetch snapshot: every stream base and packed stride,
+ * the direct-fetch primitive word, the vertex floor and @limit, and the
+ * descriptors again, in the order the passing isolated comparisons use.
+ * Stream 0's base operand is @stream0 for the kernel to relocate. */
+static void
+p3d_emit_direct_fetch(struct p3d_cs *cs, const struct p3d_state *st,
+		      uint32_t limit, uint32_t stream0)
 {
 	struct p3d_rw stream[12] = { };
 	struct p3d_rw prim[1], bounds[2], reset[1], desc[6];
@@ -1517,6 +1516,7 @@ p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 		stream[i].reg = P3D_R_STREAM0 + i * 4;
 	for (i = 0; i < 4; i++)
 		stream[8 + i].reg = P3D_R_STRIDE0 + i * 4;
+	stream[0].val = stream0;
 	stream[8].val = st->dw_per_vertex * sizeof(uint32_t);
 	p3d_reglist(cs, ARRAY(stream));
 
@@ -1527,7 +1527,7 @@ p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 	bounds[0].reg = P3D_R_VTXCAP_HI;
 	bounds[0].val = 0;
 	bounds[1].reg = P3D_R_VTXCAP;
-	bounds[1].val = nprim * 3;
+	bounds[1].val = limit;
 	p3d_reglist(cs, ARRAY(bounds));
 
 	reset[0].reg = P3D_R_DESC_INDEX;
@@ -1548,9 +1548,33 @@ p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 					    (p3d_position_has_z(st) ? 3u : 2u) +
 					    !!st->oow, !!st->vertex_alpha);
 	p3d_reglist(cs, desc, nd);
+}
 
+/* P690 mode 3 consumes ordinal ranges from a bound stream.  Live Z24 tests
+ * establish that interlock occurs at the packet boundary, not between two
+ * ranges carried by one packet, so keep exactly one triangle in every 0x8f. */
+void
+p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
+		      unsigned nprim)
+{
+	unsigned i;
+
+	p3d_emit_direct_fetch(cs, st, nprim * 3, 0);
 	for (i = 0; i < nprim; i++)
 		p3d_rangepacket(cs, i * 3, i * 3 + 3);
+}
+
+/* Indexed draws (mode 7): st->indexed_vertices vertices bound as stream 0,
+ * whose base the kernel relocates from the placeholder 3 (byte offset 0,
+ * class 3), and @npackets 0x9f packets whose index ranges the batch
+ * relocates. */
+void
+p3d_emit_indexed(struct p3d_cs *cs, const struct p3d_state *st,
+		 unsigned npackets)
+{
+	p3d_emit_direct_fetch(cs, st, st->indexed_vertices, 3);
+	for (unsigned i = 0; i < npackets; i++)
+		p3d_indexpacket_u32(cs);
 }
 
 void

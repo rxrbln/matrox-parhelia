@@ -188,6 +188,11 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_WARP_PROGRAM_SLOTS	32
 /* PARHELIA_RELOC_DRAW_RANGES is accepted. */
 #define PARHELIA_PARAM_DRAW_RANGES	33
+/* Triangles an indexed 0x9f packet may draw under DRAW_RANGES, 0 if none:
+ * its operands are the byte range of its u32 indices inside the request's
+ * vertex range, and the stream 0 base operand of the direct-fetch state it
+ * draws with is that range's byte offset | 3. */
+#define PARHELIA_PARAM_INDEXED_DRAWS	34
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
 /* Retired unsafe generic packing capability; kernels report zero. */

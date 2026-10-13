@@ -257,6 +257,11 @@ parhelia_batch_slice(struct parhelia_batch *dst,
             return -EINVAL;
          dst->relocs[dst->reloc_count].dword -= vertex_begin;
       }
+      if (reloc->type == PH_RELOC_STREAM_BASE) {
+         if (reloc->delta < vertex_begin || reloc->delta >= vertex_end)
+            return -EINVAL;
+         dst->relocs[dst->reloc_count].delta -= vertex_begin;
+      }
       dst->reloc_count++;
    }
    return 0;
@@ -290,7 +295,8 @@ static int batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
                         enum p3d_prim prim,
                         unsigned vertices_per_packet,
                         unsigned total_vertices,
-                        bool bound_ranges);
+                        bool bound_ranges,
+                        unsigned indexed_vertices);
 
 int
 parhelia_create_render(int fd, unsigned width, unsigned height,
@@ -395,7 +401,7 @@ parhelia_batch_clear_rect_surface(struct parhelia_batch *batch,
       p3d_emit_clear(&cs, &surface, value, write_mask, x, y, width, height);
    }
    return batch_finish(batch, &cs, calls, handle, 0, NULL, NULL, 0, 0, 0,
-                       P3D_TRIANGLES, 0, 0, false);
+                       P3D_TRIANGLES, 0, 0, false, 0);
 }
 
 int
@@ -429,7 +435,7 @@ parhelia_batch_depth_control(struct parhelia_batch *batch,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_depth_control(&cs, &surface, slot, control, load, value, resume);
    return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
-                       P3D_TRIANGLES, 0, 0, false);
+                       P3D_TRIANGLES, 0, 0, false, 0);
 }
 
 /* The complete hardware clear: arm the surface, then load the value.  Both
@@ -465,7 +471,7 @@ batch_zclear(struct parhelia_batch *batch, uint32_t colour_handle,
    p3d_emit_depth_control(&cs, &surface, 1, load, true, value,
                           P3D_DWGCTL_SOLID);
    return batch_finish(batch, &cs, calls, colour_handle, depth_handle, NULL,
-                       NULL, 0, 0, 0, P3D_TRIANGLES, 0, 0, false);
+                       NULL, 0, 0, 0, P3D_TRIANGLES, 0, 0, false, 0);
 }
 
 int
@@ -519,7 +525,7 @@ parhelia_batch_zclear_word(struct parhelia_batch *batch, uint32_t depth_handle,
    p3d_emit_depth_control(&cs, &surface, 1, word, true, value,
                           P3D_DWGCTL_SOLID);
    return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
-                       P3D_TRIANGLES, 0, 0, false);
+                       P3D_TRIANGLES, 0, 0, false, 0);
 }
 
 int
@@ -544,7 +550,7 @@ parhelia_batch_zcontrol(struct parhelia_batch *batch, uint32_t depth_handle,
       p3d_emit_depth_control(&cs, &surface, 1, words[i], false, 0,
                              P3D_DWGCTL_SOLID);
    return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
-                       P3D_TRIANGLES, 0, 0, false);
+                       P3D_TRIANGLES, 0, 0, false, 0);
 }
 
 /* Drop the tracked tile state after it has been written out. */
@@ -570,7 +576,7 @@ batch_zdiscard(struct parhelia_batch *batch, uint32_t depth_handle,
    p3d_emit_depth_control(&cs, &surface, 1, P3D_ZTRACK_OFF, false, 0,
                           P3D_DWGCTL_SOLID);
    return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
-                       P3D_TRIANGLES, 0, 0, false);
+                       P3D_TRIANGLES, 0, 0, false, 0);
 }
 
 int
@@ -641,7 +647,7 @@ parhelia_batch_blit_format(struct parhelia_batch *batch,
    p3d_emit_blit(&cs, &dst, dst_type, dst_x, dst_y,
                  &src, src_type, src_x, src_y, width, height);
    return batch_finish(batch, &cs, calls, dst_handle, 0, NULL, NULL,
-                       src_handle, 0, 0, P3D_TRIANGLES, 0, 0, false);
+                       src_handle, 0, 0, P3D_TRIANGLES, 0, 0, false, 0);
 }
 
 int
@@ -943,7 +949,9 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
    p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_state(&cs, &state);
-   if (state.bound_ranges)
+   if (state.indexed_vertices)
+      p3d_emit_indexed(&cs, &state, triangle_count);
+   else if (state.bound_ranges)
       p3d_emit_bound_ranges(&cs, &state, triangle_count);
    else
       p3d_emit_draws(&cs, &state, triangle_count);
@@ -956,7 +964,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
                       state.has_depth ? depth_handle : 0,
                       texture_handles, texture_offsets, 0,
                       triangle_count, state.dw_per_vertex, state.prim,
-                      per_packet, vertices, !!state.bound_ranges);
+                      per_packet, vertices, !!state.bound_ranges,
+                      state.indexed_vertices);
    /* Q3 reaches this builder with already transformed window-space vertices.
     * Keep the constant-loader/WARP-transform packet cadence outside the first
     * hardware experiment; its exact CALL grouping has separate selftests. */
@@ -1367,7 +1376,7 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
    uint64_t hash;
    int ret;
 
-   if (!cache || !state || state->bound_ranges)
+   if (!cache || !state || state->bound_ranges || state->indexed_vertices)
       return parhelia_batch_state_run_units(batch, colour_handle, depth_handle,
                                             texture_handles, state, vertices);
    per_packet = state->vertices_per_packet ? state->vertices_per_packet :
@@ -1510,7 +1519,8 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
              enum p3d_prim prim,
              unsigned vertices_per_packet,
              unsigned total_vertices,
-             bool bound_ranges)
+             bool bound_ranges,
+             unsigned indexed_vertices)
 {
    unsigned draws = 0, consumed = 0, texture_units = 0, selected_unit = 0;
    unsigned stream_packet = UINT32_MAX;
@@ -1524,6 +1534,24 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
          .offset = call->sec_off, .length = call->sec_len,
       };
       if (call->is_draw) {
+         if (indexed_vertices) {
+            /* indices follow the batch's vertices, in packet order */
+            const unsigned run = packet_run(prim, vertices_per_packet,
+                                            total_vertices - consumed);
+
+            if (call->sec_len != 3 || cmd[0] != 0x9f000001u || cmd[1] ||
+                cmd[2] || consumed >= total_vertices)
+               return -EINVAL;
+            batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
+               .packet = i,
+               .dword = (indexed_vertices * vertex_dwords + consumed) * 4,
+               .delta = run * 4,
+               .type = PARHELIA_RELOC_DRAW,
+            };
+            consumed += run;
+            draws++;
+            continue;
+         }
          if (bound_ranges) {
             if (call->sec_len != 3 || cmd[0] != 0x8f000001u ||
                 cmd[1] != draws * 3 || cmd[2] != draws * 3 + 3)
@@ -1569,10 +1597,12 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
       }
       if (cmd[0] >> 24)
          return -EINVAL;
-      if (bound_ranges && call->sec_len == 16 && cmd[0] == 0xe &&
+      if ((bound_ranges || indexed_vertices) && call->sec_len == 16 &&
+          cmd[0] == 0xe &&
           cmd[1] == 0x03020100u && cmd[6] == 0x07060504u &&
           cmd[11] == 0x13121110u && cmd[12] == vertex_dwords * 4 &&
-          !cmd[2] && !cmd[13] && !cmd[14] && !cmd[15]) {
+          cmd[2] == (indexed_vertices ? 3u : 0u) &&
+          !cmd[13] && !cmd[14] && !cmd[15]) {
          if (stream_packet != UINT32_MAX)
             return -EINVAL;
          stream_packet = i;
@@ -1620,7 +1650,14 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
       if (!!(texture_units & (1u << u)) !=
           !!(texture_handles && texture_handles[u]))
          return -EINVAL;
-   if (bound_ranges) {
+   if (indexed_vertices) {
+      if (stream_packet == UINT32_MAX ||
+          batch->reloc_count >= PH_BATCH_RELOCS)
+         return -EINVAL;
+      batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
+         .packet = stream_packet, .dword = 2, .type = PH_RELOC_STREAM_BASE,
+      };
+   } else if (bound_ranges) {
       if (stream_packet == UINT32_MAX ||
           batch->reloc_count >= PH_BATCH_RELOCS)
          return -EINVAL;
@@ -1769,7 +1806,8 @@ parhelia_batch_append_limited(struct parhelia_batch *dst,
        * their isolated diagnostic submits. */
       if (reloc->packet >= src->packet_count ||
           (reloc->type != PARHELIA_RELOC_VRAM &&
-           reloc->type != PARHELIA_RELOC_DRAW))
+           reloc->type != PARHELIA_RELOC_DRAW &&
+           reloc->type != PH_RELOC_STREAM_BASE))
          return -EINVAL;
       if (reloc->type == PARHELIA_RELOC_DRAW) {
          uint64_t end = (uint64_t)reloc->dword + reloc->delta;
@@ -1796,6 +1834,8 @@ parhelia_batch_append_limited(struct parhelia_batch *dst,
       dst->relocs[dst->reloc_count + i].packet += packet_base;
       if (src->relocs[i].type == PARHELIA_RELOC_DRAW)
          dst->relocs[dst->reloc_count + i].dword += vertex_base * 4;
+      if (src->relocs[i].type == PH_RELOC_STREAM_BASE)
+         dst->relocs[dst->reloc_count + i].delta += vertex_base * 4;
    }
    /* the caller may have staged the vertices in place already */
    if (src_vertex_dwords && src_vertices != dst_vertices + vertex_base)
@@ -2280,6 +2320,8 @@ parhelia_batch_vram_relocs(const struct parhelia_batch *batch,
       const struct drm_parhelia_reloc *src = &batch->relocs[i];
 
       out[i] = *src;
+      if (src->type == PH_RELOC_STREAM_BASE)
+         return -EINVAL;
       if (src->type == PARHELIA_RELOC_RANGE_STREAM_VRAM) {
          if (saw_vertex_source || src->handle || src->delta)
             return -EINVAL;
@@ -2399,6 +2441,15 @@ parhelia_batch_submit_ranges_async(
          return -ENOTSUP;
       if (src->type == PARHELIA_RELOC_CALL_BOUNDARY && !call_boundaries)
          continue;
+      if (src->type == PH_RELOC_STREAM_BASE) {
+         if ((src->delta & 3) || src->delta >= bytes ||
+             src->packet >= batch->packet_count ||
+             src->dword >= batch->packets[src->packet].length)
+            return -EINVAL;
+         batch->commands[batch->packets[src->packet].offset + src->dword] =
+            src->delta | 3;
+         continue;
+      }
       if (src->type != PARHELIA_RELOC_DRAW) {
          relocs[reloc_count++] = *src;
          continue;

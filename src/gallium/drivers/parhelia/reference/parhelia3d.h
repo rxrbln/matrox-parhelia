@@ -920,6 +920,9 @@ struct p3d_state {
 	 * hardware testing proved that the packet boundary supplies the depth
 	 * interlock which a second range in the same packet does not. */
 	int		   bound_ranges;
+	/* Indexed draws (mode 7): this many vertices bound as stream 0; zero
+	 * for the copied 0x97 ranges. */
+	unsigned	   indexed_vertices;
 	/* Vertices consumed by one draw packet.  Zero keeps one primitive per
 	 * packet (three vertices for a triangle list).  A larger count draws
 	 * several primitives, or a strip, fan or quad run, from one packet. */
@@ -974,6 +977,8 @@ void	 p3d_emit_draws(struct p3d_cs *cs, const struct p3d_state *st,
 			unsigned nprim);
 void	 p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 			       unsigned nprim);
+void	 p3d_emit_indexed(struct p3d_cs *cs, const struct p3d_state *st,
+			  unsigned npackets);
 
 /* Derived values, exposed because a driver wants them for validation. */
 uint32_t p3d_primword(enum p3d_prim prim);

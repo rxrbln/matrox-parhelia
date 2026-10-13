@@ -522,6 +522,15 @@ struct ph_context {
    bool colour_alpha;	/* the staged colour carries alpha: RGBA, not RGB */
    bool packed_colour;	/* the staged colour is one D3DCOLOR dword */
    bool packed_colour_fetch;	/* the fetch unpacks it (format 6) */
+   /* An indexed batch: this many vertices staged, then triangles * 3 u32
+    * indices into them. */
+   unsigned indexed_verts;
+   unsigned batch_index_dwords;	/* the indices of the batch being submitted */
+   unsigned pending_index_dwords;	/* those in the pending aggregate */
+   float *deindex;
+   unsigned deindex_cap;
+   uint32_t *tcl_seq;
+   unsigned tcl_seq_cap;
    /* A smooth line's coverage rides in the colour's alpha: the staged
     * triangles carry their final colour and bypass the fragment program. */
    bool line_coverage;
@@ -570,6 +579,7 @@ struct ph_context {
    unsigned tcl_reason[PH_TCL_REASONS];
    uint64_t tcl_reason_verts[PH_TCL_REASONS];
    uint64_t tcl_verts, tcl_clip_verts;
+   uint64_t tcl_range_verts;    /* vertices the draws' index ranges span */
    unsigned tcl_clip_why[4];	/* w <= 0, guard band, near, far */
    unsigned tcl_clipped_tris;   /* clipped on the CPU, kept transforming */
    float *tcl_clip_copy;
@@ -984,9 +994,11 @@ ph_stats_frame(struct ph_context *ctx)
               ctx->tcl_box_draws / n, ctx->tcl_slice_draws / n,
               ctx->tcl_fallbacks / n, ctx->tcl_clip_fallbacks / n);
    if (ctx->stat.start_ns && (ctx->tcl_draws || ctx->tcl_clip_fallbacks))
-      fprintf(stderr, "  hardware transform: %.0f vertices, %.1f triangles "
+      fprintf(stderr, "  hardware transform: %.0f vertices over index ranges "
+              "of %.0f, %.1f triangles "
               "clipped; software clipper tails: %.0f vertices (w<=0 %.1f, "
               "guard band %.1f, near %.1f, far %.1f)\n", ctx->tcl_verts / n,
+              ctx->tcl_range_verts / n,
               ctx->tcl_clipped_tris / n, ctx->tcl_clip_verts / n,
               ctx->tcl_clip_why[0] / n, ctx->tcl_clip_why[1] / n,
               ctx->tcl_clip_why[2] / n, ctx->tcl_clip_why[3] / n);
@@ -998,7 +1010,7 @@ ph_stats_frame(struct ph_context *ctx)
    memset(ctx->tcl_reason, 0, sizeof(ctx->tcl_reason));
    memset(ctx->tcl_reason_verts, 0, sizeof(ctx->tcl_reason_verts));
    memset(ctx->tcl_clip_why, 0, sizeof(ctx->tcl_clip_why));
-   ctx->tcl_verts = ctx->tcl_clip_verts = 0;
+   ctx->tcl_verts = ctx->tcl_clip_verts = ctx->tcl_range_verts = 0;
    ctx->tcl_clipped_tris = 0;
    ctx->tcl_draws = ctx->tcl_fallbacks = ctx->tcl_clip_fallbacks = 0;
    ctx->tcl_program_draws = ctx->tcl_box_draws = ctx->tcl_slice_draws = 0;
@@ -1800,6 +1812,7 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
    ctx->pending_batch.packet_count = 0;
    ctx->pending_batch.reloc_count = 0;
    ctx->pending_vertex_dwords = 0;
+   ctx->pending_index_dwords = 0;
    ctx->pending_submit_count = 0;
    ctx->pending_stage_calls = 0;
    ctx->pending_mark_count = 0;
@@ -1942,6 +1955,13 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
       if (ret)
          return ret;
    }
+   /* the kernel copies a submit's indices into 4096 dwords of its own */
+   if (ctx->batch_index_dwords && ctx->pending_index_dwords &&
+       ctx->pending_index_dwords + ctx->batch_index_dwords > 4096) {
+      ret = ph_drain_batch(ctx);
+      if (ret)
+         return ret;
+   }
    if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx, true)))
       return ret;
    ret = ctx->aggregate_state_stream ?
@@ -1990,6 +2010,8 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
    ph_record_pending_write(ctx, r0);
    ph_record_pending_write(ctx, r1);
    ph_reference_pending_resources(ctx, resources);
+   ctx->pending_index_dwords += ctx->batch_index_dwords;
+   ctx->batch_index_dwords = 0;
    /* re-point staging past what was just appended */
    ph_stage_at_ring_tail(ctx);
    return 0;
@@ -4338,6 +4360,9 @@ ph_batch_primitives_units(struct ph_context *ctx, struct parhelia_batch *batch,
     * per primitive. */
    unsigned group = state->prim == P3D_TRIANGLES ? ctx->prims_per_packet : 1;
 
+   if (state->indexed_vertices)
+      group = ph_screen(ctx->base.screen)->indexed_tris;
+
    if (!per_prim || !primitives)
       return -EINVAL;
    if (state->tex && !state->transform &&
@@ -4869,6 +4894,32 @@ ph_extra_unit(struct ph_context *ctx, unsigned u, uint32_t *handle,
    tex->wrap = ph_sampler_wrap_word(tex, sampler);
    tex->env = P3D_TEXENV_MODULATE;
    *handle = r->handle;
+   return true;
+}
+
+/* Expand an indexed batch into its triangles' vertices, for the routes
+ * that take a plain vertex list. */
+static bool
+ph_tcl_deindex(struct ph_context *ctx, unsigned dpv)
+{
+   const unsigned n = ctx->triangles * 3;
+   const uint32_t *idx = (const uint32_t *)ctx->vertices +
+                         (size_t)ctx->indexed_verts * dpv;
+
+   if (ctx->deindex_cap < n * dpv) {
+      float *grown = realloc(ctx->deindex, (size_t)n * dpv * sizeof(*grown));
+
+      if (!grown)
+         return false;
+      ctx->deindex = grown;
+      ctx->deindex_cap = n * dpv;
+   }
+   for (unsigned v = 0; v < n; v++)
+      memcpy(ctx->deindex + (size_t)v * dpv,
+             ctx->vertices + (size_t)idx[v] * dpv, dpv * sizeof(float));
+   ctx->vertices = ctx->deindex;
+   ctx->stage_room = 0;
+   ctx->indexed_verts = 0;
    return true;
 }
 
@@ -5467,6 +5518,21 @@ ph_submit_vertices_staged(struct ph_context *ctx)
 	ph_trace_alpha_test(ctx, &state, color, texture, sampler, texture_tiled);
 
    dpv = state.dw_per_vertex;
+   /* An indexed batch keeps its indices on the plain route; the others
+    * take its triangles expanded. */
+   if (ctx->indexed_verts) {
+      if (ctx->native_sampled_alpha || extra ||
+          (texture1 && ph_screen(ctx->base.screen)->single_texture_pipe &&
+           !one_pass_multitexture)) {
+         if (!ph_tcl_deindex(ctx, dpv)) {
+            ctx->submit_error = -ENOMEM;
+            goto out;
+         }
+      } else {
+         state.indexed_vertices = ctx->indexed_verts;
+         ctx->batch_index_dwords = ctx->triangles * 3;
+      }
+   }
 	ph_trace_blend_alpha(ctx, &state, texture, sampler, texture_tiled);
 	if (!texture && ph_env("PARHELIA_TRACE") && ctx->triangles) {
 		const float *v = ctx->vertices;
@@ -5588,7 +5654,10 @@ ph_submit_vertices_staged(struct ph_context *ctx)
                                 ctx->triangles);
    if (!ret && !submitted)
       ret = ph_submit_batch(ctx, batch, ctx->vertices,
-                            ctx->triangles * 3 * dpv,
+                            state.indexed_vertices ?
+                               state.indexed_vertices * dpv +
+                               ctx->triangles * 3 :
+                               ctx->triangles * 3 * dpv,
                             color, depth, texture, texture1);
 submission_done:
    if (ret)
@@ -5625,6 +5694,8 @@ out:
 	ctx->stencil_back = false;
 	ctx->colour_alpha = false;
 	ctx->packed_colour = false;
+	ctx->indexed_verts = 0;
+	ctx->batch_index_dwords = 0;
 	ctx->line_coverage = false;
 	ctx->alpha_micro = false;
 	ctx->alpha_micro_cutout = false;
@@ -9077,6 +9148,84 @@ ph_tcl_fetch_run_boxed(const struct ph_context *ctx,
    return ph_tcl_box_fits(ctx, mvp, NULL, lo, hi);
 }
 
+/* A stream without a colour input takes the fragment stage's constant one. */
+static void
+ph_tcl_constant_colour(struct ph_context *ctx, const struct ph_tcl_layout *lay,
+                       float *dst, unsigned count)
+{
+   float constant[4];
+   bool have;
+
+   if (lay->program ?
+          ctx->vs->prog.input_mask & (1u << P3D_WARP_V_COLOUR) :
+          ctx->vs->colour_input >= 0)
+      return;
+   have = ph_fs_constant_colour(ctx, constant);
+   for (unsigned v = 0; v < count; v++) {
+      float *c = dst + v * lay->dpv + lay->colour_offset;
+
+      c[0] = have ? constant[0] : 1.0f;
+      c[1] = have ? constant[1] : 1.0f;
+      c[2] = have ? constant[2] : 1.0f;
+      if (lay->colour_alpha)
+         c[3] = have ? constant[3] : 1.0f;
+   }
+}
+
+/* An indexed draw: the vertices of the draw's index range staged once and
+ * its indices, rebased to that range, behind them, all of it one batch.
+ * False when indexing would not stage less or does not fit; the caller then
+ * expands the triangles. */
+static bool
+ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
+                    const struct ph_tcl_fetch *fetch, const uint32_t *elts,
+                    unsigned ntri, uint32_t entry, unsigned vs_const_vec4s)
+{
+   uint32_t lo = UINT32_MAX, hi = 0, *idx;
+   unsigned nverts;
+   float *dst;
+
+   for (unsigned i = 0; i < ntri * 3; i++) {
+      lo = MIN2(lo, elts[i]);
+      hi = MAX2(hi, elts[i]);
+   }
+   nverts = hi - lo + 1;
+   if (nverts >= ntri * 3)
+      return false;
+   if (ctx->triangles) {
+      ph_submit_vertices(ctx);
+      if (ctx->submit_error)
+         return true;
+      ctx->transform = true;
+      ctx->warp_program_entry = entry;
+      ctx->vs_const_vec4s = vs_const_vec4s;
+      ctx->colour_alpha = lay->colour_alpha;
+      ctx->packed_colour = lay->packed_colour;
+   }
+   if ((size_t)nverts * lay->dpv + ntri * 3 > ph_logical_vertex_limit(ctx))
+      return false;
+   if (ctx->tcl_seq_cap < nverts) {
+      uint32_t *grown = realloc(ctx->tcl_seq, nverts * sizeof(*grown));
+
+      if (!grown)
+         return false;
+      ctx->tcl_seq = grown;
+      ctx->tcl_seq_cap = nverts;
+   }
+   for (unsigned v = 0; v < nverts; v++)
+      ctx->tcl_seq[v] = lo + v;
+   dst = ctx->vertices;
+   ph_tcl_fetch_run(fetch, ctx->tcl_seq, nverts, dst, lay->dpv);
+   ph_tcl_constant_colour(ctx, lay, dst, nverts);
+   idx = (uint32_t *)dst + (size_t)nverts * lay->dpv;
+   for (unsigned i = 0; i < ntri * 3; i++)
+      idx[i] = elts[i] - lo;
+   ctx->triangles = ntri;
+   ctx->indexed_verts = nverts;
+   ph_submit_vertices(ctx);
+   return true;
+}
+
 /* Fill the object-space vertex stream for one draw and, when every vertex
  * lands inside the hardware clip volume, keep it for a transforming batch.
  * Returns false when the caller must use the software pipeline instead. */
@@ -9167,6 +9316,15 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    ntri = ph_tcl_expand(ctx, info, draw, &elts);
    if (!ntri)
       goto fallback;
+   if (ctx->stats) {
+      uint32_t lo = UINT32_MAX, hi = 0;
+
+      for (unsigned i = 0; i < ntri * 3; i++) {
+         lo = MIN2(lo, elts[i]);
+         hi = MAX2(hi, elts[i]);
+      }
+      ctx->tcl_range_verts += hi - lo + 1;
+   }
    if (!ctx->tcl_cache) {
       ctx->tcl_cache = translate_cache_create();
       if (!ctx->tcl_cache)
@@ -9286,6 +9444,11 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
          ctx->tcl_slice_draws++;
    }
    limit = ph_triangle_batch_limit(ctx);
+   if (ph_screen(ctx->base.screen)->indexed_tris && box_fits && fetch.count &&
+       ntri <= limit &&
+       ph_tcl_draw_indexed(ctx, &lay, &fetch, elts, ntri, entry,
+                           vs_const_vec4s))
+      return true;
    while (done < ntri) {
       unsigned room = ph_logical_vertex_limit(ctx) / (3 * lay.dpv);
       unsigned space = MIN2(limit, room);
@@ -9316,22 +9479,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
       else
          translate->run_elts(translate, elts + done * 3, chunk * 3, 0, 0,
                              dst);
-      if (lay.program ?
-             !(ctx->vs->prog.input_mask & (1u << P3D_WARP_V_COLOUR)) :
-             ctx->vs->colour_input < 0) {
-         float constant[4];
-         const bool have = ph_fs_constant_colour(ctx, constant);
-
-         for (unsigned v = 0; v < chunk * 3; v++) {
-            float *c = dst + v * lay.dpv + lay.colour_offset;
-
-            c[0] = have ? constant[0] : 1.0f;
-            c[1] = have ? constant[1] : 1.0f;
-            c[2] = have ? constant[2] : 1.0f;
-            if (lay.colour_alpha)
-               c[3] = have ? constant[3] : 1.0f;
-         }
-      }
+      ph_tcl_constant_colour(ctx, &lay, dst, chunk * 3);
       chunks_fit &= chunk_fits;
       if (!chunk_fits && !ph_tcl_vertices_fit(ctx, dst, chunk * 3, lay.dpv)) {
          /* A fixed-function transform clips the crossing triangles itself. */
