@@ -810,6 +810,10 @@ struct p3d_state {
 	/* A three-component position without a depth surface: the vendor's
 	 * x,y,z,r,g,b,a stream, the only measured untextured RGBA layout. */
 	int		   pos_z;
+	/* The colour as one dword, unpacked by the fetch: attribute kind 5,
+	 * format 6, mask 1, as the vendor D3D stream declares its diffuse
+	 * colour (faaemu faa-default 0x00456040). */
+	int		   packed_colour;
 	/* Probe overrides: the z-clip range 0x12c0/0x12c4 (default full) and
 	 * the 0x12f4 guard band (default the vendor's value). */
 	int		   zclip_set;

@@ -365,6 +365,27 @@ p3d_descriptors_add_q(struct p3d_rw *desc, size_t n)
 	}
 }
 
+/* A packed colour at dword @colour: its descriptor (kind 5), if declared,
+ * fetches one dword in format 6, and every attribute after it moves on by
+ * the dwords it no longer takes, also when GL_REPLACE leaves the colour
+ * undeclared.  Explicit descriptor overrides are left as they are. */
+static void
+p3d_descriptors_pack_colour(struct p3d_rw *desc, size_t n, unsigned colour,
+			    int alpha)
+{
+	const unsigned saved = alpha ? 3u : 2u;
+
+	for (size_t i = 0; i < n; i++) {
+		if (!desc[i].val)
+			continue;
+		if (((desc[i].val >> 16) & 0xf) == 5)
+			desc[i].val = (desc[i].val & ~(0xfu << 22)) |
+				      (1u << 22) | (6u << 12);
+		else if (((desc[i].val >> 4) & 0xff) > colour)
+			desc[i].val -= saved << 4;
+	}
+}
+
 /* The attribute descriptors, by vertex layout.  Bit fields: [2:0] stream,
  * [11:4] dword offset, [19:16] attribute KIND, [25:22] component mask,
  * [31] last.  Every capture terminates the burst with a zero descriptor. */
@@ -1036,6 +1057,10 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 		p3d_descriptors_add_w(desc, nd);
 	if (st->texcoord_q)
 		p3d_descriptors_add_q(desc, nd);
+	if (st->packed_colour && !st->pos_desc)
+		p3d_descriptors_pack_colour(desc, nd,
+					    (p3d_position_has_z(st) ? 3u : 2u) +
+					    !!st->oow, !!st->vertex_alpha);
 
 	/* Interpolant 5 is the fog factor and 0x1114's nibble 5 already sources
 	 * it from o2, so the fog unit needs only its presence bit here. */
@@ -1518,6 +1543,10 @@ p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 		p3d_descriptors_add_w(desc, nd);
 	if (st->texcoord_q)
 		p3d_descriptors_add_q(desc, nd);
+	if (st->packed_colour && !st->pos_desc)
+		p3d_descriptors_pack_colour(desc, nd,
+					    (p3d_position_has_z(st) ? 3u : 2u) +
+					    !!st->oow, !!st->vertex_alpha);
 	p3d_reglist(cs, desc, nd);
 
 	for (i = 0; i < nprim; i++)

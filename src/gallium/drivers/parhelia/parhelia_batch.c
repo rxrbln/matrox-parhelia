@@ -815,7 +815,11 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 	        !!input->vertex_alpha +
 	        (input->vertex_colour1 ? 3u + !!(input->vertex_colour1 & 2) +
 	                                 !!(input->vertex_colour1 & 4) : 0u) +
-	        2u * (input->texcoord_q && !input->texcoord3)) ||
+	        2u * (input->texcoord_q && !input->texcoord3) -
+	        (input->packed_colour ? 2u + !!input->vertex_alpha : 0u)) ||
+	       /* one packed colour; the second colour stays float */
+	       (input->packed_colour &&
+	        (input->vertex_colour1 || input->texcoord3)) ||
 	       /* The projective set is measured for one 2-D unit or volume. */
 	       (input->texcoord_q &&
 	        (!input->tex || input->tex1 ||

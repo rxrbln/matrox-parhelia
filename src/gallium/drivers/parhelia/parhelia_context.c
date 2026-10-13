@@ -519,6 +519,8 @@ struct ph_context {
    bool oow;		/* the staged stream carries 1/w after z */
    bool proj;		/* set 0 carries s,t,r,q for the projective mode */
    bool colour_alpha;	/* the staged colour carries alpha: RGBA, not RGB */
+   bool packed_colour;	/* the staged colour is one D3DCOLOR dword */
+   bool packed_colour_fetch;	/* the fetch unpacks it (format 6) */
    /* A smooth line's coverage rides in the colour's alpha: the staged
     * triangles carry their final colour and bypass the fragment program. */
    bool line_coverage;
@@ -2724,17 +2726,18 @@ static void
 ph_pack_multitex_vertices(struct ph_context *ctx, bool second, bool depth,
                           bool oow)
 {
-   /* x, y[, z[, 1/w]], r, g, b, s0, t0, s1, t1 */
+   /* x, y[, z[, 1/w]], r, g, b (or one packed dword), s0, t0, s1, t1 */
    const unsigned pos = oow ? 4 : depth ? 3 : 2;
-   const unsigned src_dpv = pos + 7;
-   const unsigned dst_dpv = pos + 5;
-   const unsigned st = pos + 3 + (second ? 2 : 0);
+   const unsigned colour = ctx->packed_colour ? 1 : 3;
+   const unsigned src_dpv = pos + colour + 4;
+   const unsigned dst_dpv = pos + colour + 2;
+   const unsigned st = pos + colour + (second ? 2 : 0);
 
    for (unsigned v = 0; v < ctx->triangles * 3; v++) {
       const float *src = &ctx->vertices[v * src_dpv];
       float *dst = &ctx->packed_vertices[v * dst_dpv];
 
-      for (unsigned i = 0; i < pos + 3; i++)
+      for (unsigned i = 0; i < pos + colour; i++)
          *dst++ = src[i];
       *dst++ = src[st];
       *dst++ = src[st + 1];
@@ -5209,6 +5212,10 @@ ph_submit_vertices_staged(struct ph_context *ctx)
 		    ph_t2_free_rgba(ph_screen(ctx->base.screen)->chip_id))
 			state.warp_entry = ctx->warp_rgba;
 	}
+	if (ctx->packed_colour) {
+		state.packed_colour = 1;
+		state.dw_per_vertex -= 2 + !!state.vertex_alpha;
+	}
    state.single_texture_pipe = ph_screen(ctx->base.screen)->single_texture_pipe;
    /* One texture ganged on pipes 0+2: +25% on trilinear minification. */
    /* 0x11e8, the global texture-cache partition latch.  The production path
@@ -5490,7 +5497,8 @@ ph_submit_vertices_staged(struct ph_context *ctx)
        !one_pass_multitexture) {
       struct p3d_state lightmap = state;
       struct p3d_texture lightmap_tex = tex1;
-      unsigned packed_dpv = (zpos ? 8 : 7) + !!state.oow;
+      unsigned packed_dpv = (zpos ? 8 : 7) + !!state.oow -
+                            (ctx->packed_colour ? 2 : 0);
 
       submitted = true;
 
@@ -5610,6 +5618,7 @@ out:
 	ctx->vertex_alpha = false;
 	ctx->stencil_back = false;
 	ctx->colour_alpha = false;
+	ctx->packed_colour = false;
 	ctx->line_coverage = false;
 	ctx->alpha_micro = false;
 	ctx->alpha_micro_cutout = false;
@@ -8123,6 +8132,7 @@ struct ph_tcl_run {
    unsigned dpv, limit, vs_const_vec4s;
    uint32_t entry;
    bool colour_alpha;
+   int packed_colour;           /* dword of a packed colour, or -1 */
    float gx, gy;                /* guard band: triangles inside stay whole */
    float cx, cy;                /* the clipper's x and y planes */
 };
@@ -8177,6 +8187,21 @@ ph_tcl_append_tri(struct ph_context *ctx, const struct ph_tcl_run *r,
    return true;
 }
 
+/* A packed colour interpolated byte by byte. */
+static uint32_t
+ph_packed_colour_lerp(uint32_t a, uint32_t b, float t)
+{
+   uint32_t c = 0;
+
+   for (unsigned shift = 0; shift < 32; shift += 8) {
+      const float ca = (float)((a >> shift) & 0xff);
+      const float cb = (float)((b >> shift) & 0xff);
+
+      c |= (uint32_t)(ca + t * (cb - ca) + 0.5f) << shift;
+   }
+   return c;
+}
+
 /* Sutherland-Hodgman against the transform's planes; the intersection is
  * always taken from the inside vertex, so an edge two triangles share is cut
  * at the same point in both. */
@@ -8215,8 +8240,11 @@ ph_tcl_clip_tri(struct ph_context *ctx, const struct ph_tcl_run *r,
             const float t = din / (din - dout);
 
             for (unsigned k = 0; k < r->dpv; k++)
-               vert[nxt][m][k] = vert[cur][in][k] +
-                                 t * (vert[cur][out][k] - vert[cur][in][k]);
+               vert[nxt][m][k] = (int)k == r->packed_colour ?
+                  uif(ph_packed_colour_lerp(fui(vert[cur][in][k]),
+                                            fui(vert[cur][out][k]), t)) :
+                  vert[cur][in][k] +
+                  t * (vert[cur][out][k] - vert[cur][in][k]);
             for (unsigned k = 0; k < 4; k++)
                clip[nxt][m][k] = clip[cur][in][k] +
                                  t * (clip[cur][out][k] - clip[cur][in][k]);
@@ -8492,6 +8520,7 @@ ph_tcl_box_fits(const struct ph_context *ctx, const float *m,
 struct ph_tcl_layout {
    bool textured, multitextured;
    bool colour_alpha;           /* the colour slot is RGBA */
+   bool packed_colour;          /* the colour slot is one D3DCOLOR dword */
    bool program;                /* a compiled vertex program, not the kernel's */
    unsigned dpv;
    unsigned colour_offset, tex_offset[2];
@@ -8613,6 +8642,7 @@ ph_tcl_layout(struct ph_context *ctx, struct ph_tcl_layout *lay)
    lay->textured = textured;
    lay->multitextured = multitextured;
    lay->colour_alpha = rgba;
+   lay->packed_colour = false;
    lay->colour_offset = 3;
    lay->tex_offset[0] = 6;
    lay->tex_offset[1] = 8;
@@ -8803,6 +8833,8 @@ struct ph_tcl_fetch {
       unsigned out;                /* output dword */
       unsigned comps;
       bool unorm8;
+      bool packed;                 /* RGBA8 to one D3DCOLOR dword */
+      uint32_t alpha;              /* or-ed into a packed colour */
    } e[PIPE_MAX_ATTRIBS];
 };
 
@@ -8840,6 +8872,7 @@ ph_tcl_fetch_init(struct ph_tcl_fetch *f, const struct translate_key *key,
       f->e[f->count].out = el->output_offset / 4;
       f->e[f->count].comps = out;
       f->e[f->count].unorm8 = unorm8;
+      f->e[f->count].packed = false;
       f->count++;
    }
    return true;
@@ -8867,6 +8900,18 @@ ph_tcl_fetch_elements(const struct ph_tcl_fetch *f, const uint32_t *elts,
       const size_t stride = f->e[i].stride;
       uint32_t *d = dst + f->e[i].out;
 
+      if (f->e[i].packed) {
+         const uint32_t alpha = f->e[i].alpha;
+
+         for (unsigned v = 0; v < count; v++, d += dpv) {
+            uint32_t c;
+
+            memcpy(&c, base + elts[v] * stride, 4);
+            d[0] = (c & 0xff00ff00u) | ((c >> 16) & 0xffu) |
+                   ((c & 0xffu) << 16) | alpha;
+         }
+         continue;
+      }
       if (f->e[i].unorm8) {
          for (unsigned v = 0; v < count; v++, d += dpv) {
             const uint8_t *s = base + elts[v] * stride;
@@ -9046,6 +9091,26 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
 
          translate->set_buffer(translate, b, maps[b], strides[b], ~0u);
       }
+   } else if (ctx->packed_colour_fetch && !lay.program) {
+      /* An RGBA8 colour goes to the fetch as it is, one dword instead of
+       * three or four floats; an unobservable alpha reads as one, as the
+       * float RGB fetch's does. */
+      const unsigned saved = 2 + lay.colour_alpha;
+
+      for (unsigned i = 0; i < fetch.count && !lay.packed_colour; i++)
+         if (fetch.e[i].unorm8 && fetch.e[i].out == lay.colour_offset) {
+            fetch.e[i].packed = true;
+            fetch.e[i].alpha = lay.colour_alpha ? 0 : 0xff000000u;
+            lay.packed_colour = true;
+         }
+      if (lay.packed_colour) {
+         for (unsigned i = 0; i < fetch.count; i++)
+            if (fetch.e[i].out > lay.colour_offset)
+               fetch.e[i].out -= saved;
+         lay.tex_offset[0] -= saved;
+         lay.tex_offset[1] -= saved;
+         lay.dpv -= saved;
+      }
    }
 
    /* Mixed primitive kinds keep their order, and a batch carrying
@@ -9055,6 +9120,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    if (ctx->points || ctx->lines ||
        (ctx->triangles &&
         (!ctx->transform || ctx->colour_alpha != lay.colour_alpha ||
+         ctx->packed_colour != lay.packed_colour ||
          memcmp(ctx->mvp, mvp, sizeof mvp) ||
          ctx->warp_program_entry != entry ||
          ctx->vs_const_vec4s != vs_const_vec4s ||
@@ -9076,6 +9142,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    ctx->warp_program_entry = entry;
    ctx->transform = true;
    ctx->colour_alpha = lay.colour_alpha;
+   ctx->packed_colour = lay.packed_colour;
    ctx->tcl_draws++;
    ctx->tcl_verts += draw->count;
    if (lay.program)
@@ -9122,6 +9189,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
       ctx->warp_program_entry = entry;
       ctx->vs_const_vec4s = vs_const_vec4s;
       ctx->colour_alpha = lay.colour_alpha;
+      ctx->packed_colour = lay.packed_colour;
       chunk = MIN2(ntri - done, space - ctx->triangles);
       dst = &ctx->vertices[ctx->triangles * 3 * lay.dpv];
       if (fetch.count)
@@ -9153,6 +9221,8 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
                .dpv = lay.dpv, .limit = limit,
                .vs_const_vec4s = vs_const_vec4s, .entry = entry,
                .colour_alpha = lay.colour_alpha,
+               .packed_colour = lay.packed_colour ?
+                                (int)lay.colour_offset : -1,
                .gx = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[0])) /
                      MAX2(fabsf(ctx->viewport.scale[0]), 1e-6f),
                .gy = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[1])) /
@@ -15820,6 +15890,11 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
     * never hangs, at transform_multitex_ops 0 and 2. */
    ctx->tcl_multitexture =
       debug_get_bool_option("PARHELIA_HW_TCL_MULTITEX", true);
+   /* --packed-colour-probe: the P690 fetch unpacks a D3DCOLOR dword
+    * exactly; the original family is not measured yet. */
+   ctx->packed_colour_fetch =
+      ph_lx_family(ph_screen(screen)->chip_id) &&
+      debug_get_bool_option("PARHELIA_PACKED_COLOUR", true);
    ctx->viewport.scale[0] = ctx->viewport.scale[1] = 1.0f;
    ctx->async_submit = ph_screen(screen)->async_submit;
    ctx->stats_sync = getenv("PARHELIA_STATS") &&
