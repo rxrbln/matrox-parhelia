@@ -536,6 +536,9 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	ret = drmm_mutex_init(drm, &pdev->staging_lock);
 	if (ret)
 		return ret;
+	ret = drmm_mutex_init(drm, &pdev->vertex_pool_lock);
+	if (ret)
+		return ret;
 	ret = drmm_mutex_init(drm, &pdev->upload_lock);
 	if (ret)
 		return ret;
@@ -552,6 +555,7 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 		return dev_err_probe(&pci->dev, ret,
 				     "cannot reserve bootstrap aperture range\n");
 	INIT_LIST_HEAD(&pdev->vertex_bos);
+	INIT_LIST_HEAD(&pdev->vertex_pool);
 	pdev->primary_cpu = dmam_alloc_coherent(&pci->dev,
 			PARHELIA_PRIMARY_DWORDS * sizeof(u32),
 			&pdev->primary_bus, GFP_KERNEL);

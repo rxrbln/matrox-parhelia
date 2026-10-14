@@ -2755,8 +2755,7 @@ static void parhelia_dump_slot_calls(struct parhelia_device *pdev,
 static int parhelia_async_slot_prepare(struct parhelia_device *pdev,
 				       struct parhelia_submit_slot *slot, u32 dwords)
 {
-	if (!dwords || dwords > PARHELIA_MAX_COMMAND_DWORDS +
-		    PARHELIA_MAX_USER_PACKETS * 13u + 28u)
+	if (!dwords || dwords > PARHELIA_ASYNC_SECONDARY_DWORDS)
 		return -EINVAL;
 	if (!slot->secondary_cpu || slot->secondary_dwords < dwords) {
 		if (slot->secondary_cpu)
@@ -2813,6 +2812,138 @@ static void parhelia_async_slot_heap_fini(struct parhelia_device *pdev,
 static void parhelia_kvfree_action(void *data)
 {
 	kvfree(data);
+}
+
+static int parhelia_staging_get(struct parhelia_device *pdev);
+static int parhelia_upload_ring_get(struct parhelia_device *pdev);
+
+/* A pooled backing of at least @size bytes, else a new one.  A pooled chunk
+ * more than twice the size is taken only when a new allocation fails. */
+static void *parhelia_vertex_chunk_get(struct parhelia_device *pdev,
+				       size_t size, dma_addr_t *bus,
+				       size_t *chunk_size)
+{
+	struct parhelia_dma_chunk *c, *best = NULL;
+	void *cpu = NULL;
+
+	mutex_lock(&pdev->vertex_pool_lock);
+	list_for_each_entry(c, &pdev->vertex_pool, link)
+		if (c->size >= size && (!best || c->size < best->size))
+			best = c;
+	if (best && best->size > 2 * size) {
+		mutex_unlock(&pdev->vertex_pool_lock);
+		cpu = dma_alloc_coherent(&pdev->pdev->dev, size, bus,
+					 GFP_KERNEL | __GFP_NOWARN);
+		if (cpu) {
+			*chunk_size = size;
+			return cpu;
+		}
+		mutex_lock(&pdev->vertex_pool_lock);
+		best = NULL;
+		list_for_each_entry(c, &pdev->vertex_pool, link)
+			if (c->size >= size && (!best || c->size < best->size))
+				best = c;
+	}
+	if (best) {
+		list_del(&best->link);
+		pdev->vertex_pool_bytes -= best->size;
+	}
+	mutex_unlock(&pdev->vertex_pool_lock);
+	if (best) {
+		cpu = best->cpu;
+		*bus = best->bus;
+		*chunk_size = best->size;
+		kfree(best);
+		/* the chunk held another object's, maybe another client's, data */
+		memset(cpu, 0, size);
+		return cpu;
+	}
+	cpu = dma_alloc_coherent(&pdev->pdev->dev, size, bus,
+				 GFP_KERNEL | __GFP_NOWARN);
+	if (cpu)
+		*chunk_size = size;
+	return cpu;
+}
+
+static void parhelia_vertex_chunk_put(struct parhelia_device *pdev, void *cpu,
+				      dma_addr_t bus, size_t size)
+{
+	struct parhelia_dma_chunk *c = NULL;
+
+	mutex_lock(&pdev->vertex_pool_lock);
+	if (!pdev->vertex_pool_closed &&
+	    pdev->vertex_pool_bytes + size <= PARHELIA_VERTEX_POOL_BYTES)
+		c = kmalloc(sizeof(*c), GFP_KERNEL);
+	if (c) {
+		c->cpu = cpu;
+		c->bus = bus;
+		c->size = size;
+		list_add(&c->link, &pdev->vertex_pool);
+		pdev->vertex_pool_bytes += size;
+	}
+	mutex_unlock(&pdev->vertex_pool_lock);
+	if (!c)
+		dma_free_coherent(&pdev->pdev->dev, size, cpu, bus);
+}
+
+static void parhelia_vertex_pool_fini(struct parhelia_device *pdev)
+{
+	struct parhelia_dma_chunk *c, *tmp;
+	LIST_HEAD(chunks);
+
+	mutex_lock(&pdev->vertex_pool_lock);
+	pdev->vertex_pool_closed = true;
+	list_splice_init(&pdev->vertex_pool, &chunks);
+	pdev->vertex_pool_bytes = 0;
+	mutex_unlock(&pdev->vertex_pool_lock);
+	list_for_each_entry_safe(c, tmp, &chunks, link) {
+		dma_free_coherent(&pdev->pdev->dev, c->size, c->cpu, c->bus);
+		kfree(c);
+	}
+}
+
+/* Large coherent buffers are allocated at load, largest first, while host
+ * memory is least fragmented; what fails here is still allocated on first
+ * use as before. */
+static void parhelia_dma_preallocate(struct parhelia_device *pdev)
+{
+	unsigned int slots = 0, chunks = 0;
+	u32 i;
+
+	mutex_lock(&pdev->staging_lock);
+	parhelia_staging_get(pdev);
+	mutex_unlock(&pdev->staging_lock);
+	mutex_lock(&pdev->upload_lock);
+	parhelia_upload_ring_get(pdev);
+	mutex_unlock(&pdev->upload_lock);
+	for (i = 0; i < PARHELIA_ASYNC_SLOTS; i++) {
+		struct parhelia_submit_slot *slot = &pdev->slots[i];
+
+		slot->secondary_cpu = dma_alloc_coherent(&pdev->pdev->dev,
+			PARHELIA_ASYNC_SECONDARY_DWORDS * sizeof(u32),
+			&slot->secondary_bus, GFP_KERNEL | __GFP_NOWARN);
+		if (!slot->secondary_cpu)
+			break;
+		slot->secondary_dwords = PARHELIA_ASYNC_SECONDARY_DWORDS;
+		slots++;
+	}
+	for (i = 0; parhelia_vertex_objects(pdev) &&
+		    i < PARHELIA_VERTEX_POOL_PREALLOC; i++) {
+		dma_addr_t bus;
+		void *cpu = dma_alloc_coherent(&pdev->pdev->dev,
+			PARHELIA_VERTEX_BO_MAX_SIZE, &bus,
+			GFP_KERNEL | __GFP_NOWARN);
+
+		if (!cpu)
+			break;
+		parhelia_vertex_chunk_put(pdev, cpu, bus,
+					  PARHELIA_VERTEX_BO_MAX_SIZE);
+		chunks++;
+	}
+	dev_info(&pdev->pdev->dev,
+		 "preallocated: staging %zu KiB, upload ring %zu KiB, %u/%u async command heaps, %u vertex chunks\n",
+		 pdev->staging_size / SZ_1K, pdev->upload_size / SZ_1K, slots,
+		 PARHELIA_ASYNC_SLOTS, chunks);
 }
 
 int parhelia_submit_init(struct parhelia_device *pdev)
@@ -2878,6 +3009,7 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 			return -ENOMEM;
 		slot->state = PARHELIA_SLOT_FREE;
 	}
+	parhelia_dma_preallocate(pdev);
 	return 0;
 }
 
@@ -2901,8 +3033,8 @@ static void parhelia_vertex_object_free(struct drm_gem_object *gem)
 		container_of(to_drm_gem_dma_obj(gem), struct parhelia_vertex_bo, dma);
 
 	if (entry->dma.vaddr)
-		dma_free_coherent(drm_dev_dma_dev(gem->dev), gem->size,
-				  entry->dma.vaddr, entry->dma.dma_addr);
+		parhelia_vertex_chunk_put(to_parhelia(gem->dev), entry->dma.vaddr,
+					  entry->dma.dma_addr, entry->chunk_size);
 	drm_gem_object_release(gem);
 	kfree(entry);
 }
@@ -2951,9 +3083,9 @@ parhelia_vertex_bo_create(struct drm_device *drm, size_t size)
 	ret = drm_gem_create_mmap_offset(&entry->dma.base);
 	if (ret)
 		goto out_put;
-	entry->dma.vaddr = dma_alloc_coherent(drm_dev_dma_dev(drm), size,
-					      &entry->dma.dma_addr,
-					      GFP_KERNEL | __GFP_NOWARN);
+	entry->dma.vaddr = parhelia_vertex_chunk_get(to_parhelia(drm), size,
+						     &entry->dma.dma_addr,
+						     &entry->chunk_size);
 	if (!entry->dma.vaddr) {
 		ret = -ENOMEM;
 		goto out_put;
@@ -6500,6 +6632,7 @@ void parhelia_submit_fini(struct parhelia_device *pdev)
 		drm_gem_object_put(&entry->dma.base);
 	}
 	parhelia_submit_unlock(pdev);
+	parhelia_vertex_pool_fini(pdev);
 	mutex_lock(&pdev->upload_lock);
 	while ((span = list_first_entry_or_null(&pdev->upload_busy,
 			struct parhelia_upload_span, link)))

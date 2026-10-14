@@ -337,6 +337,10 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
  * may contain many independently relocated intervals from the same object. */
 #define PARHELIA_MAX_DRAW_DWORDS	4096u
 #define PARHELIA_VERTEX_BO_MAX_SIZE	(1u << 20)
+#define PARHELIA_VERTEX_POOL_PREALLOC	2u
+#define PARHELIA_VERTEX_POOL_BYTES	(8u * PARHELIA_VERTEX_BO_MAX_SIZE)
+#define PARHELIA_ASYNC_SECONDARY_DWORDS	(PARHELIA_MAX_COMMAND_DWORDS + \
+					 PARHELIA_MAX_USER_PACKETS * 13u + 28u)
 
 /* Heap-relative instruction entries. Runtime GET_PARAM returns the DMA
  * entry, not these offsets; the heap path uses memory class3.
@@ -445,6 +449,16 @@ struct parhelia_vertex_bo {
 	struct drm_gem_dma_object dma;
 	struct list_head link;
 	struct drm_file *file;
+	size_t chunk_size;	/* coherent backing, at least the object size */
+};
+
+/* A coherent backing kept for reuse: high-order coherent allocations fail
+ * once host memory is fragmented. */
+struct parhelia_dma_chunk {
+	struct list_head link;
+	void *cpu;
+	dma_addr_t bus;
+	size_t size;
 };
 
 /*
@@ -610,6 +624,10 @@ struct parhelia_device {
 	bool root_trace_valid;
 	struct mutex submit_lock;
 	struct list_head vertex_bos;
+	struct mutex vertex_pool_lock;
+	struct list_head vertex_pool;
+	size_t vertex_pool_bytes;
+	bool vertex_pool_closed;
 	/* The primary ring is small. Secondary packets use independently allocated
 	 * 16 KiB coherent blocks so probe works on fragmented 32-bit DMA memory. */
 	void *primary_cpu;
