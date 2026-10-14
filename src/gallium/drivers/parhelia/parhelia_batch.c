@@ -792,8 +792,30 @@ packet_vertex_step(enum p3d_prim prim)
  * other count from three to sixty is byte-exact against one packet per
  * primitive.  PARHELIA_PACKET_TRAPS is a comma-separated override for
  * bisecting further counts; PARHELIA_NINE_VERTEX_PACKETS=1 clears the set. */
+/* Packets above two triangles (PARHELIA_PRIMS_PER_PACKET) take only counts
+ * --multi-prim-stress ran thousands of times with overlapping triangles;
+ * 9, 18, 33, 63 and 135 stall the P690, 60 with overlap. */
+static bool lx_packet_sizes;
+
+void
+parhelia_batch_set_lx_packet_sizes(bool enable)
+{
+   lx_packet_sizes = enable;
+}
+
 static bool
-packet_vertex_trap(unsigned run)
+packet_vertex_measured(unsigned run)
+{
+   static const uint8_t measured[] = { 3, 6, 12, 15, 24 };
+
+   for (unsigned i = 0; i < sizeof(measured); i++)
+      if (run == measured[i])
+         return true;
+   return false;
+}
+
+static bool
+packet_vertex_trap(enum p3d_prim prim, unsigned run)
 {
    /* This is asked for every draw packet - over a thousand per frame in
     * ioquake3 - so the environment is read once, not per packet. */
@@ -807,6 +829,8 @@ packet_vertex_trap(unsigned run)
    }
    if (allow && strcmp(allow, "0"))
       return false;
+   if (!traps && lx_packet_sizes && prim == P3D_TRIANGLES)
+      return !packet_vertex_measured(run);
    /* 18 stalls the P690 engine even alone in a CALL span */
    if (!traps)
       return run == 9 || (split_multi_draws && run == 18);
@@ -832,7 +856,7 @@ packet_run(enum p3d_prim prim, unsigned per_packet, unsigned left)
    const unsigned step = packet_vertex_step(prim);
    unsigned run = left < per_packet ? left : per_packet;
 
-   while (run > step && packet_vertex_trap(run))
+   while (run > step && packet_vertex_trap(prim, run))
       run -= step;
    return run;
 }

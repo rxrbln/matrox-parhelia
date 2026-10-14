@@ -1841,6 +1841,7 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &split_multi) &&
       split_multi.value == 1;
    parhelia_batch_set_split_multi_draws(s->split_multi_draws);
+   parhelia_batch_set_lx_packet_sizes(ph_lx_family(s->chip_id));
    parhelia_batch_set_inline_draws(
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &inline_draws) &&
       inline_draws.value == 1);

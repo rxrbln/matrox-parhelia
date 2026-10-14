@@ -16521,14 +16521,15 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    const bool lx = ph_lx_family(ph_screen(screen)->chip_id);
 
    ph_unorm8_bits_init();
-   /* With the kernel's span rule the P690 takes packets as large as the
-    * vertex layout allows, like the vendor: ioquake3 CPU per frame on nano
-    * 11.7 ms at two triangles, 9.7 at 21, 9.5 at 85-170; four (12.5 ms)
-    * lose to the extra CALL per packet. */
+   /* The original family takes packets as large as the vertex layout allows
+    * under the kernel's span rule.  The P690 keeps two triangles: larger
+    * packets (21 measured 11.7 -> 9.7 ms ioquake3 CPU per frame on nano)
+    * leave its engine in a state that locks up a later draw within the first
+    * dozen piglit tests (parhelia-p690-multi-primitive-packet-hang.md). */
    ctx->prims_per_packet =
       debug_get_num_option("PARHELIA_PRIMS_PER_PACKET",
-                           ph_screen(screen)->split_multi_draws ?
-                              PH_BATCH_MAX_DRAW_DWORDS : lx ? 2 : 8);
+                           lx ? 2 : ph_screen(screen)->split_multi_draws ?
+                              PH_BATCH_MAX_DRAW_DWORDS : 8);
    if (ctx->prims_per_packet < 1)
       ctx->prims_per_packet = 1;
    /* Larger packets need the kernel to keep them out of shared spans. */
