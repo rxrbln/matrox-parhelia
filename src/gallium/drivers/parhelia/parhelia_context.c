@@ -11165,7 +11165,7 @@ ph_draw_broadcast(struct ph_context *ctx, const struct pipe_draw_info *info,
       ((dsa->depth_enabled && dsa->depth_writemask) ||
        (dsa->stencil[0].enabled && dsa->stencil[0].writemask) ||
        (dsa->stencil[1].enabled && dsa->stencil[1].writemask));
-   struct pipe_framebuffer_state saved = { 0 }, one;
+   struct pipe_framebuffer_state saved, one;
    unsigned bound = 0;
 
    if (ctx->broadcasting || ctx->fb.nr_cbufs < 2)
@@ -11185,7 +11185,9 @@ ph_draw_broadcast(struct ph_context *ctx, const struct pipe_draw_info *info,
       if (!readonly)
          return false;
    }
-   /* The state tracker's surfaces: stand-ins are rebound per pass. */
+   /* The state tracker's surfaces: stand-ins are rebound per pass.  Only
+    * a broadcast clears the copy: most draws return above. */
+   memset(&saved, 0, sizeof(saved));
    util_copy_framebuffer_state(&saved, &ctx->fb_api);
    ctx->broadcasting = true;
    for (unsigned i = 0, done = 0; i < saved.nr_cbufs; i++) {

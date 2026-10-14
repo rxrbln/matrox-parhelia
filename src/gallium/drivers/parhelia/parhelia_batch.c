@@ -3009,7 +3009,7 @@ parhelia_batch_submit_ranges_async(
    struct drm_parhelia_reloc relocs[PH_BATCH_RELOCS + 1];
    struct drm_parhelia_packet runs[PH_BATCH_PACKETS];
    uint16_t run_map[PH_BATCH_PACKETS];
-   bool draw[PH_BATCH_PACKETS] = { false }, other[PH_BATCH_PACKETS] = { false };
+   bool draw[PH_BATCH_PACKETS], other[PH_BATCH_PACKETS];
    const struct drm_parhelia_packet *packets = batch ? batch->packets : NULL;
    struct drm_parhelia_submit submit;
    uint64_t bytes = (uint64_t)vertex_dwords * sizeof(uint32_t);
@@ -3017,8 +3017,12 @@ parhelia_batch_submit_ranges_async(
 
    if (!batch || !fence || batch->reloc_count > PH_BATCH_RELOCS ||
        !vertex_handle || !vertex_dwords || (vertex_offset & 3) ||
-       bytes > UINT32_MAX || vertex_offset > UINT32_MAX - bytes)
+       bytes > UINT32_MAX || vertex_offset > UINT32_MAX - bytes ||
+       batch->packet_count > PH_BATCH_PACKETS)
       return -EINVAL;
+   /* packet indices below packet_count are all that is read */
+   memset(draw, 0, batch->packet_count * sizeof(draw[0]));
+   memset(other, 0, batch->packet_count * sizeof(other[0]));
    for (unsigned i = 0; i < batch->reloc_count; i++) {
       const struct drm_parhelia_reloc *src = &batch->relocs[i];
       uint32_t *cmd;
