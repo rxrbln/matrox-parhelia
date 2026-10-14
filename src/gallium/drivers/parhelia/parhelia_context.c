@@ -526,6 +526,9 @@ struct ph_context {
    unsigned tcl_vclip_cap;
    float *tcl_cross;
    size_t tcl_cross_cap;
+   uint8_t *tcl_vhave;           /* the vertex's clip coordinates are set */
+   struct ph_tcl_box *tcl_block_box;
+   size_t tcl_block_box_cap;
    /* a submit without its repeated plain register writes */
    bool drop_repeats;
    struct parhelia_batch *repeat_batch;
@@ -9412,7 +9415,7 @@ static bool ATTRIBUTE_NOINLINE
 ph_tcl_fetch_run_boxed(const struct ph_context *ctx,
                        const struct ph_tcl_fetch *f, const uint32_t *elts,
                        unsigned count, float *dst, unsigned dpv,
-                       const float *mvp)
+                       const float *mvp, struct ph_tcl_box *blocks)
 {
    struct ph_tcl_box box = {
       .lo = { INT32_MAX, INT32_MAX, INT32_MAX },
@@ -9425,8 +9428,26 @@ ph_tcl_fetch_run_boxed(const struct ph_context *ctx,
       const unsigned n = MIN2(count - b, PH_TCL_FETCH_BLOCK);
       uint32_t *d = (uint32_t *)dst + (size_t)b * dpv;
 
-      ph_tcl_fetch_position_box(&f->e[f->box_elem], elts + b, n,
-                                d + f->e[f->box_elem].out, dpv, &box);
+      if (blocks) {
+         /* each block's own box as well, for the clipper to skip whole
+          * blocks inside the volume */
+         struct ph_tcl_box *own = &blocks[b / PH_TCL_FETCH_BLOCK];
+
+         *own = (struct ph_tcl_box) {
+            .lo = { INT32_MAX, INT32_MAX, INT32_MAX },
+            .hi = { INT32_MIN, INT32_MIN, INT32_MIN },
+         };
+         ph_tcl_fetch_position_box(&f->e[f->box_elem], elts + b, n,
+                                   d + f->e[f->box_elem].out, dpv, own);
+         for (unsigned c = 0; c < 3; c++) {
+            box.lo[c] = MIN2(box.lo[c], own->lo[c]);
+            box.hi[c] = MAX2(box.hi[c], own->hi[c]);
+         }
+         box.nan |= own->nan;
+      } else {
+         ph_tcl_fetch_position_box(&f->e[f->box_elem], elts + b, n,
+                                   d + f->e[f->box_elem].out, dpv, &box);
+      }
       ph_tcl_fetch_elements_but(f, f->box_elem, elts + b, n, d, dpv);
    }
    if (box.nan)
@@ -9519,19 +9540,41 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
    unsigned kept = 0, crossing = 0;
    float *cross;
 
+   size_t have_cap = ctx->tcl_vclip_cap;
+
    if (!ph_tcl_grow((void **)&ctx->tcl_vclip, &clip_cap,
                     (size_t)nverts * 4 * sizeof(float)) ||
-       !ph_tcl_grow((void **)&ctx->tcl_vcode, &code_cap, nverts))
+       !ph_tcl_grow((void **)&ctx->tcl_vcode, &code_cap, nverts) ||
+       !ph_tcl_grow((void **)&ctx->tcl_vhave, &have_cap, nverts))
       return false;
-   ctx->tcl_vclip_cap = MIN2(clip_cap / (4 * sizeof(float)), code_cap);
+   ctx->tcl_vclip_cap = MIN3(clip_cap / (4 * sizeof(float)), code_cap,
+                             have_cap);
    for (unsigned i = 0; i < ntri * 3; i++)
       if (elts[i] - lo >= nverts)
          return false;
-   for (unsigned v = 0; v < nverts; v++) {
-      float *c = ctx->tcl_vclip + (size_t)v * 4;
+   /* a block whose box fits holds only inside vertices: no transform */
+   for (unsigned b = 0; b < nverts; b += PH_TCL_FETCH_BLOCK) {
+      const unsigned n = MIN2(nverts - b, PH_TCL_FETCH_BLOCK);
+      const struct ph_tcl_box *box =
+         &ctx->tcl_block_box[b / PH_TCL_FETCH_BLOCK];
+      float blo[3], bhi[3];
 
-      ph_tcl_clip_coords(ctx->mvp, dst + (size_t)v * dpv, c);
-      ctx->tcl_vcode[v] = ph_tcl_vertex_code(r, c);
+      for (unsigned c = 0; c < 3; c++) {
+         blo[c] = ph_float_from_order_key(box->lo[c]);
+         bhi[c] = ph_float_from_order_key(box->hi[c]);
+      }
+      if (!box->nan && ph_tcl_box_fits(ctx, ctx->mvp, NULL, blo, bhi)) {
+         memset(ctx->tcl_vcode + b, PH_TCL_VCODE_INSIDE, n);
+         memset(ctx->tcl_vhave + b, 0, n);
+         continue;
+      }
+      for (unsigned v = b; v < b + n; v++) {
+         float *c = ctx->tcl_vclip + (size_t)v * 4;
+
+         ph_tcl_clip_coords(ctx->mvp, dst + (size_t)v * dpv, c);
+         ctx->tcl_vcode[v] = ph_tcl_vertex_code(r, c);
+         ctx->tcl_vhave[v] = 1;
+      }
    }
    for (unsigned t = 0; t < ntri; t++) {
       const uint8_t a = ctx->tcl_vcode[elts[t * 3] - lo];
@@ -9563,6 +9606,13 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
          kept++;
       } else if (!(a & b & c & ~PH_TCL_VCODE_INSIDE & 0xff)) {
          for (unsigned v = 0; v < 3; v++) {
+            const unsigned u = e[v] - lo;
+
+            if (!ctx->tcl_vhave[u]) {
+               ph_tcl_clip_coords(ctx->mvp, dst + (size_t)u * dpv,
+                                  ctx->tcl_vclip + (size_t)u * 4);
+               ctx->tcl_vhave[u] = 1;
+            }
             memcpy(cross + v * dpv, dst + (size_t)(e[v] - lo) * dpv,
                    dpv * sizeof(float));
             memcpy(cross + 3 * dpv + v * 4,
@@ -9640,8 +9690,15 @@ ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
    /* a fused box bounds the range while fetching it; outside the volume the
     * caller clips the expanded triangles */
    if (fused_mvp) {
+      const size_t blocks = DIV_ROUND_UP(nverts, PH_TCL_FETCH_BLOCK) *
+                            sizeof(struct ph_tcl_box);
+
+      if (clip && !ph_tcl_grow((void **)&ctx->tcl_block_box,
+                               &ctx->tcl_block_box_cap, blocks))
+         return false;
       if (!ph_tcl_fetch_run_boxed(ctx, fetch, ctx->tcl_seq, nverts, dst,
-                                  lay->dpv, fused_mvp)) {
+                                  lay->dpv, fused_mvp,
+                                  clip ? ctx->tcl_block_box : NULL)) {
          if (!clip)
             return false;
          ph_tcl_constant_colour(ctx, lay, dst, nverts);
@@ -9938,7 +9995,8 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
 
       if (fused_box)
          chunk_fits = ph_tcl_fetch_run_boxed(ctx, &fetch, elts + done * 3,
-                                             chunk * 3, dst, lay.dpv, mvp);
+                                             chunk * 3, dst, lay.dpv, mvp,
+                                             NULL);
       else if (fetch.count)
          ph_tcl_fetch_run(&fetch, elts + done * 3, chunk * 3, dst, lay.dpv);
       else
@@ -16661,6 +16719,8 @@ ph_destroy_context(struct pipe_context *p)
    free(ctx->tcl_vclip);
    free(ctx->tcl_vcode);
    free(ctx->tcl_cross);
+   free(ctx->tcl_vhave);
+   free(ctx->tcl_block_box);
    FREE(ctx->slice_batch);
    FREE(ctx->repeat_batch);
    FREE(ctx->pending_vertex_store);
