@@ -522,6 +522,11 @@ struct parhelia_submit_stats {
 	u64 last_retire_ns;
 	/* CPU time per submit phase (enum parhelia_submit_phase) */
 	atomic64_t phase_ns[PARHELIA_SUBMIT_PHASES];
+	/* request sizes, counted with the phases */
+	atomic64_t packets;
+	atomic64_t command_dwords;
+	atomic64_t relocs;
+	atomic64_t reloc_pins;
 };
 
 struct parhelia_bo;
@@ -578,6 +583,8 @@ struct parhelia_bo {
 	u8 cpp;
 	bool host_aperture;
 	bool host_view;
+	/* submissions holding the object; together they own one TTM pin */
+	atomic_t submit_pins;
 };
 
 static inline struct parhelia_bo *to_parhelia_bo(struct drm_gem_object *gem)
@@ -586,6 +593,7 @@ static inline struct parhelia_bo *to_parhelia_bo(struct drm_gem_object *gem)
 }
 
 struct parhelia_ch7301;
+struct parhelia_reloc_map;
 
 struct parhelia_device {
 	struct drm_device drm;
@@ -715,6 +723,7 @@ struct parhelia_device {
 	struct parhelia_submit_stats submit_stats;
 	/* One reusable submit call plan instead of a zeroed allocation each. */
 	struct parhelia_call_plan *plan_cache;
+	struct parhelia_reloc_map *reloc_map_cache;
 	struct parhelia_reg_shadow reg_shadow;
 	u64 reg_shadow_submits;
 	u64 reg_shadow_packets;

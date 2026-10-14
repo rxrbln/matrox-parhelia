@@ -10,6 +10,7 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
+#include <linux/hash.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
@@ -151,6 +152,11 @@ static int parhelia_submit_stats_show(struct seq_file *m, void *data)
 	seq_printf(m, "gpu_busy_ns %lld\n", atomic64_read(&stats->gpu_busy_ns));
 	seq_printf(m, "fence_wait_ns %lld\n",
 		   atomic64_read(&stats->fence_wait_ns));
+	seq_printf(m, "packets %lld\n", atomic64_read(&stats->packets));
+	seq_printf(m, "command_dwords %lld\n",
+		   atomic64_read(&stats->command_dwords));
+	seq_printf(m, "relocs %lld\n", atomic64_read(&stats->relocs));
+	seq_printf(m, "reloc_pins %lld\n", atomic64_read(&stats->reloc_pins));
 	for (int i = 0; i < PARHELIA_SUBMIT_PHASES; i++)
 		seq_printf(m, "phase_%s_ns %lld\n", parhelia_phase_names[i],
 			   atomic64_read(&stats->phase_ns[i]));
@@ -2324,31 +2330,91 @@ void parhelia_vram_unpin(struct drm_gem_vram_object *bo)
 	}
 }
 
-/* Pin @bo inside VRAM pages [fpfn, lpfn), moving it there if needed.  An
- * object already pinned elsewhere cannot move and returns -EBUSY. */
-static int parhelia_vram_pin_range(struct drm_gem_vram_object *bo,
-				   unsigned long fpfn, unsigned long lpfn)
+
+/* Submissions share one TTM pin per object, counted in submit_pins: while
+ * queued work holds an object, pinning it again needs no reservation.  Only
+ * the 0 <-> 1 transitions take the reservation, which serialises them. */
+static int parhelia_submit_pin(struct drm_gem_vram_object *gbo)
 {
-	struct parhelia_device *pdev = to_parhelia(bo->bo.base.dev);
-	struct ttm_operation_ctx ctx = { false, false };
+	struct parhelia_bo *bo = container_of(gbo, struct parhelia_bo, gbo);
 	int ret;
 
-	ret = ttm_bo_reserve(&bo->bo, true, false, NULL);
+	if (atomic_inc_not_zero(&bo->submit_pins))
+		return 0;
+	ret = ttm_bo_reserve(&gbo->bo, true, false, NULL);
 	if (ret)
 		return ret;
-	if (bo->bo.pin_count) {
-		if (!bo->bo.resource || bo->bo.resource->start < fpfn ||
-		    bo->bo.resource->start + PFN_UP(bo->bo.base.size) > lpfn)
-			ret = -EBUSY;
-	} else {
-		ret = parhelia_vram_placement_range(bo, pdev->vram_size, false,
-						    fpfn, lpfn);
+	if (!atomic_inc_not_zero(&bo->submit_pins)) {
+		ret = parhelia_vram_pin_locked(gbo);
 		if (!ret)
-			ret = ttm_bo_validate(&bo->bo, &bo->placement, &ctx);
+			atomic_set(&bo->submit_pins, 1);
 	}
-	if (!ret)
-		ttm_bo_pin(&bo->bo);
-	ttm_bo_unreserve(&bo->bo);
+	ttm_bo_unreserve(&gbo->bo);
+	return ret;
+}
+
+static void parhelia_submit_unpin(struct drm_gem_vram_object *gbo)
+{
+	struct parhelia_bo *bo = container_of(gbo, struct parhelia_bo, gbo);
+
+	if (atomic_add_unless(&bo->submit_pins, -1, 1))
+		return;
+	if (!ttm_bo_reserve(&gbo->bo, false, false, NULL)) {
+		if (atomic_dec_and_test(&bo->submit_pins))
+			ttm_bo_unpin(&gbo->bo);
+		ttm_bo_unreserve(&gbo->bo);
+	}
+}
+
+static bool parhelia_resource_within(struct drm_gem_vram_object *gbo,
+				     unsigned long fpfn, unsigned long lpfn)
+{
+	return gbo->bo.resource && gbo->bo.resource->start >= fpfn &&
+	       gbo->bo.resource->start + PFN_UP(gbo->bo.base.size) <= lpfn;
+}
+
+/* parhelia_submit_pin() inside VRAM pages [fpfn, lpfn), moving the object
+ * there if no pin holds it elsewhere; -EBUSY if one does. */
+static int parhelia_submit_pin_range(struct drm_gem_vram_object *gbo,
+				     unsigned long fpfn, unsigned long lpfn)
+{
+	struct parhelia_bo *bo = container_of(gbo, struct parhelia_bo, gbo);
+	struct parhelia_device *pdev = to_parhelia(gbo->bo.base.dev);
+	struct ttm_operation_ctx ctx = { false, false };
+	int ret = 0;
+
+	if (atomic_inc_not_zero(&bo->submit_pins)) {
+		if (parhelia_resource_within(gbo, fpfn, lpfn))
+			return 0;
+		parhelia_submit_unpin(gbo);
+		return -EBUSY;
+	}
+	ret = ttm_bo_reserve(&gbo->bo, true, false, NULL);
+	if (ret)
+		return ret;
+	if (atomic_inc_not_zero(&bo->submit_pins)) {
+		if (!parhelia_resource_within(gbo, fpfn, lpfn)) {
+			if (atomic_dec_and_test(&bo->submit_pins))
+				ttm_bo_unpin(&gbo->bo);
+			ret = -EBUSY;
+		}
+	} else {
+		if (gbo->bo.pin_count) {
+			if (!parhelia_resource_within(gbo, fpfn, lpfn))
+				ret = -EBUSY;
+		} else {
+			ret = parhelia_vram_placement_range(gbo, pdev->vram_size,
+							    false, fpfn, lpfn);
+			if (!ret)
+				ret = ttm_bo_validate(&gbo->bo, &gbo->placement,
+						      &ctx);
+		}
+		if (!ret) {
+			ttm_bo_pin(&gbo->bo);
+			atomic_set(&bo->submit_pins, 1);
+		}
+	}
+	ttm_bo_unreserve(&gbo->bo);
 	return ret;
 }
 
@@ -2422,17 +2488,6 @@ static void parhelia_recent_add(struct parhelia_recent_objects *r,
 	r->next = (r->next + 1) % PARHELIA_RECENT_OBJECTS;
 }
 
-/* Whether relocation @i is the first to name its pinned object (trace only). */
-static bool parhelia_first_pinned(struct drm_gem_object **objects,
-				  struct drm_gem_vram_object **pinned, u32 i)
-{
-	u32 j;
-
-	for (j = 0; j < i; j++)
-		if (objects[j] == objects[i] && pinned[j])
-			return false;
-	return true;
-}
 
 /* Every render relocation is conservatively a write dependency until a
  * complete state-usage table can distinguish sampled inputs.  Lock one
@@ -2500,7 +2555,7 @@ static void parhelia_slot_release_locked(struct parhelia_device *pdev,
 	}
 	for (i = 0; i < slot->reloc_count; i++) {
 		if (slot->pinned[i]) {
-			parhelia_vram_unpin(slot->pinned[i]);
+			parhelia_submit_unpin(slot->pinned[i]);
 			slot->pinned[i] = NULL;
 		}
 		if (slot->objects[i]) {
@@ -4697,7 +4752,7 @@ static int parhelia_pin_depth_window(struct parhelia_device *pdev,
 			(unsigned long long)hi);
 	}
 	for (tries = 0; tries < 4; tries++) {
-		ret = parhelia_vram_pin_range(depth, lo >> PAGE_SHIFT,
+		ret = parhelia_submit_pin_range(depth, lo >> PAGE_SHIFT,
 					      hi >> PAGE_SHIFT);
 		if (ret != -EBUSY)
 			break;
@@ -4785,6 +4840,117 @@ static void parhelia_move_colour_below_depth(struct parhelia_device *pdev,
 			(unsigned long long)moved, ret);
 }
 
+/* Per-submit map from a relocation's handle (or kernel object) to the first
+ * relocation naming it, so each object is looked up, referenced and pinned
+ * once.  Entries of earlier submits are told apart by generation; the map
+ * is cached per device and grows with the relocation count. */
+struct parhelia_reloc_map {
+	struct parhelia_reloc_map_entry {
+		unsigned long key;
+		u32 gen;
+		u32 index;
+	} *entry;
+	u32 *first;
+	u32 mask, capacity, gen;
+};
+
+static struct parhelia_reloc_map *
+parhelia_reloc_map_get(struct parhelia_device *pdev, u32 count)
+{
+	struct parhelia_reloc_map *map = xchg(&pdev->reloc_map_cache, NULL);
+	u32 size = roundup_pow_of_two(max(2 * count, 16u));
+
+	if (!map) {
+		map = kzalloc_obj(*map);
+		if (!map)
+			return NULL;
+	}
+	if (count > map->capacity || size > map->mask + 1) {
+		kvfree(map->entry);
+		kvfree(map->first);
+		map->entry = kvcalloc(size, sizeof(*map->entry), GFP_KERNEL);
+		map->first = kvmalloc_array(size / 2, sizeof(*map->first),
+					    GFP_KERNEL);
+		map->mask = size - 1;
+		map->capacity = size / 2;
+		map->gen = 0;
+		if (!map->entry || !map->first) {
+			kvfree(map->entry);
+			kvfree(map->first);
+			kfree(map);
+			return NULL;
+		}
+	}
+	if (!++map->gen) {
+		memset(map->entry, 0, (map->mask + 1) * sizeof(*map->entry));
+		map->gen = 1;
+	}
+	return map;
+}
+
+static void parhelia_reloc_map_put(struct parhelia_device *pdev,
+				   struct parhelia_reloc_map *map)
+{
+	if (!map)
+		return;
+	map = xchg(&pdev->reloc_map_cache, map);
+	if (map) {
+		kvfree(map->entry);
+		kvfree(map->first);
+		kfree(map);
+	}
+}
+
+/* The first relocation of @key, or @index after recording it as such. */
+static u32 parhelia_reloc_map_first(struct parhelia_reloc_map *map,
+				    unsigned long key, u32 index)
+{
+	u32 h = hash_long(key, 32) & map->mask;
+
+	for (;; h = (h + 1) & map->mask) {
+		struct parhelia_reloc_map_entry *e = &map->entry[h];
+
+		if (e->gen != map->gen) {
+			*e = (struct parhelia_reloc_map_entry){ key, map->gen, index };
+			return index;
+		}
+		if (e->key == key)
+			return e->index;
+	}
+}
+
+/* Pin @colour and @depth without reservations when queued work already
+ * holds both with the depth surface in the window above the colour target. */
+static bool parhelia_submit_pin_pair(struct parhelia_device *pdev,
+				     struct drm_gem_vram_object *colour,
+				     struct drm_gem_vram_object *depth)
+{
+	struct parhelia_bo *c = container_of(colour, struct parhelia_bo, gbo);
+	struct parhelia_bo *d = container_of(depth, struct parhelia_bo, gbo);
+	u32 cgpu, dgpu, window;
+
+	if (!atomic_inc_not_zero(&c->submit_pins))
+		return false;
+	if (!atomic_inc_not_zero(&d->submit_pins)) {
+		parhelia_submit_unpin(colour);
+		return false;
+	}
+	if (!parhelia_vram_gpu_addr(pdev, colour, 0, colour->bo.base.size,
+				    &cgpu) &&
+	    !parhelia_vram_gpu_addr(pdev, depth, 0, depth->bo.base.size,
+				    &dgpu)) {
+		window = ALIGN_DOWN(cgpu, SZ_16M) + SZ_16M;
+		if (dgpu >= window && dgpu - window <= SZ_16M - depth->bo.base.size)
+			return true;
+	}
+	parhelia_submit_unpin(depth);
+	parhelia_submit_unpin(colour);
+	return false;
+}
+
+/* Look up and pin each distinct VRAM target once.  objects[] and pinned[]
+ * hold a reference and a pin at the first relocation naming an object only;
+ * first[] maps every VRAM relocation to that entry. */
 static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 				      struct drm_file *file,
 				      struct drm_gem_object **kernel_objects,
@@ -4792,61 +4958,71 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 				      const struct drm_parhelia_packet *packets,
 				      u32 packet_count,
 				      const struct drm_parhelia_reloc *relocs,
-				      u32 count,
+				      u32 count, struct parhelia_reloc_map *map,
 				      struct drm_gem_object **objects,
 				      struct drm_gem_vram_object **pinned)
 {
 	struct drm_gem_object *colour = NULL, *depth = NULL, *last_colour = NULL;
-	struct parhelia_recent_objects recent = { };
-	u32 i, j, reg;
+	const bool pairs = pdev->pdev->device == PARHELIA_512 ||
+			   pdev->pdev->device == PARHELIA_8X;
+	bool paired = false;
+	u32 i, f, reg;
 	int ret;
 
 	for (i = 0; i < count; i++) {
+		struct drm_gem_object *obj;
+
 		if (relocs[i].type != PARHELIA_RELOC_VRAM)
 			continue;
-		if (kernel_objects) {
-			objects[i] = kernel_objects[i];
-			drm_gem_object_get(objects[i]);
-		} else {
-			objects[i] = drm_gem_object_lookup(file, relocs[i].handle);
+		f = parhelia_reloc_map_first(map, kernel_objects ?
+				(unsigned long)kernel_objects[i] :
+				relocs[i].handle, i);
+		map->first[i] = f;
+		if (f == i) {
+			if (kernel_objects) {
+				objects[i] = kernel_objects[i];
+				drm_gem_object_get(objects[i]);
+			} else {
+				objects[i] = drm_gem_object_lookup(file,
+							relocs[i].handle);
+			}
+			if (!objects[i]) {
+				ret = -ENOENT;
+				goto unwind;
+			}
 		}
-		if (!objects[i]) {
-			ret = -ENOENT;
-			goto unwind;
-		}
+		obj = objects[f];
 		/* Pair a draw's depth with the colour bound before it.  A clear
 		 * binds one surface into both slots, so its 0x1228 names the
 		 * 0x1220 object and is not a pair. */
-		if ((pdev->pdev->device == PARHELIA_512 ||
-		     pdev->pdev->device == PARHELIA_8X) && !depth &&
+		if (pairs && !depth &&
 		    parhelia_reloc_target_reg(commands, command_dwords, packets,
 					      packet_count, &relocs[i], &reg)) {
 			if (reg == 0x1220) {
-				last_colour = objects[i];
+				last_colour = obj;
 			} else if (reg == 0x1228 && last_colour &&
-				   last_colour != objects[i]) {
+				   last_colour != obj) {
 				colour = last_colour;
-				depth = objects[i];
+				depth = obj;
 			}
 		}
 	}
-	if (colour && depth)
-		parhelia_move_colour_below_depth(pdev,
-						 drm_gem_vram_of_gem(colour),
-						 drm_gem_vram_of_gem(depth));
+	if (colour && depth) {
+		paired = parhelia_submit_pin_pair(pdev, drm_gem_vram_of_gem(colour),
+						  drm_gem_vram_of_gem(depth));
+		if (!paired)
+			parhelia_move_colour_below_depth(pdev,
+					drm_gem_vram_of_gem(colour),
+					drm_gem_vram_of_gem(depth));
+	}
 	for (i = 0; i < count; i++) {
 		if (!objects[i] || (depth && objects[i] == depth))
 			continue;
-		/* only first occurrences are pinned, so a recent hit is one */
-		if (parhelia_recent_find(&recent, objects[i], &j))
+		if (paired && objects[i] == colour) {
+			pinned[i] = drm_gem_vram_of_gem(colour);
 			continue;
-		for (j = 0; j < i; j++)
-			if (objects[j] == objects[i] && pinned[j])
-				break;
-		parhelia_recent_add(&recent, objects[i], j);
-		if (j < i)
-			continue;
-		ret = parhelia_vram_pin(drm_gem_vram_of_gem(objects[i]));
+		}
+		ret = parhelia_submit_pin(drm_gem_vram_of_gem(objects[i]));
 		if (ret)
 			goto unwind;
 		pinned[i] = drm_gem_vram_of_gem(objects[i]);
@@ -4854,10 +5030,10 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 	if (depth) {
 		for (i = 0; objects[i] != depth; i++)
 			;
-		ret = colour ?
+		ret = paired ? 0 : colour ?
 			parhelia_pin_depth_window(pdev, drm_gem_vram_of_gem(colour),
 						  drm_gem_vram_of_gem(depth)) :
-			parhelia_vram_pin(drm_gem_vram_of_gem(depth));
+			parhelia_submit_pin(drm_gem_vram_of_gem(depth));
 		if (ret)
 			goto unwind;
 		pinned[i] = drm_gem_vram_of_gem(depth);
@@ -4865,9 +5041,20 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 	return 0;
 
 unwind:
+	if (paired) {
+		/* the pair's pins not yet recorded in pinned[] */
+		for (i = 0; i < count && objects[i] != colour; i++)
+			;
+		if (i == count || !pinned[i])
+			parhelia_submit_unpin(drm_gem_vram_of_gem(colour));
+		for (i = 0; i < count && objects[i] != depth; i++)
+			;
+		if (i == count || !pinned[i])
+			parhelia_submit_unpin(drm_gem_vram_of_gem(depth));
+	}
 	for (i = 0; i < count; i++) {
 		if (pinned[i]) {
-			parhelia_vram_unpin(pinned[i]);
+			parhelia_submit_unpin(pinned[i]);
 			pinned[i] = NULL;
 		}
 		if (objects[i]) {
@@ -4958,6 +5145,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	struct parhelia_file_waiter file_waiter = { .file = file };
 	struct parhelia_rebind rebind_state;
 	struct parhelia_validate_state validate = { };
+	struct parhelia_reloc_map *reloc_map = NULL;
 	u32 *primary;
 	void *vertex_cpu = pdev->vertex_cpu;
 	dma_addr_t vertex_bus = pdev->vertex_bus;
@@ -5024,12 +5212,28 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 		ret = -ENOMEM;
 		goto out_relocs;
 	}
+	reloc_map = parhelia_reloc_map_get(pdev, args->reloc_count);
+	if (!reloc_map) {
+		ret = -ENOMEM;
+		goto out_relocs;
+	}
 	ret = parhelia_pin_reloc_targets(pdev, file, kernel_objects, commands,
 					 args->command_dwords, packets,
 					 args->packet_count, relocs,
-					 args->reloc_count, objects, pinned);
+					 args->reloc_count, reloc_map, objects,
+					 pinned);
 	if (ret)
 		goto out_relocs;
+	if (submit_stats) {
+		u32 pins = 0;
+
+		for (i = 0; i < args->reloc_count; i++)
+			pins += !!pinned[i];
+		atomic64_add(args->packet_count, &stats->packets);
+		atomic64_add(args->command_dwords, &stats->command_dwords);
+		atomic64_add(args->reloc_count, &stats->relocs);
+		atomic64_add(pins, &stats->reloc_pins);
+	}
 	parhelia_phase(&phase_t, PARHELIA_PHASE_PIN, stats);
 
 	if (pdev->pdev->device == PARHELIA_P690) {
@@ -5295,6 +5499,7 @@ retry_slot:
 	for (i = 0; i < args->reloc_count; i++) {
 		struct drm_parhelia_reloc *reloc = &relocs[i];
 		struct drm_parhelia_packet *packet;
+		struct drm_gem_object *obj;
 		u32 *packet_cmd;
 
 		if (reloc->packet >= args->packet_count) {
@@ -5605,37 +5810,33 @@ retry_slot:
 			ret = -EINVAL;
 			goto out_unpin;
 		}
-		if (!objects[i]) {
+		obj = objects[reloc_map->first[i]];
+		if (!obj) {
 			ret = -ENOENT;
 			goto out_unpin;
 		}
-		if (reloc->delta >= objects[i]->size) {
+		if (reloc->delta >= obj->size) {
 			ret = -EINVAL;
 			goto out_unpin;
 		}
-		/* A Q3 state batch names a colour target and texture repeatedly.
-		 * parhelia_pin_reloc_targets() kept one GEM reference for every
-		 * relocation so the existing cleanup stays simple, but only one
-		 * TTM pin per unique object, at its first occurrence. */
-		ret = parhelia_vram_gpu_addr(pdev,
-				drm_gem_vram_of_gem(objects[i]), reloc->delta,
-				objects[i]->size - reloc->delta,
+		ret = parhelia_vram_gpu_addr(pdev, drm_gem_vram_of_gem(obj),
+				reloc->delta, obj->size - reloc->delta,
 				&packet_cmd[reloc->dword]);
 		if (ret)
 			goto out_unpin;
-		if (trace_vram_reloc && parhelia_first_pinned(objects, pinned, i)) {
-			struct parhelia_bo *pbo = to_parhelia_bo(objects[i]);
+		if (trace_vram_reloc && reloc_map->first[i] == i) {
+			struct parhelia_bo *pbo = to_parhelia_bo(obj);
 			u32 target_reg = 0, bar_addr = 0;
 			s64 node = drm_gem_vram_offset(&pbo->gbo);
 
 			parhelia_vram_operand_reg(packet_cmd, packet->length,
 				reloc->dword, &target_reg);
 			parhelia_vram_bar_addr(pdev, &pbo->gbo, 0,
-				objects[i]->size, &bar_addr);
+				obj->size, &bar_addr);
 			dev_info(&pdev->pdev->dev,
 				 "VRAM reloc pid=%d file=%p handle=%u reg=%#x layout=%u size=%zu node=%#llx bar=%#x delta=%#x gpu=%#x pin_count=%u\n",
 				 task_pid_nr(current), file, reloc->handle, target_reg,
-				 pbo->layout, objects[i]->size, (unsigned long long)node,
+				 pbo->layout, obj->size, (unsigned long long)node,
 				 bar_addr, reloc->delta, packet_cmd[reloc->dword],
 				 pbo->gbo.bo.pin_count);
 		}
@@ -6285,10 +6486,11 @@ out_relocs:
 	}
 	for (i = 0; objects && pinned && i < args->reloc_count; i++) {
 		if (pinned[i])
-			parhelia_vram_unpin(pinned[i]);
+			parhelia_submit_unpin(pinned[i]);
 		if (objects[i])
 			drm_gem_object_put(objects[i]);
 	}
+	parhelia_reloc_map_put(pdev, reloc_map);
 	kfree(objects);
 	kfree(pinned);
 	kfree(call_boundaries);
@@ -7077,12 +7279,19 @@ bool parhelia_submit_quiesce(struct parhelia_device *pdev)
 
 void parhelia_submit_fini(struct parhelia_device *pdev)
 {
+	struct parhelia_reloc_map *reloc_map;
 	struct parhelia_vertex_bo *entry, *tmp;
 	struct parhelia_upload_span *span;
 	u32 i;
 
 	cancel_delayed_work_sync(&pdev->retire_work);
 	kvfree(xchg(&pdev->plan_cache, NULL));
+	reloc_map = xchg(&pdev->reloc_map_cache, NULL);
+	if (reloc_map) {
+		kvfree(reloc_map->entry);
+		kvfree(reloc_map->first);
+		kfree(reloc_map);
+	}
 	parhelia_submit_lock(pdev);
 	pdev->wedged = true;
 	parhelia_state_shadow_invalidate(pdev, "submit teardown");
@@ -7093,7 +7302,7 @@ void parhelia_submit_fini(struct parhelia_device *pdev)
 	 */
 	for (i = 0; i < pdev->quarantine_count; i++) {
 		if (pdev->quarantine_pinned[i])
-			parhelia_vram_unpin(pdev->quarantine_pinned[i]);
+			parhelia_submit_unpin(pdev->quarantine_pinned[i]);
 		if (pdev->quarantine_objects[i])
 			drm_gem_object_put(pdev->quarantine_objects[i]);
 	}
