@@ -200,6 +200,9 @@ int parhelia_batch_state_run_units(struct parhelia_batch *batch,
 struct parhelia_state_cache;
 struct parhelia_state_cache *parhelia_state_cache_create(void);
 void parhelia_state_cache_destroy(struct parhelia_state_cache *cache);
+/* The adjacent-packed CALL count of the batch the last cached build made,
+ * as if submitted alone; -1 if unknown. */
+int parhelia_state_cache_last_calls(const struct parhelia_state_cache *cache);
 int parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
                                           struct parhelia_batch *batch,
                                           uint32_t colour_handle,

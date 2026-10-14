@@ -1039,6 +1039,7 @@ struct state_cache_entry {
    struct drm_parhelia_reloc *relocs;
    unsigned command_count, packet_count, reloc_count;
    int mvp_offset;               /* the matrix's dwords in commands, or -1 */
+   int calls;                    /* packed CALLs of the batch alone, or -1 */
 };
 
 struct parhelia_state_cache {
@@ -1048,6 +1049,7 @@ struct parhelia_state_cache {
    size_t key_len, key_cap;
    bool verify;
    unsigned long hits, misses;
+   int last_calls;               /* the last batch's entry calls, or -1 */
 };
 
 /* Entries before the cache is flushed and refilled. */
@@ -1405,6 +1407,8 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
    uint64_t hash;
    int ret;
 
+   if (cache)
+      cache->last_calls = -1;
    if (!cache || !state || state->bound_ranges || state->indexed_vertices)
       return parhelia_batch_state_run_units(batch, colour_handle, depth_handle,
                                             texture_handles, state, vertices);
@@ -1429,6 +1433,7 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
       cache->hits++;
       ret = state_cache_replay(batch, *slot, state, draws, per_packet,
                                vertices);
+      cache->last_calls = ret ? -1 : (*slot)->calls;
       if (ret || !cache->verify)
          return ret;
       /* PARHELIA_STATE_CACHE_VERIFY=1: rebuild and compare every hit */
@@ -1473,6 +1478,15 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
          return 0;
       }
    }
+   /* a longer draw run may take one more CALL than the captured one */
+   {
+      unsigned calls;
+
+      e->calls = parhelia_batch_packed_call_count(batch, 0,
+                                                  batch->packet_count, true,
+                                                  &calls) ? -1 :
+                 (int)calls + 1;
+   }
    e->hash = hash;
    e->key = malloc(cache->key_len);
    if (!e->key) {
@@ -1483,7 +1497,14 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
    e->key_len = cache->key_len;
    *slot = e;
    cache->count++;
+   cache->last_calls = e->calls;
    return 0;
+}
+
+int
+parhelia_state_cache_last_calls(const struct parhelia_state_cache *cache)
+{
+   return cache ? cache->last_calls : -1;
 }
 
 int

@@ -610,6 +610,10 @@ struct ph_context {
    uint32_t *pending_vertex_store;
    /* built state prefixes, reused while a state repeats */
    struct parhelia_state_cache *state_cache;
+   /* packed CALLs of the batch being submitted (-1 unknown), and an upper
+    * bound for the pending aggregate (UINT_MAX unknown) */
+   int batch_calls;
+   unsigned pending_call_bound;
    int pending_ring_slot;        /* -1: not in the ring */
    uint32_t pending_ring_fence;  /* last submit that read the slot */
    unsigned pending_vertex_dwords;
@@ -1793,12 +1797,17 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
       if (line < ph_drain_sites.cap)
          ph_drain_sites.count[line]++;
    }
-   packed_calls_valid = !parhelia_batch_packed_call_count(
-      &ctx->pending_batch, 0, ctx->pending_batch.packet_count,
-      ctx->pack_adjacent_packets, &packed_calls);
+   /* the exact count only where the bound cannot rule out a split */
+   packed_calls_valid =
+      (ph_env("PARHELIA_TRACE_BATCH") ||
+       (ctx->aggregate_state_stream && ctx->pending_mark_count > 1 &&
+        ctx->pending_call_bound > PH_BATCH_HW_CALLS)) &&
+      !parhelia_batch_packed_call_count(
+         &ctx->pending_batch, 0, ctx->pending_batch.packet_count,
+         ctx->pack_adjacent_packets, &packed_calls);
    if (ph_env("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
-              "parhelia: aggregate submits=%u commands=%u packets=%u stages=%u relocs=%u vertices=%u resources=%u estimated_calls=%u\n",
+              "parhelia: aggregate submits=%u commands=%u packets=%u stages=%u relocs=%u vertices=%u resources=%u estimated_calls=%u call_bound=%u\n",
               ctx->pending_submit_count,
               ctx->pending_batch.command_count,
               ctx->pending_batch.packet_count,
@@ -1806,7 +1815,8 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
               ctx->pending_batch.reloc_count,
               ctx->pending_vertex_dwords,
               ctx->pending_resource_count,
-              packed_calls_valid ? packed_calls : 0);
+              packed_calls_valid ? packed_calls : 0,
+              ctx->pending_call_bound);
    if (ctx->aggregate_state_stream && ctx->pending_mark_count > 1 &&
        packed_calls_valid &&
        packed_calls > PH_BATCH_HW_CALLS)
@@ -1832,6 +1842,7 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
    ctx->pending_vertex_dwords = 0;
    ctx->pending_index_dwords = 0;
    ctx->pending_submit_count = 0;
+   ctx->pending_call_bound = 2;
    ctx->pending_stage_calls = 0;
    ctx->pending_mark_count = 0;
    if (ret)
@@ -1902,6 +1913,15 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
    bool draw_batch;
    int ret;
 
+   int batch_calls = ctx->batch_calls;
+   unsigned calls;
+
+   ctx->batch_calls = -1;
+   /* uncached batches (clears, copies) are short: count them here */
+   if (batch_calls < 0 && ctx->pack_adjacent_packets && batch->packet_count &&
+       !parhelia_batch_packed_call_count(batch, 0, batch->packet_count, true,
+                                         &calls))
+      batch_calls = (int)calls;
    ctx->stat.batches++;
    ctx->stat.draw_batches += vertex_dwords != 0;
    ctx->stat.vertex_dwords += vertex_dwords;
@@ -2014,6 +2034,12 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
    }
    if (ret)
       return ret;
+   /* packing across batches only joins runs, so the batches' counts bound
+    * the stream's; each counts the stream's final EOB and drain itself */
+   ctx->pending_call_bound =
+      batch_calls < 2 || !ctx->pack_adjacent_packets ||
+      ctx->pending_call_bound == UINT_MAX ? UINT_MAX :
+      ctx->pending_call_bound + (unsigned)batch_calls - 2;
    ctx->pending_submit_count++;
    ctx->pending_stage_calls += stage_calls;
    if (ctx->aggregate_state_stream) {
@@ -4404,10 +4430,17 @@ ph_batch_primitives_units(struct ph_context *ctx, struct parhelia_batch *batch,
    else if (state->warp_entry == ctx->warp_passthrough &&
             state->prim == P3D_TRIANGLES && group >= 2)
       ctx->restore_after_transform = false;
-   return parhelia_batch_state_run_units_cached(ctx->state_cache, batch,
-                                                colour_handle, depth_handle,
-                                                handles, state,
-                                                primitives * per_prim);
+   {
+      const int ret =
+         parhelia_batch_state_run_units_cached(ctx->state_cache, batch,
+                                               colour_handle, depth_handle,
+                                               handles, state,
+                                               primitives * per_prim);
+
+      ctx->batch_calls = ret ? -1 :
+                         parhelia_state_cache_last_calls(ctx->state_cache);
+      return ret;
+   }
 }
 
 static int
@@ -16360,6 +16393,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       ph_lx_family(ph_screen(screen)->chip_id) &&
       debug_get_bool_option("PARHELIA_PACKED_COLOUR", true);
    ctx->drop_repeats = debug_get_bool_option("PARHELIA_DROP_REPEATS", false);
+   ctx->batch_calls = -1;
+   ctx->pending_call_bound = 2;
    ctx->viewport.scale[0] = ctx->viewport.scale[1] = 1.0f;
    ctx->async_submit = ph_screen(screen)->async_submit;
    ctx->stats_sync = getenv("PARHELIA_STATS") &&
