@@ -73,6 +73,8 @@ struct ph_mip_layout {
    unsigned cpp;
    /* Bytes per 4x4 block when the storage is S3TC; zero otherwise. */
    unsigned block_bytes;
+   /* S3TC in the original family's block order (ph_dxt_block_offset()). */
+   bool dxt_original;
    /* Levels the texture unit addresses as stored; 0 when all of them. */
    unsigned sampled_levels;
    /* The measured P690 8/16-bit tile order backs this chain. */
@@ -111,8 +113,8 @@ ph_mip_next_pot(unsigned value)
  * (texel x bit 5 ^ texel y bit 5).  Measured on the P690 with
  * parhelia-drm-test --texture-dxt-probe PROBE_LINEAR=1 PROBE_MAP=1. */
 static inline size_t
-ph_dxt_block_offset(unsigned pitch, unsigned bx, unsigned by,
-                    unsigned block_bytes)
+ph_dxt_block_offset_lx(unsigned pitch, unsigned bx, unsigned by,
+                       unsigned block_bytes)
 {
    const unsigned unit_rows = 512u / (8u * block_bytes);
    const unsigned tile_bytes = 1024u * (8u / unit_rows);
@@ -126,14 +128,60 @@ ph_dxt_block_offset(unsigned pitch, unsigned bx, unsigned by,
           (size_t)(bx & 7u) * block_bytes;
 }
 
+/* The original family (0528) uses 256-byte units, 8 blocks wide and 4 DXT1
+ * or 2 DXT3/5 block rows tall; bits 10 and up of a tile select the unit row.
+ * A level taller than 32 texels has 64x64-texel tiles: bit 8 is block x
+ * bit 3 ^ tile row bit 0, bit 9 block y bit 3, and tile rows advance by
+ * pitch/64 tiles as on the P690.  A level of 32 rows or fewer is one band
+ * of 128x32-texel tiles: bit 8 is block x bit 4, bit 9 block x bit 3.
+ * Measured on the 0528 (Alpha) with the same probe: block maps of 32x128 to
+ * 256x128 and 64x8 to 512x32, both block sizes, and the 128x128 chains. */
+static inline size_t
+ph_dxt_block_offset_original(unsigned pitch, unsigned height, unsigned bx,
+                             unsigned by, unsigned block_bytes)
+{
+   const unsigned unit_rows = 256u / (8u * block_bytes);
+   const size_t unit = (size_t)((by & 7u) / unit_rows) * 1024u +
+                       (size_t)(by % unit_rows) * (8u * block_bytes) +
+                       (size_t)(bx & 7u) * block_bytes;
+
+   if (height <= 32) {
+      return (size_t)(bx >> 5) * (256u * block_bytes) +
+             ((bx >> 4) & 1u) * 256u + ((bx >> 3) & 1u) * 512u + unit;
+   } else {
+      const unsigned ty = by >> 4;
+      const size_t tile = ((size_t)ty * pitch >> 6) + (bx >> 4);
+      const unsigned ux = ((bx >> 3) & 1u) ^ (ty & 1u);
+
+      return tile * (256u * block_bytes) + ux * 256u +
+             ((by >> 3) & 1u) * 512u + unit;
+   }
+}
+
+/* @height is the level's: the original family's order depends on it. */
+static inline size_t
+ph_dxt_block_offset(bool original, unsigned pitch, unsigned height,
+                    unsigned bx, unsigned by, unsigned block_bytes)
+{
+   return original ?
+      ph_dxt_block_offset_original(pitch, height, bx, by, block_bytes) :
+      ph_dxt_block_offset_lx(pitch, bx, by, block_bytes);
+}
+
 /* Bytes a compressed level of @pitch texels and @height rows occupies: its
  * 32-row bands of tiles (see ph_dxt_block_offset), two bands sharing a tile
  * at a 32-texel pitch. */
 static inline size_t
-ph_dxt_level_size(unsigned pitch, unsigned height, unsigned block_bytes)
+ph_dxt_level_size(bool original, unsigned pitch, unsigned height,
+                  unsigned block_bytes)
 {
-   const unsigned tile_bytes = block_bytes == 8 ? 1024u : 2048u;
-   const size_t bands = (height + 31) / 32;
+   const unsigned tile_bytes = original ? 256u * block_bytes :
+                               block_bytes == 8 ? 1024u : 2048u;
+   const unsigned band_rows = original ? 64u : 32u;
+   const size_t bands = (height + band_rows - 1) / band_rows;
+
+   if (original && height <= 32)
+      return ((pitch + 127) >> 7) * tile_bytes;
 
    return ((bands * pitch + 63) >> 6) * tile_bytes;
 }
@@ -150,11 +198,12 @@ ph_dxt_level_size(unsigned pitch, unsigned height, unsigned block_bytes)
  * texels (+16,0), (+24,0), (+16,+8) and (+24,+8) of the tail level. */
 static inline void
 ph_dxt_layout_init(struct ph_mip_layout *mip, unsigned width, unsigned height,
-                   unsigned levels, unsigned block_bytes)
+                   unsigned levels, unsigned block_bytes, bool original)
 {
    static const unsigned tail_x[] = { 0, 16, 24, 16, 24 };
    static const unsigned tail_y[] = { 0, 0, 0, 8, 8 };
-   const unsigned tile_bytes = block_bytes == 8 ? 1024u : 2048u;
+   const unsigned tile_bytes = original ? 256u * block_bytes :
+                               block_bytes == 8 ? 1024u : 2048u;
    size_t offset = 0, end = 0;
    int tail = -1;
 
@@ -162,6 +211,7 @@ ph_dxt_layout_init(struct ph_mip_layout *mip, unsigned width, unsigned height,
    memset(mip->level, 0, sizeof(mip->level));
    mip->levels = levels;
    mip->block_bytes = block_bytes;
+   mip->dxt_original = original;
    mip->sampled_levels = (width & (width - 1)) || (height & (height - 1)) ?
                          1 : 0;
    for (unsigned l = 0; l < levels; l++) {
@@ -181,13 +231,23 @@ ph_dxt_layout_init(struct ph_mip_layout *mip, unsigned width, unsigned height,
          const unsigned k = l - tail < 4u ? l - tail : 4u;
 
          lv->offset = mip->level[tail].offset +
-                      tail_y[k] / 4 * (8u * block_bytes) +
-                      tail_x[k] / 4 * block_bytes;
+                      ph_dxt_block_offset(original, mip->level[tail].pitch,
+                                          mip->level[tail].height,
+                                          tail_x[k] / 4, tail_y[k] / 4,
+                                          block_bytes);
          lv->tail_x = tail_x[k];
          lv->tail_y = tail_y[k];
+      } else if (original && l &&
+                 (mip->level[l - 1].height <= 32 ?
+                     mip->level[l - 1].width <= 64 :
+                     mip->level[l - 1].width <= 32 &&
+                     mip->level[l - 1].height <= 64)) {
+         /* the 0528 packs a level into the free bit-8 half of the previous
+          * level's tile (block x bit 4 short, x bit 3 tall) */
+         lv->offset = mip->level[l - 1].offset + 256u;
       } else {
          lv->offset = offset;
-         lv->bytes = ph_dxt_level_size(lv->pitch, h, block_bytes);
+         lv->bytes = ph_dxt_level_size(original, lv->pitch, h, block_bytes);
          offset += lv->bytes;
          end = offset;
       }

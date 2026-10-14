@@ -59,19 +59,6 @@ struct ph_velems {
    struct pipe_vertex_element elem[PIPE_MAX_ATTRIBS];
 };
 
-/* 0x2537, 0x2538 and 0x2539 are the LX/P650/P750/P690 family: the vendor's
- * class mask 0x7fc00 covers exactly these three device ids. */
-static inline bool ph_lx_family(uint32_t chip_id)
-{
-   return chip_id == 0x2537 || chip_id == 0x2538 || chip_id == 0x2539;
-}
-
-/* 0x0527 and 0x0528, the original Parhelia (Parhelia-512 / -8X). */
-static inline bool ph_original_family(uint32_t chip_id)
-{
-   return chip_id == 0x0527 || chip_id == 0x0528;
-}
-
 /* RGBA draws take a T2-free program after the per-slot T2 prime: the LX
  * class, and the original family (latch measured on the 0528). */
 static inline bool ph_t2_free_rgba(uint32_t chip_id)
@@ -15737,7 +15724,9 @@ ph_copy_blocks(struct parhelia_resource *r, unsigned level, void *staging,
       for (unsigned i = 0; i < bw; i++) {
          uint8_t *host = (uint8_t *)staging + (size_t)j * stride + i * block;
          uint8_t *gpu = (uint8_t *)r->map + r->mip.level[level].offset +
-            ph_dxt_block_offset(pitch, box->x / 4 + i, box->y / 4 + j, block);
+            ph_dxt_block_offset(r->mip.dxt_original, pitch,
+                                r->mip.level[level].height, box->x / 4 + i,
+                                box->y / 4 + j, block);
 
          if (to_gpu)
             memcpy(gpu, host, block);

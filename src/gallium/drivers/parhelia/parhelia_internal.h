@@ -27,6 +27,19 @@
 #define PH_VRAM_VERTEX_LEGACY_SLOTS 3
 #define PH_VRAM_VERTEX_SLOTS_MAX 16
 
+/* 0x2537, 0x2538 and 0x2539 are the LX/P650/P750/P690 family: the vendor's
+ * class mask 0x7fc00 covers exactly these three device ids. */
+static inline bool ph_lx_family(uint32_t chip_id)
+{
+   return chip_id == 0x2537 || chip_id == 0x2538 || chip_id == 0x2539;
+}
+
+/* 0x0527 and 0x0528, the original Parhelia (Parhelia-512 / -8X). */
+static inline bool ph_original_family(uint32_t chip_id)
+{
+   return chip_id == 0x0527 || chip_id == 0x0528;
+}
+
 struct parhelia_screen {
    struct pipe_screen base;
    int fd;

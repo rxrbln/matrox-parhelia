@@ -867,7 +867,7 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    if (block_bytes) {
       ph_dxt_layout_init(&r->mip, templ->width0, templ->height0,
                          MIN2(templ->last_level + 1, PH_MAX_MIP_LEVELS),
-                         block_bytes);
+                         block_bytes, ph_original_family(screen->chip_id));
       r->mip.size = ph_mip_align(r->mip.size,
                                  block_bytes == 8 ? 0x800u : 0x1000u);
    }
@@ -1832,12 +1832,12 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->narrow_formats = s->texture_upload &&
       p3d_texture_uses_p690_narrow(s->chip_id, s->tile_layout, 2) &&
       !ph_env("PARHELIA_NO_NARROW_FORMATS");
-   /* S3TC block order, chain and NPOT bases are measured on the LX family
-    * (--texture-dxt-probe); the original family takes it on request until
-    * measured there.  PARHELIA_NO_S3TC=1 opts out. */
+   /* S3TC block order and chain are measured on the LX family and the 0528
+    * (--texture-dxt-probe, each family its own order).  PARHELIA_NO_S3TC=1
+    * opts out. */
    s->s3tc = s->texture_upload && !ph_env("PARHELIA_NO_S3TC") &&
              ((s->chip_id >= 0x2537 && s->chip_id <= 0x2539) ||
-              ph_env("PARHELIA_S3TC"));
+              ph_original_family(s->chip_id) || ph_env("PARHELIA_S3TC"));
    /* Volume and cube-map targets need the native 32-bit texture order, whose
     * storage tile carries the volume slice interleave, and the address unit's
     * three-coordinate mode.  Both are measured: --texture-volume-probe
