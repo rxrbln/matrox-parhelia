@@ -1172,14 +1172,18 @@ parhelia_state_cache_destroy(struct parhelia_state_cache *c)
    free(c);
 }
 
+/* Every part starts on a 64-bit boundary, zero padded: unaligned parts sent
+ * the key's copies and compares down libc's byte-shifting paths. */
 static bool
 state_key_put(struct parhelia_state_cache *c, const void *data, size_t len)
 {
-   if (c->key_len + len > c->key_cap) {
+   const size_t padded = (len + 7) & ~(size_t)7;
+
+   if (c->key_len + padded > c->key_cap) {
       size_t cap = c->key_cap ? c->key_cap : 1024;
       uint8_t *grown;
 
-      while (cap < c->key_len + len)
+      while (cap < c->key_len + padded)
          cap *= 2;
       grown = realloc(c->key, cap);
       if (!grown)
@@ -1188,7 +1192,8 @@ state_key_put(struct parhelia_state_cache *c, const void *data, size_t len)
       c->key_cap = cap;
    }
    memcpy(c->key + c->key_len, data, len);
-   c->key_len += len;
+   memset(c->key + c->key_len + len, 0, padded - len);
+   c->key_len += padded;
    return true;
 }
 
@@ -1270,11 +1275,20 @@ state_key_build(struct parhelia_state_cache *c, const struct p3d_state *input,
           state_key_texture(c, input->tex3);
 }
 
-/* Four independent lanes over the ~1 KiB key: one multiply chain was a
- * quarter of a cache hit's time. */
+static inline uint64_t
+state_key_rotl(uint64_t v, unsigned r)
+{
+   return (v << r) | (v >> (64 - r));
+}
+
+/* Four independent lanes over the ~1 KiB, 64-bit padded key.  Rotate, xor
+ * and times-five steps: a 64-bit multiply per word kept the EV5 multiplier
+ * busy for eight cycles each.  Hits are verified by a compare. */
 static uint64_t
 state_key_hash(const uint8_t *key, size_t len)
 {
+   const uint8_t *k = __builtin_assume_aligned(key, 8);
+   const size_t words = len / 8;
    uint64_t h[4] = {
       0x9e3779b97f4a7c15ull ^ len, 0xc2b2ae3d27d4eb4full,
       0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull,
@@ -1282,20 +1296,25 @@ state_key_hash(const uint8_t *key, size_t len)
    uint64_t r;
    size_t i = 0;
 
-   for (; i + 32 <= len; i += 32) {
+   for (; i + 4 <= words; i += 4) {
       for (unsigned l = 0; l < 4; l++) {
          uint64_t w;
 
-         memcpy(&w, key + i + l * 8, 8);
-         h[l] = (h[l] ^ w) * 0xff51afd7ed558ccdull;
-         h[l] ^= h[l] >> 32;
+         memcpy(&w, k + (i + l) * 8, 8);
+         h[l] = state_key_rotl(h[l] ^ w, 27) * 5 + 0x52dce729u;
       }
    }
-   r = h[0] ^ (h[1] * 0x9e3779b97f4a7c15ull) ^
-       (h[2] * 0xc2b2ae3d27d4eb4full) ^ (h[3] * 0x165667b19e3779f9ull);
-   for (; i < len; i++)
-      r = (r ^ key[i]) * 0x100000001b3ull;
-   return r ^ (r >> 29);
+   for (; i < words; i++) {
+      uint64_t w;
+
+      memcpy(&w, k + i * 8, 8);
+      h[0] = state_key_rotl(h[0] ^ w, 31) * 5 + 0x38495ab5u;
+   }
+   r = h[0] ^ state_key_rotl(h[1], 16) ^ state_key_rotl(h[2], 32) ^
+       state_key_rotl(h[3], 48);
+   r = (r ^ (r >> 33)) * 0xff51afd7ed558ccdull;
+   r = (r ^ (r >> 33)) * 0xc4ceb9fe1a85ec53ull;
+   return r ^ (r >> 33);
 }
 
 static struct state_cache_entry **
