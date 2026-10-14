@@ -599,6 +599,10 @@ struct ph_context {
    /* Reused per-draw builder storage keeps the expanded aggregate command
     * allocation off the hot draw-call stack. */
    struct parhelia_batch build_batch;
+   /* a state-cache hit for build_batch, appended to the pending stream
+    * without being copied there first */
+   struct parhelia_batch_replay replay;
+   bool defer_replay;
    struct parhelia_batch *slice_batch;	/* a pending group's submit */
    /* The aggregate's vertices: in the ring slot it will be submitted from
     * while a ring is mapped, else in pending_vertex_store. */
@@ -1935,9 +1939,20 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
    int ret;
    int batch_calls = ctx->batch_calls;
    const bool cached = batch_calls >= 0;
-   unsigned calls, stage_calls;
+   unsigned calls, stage_calls, batch_packets = batch->packet_count;
+   unsigned replay_commands, replay_relocs;
+   const struct parhelia_batch_replay replay_entry = ctx->replay;
+   const bool replay = ctx->replay.entry && ctx->aggregate_batches &&
+                       ctx->aggregate_state_stream;
 
    ctx->batch_calls = -1;
+   if (replay)
+      parhelia_batch_replay_counts(&ctx->replay, &replay_commands,
+                                   &batch_packets, &replay_relocs);
+   else if (ctx->replay.entry &&
+            (ret = parhelia_batch_replay_materialize(batch, &ctx->replay)))
+      return ret;
+   ctx->replay.entry = NULL;
    /* uncached batches (clears, copies) are short: count them here */
    if (batch_calls < 0 && ctx->pack_adjacent_packets && batch->packet_count &&
        !parhelia_batch_packed_call_count(batch, 0, batch->packet_count, true,
@@ -1967,7 +1982,7 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
    }
 
    stage_calls = cached ? ctx->batch_stages : ph_batch_stage_calls(batch);
-   draw_batch = ph_batch_has_draw(batch);
+   draw_batch = replay || ph_batch_has_draw(batch);
    if (ctx->aggregate_state_stream && ctx->pending_batch.packet_count &&
        ph_batch_has_draw(&ctx->pending_batch) && !draw_batch) {
       /* A clear/blit after rendering must observe the preceding pixel-pipe
@@ -1990,11 +2005,11 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
          return ret;
    }
    if (ctx->aggregate_state_stream &&
-       batch->packet_count + stage_calls > ctx->batch_limits.packets)
+       batch_packets + stage_calls > ctx->batch_limits.packets)
       return -E2BIG;
    if (ctx->aggregate_state_stream && ctx->pending_batch.packet_count &&
        ctx->pending_batch.packet_count + ctx->pending_stage_calls +
-          batch->packet_count + stage_calls > ctx->batch_limits.packets) {
+          batch_packets + stage_calls > ctx->batch_limits.packets) {
       ret = ph_drain_batch(ctx);
       if (ret)
          return ret;
@@ -2024,7 +2039,12 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
    }
    if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx, true)))
       return ret;
-   ret = ctx->aggregate_state_stream ?
+   ret = replay ?
+      parhelia_batch_append_replay_limited(
+         &ctx->pending_batch, ctx->pending_vertices,
+         &ctx->pending_vertex_dwords, &replay_entry, vertices, vertex_dwords,
+         &ctx->batch_limits, ctx->pack_adjacent_packets) :
+      ctx->aggregate_state_stream ?
       ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
       ctx->aggregate_state_batches ?
       parhelia_batch_append_stateful_limited(
@@ -2042,7 +2062,12 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
          return ret;
       if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx, true)))
          return ret;
-      ret = ctx->aggregate_state_stream ?
+      ret = replay ?
+         parhelia_batch_append_replay_limited(
+            &ctx->pending_batch, ctx->pending_vertices,
+            &ctx->pending_vertex_dwords, &replay_entry, vertices,
+            vertex_dwords, &ctx->batch_limits, ctx->pack_adjacent_packets) :
+         ctx->aggregate_state_stream ?
          ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
          ctx->aggregate_state_batches ?
          parhelia_batch_append_stateful_limited(
@@ -4459,11 +4484,14 @@ ph_batch_primitives_units(struct ph_context *ctx, struct parhelia_batch *batch,
             state->prim == P3D_TRIANGLES && group >= 2)
       ctx->restore_after_transform = false;
    {
+      ctx->replay.entry = NULL;
       const int ret =
-         parhelia_batch_state_run_units_cached(ctx->state_cache, batch,
-                                               colour_handle, depth_handle,
-                                               handles, state,
-                                               primitives * per_prim);
+         parhelia_batch_state_run_units_deferred(ctx->state_cache, batch,
+                                                 colour_handle, depth_handle,
+                                                 handles, state,
+                                                 primitives * per_prim,
+                                                 ctx->defer_replay ?
+                                                    &ctx->replay : NULL);
 
       ctx->batch_calls = ret ? -1 :
                          parhelia_state_cache_last_calls(ctx->state_cache,
@@ -5737,11 +5765,15 @@ ph_submit_vertices_staged(struct ph_context *ctx)
                                       depth ? depth->handle : 0, handles,
                                       ctx->triangles);
    else
+   {
+      ctx->defer_replay = !submitted;
       ret = ph_batch_primitives(ctx, batch, &state, color->handle,
                                 depth ? depth->handle : 0,
                                 texture ? texture_handle : 0,
                                 texture1 ? texture1_handle : 0,
                                 ctx->triangles);
+      ctx->defer_replay = false;
+   }
    if (!ret && !submitted)
       ret = ph_submit_batch(ctx, batch, ctx->vertices,
                             state.indexed_vertices ?

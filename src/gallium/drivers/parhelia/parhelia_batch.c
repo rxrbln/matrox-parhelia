@@ -1692,60 +1692,151 @@ state_cache_find_mvp(const struct state_cache_entry *e, const float *mvp)
    return found;
 }
 
-/* The cached prefix plus the draw packets batch_finish() would emit. */
-static int
-state_cache_replay(struct parhelia_batch *batch,
-                   const struct state_cache_entry *e,
-                   const struct p3d_state *state, unsigned draws,
-                   unsigned per_packet, unsigned vertices)
+/* What a hit of @e for @state replays: the header and operands of its draw
+ * packets, filled in once. */
+static void
+state_cache_replay_init(struct parhelia_batch_replay *r,
+                        const struct state_cache_entry *e,
+                        const struct p3d_state *state, unsigned draws,
+                        unsigned per_packet, unsigned vertices)
 {
-   const uint32_t header = state->indexed_vertices ? 0x9f000001u :
-                           0x97000000u |
-                           (((state->dw_per_vertex - 1) & 0x3f) << 17) | 1u;
-   /* indices follow the batch's vertices */
-   const unsigned base = state->indexed_vertices * state->dw_per_vertex;
-   const unsigned stride = state->indexed_vertices ? 1 : state->dw_per_vertex;
+   *r = (struct parhelia_batch_replay) {
+      .entry = e,
+      .mvp = state->mvp,
+      .header = state->indexed_vertices ? 0x9f000001u :
+                0x97000000u |
+                (((state->dw_per_vertex - 1) & 0x3f) << 17) | 1u,
+      .limit = state->indexed_vertices,
+      /* indices follow the batch's vertices */
+      .base = state->indexed_vertices * state->dw_per_vertex,
+      .stride = state->indexed_vertices ? 1 : state->dw_per_vertex,
+      .draws = draws,
+      .per_packet = per_packet,
+      .vertices = vertices,
+      .prim = state->prim,
+   };
+}
+
+void
+parhelia_batch_replay_counts(const struct parhelia_batch_replay *r,
+                             unsigned *commands, unsigned *packets,
+                             unsigned *relocs)
+{
+   *commands = r->entry->command_count + 3 * r->draws;
+   *packets = r->entry->packet_count + r->draws;
+   *relocs = r->entry->reloc_count + r->draws;
+}
+
+/* Write the replay at @dst's end: the prefix rebased by @command_base,
+ * @packet_base and @vertex_base dwords, then its draw packets. */
+static int
+state_cache_replay_at(struct parhelia_batch *dst,
+                      const struct parhelia_batch_replay *r,
+                      unsigned vertex_base)
+{
+   const struct state_cache_entry *e = r->entry;
+   const unsigned command_base = dst->command_count;
+   const unsigned packet_base = dst->packet_count;
+   uint32_t *commands = dst->commands + command_base;
    unsigned consumed = 0;
 
-   if (e->command_count + 3 * draws > PH_BATCH_DWORDS ||
-       e->packet_count + draws > PH_BATCH_PACKETS ||
-       e->reloc_count + draws > PH_BATCH_RELOCS)
-      return -E2BIG;
-   memcpy(batch->commands, e->commands, e->command_count * sizeof(uint32_t));
+   if (r->limit && e->limit_offset < 0)
+      return -EINVAL;
+   memcpy(commands, e->commands, e->command_count * sizeof(uint32_t));
    if (e->mvp_offset >= 0)
-      memcpy(batch->commands + e->mvp_offset, state->mvp, 16 * sizeof(float));
-   if (state->indexed_vertices) {
-      if (e->limit_offset < 0)
-         return -EINVAL;
-      batch->commands[e->limit_offset] = state->indexed_vertices;
-   }
-   memcpy(batch->packets, e->packets, e->packet_count * sizeof(*e->packets));
-   memcpy(batch->relocs, e->relocs, e->reloc_count * sizeof(*e->relocs));
-   batch->command_count = e->command_count;
-   batch->packet_count = e->packet_count;
-   batch->reloc_count = e->reloc_count;
-   for (unsigned k = 0; k < draws; k++) {
-      const unsigned run = packet_run(state->prim, per_packet,
-                                      vertices - consumed);
-      uint32_t *cmd = batch->commands + batch->command_count;
+      memcpy(commands + e->mvp_offset, r->mvp, 16 * sizeof(float));
+   if (r->limit)
+      commands[e->limit_offset] = r->limit;
+   for (unsigned i = 0; i < e->packet_count; i++)
+      dst->packets[packet_base + i] = (struct drm_parhelia_packet) {
+         .offset = e->packets[i].offset + command_base,
+         .length = e->packets[i].length,
+      };
+   for (unsigned i = 0; i < e->reloc_count; i++) {
+      struct drm_parhelia_reloc *out = &dst->relocs[dst->reloc_count + i];
 
-      cmd[0] = header;
+      *out = e->relocs[i];
+      out->packet += packet_base;
+      if (out->type == PH_RELOC_STREAM_BASE)
+         out->delta += vertex_base * 4;
+   }
+   dst->command_count += e->command_count;
+   dst->packet_count += e->packet_count;
+   dst->reloc_count += e->reloc_count;
+   for (unsigned k = 0; k < r->draws; k++) {
+      const unsigned run = packet_run(r->prim, r->per_packet,
+                                      r->vertices - consumed);
+      uint32_t *cmd = dst->commands + dst->command_count;
+
+      cmd[0] = r->header;
       cmd[1] = 0;
       cmd[2] = 0;
-      batch->packets[batch->packet_count] = (struct drm_parhelia_packet) {
-         .offset = batch->command_count, .length = 3,
+      dst->packets[dst->packet_count] = (struct drm_parhelia_packet) {
+         .offset = dst->command_count, .length = 3,
       };
-      batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
-         .packet = batch->packet_count,
-         .dword = (base + consumed * stride) * 4,
-         .delta = run * stride * 4,
+      dst->relocs[dst->reloc_count++] = (struct drm_parhelia_reloc) {
+         .packet = dst->packet_count,
+         .dword = (vertex_base + r->base + consumed * r->stride) * 4,
+         .delta = run * r->stride * 4,
          .type = PARHELIA_RELOC_DRAW,
       };
-      batch->packet_count++;
-      batch->command_count += 3;
+      dst->packet_count++;
+      dst->command_count += 3;
       consumed += run;
    }
    return 0;
+}
+
+int
+parhelia_batch_replay_materialize(struct parhelia_batch *batch,
+                                  struct parhelia_batch_replay *r)
+{
+   unsigned commands, packets, relocs;
+   int ret;
+
+   parhelia_batch_replay_counts(r, &commands, &packets, &relocs);
+   if (commands > PH_BATCH_DWORDS || packets > PH_BATCH_PACKETS ||
+       relocs > PH_BATCH_RELOCS)
+      return -E2BIG;
+   batch->command_count = batch->packet_count = batch->reloc_count = 0;
+   ret = state_cache_replay_at(batch, r, 0);
+   r->entry = NULL;
+   return ret;
+}
+
+int
+parhelia_batch_append_replay_limited(struct parhelia_batch *dst,
+                                     uint32_t *dst_vertices,
+                                     unsigned *dst_vertex_dwords,
+                                     const struct parhelia_batch_replay *r,
+                                     const void *src_vertices,
+                                     unsigned src_vertex_dwords,
+                                     const struct parhelia_batch_limits *limits,
+                                     bool call_boundary)
+{
+   const unsigned vertex_base = *dst_vertex_dwords;
+   unsigned commands, packets, relocs;
+
+   parhelia_batch_replay_counts(r, &commands, &packets, &relocs);
+   call_boundary = call_boundary && dst->packet_count;
+   if (commands > limits->command_dwords - dst->command_count ||
+       packets > limits->packets - dst->packet_count ||
+       relocs + call_boundary > limits->relocs - dst->reloc_count ||
+       src_vertex_dwords > limits->vertex_dwords - vertex_base)
+      return -E2BIG;
+   /* the draws' ranges must lie in the appended vertices */
+   if (r->base + r->vertices * r->stride > src_vertex_dwords)
+      return -EINVAL;
+   if (call_boundary)
+      dst->relocs[dst->reloc_count++] = (struct drm_parhelia_reloc) {
+         .packet = dst->packet_count,
+         .type = PARHELIA_RELOC_CALL_BOUNDARY,
+      };
+   if (src_vertex_dwords && src_vertices != dst_vertices + vertex_base)
+      memmove(dst_vertices + vertex_base, src_vertices,
+              src_vertex_dwords * sizeof(dst_vertices[0]));
+   *dst_vertex_dwords += src_vertex_dwords;
+   return state_cache_replay_at(dst, r, vertex_base);
 }
 
 int
@@ -1756,6 +1847,22 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
                                       const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS],
                                       const struct p3d_state *state,
                                       unsigned vertices)
+{
+   return parhelia_batch_state_run_units_deferred(cache, batch, colour_handle,
+                                                  depth_handle,
+                                                  texture_handles, state,
+                                                  vertices, NULL);
+}
+
+int
+parhelia_batch_state_run_units_deferred(struct parhelia_state_cache *cache,
+                                        struct parhelia_batch *batch,
+                                        uint32_t colour_handle,
+                                        uint32_t depth_handle,
+                                        const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS],
+                                        const struct p3d_state *state,
+                                        unsigned vertices,
+                                        struct parhelia_batch_replay *replay)
 {
    struct state_cache_entry **slot, *e;
    unsigned per_packet, draws;
@@ -1785,15 +1892,25 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
       fprintf(stderr, "parhelia: state cache %lu hits, %lu misses, %u entries\n",
               cache->hits, cache->misses, cache->count);
    if (*slot) {
+      struct parhelia_batch_replay hit;
+
       cache->hits++;
       (*slot)->hits++;
-      ret = state_cache_replay(batch, *slot, state, draws, per_packet,
-                               vertices);
+      state_cache_replay_init(&hit, *slot, state, draws, per_packet,
+                              vertices);
       /* under the span rule each large draw may take a CALL */
-      cache->last_calls = ret || (*slot)->calls < 0 ? -1 :
+      cache->last_calls = (*slot)->calls < 0 ? -1 :
                           (*slot)->calls +
                           (split_multi_draws ? (int)draws : 0);
       cache->last_stages = (*slot)->stages;
+      if (replay && !cache->verify && (*slot)->calls >= 0) {
+         *replay = hit;
+         batch->command_count = batch->packet_count = batch->reloc_count = 0;
+         return 0;
+      }
+      ret = parhelia_batch_replay_materialize(batch, &hit);
+      if (ret)
+         cache->last_calls = -1;
       if (ret || !cache->verify)
          return ret;
       /* PARHELIA_STATE_CACHE_VERIFY=1: rebuild and compare every hit */

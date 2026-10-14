@@ -227,6 +227,38 @@ void parhelia_state_cache_destroy(struct parhelia_state_cache *cache);
  * as if submitted alone, and its vertex-program binds; -1 if unknown. */
 int parhelia_state_cache_last_calls(const struct parhelia_state_cache *cache,
                                     unsigned *stages);
+struct state_cache_entry;
+
+/* A state-cache hit not yet copied anywhere: its prefix and draw packets go
+ * straight into the stream they are appended to. */
+struct parhelia_batch_replay {
+   const struct state_cache_entry *entry;   /* NULL: nothing deferred */
+   const float *mvp;
+   uint32_t header, limit;
+   unsigned base, stride, draws, per_packet, vertices;
+   enum p3d_prim prim;
+};
+
+void parhelia_batch_replay_counts(const struct parhelia_batch_replay *replay,
+                                  unsigned *commands, unsigned *packets,
+                                  unsigned *relocs);
+int parhelia_batch_replay_materialize(struct parhelia_batch *batch,
+                                      struct parhelia_batch_replay *replay);
+int parhelia_batch_append_replay_limited(
+   struct parhelia_batch *dst, uint32_t *dst_vertices,
+   unsigned *dst_vertex_dwords, const struct parhelia_batch_replay *replay,
+   const void *src_vertices, unsigned src_vertex_dwords,
+   const struct parhelia_batch_limits *limits, bool call_boundary);
+/* As parhelia_batch_state_run_units_cached(); a hit with @replay set is
+ * recorded there instead of written to @batch. */
+int parhelia_batch_state_run_units_deferred(struct parhelia_state_cache *cache,
+                                            struct parhelia_batch *batch,
+                                            uint32_t colour_handle,
+                                            uint32_t depth_handle,
+                                            const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS],
+                                            const struct p3d_state *state,
+                                            unsigned vertices,
+                                            struct parhelia_batch_replay *replay);
 int parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
                                           struct parhelia_batch *batch,
                                           uint32_t colour_handle,
