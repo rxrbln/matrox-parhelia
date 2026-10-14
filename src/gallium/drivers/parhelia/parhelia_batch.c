@@ -71,6 +71,16 @@ parhelia_batch_set_split_multi_draws(bool enable)
    split_multi_draws = enable;
 }
 
+/* The kernel copies a large draw's vertices in front of its header, so the
+ * draw opens a CALL span (PARHELIA_PARAM_INLINE_DRAWS). */
+static bool inline_draws;
+
+void
+parhelia_batch_set_inline_draws(bool enable)
+{
+   inline_draws = enable;
+}
+
 /* A 0x97 draw whose range of @bytes needs a CALL span of its own. */
 static bool
 batch_multi_draw(uint32_t header, uint32_t bytes)
@@ -179,7 +189,8 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
             run_words = 0;
          }
          /* the kernel's span rule for large draws */
-         if (active && is_draw && run_draws && (multi || run_multi)) {
+         if (active && is_draw && ((run_draws && (multi || run_multi)) ||
+                                   (inline_draws && multi))) {
             count++;
             active = false;
             run_words = 0;
@@ -1107,6 +1118,7 @@ struct state_cache_entry {
    struct drm_parhelia_reloc *relocs;
    unsigned command_count, packet_count, reloc_count;
    int mvp_offset;               /* the matrix's dwords in commands, or -1 */
+   int limit_offset;             /* an indexed prefix's 0x1060 operand, or -1 */
    int calls;                    /* packed CALLs of the batch alone, or -1 */
    unsigned stages;              /* its vertex-program binds (stage CALLs) */
    unsigned long hits;
@@ -1300,6 +1312,7 @@ state_key_build(struct parhelia_state_cache *c, const struct p3d_state *input,
    /* the pointed-to data follows below; the key buffer is malloc-aligned */
    s = (struct p3d_state *)c->key;
    s->fence = 0;
+   s->indexed_vertices = !!input->indexed_vertices;
    s->fog_table = NULL;
    s->mvp = s->vs_const = s->aux_const = NULL;
    s->comb = NULL;
@@ -1418,8 +1431,10 @@ state_cache_grow(struct parhelia_state_cache *c)
 /* The prefix of a freshly built batch: its packets before the first draw,
  * provided the rest is exactly @draws DRAW-relocated draw packets. */
 static struct state_cache_entry *
-state_cache_capture(const struct parhelia_batch *batch, unsigned draws)
+state_cache_capture(const struct parhelia_batch *batch, unsigned draws,
+                    bool indexed)
 {
+   const uint32_t opcode = indexed ? 0x9f : 0x97;
    struct state_cache_entry *e;
    unsigned first, relocs = 0;
 
@@ -1428,7 +1443,7 @@ state_cache_capture(const struct parhelia_batch *batch, unsigned draws)
    first = batch->packet_count - draws;
    for (unsigned i = first; i < batch->packet_count; i++)
       if (batch->packets[i].length != 3 ||
-          (batch->commands[batch->packets[i].offset] >> 24) != 0x97 ||
+          (batch->commands[batch->packets[i].offset] >> 24) != opcode ||
           batch->packets[i].offset != batch->packets[first].offset + 3 * (i - first))
          return NULL;
    if (batch->packets[first].offset + 3 * draws != batch->command_count)
@@ -1458,7 +1473,38 @@ state_cache_capture(const struct parhelia_batch *batch, unsigned draws)
    memcpy(e->packets, batch->packets, first * sizeof(*e->packets));
    memcpy(e->relocs, batch->relocs, relocs * sizeof(*e->relocs));
    e->mvp_offset = -1;
+   e->limit_offset = -1;
    return e;
+}
+
+/* The last 0x1060 write of a prefix: the direct-fetch vertex limit. */
+static int
+state_cache_find_limit(const struct state_cache_entry *e)
+{
+   const unsigned index = (P3D_R_VTXCAP - P3D_REG_BASE) / 4;
+   int found = -1;
+
+   for (unsigned i = 0; i < e->packet_count; i++) {
+      const uint32_t *cmd = e->commands + e->packets[i].offset;
+      const unsigned len = e->packets[i].length;
+      unsigned pos = 1;
+
+      if (cmd[0] >> 24)
+         continue;
+      while (pos < len) {
+         const uint32_t tag = cmd[pos++];
+
+         for (unsigned slot = 0; slot < 4 && pos < len; slot++, pos++) {
+            const unsigned reg = (tag >> (8 * slot)) & 0xff;
+
+            if (reg == 0x21)
+               break;
+            if (reg == index)
+               found = (int)(e->packets[i].offset + pos);
+         }
+      }
+   }
+   return found;
 }
 
 /* The one constant load at slot 0 holding @mvp verbatim, or -1. */
@@ -1497,8 +1543,12 @@ state_cache_replay(struct parhelia_batch *batch,
                    const struct p3d_state *state, unsigned draws,
                    unsigned per_packet, unsigned vertices)
 {
-   const uint32_t header = 0x97000000u |
+   const uint32_t header = state->indexed_vertices ? 0x9f000001u :
+                           0x97000000u |
                            (((state->dw_per_vertex - 1) & 0x3f) << 17) | 1u;
+   /* indices follow the batch's vertices */
+   const unsigned base = state->indexed_vertices * state->dw_per_vertex;
+   const unsigned stride = state->indexed_vertices ? 1 : state->dw_per_vertex;
    unsigned consumed = 0;
 
    if (e->command_count + 3 * draws > PH_BATCH_DWORDS ||
@@ -1508,6 +1558,11 @@ state_cache_replay(struct parhelia_batch *batch,
    memcpy(batch->commands, e->commands, e->command_count * sizeof(uint32_t));
    if (e->mvp_offset >= 0)
       memcpy(batch->commands + e->mvp_offset, state->mvp, 16 * sizeof(float));
+   if (state->indexed_vertices) {
+      if (e->limit_offset < 0)
+         return -EINVAL;
+      batch->commands[e->limit_offset] = state->indexed_vertices;
+   }
    memcpy(batch->packets, e->packets, e->packet_count * sizeof(*e->packets));
    memcpy(batch->relocs, e->relocs, e->reloc_count * sizeof(*e->relocs));
    batch->command_count = e->command_count;
@@ -1526,8 +1581,8 @@ state_cache_replay(struct parhelia_batch *batch,
       };
       batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
          .packet = batch->packet_count,
-         .dword = consumed * state->dw_per_vertex * 4,
-         .delta = run * state->dw_per_vertex * 4,
+         .dword = (base + consumed * stride) * 4,
+         .delta = run * stride * 4,
          .type = PARHELIA_RELOC_DRAW,
       };
       batch->packet_count++;
@@ -1553,7 +1608,7 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
 
    if (cache)
       cache->last_calls = -1;
-   if (!cache || !state || state->bound_ranges || state->indexed_vertices)
+   if (!cache || !state || state->bound_ranges)
       return parhelia_batch_state_run_units(batch, colour_handle, depth_handle,
                                             texture_handles, state, vertices);
    per_packet = state->vertices_per_packet ? state->vertices_per_packet :
@@ -1617,9 +1672,17 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
       state_cache_flush(cache);
       slot = state_cache_find(cache, hash);
    }
-   e = state_cache_capture(batch, draws);
+   e = state_cache_capture(batch, draws, state->indexed_vertices);
    if (!e)
       return 0;
+   if (state->indexed_vertices) {
+      e->limit_offset = state_cache_find_limit(e);
+      if (e->limit_offset < 0 ||
+          e->commands[e->limit_offset] != state->indexed_vertices) {
+         state_cache_entry_free(e);
+         return 0;
+      }
+   }
    if (state_mvp_patchable(state)) {
       e->mvp_offset = state_cache_find_mvp(e, state->mvp);
       if (e->mvp_offset < 0) {
@@ -1814,6 +1877,14 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
          if (stream_packet != UINT32_MAX)
             return -EINVAL;
          stream_packet = i;
+         /* in packet order, so a cached prefix holds it */
+         if (indexed_vertices) {
+            if (batch->reloc_count >= PH_BATCH_RELOCS)
+               return -EINVAL;
+            batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
+               .packet = i, .dword = 2, .type = PH_RELOC_STREAM_BASE,
+            };
+         }
       }
       unsigned pos = 1;
       while (pos < call->sec_len) {
@@ -1859,12 +1930,8 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
           !!(texture_handles && texture_handles[u]))
          return -EINVAL;
    if (indexed_vertices) {
-      if (stream_packet == UINT32_MAX ||
-          batch->reloc_count >= PH_BATCH_RELOCS)
+      if (stream_packet == UINT32_MAX)
          return -EINVAL;
-      batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
-         .packet = stream_packet, .dword = 2, .type = PH_RELOC_STREAM_BASE,
-      };
    } else if (bound_ranges) {
       if (stream_packet == UINT32_MAX ||
           batch->reloc_count >= PH_BATCH_RELOCS)

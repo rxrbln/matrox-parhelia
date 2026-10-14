@@ -1749,6 +1749,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param split_multi = {
       .param = PARHELIA_PARAM_SPLIT_MULTI_DRAWS,
    };
+   struct drm_parhelia_get_param inline_draws = {
+      .param = PARHELIA_PARAM_INLINE_DRAWS,
+   };
    struct drm_parhelia_get_param max_packets = {
       .param = PARHELIA_PARAM_MAX_PACKETS,
    };
@@ -1838,6 +1841,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &split_multi) &&
       split_multi.value == 1;
    parhelia_batch_set_split_multi_draws(s->split_multi_draws);
+   parhelia_batch_set_inline_draws(
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &inline_draws) &&
+      inline_draws.value == 1);
    /* Indexed draws: the kernel says how many triangles one packet takes. */
    s->indexed_tris = s->draw_ranges && ph_env("PARHELIA_INDEXED") &&
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &indexed) ?

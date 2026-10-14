@@ -199,6 +199,9 @@ struct drm_parhelia_upload_render {
 /* A 0x97 draw of more than six vertices runs in a CALL span without any
  * other draw, and a run of draws may not carry one. */
 #define PARHELIA_PARAM_SPLIT_MULTI_DRAWS	36
+/* A 0x97 draw of more than six vertices also opens its CALL span: the
+ * kernel copies its vertices in front of its header (P690 inline draws). */
+#define PARHELIA_PARAM_INLINE_DRAWS	37
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
 /* Retired unsafe generic packing capability; kernels report zero. */

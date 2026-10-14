@@ -69,8 +69,8 @@ p3d_dwgctl(const struct p3d_state *st)
 
 	/* [7:4] is the raster op; 0xC is GXcopy, the engine's default and the
 	 * only code that leaves blending enabled. */
-	const uint32_t base = st->lx_vendor_dwgctl ?
-			      (0x00a60ec4u & ~0x00200000u) | 0x00100000u :
+	const uint32_t base = st->dwgctl_base ? st->dwgctl_base :
+			      st->lx_vendor_dwgctl ? 0x00a60ec4u & ~0x00200000u :
 			      0x00a60ec4u;
 
 	return (base & ~0xffu) | (rop << 4) | nibble;

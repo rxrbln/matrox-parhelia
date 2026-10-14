@@ -931,9 +931,11 @@ struct p3d_state {
 	 * cadence of KRN mtx1017, instead of once before the run. */
 	int		   stream_bind_per_draw;
 	/* LX family copied draws in the vendor PSER form (mtxpserd.dll under
-	 * faaemu): PRIMWORD bit 18 clear; DWGCTL bit 21 clear and bit 20 set. */
+	 * faaemu): PRIMWORD bit 18 clear, DWGCTL bit 21 clear.  The PSER's bit
+	 * 20 is D3D's integer pixel centres (measured), not an LX value. */
 	int		   lx_vendor_primword;
 	int		   lx_vendor_dwgctl;
+	uint32_t	   dwgctl_base;	/* diagnostic 3-D DWGCTL, 0 = derived */
 	uint32_t	   fence;	/* first fence tag; steps by 8 per draw */
 };
 

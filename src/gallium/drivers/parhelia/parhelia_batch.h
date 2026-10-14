@@ -131,6 +131,7 @@ void parhelia_batch_set_compact_transform(bool enable);
 /* The kernel gives draws of more than six vertices CALL spans of their own
  * (PARHELIA_PARAM_SPLIT_MULTI_DRAWS); CALL counts and draw runs follow it. */
 void parhelia_batch_set_split_multi_draws(bool enable);
+void parhelia_batch_set_inline_draws(bool enable);
 /* One-shot Z-unit control words for @depth_handle, in order (probes). */
 int parhelia_batch_zcontrol(struct parhelia_batch *batch,
                             uint32_t depth_handle, unsigned pitch,
