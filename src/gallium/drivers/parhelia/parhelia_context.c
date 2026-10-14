@@ -1151,7 +1151,9 @@ ph_create_vertex_ring(struct ph_context *ctx)
     * CREATE_VERTEX ABI even when a kernel reports sixteen async slots. */
    slot_count = ph_vertex_ring_slot_count(screen->async_slots, slot_bytes,
                                           MIN2(screen->vertex_bo_max,
-                                               PH_VRAM_VERTEX_RING_BYTES));
+                                               ph_lx_family(screen->chip_id) ?
+                                                  PH_VRAM_VERTEX_RING_BYTES_LX :
+                                                  PH_VRAM_VERTEX_RING_BYTES));
    if (!slot_count)
       return;
    create.size = slot_count * slot_bytes;

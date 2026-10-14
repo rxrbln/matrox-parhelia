@@ -30,6 +30,9 @@
  * miss on every line.  64 Ki-dword slots hold a q3 frame's part between its
  * clear, fill and present drains. */
 #define PH_VRAM_VERTEX_RING_BYTES (1u << 20)
+/* The P690: four such slots make the CPU wait for slot fences (nano q3
+ * 640x360: 2 waits a frame, 83.1 -> 77.7 fps); fifteen do not. */
+#define PH_VRAM_VERTEX_RING_BYTES_LX (1u << 22)
 #define PH_VRAM_VERTEX_SLOT_DWORDS (64u * 1024u)
 
 /* 0x2537, 0x2538 and 0x2539 are the LX/P650/P750/P690 family: the vendor's
