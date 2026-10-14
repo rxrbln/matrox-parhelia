@@ -1853,15 +1853,22 @@ parhelia_batch_append_limited(struct parhelia_batch *dst,
        src_vertex_dwords > limits->vertex_dwords - *dst_vertex_dwords)
       return -E2BIG;
 
+   command_base = dst->command_count;
+   packet_base = dst->packet_count;
+   vertex_base = *dst_vertex_dwords;
+   /* checked while copied: dst's counts only move once all of it passed */
    for (unsigned i = 0; i < src->packet_count; i++) {
       const struct drm_parhelia_packet *packet = &src->packets[i];
 
       if (packet->offset > src->command_count ||
           packet->length > src->command_count - packet->offset)
          return -EINVAL;
+      dst->packets[packet_base + i] = (struct drm_parhelia_packet) {
+         .offset = packet->offset + command_base, .length = packet->length };
    }
    for (unsigned i = 0; i < src->reloc_count; i++) {
       const struct drm_parhelia_reloc *reloc = &src->relocs[i];
+      struct drm_parhelia_reloc *out = &dst->relocs[dst->reloc_count + i];
 
       /* Production aggregation accepts only the normal state-builder ABI.
        * Mode-7 stream/index offsets have different meanings and remain in
@@ -1871,6 +1878,8 @@ parhelia_batch_append_limited(struct parhelia_batch *dst,
            reloc->type != PARHELIA_RELOC_DRAW &&
            reloc->type != PH_RELOC_STREAM_BASE))
          return -EINVAL;
+      *out = *reloc;
+      out->packet += packet_base;
       if (reloc->type == PARHELIA_RELOC_DRAW) {
          uint64_t end = (uint64_t)reloc->dword + reloc->delta;
 
@@ -1879,26 +1888,13 @@ parhelia_batch_append_limited(struct parhelia_batch *dst,
              reloc->delta > PH_BATCH_MAX_DRAW_DWORDS * sizeof(uint32_t) ||
              end > (uint64_t)src_vertex_dwords * 4)
             return -EINVAL;
+         out->dword += vertex_base * 4;
+      } else if (reloc->type == PH_RELOC_STREAM_BASE) {
+         out->delta += vertex_base * 4;
       }
    }
-
-   command_base = dst->command_count;
-   packet_base = dst->packet_count;
-   vertex_base = *dst_vertex_dwords;
    memcpy(dst->commands + command_base, src->commands,
           src->command_count * sizeof(src->commands[0]));
-   for (unsigned i = 0; i < src->packet_count; i++) {
-      dst->packets[packet_base + i] = src->packets[i];
-      dst->packets[packet_base + i].offset += command_base;
-   }
-   for (unsigned i = 0; i < src->reloc_count; i++) {
-      dst->relocs[dst->reloc_count + i] = src->relocs[i];
-      dst->relocs[dst->reloc_count + i].packet += packet_base;
-      if (src->relocs[i].type == PARHELIA_RELOC_DRAW)
-         dst->relocs[dst->reloc_count + i].dword += vertex_base * 4;
-      if (src->relocs[i].type == PH_RELOC_STREAM_BASE)
-         dst->relocs[dst->reloc_count + i].delta += vertex_base * 4;
-   }
    /* the caller may have staged the vertices in place already */
    if (src_vertex_dwords && src_vertices != dst_vertices + vertex_base)
       memmove(dst_vertices + vertex_base, src_vertices,
