@@ -1858,10 +1858,12 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
       inline_draws.value == 1);
    /* Indexed draws: the kernel says how many triangles one packet takes.
     * On by default on the original family (q3 720p on the 0528: 105k ->
-    * 70k vertex dwords, 48.0 -> 46.3 ms); PARHELIA_INDEXED overrides. */
+    * 70k vertex dwords, 48.0 -> 46.3 ms) and the P690 (q3 720p on nano:
+    * 135k -> 87k vertex dwords); PARHELIA_INDEXED overrides. */
    s->indexed_tris = s->draw_ranges &&
       debug_get_bool_option("PARHELIA_INDEXED",
-                            ph_original_family(s->chip_id)) &&
+                            ph_original_family(s->chip_id) ||
+                            s->chip_id == 0x2539) &&
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &indexed) ?
       (unsigned)indexed.value : 0;
    /* Native 8- and 16-bit sampler storage is on where its texel order has

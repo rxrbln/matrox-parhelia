@@ -624,6 +624,7 @@ struct ph_context {
    /* Primitives carried by one draw packet.  The vendor's own packets hold
     * 24 vertices; one packet per primitive is the conservative fallback. */
    unsigned prims_per_packet;
+   unsigned indexed_prims_per_packet;	/* triangles per indexed (0x9f) packet */
    /* Submission fallback is a property of this context.  One client's
     * transient DMA allocation failure must not change another context's
     * execution path through mutable pipe_screen state. */
@@ -4418,8 +4419,7 @@ ph_batch_primitives_units(struct ph_context *ctx, struct parhelia_batch *batch,
    unsigned group = state->prim == P3D_TRIANGLES ? ctx->prims_per_packet : 1;
 
    if (state->indexed_vertices)
-      group = MIN2(ph_screen(ctx->base.screen)->indexed_tris,
-                   MAX2(ctx->prims_per_packet, 1u));
+      group = ctx->indexed_prims_per_packet;
 
    if (!per_prim || !primitives)
       return -EINVAL;
@@ -16554,6 +16554,13 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
               ctx->prims_per_packet);
       ctx->prims_per_packet = 2;
    }
+   /* P690 0x9f packets draw up to the kernel's cap exactly
+    * (--indexed-run-probe: 1-20 triangles with shared vertices). */
+   ctx->indexed_prims_per_packet =
+      MIN2(ph_screen(screen)->indexed_tris,
+           lx ? debug_get_num_option("PARHELIA_INDEXED_PRIMS_PER_PACKET",
+                                     ph_screen(screen)->indexed_tris) :
+                MAX2(ctx->prims_per_packet, 1u));
    if (ctx->aggregate_state_batches && ph_env("PARHELIA_TRACE_BATCH"))
       fprintf(stderr,
               "parhelia: preserving per-state EOB/DWGSYNC boundaries inside aggregate submits\n");
