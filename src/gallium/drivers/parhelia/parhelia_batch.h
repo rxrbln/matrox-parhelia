@@ -321,12 +321,13 @@ int parhelia_batch_submit_vram_async_bounded(
    int fd, const struct parhelia_batch *batch, uint32_t vertex_handle,
    uint32_t vertex_offset, unsigned vertex_dwords, uint32_t *fence);
 /* The same with one PARHELIA_RELOC_DRAW_RANGES for every draw packet: each
- * draw's range is written into its packet.  -ENOTSUP for a batch that needs
- * the per-packet form. */
+ * draw's range is written into its packet, and with @draw_runs adjacent
+ * identical-header draws share one packet entry.  -ENOTSUP for a batch that
+ * needs the per-packet form. */
 int parhelia_batch_submit_ranges_async(
    int fd, struct parhelia_batch *batch, uint32_t vertex_handle,
    uint32_t vertex_offset, unsigned vertex_dwords, bool call_boundaries,
-   uint32_t *fence);
+   bool draw_runs, uint32_t *fence);
 
 /* Deliberately narrow P690 mode-7 exercise builder.  It is for the DRM
  * screen test only: one untextured interleaved class-3 stream and one u32

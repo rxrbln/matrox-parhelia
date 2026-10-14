@@ -1726,6 +1726,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param indexed = {
       .param = PARHELIA_PARAM_INDEXED_DRAWS,
    };
+   struct drm_parhelia_get_param draw_runs = {
+      .param = PARHELIA_PARAM_DRAW_RUNS,
+   };
    struct drm_parhelia_get_param max_packets = {
       .param = PARHELIA_PARAM_MAX_PACKETS,
    };
@@ -1807,6 +1810,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
       debug_get_bool_option("PARHELIA_DRAW_RANGES", true) &&
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &draw_ranges) &&
       draw_ranges.value == 1;
+   s->draw_runs = s->draw_ranges &&
+      debug_get_bool_option("PARHELIA_DRAW_RUNS", true) &&
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &draw_runs) &&
+      draw_runs.value == 1;
    /* Indexed draws: the kernel says how many triangles one packet takes. */
    s->indexed_tris = s->draw_ranges && ph_env("PARHELIA_INDEXED") &&
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &indexed) ?

@@ -193,6 +193,9 @@ struct drm_parhelia_upload_render {
  * vertex range, and the stream 0 base operand of the direct-fetch state it
  * draws with is that range's byte offset | 3. */
 #define PARHELIA_PARAM_INDEXED_DRAWS	34
+/* Under DRAW_RANGES one packet may carry a run of identical-header 0x97
+ * draws back to back, each relocated like a lone one. */
+#define PARHELIA_PARAM_DRAW_RUNS	35
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
 /* Retired unsafe generic packing capability; kernels report zero. */

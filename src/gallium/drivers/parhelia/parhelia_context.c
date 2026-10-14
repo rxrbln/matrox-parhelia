@@ -1531,7 +1531,8 @@ ph_submit_batch_now_untimed(struct ph_context *ctx,
       ret = screen->draw_ranges ?
          parhelia_batch_submit_ranges_async(
             screen->fd, batch, ctx->vram_vertex_handle, offset,
-            vertex_dwords, boundary_aware, &ctx->fence) : -ENOTSUP;
+            vertex_dwords, boundary_aware, screen->draw_runs,
+            &ctx->fence) : -ENOTSUP;
       if (ret == -ENOTSUP)
          ret = boundary_aware ?
             parhelia_batch_submit_vram_async_bounded(

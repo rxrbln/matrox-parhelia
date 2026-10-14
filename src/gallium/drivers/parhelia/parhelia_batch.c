@@ -2589,16 +2589,23 @@ parhelia_batch_submit_vram_async(int fd, const struct parhelia_batch *batch,
    return 0;
 }
 
+/* the kernel's DMA block bound on one packet */
+#define PH_RUN_MAX_DWORDS 4095u
+
 int
 parhelia_batch_submit_ranges_async(
    int fd, struct parhelia_batch *batch, uint32_t vertex_handle,
    uint32_t vertex_offset, unsigned vertex_dwords, bool call_boundaries,
-   uint32_t *fence)
+   bool draw_runs, uint32_t *fence)
 {
    struct drm_parhelia_reloc relocs[PH_BATCH_RELOCS + 1];
+   struct drm_parhelia_packet runs[PH_BATCH_PACKETS];
+   uint16_t run_map[PH_BATCH_PACKETS];
+   bool draw[PH_BATCH_PACKETS] = { false }, other[PH_BATCH_PACKETS] = { false };
+   const struct drm_parhelia_packet *packets = batch ? batch->packets : NULL;
    struct drm_parhelia_submit submit;
    uint64_t bytes = (uint64_t)vertex_dwords * sizeof(uint32_t);
-   unsigned reloc_count = 0;
+   unsigned reloc_count = 0, packet_count = batch ? batch->packet_count : 0;
 
    if (!batch || !fence || batch->reloc_count > PH_BATCH_RELOCS ||
        !vertex_handle || !vertex_dwords || (vertex_offset & 3) ||
@@ -2622,6 +2629,8 @@ parhelia_batch_submit_ranges_async(
          continue;
       }
       if (src->type != PARHELIA_RELOC_DRAW) {
+         if (src->packet < batch->packet_count)
+            other[src->packet] = true;
          relocs[reloc_count++] = *src;
          continue;
       }
@@ -2635,6 +2644,32 @@ parhelia_batch_submit_ranges_async(
       cmd = batch->commands + batch->packets[src->packet].offset;
       cmd[1] = src->dword;
       cmd[2] = src->dword + src->delta;
+      draw[src->packet] = true;
+   }
+   if (draw_runs && batch->packet_count <= PH_BATCH_PACKETS) {
+      unsigned head = 0;
+
+      packet_count = 0;
+      for (unsigned i = 0; i < batch->packet_count; i++) {
+         const struct drm_parhelia_packet *p = &batch->packets[i];
+         struct drm_parhelia_packet *run = packet_count ?
+            &runs[packet_count - 1] : NULL;
+
+         /* a draw no other relocation names joins the run before it */
+         if (run && draw[head] && draw[i] && !other[i] &&
+             run->offset + run->length == p->offset &&
+             run->length + 3 <= PH_RUN_MAX_DWORDS &&
+             batch->commands[run->offset] == batch->commands[p->offset]) {
+            run->length += 3;
+         } else {
+            runs[packet_count++] = *p;
+            head = i;
+         }
+         run_map[i] = packet_count - 1;
+      }
+      for (unsigned r = 0; r < reloc_count; r++)
+         relocs[r].packet = run_map[relocs[r].packet];
+      packets = runs;
    }
    relocs[reloc_count++] = (struct drm_parhelia_reloc) {
       .dword = (uint32_t)bytes,
@@ -2644,10 +2679,10 @@ parhelia_batch_submit_ranges_async(
    };
    submit = (struct drm_parhelia_submit) {
       .commands = (uintptr_t)batch->commands,
-      .packets = (uintptr_t)batch->packets,
+      .packets = (uintptr_t)packets,
       .relocs = (uintptr_t)relocs,
       .command_dwords = batch->command_count,
-      .packet_count = batch->packet_count,
+      .packet_count = packet_count,
       .reloc_count = reloc_count,
       .flags = PARHELIA_SUBMIT_FENCE | PARHELIA_SUBMIT_ASYNC |
                (call_boundaries ? PARHELIA_SUBMIT_CALL_BOUNDARIES : 0),
