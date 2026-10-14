@@ -1621,7 +1621,8 @@ static int parhelia_transfer_render_ioctl(struct drm_device *drm, void *data,
 		bo->layout == PARHELIA_BO_LAYOUT_NATIVE_64X16)) ||
 	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_COLOR ||
 	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_DEPTH ||
-	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_SCANOUT) ||
+	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_SCANOUT ||
+	      bo->placement_class == PARHELIA_PLACEMENT_NATIVE_OFFSCREEN) ||
 	    args->offset >= gem->size || args->size > gem->size - args->offset) {
 		ret = -EINVAL;
 		goto out_gem;

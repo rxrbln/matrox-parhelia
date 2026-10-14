@@ -72,6 +72,12 @@
  * third 32 MiB band (bank B) so display refresh does not compete with the
  * colour and texture traffic of bank A. */
 #define PARHELIA_CREATE_RENDER_NATIVE_SCANOUT	(1u << 5)
+/* P690 2-D offscreen object (an X pixmap): native colour layout in bank A,
+ * opposite the display band, where it has room, else in bank B.  A BITBLT
+ * between the banks ran at 1904 MB/s, within either bank at 800 MB/s.  Its
+ * CPU view is the same as the native classes'.  Older kernels refuse the
+ * flag with -EINVAL. */
+#define PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN	(1u << 6)
 /* The three native classes report mmap_offset 0, yet their GEM mmap offset
  * (MAP_DUMB) is a CPU-linear view with GET_BO_INFO's host_pitch. */
 

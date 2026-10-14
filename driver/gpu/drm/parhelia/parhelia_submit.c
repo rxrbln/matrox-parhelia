@@ -2023,6 +2023,9 @@ static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 	if (pbo->placement_class == PARHELIA_PLACEMENT_NATIVE_SCANOUT)
 		return parhelia_vram_placement_range(bo, vram_size, false,
 						     2 * band_pages, 3 * band_pages);
+	/* Bank A first: TTM takes free room in either place before it evicts. */
+	if (pbo->placement_class == PARHELIA_PLACEMENT_NATIVE_OFFSCREEN)
+		return parhelia_vram_placement_range(bo, vram_size, true, 0, 0);
 	return parhelia_vram_placement_range(bo, vram_size, split_banks, 0, 0);
 }
 
@@ -2077,6 +2080,13 @@ static int parhelia_vram_placement_static_selftest(void)
 	    pbo.gbo.placement.num_placement != 1 ||
 	    pbo.gbo.placements[0].fpfn != 2 * band_pages ||
 	    pbo.gbo.placements[0].lpfn != 3 * band_pages)
+		return -EINVAL;
+	pbo.placement_class = PARHELIA_PLACEMENT_NATIVE_OFFSCREEN;
+	if (parhelia_vram_placement(&pbo.gbo, SZ_128M, false) ||
+	    pbo.gbo.placement.num_placement != 2 ||
+	    pbo.gbo.placements[0].fpfn || pbo.gbo.placements[0].lpfn != bank_pages ||
+	    pbo.gbo.placements[1].fpfn != bank_pages ||
+	    pbo.gbo.placements[1].lpfn != 2 * bank_pages)
 		return -EINVAL;
 	return 0;
 }
@@ -3738,7 +3748,8 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 			    PARHELIA_CREATE_RENDER_TEXTURE |
 			    PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 			    PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
-			    PARHELIA_CREATE_RENDER_NATIVE_SCANOUT) ||
+			    PARHELIA_CREATE_RENDER_NATIVE_SCANOUT |
+			    PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN) ||
 	    hweight32(args->flags) > 1 || (args->cpp && args->cpp != 4 &&
 					   args->cpp != 2) ||
 	    args->handle || args->pitch || args->size || args->mmap_offset)
@@ -3753,7 +3764,8 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 		return -EOPNOTSUPP;
 	if ((args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 			    PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
-			    PARHELIA_CREATE_RENDER_NATIVE_SCANOUT)) &&
+			    PARHELIA_CREATE_RENDER_NATIVE_SCANOUT |
+			    PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN)) &&
 	    (pdev->pdev->device != PARHELIA_P690 || pdev->vram_size < SZ_128M))
 		return -EOPNOTSUPP;
 	/* Legacy flags=0 retains the exact-anchor policy.  Explicit P690 colour
@@ -3764,7 +3776,8 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 				       PARHELIA_CREATE_RENDER_TEXTURE |
 				       PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 				       PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
-				       PARHELIA_CREATE_RENDER_NATIVE_SCANOUT)) ?
+				       PARHELIA_CREATE_RENDER_NATIVE_SCANOUT |
+				       PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN)) ?
 			      SZ_32M / PAGE_SIZE :
 			      max_t(unsigned long, 1, SZ_8K / PAGE_SIZE);
 	/* Tiled surfaces occupy complete hardware tile rows.  Rounding only the
@@ -3834,6 +3847,9 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	else if (args->flags & PARHELIA_CREATE_RENDER_NATIVE_SCANOUT)
 		parhelia_bo_set_placement_class(bo,
 			PARHELIA_PLACEMENT_NATIVE_SCANOUT);
+	else if (args->flags & PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN)
+		parhelia_bo_set_placement_class(bo,
+			PARHELIA_PLACEMENT_NATIVE_OFFSCREEN);
 	else if (!args->flags && parhelia_original_family(pdev) &&
 		 bo_size <= SZ_16M)
 		parhelia_bo_set_placement_class(bo, PARHELIA_PLACEMENT_WINDOWED);
@@ -3841,7 +3857,8 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 		parhelia_bo_make_unmappable(bo);
 	} else if (args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 				  PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
-				  PARHELIA_CREATE_RENDER_NATIVE_SCANOUT)) {
+				  PARHELIA_CREATE_RENDER_NATIVE_SCANOUT |
+				  PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN)) {
 		ret = parhelia_bo_init_host_view(bo, cpp, allocation_height);
 		if (ret) {
 			drm_gem_object_put(&bo->bo.base);
@@ -3871,7 +3888,8 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	ret = drm_gem_handle_create(file, &bo->bo.base, &handle);
 	if (!ret && !(args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 				  PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
-				  PARHELIA_CREATE_RENDER_NATIVE_SCANOUT)) &&
+				  PARHELIA_CREATE_RENDER_NATIVE_SCANOUT |
+				  PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN)) &&
 	    (layout != PARHELIA_BO_LAYOUT_TEXTURE ||
 		     !parhelia_texture_upload_enabled()))
 		args->mmap_offset = drm_vma_node_offset_addr(&bo->bo.base.vma_node);
