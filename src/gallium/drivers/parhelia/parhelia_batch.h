@@ -18,8 +18,15 @@
 #define PH_BATCH_MAX_DRAW_DWORDS 4096
 #define PH_BATCH_STATE_PACKET_RESERVE 64
 #define PH_BATCH_MAX_DRAWS (PH_BATCH_PACKETS - PH_BATCH_STATE_PACKET_RESERVE)
-/* Vertices one draw packet may consume; the vendor's own packets hold 24. */
+/* Vertices of the probe tables' widest packet. */
 #define PH_BATCH_MAX_PACKET_VERTICES 64u
+/* Vertices one draw packet of @dw_per_vertex dwords may consume: the
+ * kernel's bound on one draw's range. */
+static inline unsigned
+ph_batch_packet_vertex_cap(unsigned dw_per_vertex)
+{
+   return dw_per_vertex ? PH_BATCH_MAX_DRAW_DWORDS / dw_per_vertex : 0;
+}
 /* Mesa-private relocation: the stream 0 base operand (@dword) of an indexed
  * batch's direct-fetch state, @delta bytes into its vertex stream.  It is
  * rebased like a DRAW range and written as an offset | 3 before a

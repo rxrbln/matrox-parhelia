@@ -1175,14 +1175,18 @@ ph_prime_warp(struct ph_context *ctx)
       .width = 64, .height = 16,
    };
    struct parhelia_batch *batch = &ctx->build_batch;
-   float point[PH_BATCH_MAX_PACKET_VERTICES][5];
    const unsigned group = MIN2(MAX2(ctx->prims_per_packet, 1u),
-                               PH_BATCH_MAX_PACKET_VERTICES / 3);
+                               ph_batch_packet_vertex_cap(5) / 3);
+   float (*point)[5];
    uint32_t fence = 0;
 
    if ((screen->chip_id != 0x2539 && !ph_original_family(screen->chip_id)) ||
-       ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &target))
+       !(point = calloc(3 * group, sizeof(*point))))
       return;
+   if (ioctl(screen->fd, DRM_IOCTL_PARHELIA_CREATE_RENDER, &target)) {
+      free(point);
+      return;
+   }
    struct p3d_state state = {
       .colour = {.pitch = target.pitch / 4, .fmt = 0x32},
       .screen_w = 64, .screen_h = 16, .prim = P3D_TRIANGLES,
@@ -1201,6 +1205,7 @@ ph_prime_warp(struct ph_context *ctx)
        !parhelia_batch_submit_async(screen->fd, batch, point, 15 * group,
                                     &fence))
       parhelia_wait_fence(screen->fd, fence, 2000000000ll, NULL);
+   free(point);
    struct drm_gem_close close_bo = {.handle = target.handle};
    ioctl(screen->fd, DRM_IOCTL_GEM_CLOSE, &close_bo);
 }
@@ -4423,8 +4428,8 @@ ph_batch_primitives_units(struct ph_context *ctx, struct parhelia_batch *batch,
        !state->indexed_vertices && group * per_prim > 6 &&
        primitives > group * (PH_BATCH_HW_CALLS / 2))
       group = DIV_ROUND_UP(primitives, PH_BATCH_HW_CALLS / 2);
-   if (group > PH_BATCH_MAX_PACKET_VERTICES / per_prim)
-      group = PH_BATCH_MAX_PACKET_VERTICES / per_prim;
+   if (group > ph_batch_packet_vertex_cap(state->dw_per_vertex) / per_prim)
+      group = ph_batch_packet_vertex_cap(state->dw_per_vertex) / per_prim;
    if (group > primitives)
       group = primitives;
    state->vertices_per_packet = group * per_prim;
@@ -16429,14 +16434,15 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    const bool lx = ph_lx_family(ph_screen(screen)->chip_id);
 
    ph_unorm8_bits_init();
-   /* With the kernel's span rule the P690 takes the largest packets the
-    * batch allows: 21 triangles cut ioquake3's CPU per frame 11.7 -> 9.6 ms
-    * on nano, where four (12.5 ms) lose to the extra CALL per packet. */
+   /* With the kernel's span rule the P690 takes packets as large as the
+    * vertex layout allows, like the vendor: ioquake3 CPU per frame on nano
+    * 11.7 ms at two triangles, 9.7 at 21, 9.5 at 85-170; four (12.5 ms)
+    * lose to the extra CALL per packet. */
    ctx->prims_per_packet =
       debug_get_num_option("PARHELIA_PRIMS_PER_PACKET",
                            !lx ? 8 :
                            ph_screen(screen)->split_multi_draws ?
-                              PH_BATCH_MAX_PACKET_VERTICES / 3 : 2);
+                              PH_BATCH_MAX_DRAW_DWORDS : 2);
    if (ctx->prims_per_packet < 1)
       ctx->prims_per_packet = 1;
    /* Larger packets need the kernel to keep them out of shared spans. */

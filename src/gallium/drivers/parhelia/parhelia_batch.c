@@ -886,7 +886,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
        ((input->prim != P3D_TRIANGLES && input->prim != P3D_LINES &&
          input->prim != P3D_POINTS) && !input->vertices_per_packet) ||
        (input->vertices_per_packet &&
-        (input->vertices_per_packet > PH_BATCH_MAX_PACKET_VERTICES ||
+        (input->vertices_per_packet >
+            ph_batch_packet_vertex_cap(input->dw_per_vertex) ||
          input->vertices_per_packet <
             p3d_minimum_vertices(input->prim) ||
          input->vertices_per_packet %
