@@ -9599,14 +9599,11 @@ ph_tcl_constant_colour(struct ph_context *ctx, const struct ph_tcl_layout *lay,
  * one per clipper plane it lies outside of. */
 #define PH_TCL_VCODE_INSIDE 0x80u
 
-static inline uint8_t
-ph_tcl_vertex_code(const struct ph_tcl_run *r, const float c[4])
+static uint8_t
+ph_tcl_vertex_code_float(const float c[4], const float p[5])
 {
-   /* ph_tcl_plane_distance() < 0 for each plane, its products once */
    const float x = c[0], y = c[1], z = c[2], w = c[3];
-   const float iw = (1.0f - 1.0f / 65536.0f) * w;
-   const float px = r->cx * iw, py = r->cy * iw;
-   const float gx = r->gx * w, gy = r->gy * w;
+   const float iw = p[0], px = p[1], py = p[2], gx = p[3], gy = p[4];
    uint8_t code = (w < 2e-6f) | (z < -iw) << 1 | (z > iw) << 2 |
                   (x > px) << 3 | (x < -px) << 4 | (y > py) << 5 |
                   (y < -py) << 6;
@@ -9614,6 +9611,50 @@ ph_tcl_vertex_code(const struct ph_tcl_run *r, const float c[4])
    if (w > 1e-6f && fabsf(x) <= gx && fabsf(y) <= gy && z >= -w && z <= w)
       code |= PH_TCL_VCODE_INSIDE;
    return code;
+}
+
+/* A float's order as a signed integer with -0 equal to +0 (NaN aside). */
+static inline int32_t
+ph_float_cmp_key(uint32_t bits)
+{
+   const int32_t m = bits & 0x7fffffffu, s = (int32_t)bits >> 31;
+
+   return (m ^ s) - s;
+}
+
+static inline uint8_t
+ph_tcl_vertex_code(const struct ph_tcl_run *r, const float c[4])
+{
+   /* ph_tcl_plane_distance() < 0 for each plane, its products once */
+   const float w = c[3], iw = (1.0f - 1.0f / 65536.0f) * w;
+   const float p[5] = { iw, r->cx * iw, r->cy * iw, r->gx * w, r->gy * w };
+   uint32_t b[9], nan = 0;
+
+   /* compared as integers: under -mieee every float compare is a
+    * conversion and a trap barrier on the EV5 */
+   memcpy(b, c, 4 * sizeof(float));
+   memcpy(b + 4, p, sizeof(p));
+   for (unsigned i = 0; i < 9; i++)
+      nan |= (b[i] & 0x7fffffffu) > 0x7f800000u;
+   if (nan)
+      return ph_tcl_vertex_code_float(c, p);
+
+   const int32_t x = ph_float_cmp_key(b[0]), y = ph_float_cmp_key(b[1]);
+   const int32_t z = ph_float_cmp_key(b[2]), wk = ph_float_cmp_key(b[3]);
+   const int32_t ik = ph_float_cmp_key(b[4]), px = ph_float_cmp_key(b[5]);
+   const int32_t py = ph_float_cmp_key(b[6]), gx = ph_float_cmp_key(b[7]);
+   const int32_t gy = ph_float_cmp_key(b[8]);
+   const int32_t two_micro = ph_float_cmp_key(fui(2e-6f));
+   const int32_t one_micro = ph_float_cmp_key(fui(1e-6f));
+   const uint8_t code = (wk < two_micro) | (z < -ik) << 1 | (z > ik) << 2 |
+                        (x > px) << 3 | (x < -px) << 4 | (y > py) << 5 |
+                        (y < -py) << 6;
+   const bool inside = (wk > one_micro) &
+                       ((int32_t)(b[0] & 0x7fffffffu) <= gx) &
+                       ((int32_t)(b[1] & 0x7fffffffu) <= gy) &
+                       (z >= -wk) & (z <= wk);
+
+   return code | (inside ? PH_TCL_VCODE_INSIDE : 0);
 }
 
 static bool
