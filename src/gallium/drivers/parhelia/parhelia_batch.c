@@ -1270,6 +1270,9 @@ struct state_cache_entry {
    uint8_t *key;
    size_t key_len;
    uint32_t *commands;
+   /* the commands again at the other 8-byte parity: a replay copies from
+    * the one whose alignment matches its destination's */
+   uint32_t *commands_odd, *odd_storage;
    struct drm_parhelia_packet *packets;
    struct drm_parhelia_reloc *relocs;
    unsigned command_count, packet_count, reloc_count;
@@ -1358,6 +1361,7 @@ state_cache_entry_free(struct state_cache_entry *e)
       return;
    free(e->key);
    free(e->commands);
+   free(e->odd_storage);
    free(e->packets);
    free(e->relocs);
    free(e->packet_flags);
@@ -1840,11 +1844,16 @@ state_cache_capture(const struct parhelia_batch *batch, unsigned draws,
    memcpy(e->relocs, batch->relocs, relocs * sizeof(*e->relocs));
    e->mvp_offset = -1;
    e->limit_offset = -1;
+   e->odd_storage = malloc((e->command_count + 2) * sizeof(uint32_t));
    e->packet_flags = calloc(first + 1, 1);
-   if (!e->packet_flags) {
+   if (!e->odd_storage || !e->packet_flags) {
       state_cache_entry_free(e);
       return NULL;
    }
+   e->commands_odd = e->odd_storage +
+                     ((((uintptr_t)e->commands ^ (uintptr_t)e->odd_storage) &
+                       7) ? 0 : 1);
+   memcpy(e->commands_odd, e->commands, e->command_count * sizeof(uint32_t));
    for (unsigned i = 0; i < relocs; i++)
       e->packet_flags[e->relocs[i].packet] |= STATE_PACKET_RELOC;
    for (unsigned i = 0; i < first; i++) {
@@ -1971,7 +1980,11 @@ state_cache_replay_at(struct parhelia_batch *dst,
    if (r->limit && e->limit_offset < 0)
       return -EINVAL;
    if (!shadow) {
-      memcpy(commands, e->commands, e->command_count * sizeof(uint32_t));
+      /* a source at the destination's parity takes libc's aligned copy */
+      memcpy(commands,
+             (((uintptr_t)commands ^ (uintptr_t)e->commands) & 7) ?
+                e->commands_odd : e->commands,
+             e->command_count * sizeof(uint32_t));
       if (e->mvp_offset >= 0)
          memcpy(commands + e->mvp_offset, r->mvp, 16 * sizeof(float));
       if (r->limit)
