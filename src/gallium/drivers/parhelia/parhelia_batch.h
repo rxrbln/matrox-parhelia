@@ -5,6 +5,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "parhelia_drm.h"
 #include "reference/parhelia3d.h"
@@ -229,6 +230,25 @@ int parhelia_state_cache_last_calls(const struct parhelia_state_cache *cache,
                                     unsigned *stages);
 struct state_cache_entry;
 
+/* The register values the pending stream leaves behind, for dropping a
+ * replayed write that would store the same value again.  Only registers in
+ * @cacheable are tracked; @valid is cleared whenever the stream may have
+ * lost them (a new submit, an untracked batch). */
+struct parhelia_reg_shadow {
+   uint64_t valid[4];
+   uint64_t cacheable[4];
+   uint32_t value[256];
+};
+
+void parhelia_reg_shadow_init(struct parhelia_reg_shadow *shadow,
+                              uint32_t chip_id);
+
+static inline void
+parhelia_reg_shadow_reset(struct parhelia_reg_shadow *shadow)
+{
+   memset(shadow->valid, 0, sizeof(shadow->valid));
+}
+
 /* A state-cache hit not yet copied anywhere: its prefix and draw packets go
  * straight into the stream they are appended to. */
 struct parhelia_batch_replay {
@@ -248,7 +268,8 @@ int parhelia_batch_append_replay_limited(
    struct parhelia_batch *dst, uint32_t *dst_vertices,
    unsigned *dst_vertex_dwords, const struct parhelia_batch_replay *replay,
    const void *src_vertices, unsigned src_vertex_dwords,
-   const struct parhelia_batch_limits *limits, bool call_boundary);
+   const struct parhelia_batch_limits *limits, bool call_boundary,
+   struct parhelia_reg_shadow *shadow);
 /* As parhelia_batch_state_run_units_cached(); a hit with @replay set is
  * recorded there instead of written to @batch. */
 int parhelia_batch_state_run_units_deferred(struct parhelia_state_cache *cache,

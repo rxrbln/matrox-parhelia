@@ -603,6 +603,9 @@ struct ph_context {
     * without being copied there first */
    struct parhelia_batch_replay replay;
    bool defer_replay;
+   /* registers the pending stream has set, for filtering replayed state */
+   struct parhelia_reg_shadow reg_shadow;
+   bool state_filter;
    struct parhelia_batch *slice_batch;	/* a pending group's submit */
    /* The aggregate's vertices: in the ring slot it will be submitted from
     * while a ring is mapped, else in pending_vertex_store. */
@@ -1871,6 +1874,8 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
    ctx->pending_call_bound = 2;
    ctx->pending_stage_calls = 0;
    ctx->pending_mark_count = 0;
+   /* the next submit may follow another client's: it starts unfiltered */
+   parhelia_reg_shadow_reset(&ctx->reg_shadow);
    if (ret)
       ctx->submit_error = ret;
    else
@@ -2037,13 +2042,25 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
       if (ret)
          return ret;
    }
+   /* A filtered stream must reach the kernel as one submit: a later
+    * group's state could follow another client's 2-D writes. */
+   if (ctx->state_filter && ctx->pending_batch.packet_count &&
+       ctx->pack_adjacent_packets && ctx->pending_call_bound != UINT_MAX &&
+       batch_calls >= 2 &&
+       ctx->pending_call_bound + (unsigned)batch_calls - 2 >
+          PH_BATCH_HW_CALLS) {
+      ret = ph_drain_batch(ctx);
+      if (ret)
+         return ret;
+   }
    if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx, true)))
       return ret;
    ret = replay ?
       parhelia_batch_append_replay_limited(
          &ctx->pending_batch, ctx->pending_vertices,
          &ctx->pending_vertex_dwords, &replay_entry, vertices, vertex_dwords,
-         &ctx->batch_limits, ctx->pack_adjacent_packets) :
+         &ctx->batch_limits, ctx->pack_adjacent_packets,
+         ctx->state_filter ? &ctx->reg_shadow : NULL) :
       ctx->aggregate_state_stream ?
       ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
       ctx->aggregate_state_batches ?
@@ -2066,7 +2083,8 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
          parhelia_batch_append_replay_limited(
             &ctx->pending_batch, ctx->pending_vertices,
             &ctx->pending_vertex_dwords, &replay_entry, vertices,
-            vertex_dwords, &ctx->batch_limits, ctx->pack_adjacent_packets) :
+            vertex_dwords, &ctx->batch_limits, ctx->pack_adjacent_packets,
+            ctx->state_filter ? &ctx->reg_shadow : NULL) :
          ctx->aggregate_state_stream ?
          ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
          ctx->aggregate_state_batches ?
@@ -2081,6 +2099,9 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
    }
    if (ret)
       return ret;
+   /* the shadow does not know what an untracked batch wrote */
+   if (!replay)
+      parhelia_reg_shadow_reset(&ctx->reg_shadow);
    /* packing across batches only joins runs, so the batches' counts bound
     * the stream's; each counts the stream's final EOB and drain itself */
    ctx->pending_call_bound =
@@ -16703,6 +16724,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->pending_vertices = ctx->pending_vertex_store;
    ctx->pending_ring_slot = -1;
    ctx->state_cache = parhelia_state_cache_create();
+   parhelia_reg_shadow_init(&ctx->reg_shadow, ph_screen(screen)->chip_id);
+   ctx->state_filter = debug_get_bool_option("PARHELIA_STATE_FILTER", false);
    /* All zero, like the state tracker's own initial copy: it only calls
     * set_scissor_states for a rectangle that differs from that copy. */
    ctx->base.screen = screen;

@@ -1276,6 +1276,7 @@ struct state_cache_entry {
    int mvp_offset;               /* the matrix's dwords in commands, or -1 */
    int limit_offset;             /* an indexed prefix's 0x1060 operand, or -1 */
    int calls;                    /* packed CALLs of the batch alone, or -1 */
+   uint8_t *packet_flags;        /* STATE_PACKET_* per prefix packet */
    unsigned stages;              /* its vertex-program binds (stage CALLs) */
    unsigned long hits;
 };
@@ -1359,6 +1360,7 @@ state_cache_entry_free(struct state_cache_entry *e)
    free(e->commands);
    free(e->packets);
    free(e->relocs);
+   free(e->packet_flags);
    free(e);
 }
 
@@ -1584,6 +1586,134 @@ state_cache_grow(struct parhelia_state_cache *c)
    return true;
 }
 
+#define STATE_PACKET_RELOC   0x1u   /* an operand is relocated */
+#define STATE_PACKET_REGLIST 0x2u   /* a plain, 0x21-terminated register list */
+#define STATE_PACKET_EXACT   0x4u   /* a shape the kernel matches exactly */
+
+/* A register list whose every write can be parsed and repacked. */
+static bool
+state_reglist_plain(const uint32_t *cmd, unsigned length)
+{
+   unsigned pos = 1;
+
+   if (length < 2 || (cmd[0] & 0xffff0000u) || (cmd[0] & 0xffffu) + 2u != length)
+      return false;
+   while (pos < length) {
+      const uint32_t tag = cmd[pos++];
+
+      for (unsigned slot = 0; slot < 4; slot++) {
+         const unsigned index = (tag >> (slot * 8)) & 0xff;
+
+         if (index == 0x21)
+            break;
+         if (index == 0x20 || pos == length)
+            return false;
+         pos++;
+      }
+   }
+   return pos == length;
+}
+
+/* Raster and depth scalars: pure state the vendor caches in its register
+ * shadow (the kernel's state_shadow_cache list). */
+static const uint8_t reg_shadow_original[] = {
+   0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb9, 0xba, 0xbe, 0xbf,
+   0xc9, 0xca, 0xcb,
+};
+
+void
+parhelia_reg_shadow_init(struct parhelia_reg_shadow *shadow, uint32_t chip_id)
+{
+   memset(shadow, 0, sizeof(*shadow));
+   if (chip_id != 0x0527 && chip_id != 0x0528)
+      return;
+   for (unsigned i = 0; i < sizeof(reg_shadow_original); i++)
+      shadow->cacheable[reg_shadow_original[i] >> 6] |=
+         UINT64_C(1) << (reg_shadow_original[i] & 63);
+}
+
+static inline bool
+reg_shadow_has(const uint64_t *bits, unsigned index)
+{
+   return bits[index >> 6] >> (index & 63) & 1;
+}
+
+/* Record @value in @shadow; true when it was there already. */
+static inline bool
+reg_shadow_store(struct parhelia_reg_shadow *shadow, unsigned index,
+                 uint32_t value)
+{
+   const uint64_t bit = UINT64_C(1) << (index & 63);
+   bool same;
+
+   if (!(shadow->cacheable[index >> 6] & bit))
+      return false;
+   same = (shadow->valid[index >> 6] & bit) && shadow->value[index] == value;
+   shadow->value[index] = value;
+   shadow->valid[index >> 6] |= bit;
+   return same;
+}
+
+/* Copy register list @cmd to @out without the writes @shadow already holds;
+ * @limit replaces the operand at @limit_pos.  Returns the dwords written,
+ * 0 when every write was dropped. */
+static unsigned
+reg_shadow_filter(struct parhelia_reg_shadow *shadow, uint32_t *out,
+                  const uint32_t *cmd, unsigned length, int limit_pos,
+                  uint32_t limit)
+{
+   unsigned pos = 1, w = 1, tag_at = 0, slot = 4;
+
+   while (pos < length) {
+      const uint32_t tag = cmd[pos++];
+
+      for (unsigned s = 0; s < 4; s++) {
+         const unsigned index = (tag >> (s * 8)) & 0xff;
+         uint32_t value;
+
+         if (index == 0x21)
+            break;
+         value = (int)pos == limit_pos ? limit : cmd[pos];
+         pos++;
+         if (reg_shadow_store(shadow, index, value))
+            continue;
+         if (slot == 4) {
+            tag_at = w++;
+            out[tag_at] = 0x21212121u;
+            slot = 0;
+         }
+         out[tag_at] = (out[tag_at] & ~(0xffu << (slot * 8))) |
+                       index << (slot * 8);
+         slot++;
+         out[w++] = value;
+      }
+   }
+   if (w == 1)
+      return 0;
+   out[0] = w - 2;
+   return w;
+}
+
+/* Note the writes of a register list copied verbatim. */
+static void
+reg_shadow_track(struct parhelia_reg_shadow *shadow, const uint32_t *cmd,
+                 unsigned length)
+{
+   unsigned pos = 1;
+
+   while (pos < length) {
+      const uint32_t tag = cmd[pos++];
+
+      for (unsigned s = 0; s < 4 && pos < length; s++) {
+         const unsigned index = (tag >> (s * 8)) & 0xff;
+
+         if (index == 0x21)
+            break;
+         reg_shadow_store(shadow, index, cmd[pos++]);
+      }
+   }
+}
+
 /* The prefix of a freshly built batch: its packets before the first draw,
  * provided the rest is exactly @draws DRAW-relocated draw packets. */
 static struct state_cache_entry *
@@ -1630,6 +1760,24 @@ state_cache_capture(const struct parhelia_batch *batch, unsigned draws,
    memcpy(e->relocs, batch->relocs, relocs * sizeof(*e->relocs));
    e->mvp_offset = -1;
    e->limit_offset = -1;
+   e->packet_flags = calloc(first + 1, 1);
+   if (!e->packet_flags) {
+      state_cache_entry_free(e);
+      return NULL;
+   }
+   for (unsigned i = 0; i < relocs; i++)
+      e->packet_flags[e->relocs[i].packet] |= STATE_PACKET_RELOC;
+   for (unsigned i = 0; i < first; i++) {
+      const uint32_t *cmd = e->commands + e->packets[i].offset;
+      const unsigned len = e->packets[i].length;
+
+      if (state_reglist_plain(cmd, len))
+         e->packet_flags[i] |= STATE_PACKET_REGLIST;
+      /* exact-shape packets the kernel recognises stay byte-exact */
+      if (batch_packet_adds_stage_call(cmd, len) ||
+          batch_packet_is_opening_watermark(cmd, len))
+         e->packet_flags[i] |= STATE_PACKET_EXACT;
+   }
    return e;
 }
 
@@ -1732,7 +1880,7 @@ parhelia_batch_replay_counts(const struct parhelia_batch_replay *r,
 static int
 state_cache_replay_at(struct parhelia_batch *dst,
                       const struct parhelia_batch_replay *r,
-                      unsigned vertex_base)
+                      unsigned vertex_base, struct parhelia_reg_shadow *shadow)
 {
    const struct state_cache_entry *e = r->entry;
    const unsigned command_base = dst->command_count;
@@ -1742,27 +1890,80 @@ state_cache_replay_at(struct parhelia_batch *dst,
 
    if (r->limit && e->limit_offset < 0)
       return -EINVAL;
-   memcpy(commands, e->commands, e->command_count * sizeof(uint32_t));
-   if (e->mvp_offset >= 0)
-      memcpy(commands + e->mvp_offset, r->mvp, 16 * sizeof(float));
-   if (r->limit)
-      commands[e->limit_offset] = r->limit;
-   for (unsigned i = 0; i < e->packet_count; i++)
-      dst->packets[packet_base + i] = (struct drm_parhelia_packet) {
-         .offset = e->packets[i].offset + command_base,
-         .length = e->packets[i].length,
-      };
-   for (unsigned i = 0; i < e->reloc_count; i++) {
-      struct drm_parhelia_reloc *out = &dst->relocs[dst->reloc_count + i];
+   if (!shadow) {
+      memcpy(commands, e->commands, e->command_count * sizeof(uint32_t));
+      if (e->mvp_offset >= 0)
+         memcpy(commands + e->mvp_offset, r->mvp, 16 * sizeof(float));
+      if (r->limit)
+         commands[e->limit_offset] = r->limit;
+      for (unsigned i = 0; i < e->packet_count; i++)
+         dst->packets[packet_base + i] = (struct drm_parhelia_packet) {
+            .offset = e->packets[i].offset + command_base,
+            .length = e->packets[i].length,
+         };
+      for (unsigned i = 0; i < e->reloc_count; i++) {
+         struct drm_parhelia_reloc *out = &dst->relocs[dst->reloc_count + i];
 
-      *out = e->relocs[i];
-      out->packet += packet_base;
-      if (out->type == PH_RELOC_STREAM_BASE)
-         out->delta += vertex_base * 4;
+         *out = e->relocs[i];
+         out->packet += packet_base;
+         if (out->type == PH_RELOC_STREAM_BASE)
+            out->delta += vertex_base * 4;
+      }
+      dst->command_count += e->command_count;
+      dst->packet_count += e->packet_count;
+      dst->reloc_count += e->reloc_count;
+   } else {
+      /* without the writes the stream already made; only relocation-free
+       * plain lists are rewritten, so relocated packets keep their dwords */
+      uint16_t map[PH_BATCH_PACKETS];
+      unsigned packets = packet_base;
+
+      for (unsigned i = 0; i < e->packet_count; i++) {
+         const uint32_t *cmd = e->commands + e->packets[i].offset;
+         const unsigned len = e->packets[i].length;
+         const uint8_t flags = e->packet_flags[i];
+         uint32_t *out = dst->commands + dst->command_count;
+         unsigned written;
+
+         if (flags == STATE_PACKET_REGLIST) {
+            const int at = e->limit_offset - (int)e->packets[i].offset;
+
+            written = reg_shadow_filter(shadow, out, cmd, len,
+                                        r->limit && at > 0 &&
+                                           at < (int)len ? at : -1,
+                                        r->limit);
+            if (!written)
+               continue;
+         } else {
+            memcpy(out, cmd, len * sizeof(uint32_t));
+            if (e->mvp_offset >= (int)e->packets[i].offset &&
+                e->mvp_offset < (int)(e->packets[i].offset + len))
+               memcpy(out + e->mvp_offset - e->packets[i].offset, r->mvp,
+                      16 * sizeof(float));
+            if (r->limit && e->limit_offset >= (int)e->packets[i].offset &&
+                e->limit_offset < (int)(e->packets[i].offset + len))
+               out[e->limit_offset - e->packets[i].offset] = r->limit;
+            if (flags & STATE_PACKET_REGLIST)
+               reg_shadow_track(shadow, out, len);
+            written = len;
+         }
+         map[i] = packets;
+         dst->packets[packets++] = (struct drm_parhelia_packet) {
+            .offset = dst->command_count, .length = written,
+         };
+         dst->command_count += written;
+      }
+      /* a dropped list carried no relocation */
+      for (unsigned i = 0; i < e->reloc_count; i++) {
+         struct drm_parhelia_reloc *o = &dst->relocs[dst->reloc_count++];
+
+         *o = e->relocs[i];
+         o->packet = map[e->relocs[i].packet];
+         if (o->type == PH_RELOC_STREAM_BASE)
+            o->delta += vertex_base * 4;
+      }
+      dst->packet_count = packets;
    }
-   dst->command_count += e->command_count;
-   dst->packet_count += e->packet_count;
-   dst->reloc_count += e->reloc_count;
    for (unsigned k = 0; k < r->draws; k++) {
       const unsigned run = packet_run(r->prim, r->per_packet,
                                       r->vertices - consumed);
@@ -1799,7 +2000,7 @@ parhelia_batch_replay_materialize(struct parhelia_batch *batch,
        relocs > PH_BATCH_RELOCS)
       return -E2BIG;
    batch->command_count = batch->packet_count = batch->reloc_count = 0;
-   ret = state_cache_replay_at(batch, r, 0);
+   ret = state_cache_replay_at(batch, r, 0, NULL);
    r->entry = NULL;
    return ret;
 }
@@ -1812,7 +2013,8 @@ parhelia_batch_append_replay_limited(struct parhelia_batch *dst,
                                      const void *src_vertices,
                                      unsigned src_vertex_dwords,
                                      const struct parhelia_batch_limits *limits,
-                                     bool call_boundary)
+                                     bool call_boundary,
+                                     struct parhelia_reg_shadow *shadow)
 {
    const unsigned vertex_base = *dst_vertex_dwords;
    unsigned commands, packets, relocs;
@@ -1836,7 +2038,7 @@ parhelia_batch_append_replay_limited(struct parhelia_batch *dst,
       memmove(dst_vertices + vertex_base, src_vertices,
               src_vertex_dwords * sizeof(dst_vertices[0]));
    *dst_vertex_dwords += src_vertex_dwords;
-   return state_cache_replay_at(dst, r, vertex_base);
+   return state_cache_replay_at(dst, r, vertex_base, shadow);
 }
 
 int
