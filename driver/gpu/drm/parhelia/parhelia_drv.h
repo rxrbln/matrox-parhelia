@@ -575,6 +575,11 @@ struct parhelia_device {
 	/* one TTM place per 16 MiB VRAM window, for PARHELIA_PLACEMENT_WINDOWED */
 	struct ttm_place *window_places;
 	u32 window_count;
+	/* Engine addresses of the last WINDOW_COLOR/WINDOW_DEPTH target that
+	 * pair_client created, ~0 when none, under pair_lock. */
+	spinlock_t pair_lock;
+	u64 pair_client;
+	u64 pair_colour_gpu, pair_depth_gpu;
 	struct parhelia_bios bios;
 	struct drm_simple_display_pipe pipe;
 	/* the simple pipe's plane helpers plus the asynchronous flip hooks */

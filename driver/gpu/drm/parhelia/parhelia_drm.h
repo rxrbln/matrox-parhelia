@@ -78,6 +78,13 @@
  * CPU view is the same as the native classes'.  Older kernels refuse the
  * flag with -EINVAL. */
 #define PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN	(1u << 6)
+/* Original family: a plain target that is a client's colour or depth
+ * surface.  The depth unit takes Z from the 16 MiB window above the colour
+ * target, so the kernel places a depth surface above the file's latest
+ * colour target and a colour target below its latest depth surface where
+ * that window has room.  Storage and mapping are those of flags 0. */
+#define PARHELIA_CREATE_RENDER_WINDOW_COLOR	(1u << 7)
+#define PARHELIA_CREATE_RENDER_WINDOW_DEPTH	(1u << 8)
 /* The three native classes report mmap_offset 0, yet their GEM mmap offset
  * (MAP_DUMB) is a CPU-linear view with GET_BO_INFO's host_pitch. */
 
@@ -220,6 +227,8 @@ struct drm_parhelia_upload_render {
 /* A 0x97 draw of more than six vertices also opens its CALL span: the
  * kernel copies its vertices in front of its header (P690 inline draws). */
 #define PARHELIA_PARAM_INLINE_DRAWS	37
+/* CREATE_RENDER accepts the WINDOW_COLOR and WINDOW_DEPTH hints. */
+#define PARHELIA_PARAM_WINDOW_PAIRS	38
 
 #define PARHELIA_TEXTURE_PIPES_PAIRED	0
 #define PARHELIA_TEXTURE_PIPES_SINGLE	1

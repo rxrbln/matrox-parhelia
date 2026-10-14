@@ -2036,6 +2036,21 @@ static int parhelia_vram_placement_range(struct drm_gem_vram_object *bo,
 	return 0;
 }
 
+/* VRAM offset of the 16 MiB window at engine address @window, false when
+ * no VRAM backs all of it. */
+static bool parhelia_window_vram(const struct parhelia_device *pdev,
+				 u64 window, u64 *lo)
+{
+	u64 bank_size = pdev->vram_size >> 1;
+
+	if (window >= PARHELIA_LOCAL_BANK_B_BASE) {
+		*lo = window - PARHELIA_LOCAL_BANK_B_BASE + bank_size;
+		return *lo + SZ_16M <= pdev->vram_size;
+	}
+	*lo = window;
+	return window + SZ_16M <= bank_size;
+}
+
 /* The original family's Z unit takes the depth window from the colour
  * address per pixel, so a render target crossing a 16 MiB boundary sent
  * depth into colour rows (0528: colour 0x1f5e000 + 3 MiB).  One place per
@@ -2046,6 +2061,8 @@ int parhelia_window_places_init(struct parhelia_device *pdev)
 {
 	u32 i;
 
+	spin_lock_init(&pdev->pair_lock);
+	pdev->pair_colour_gpu = pdev->pair_depth_gpu = ~0ull;
 	if (!parhelia_original_family(pdev))
 		return 0;
 	pdev->window_count = pdev->vram_size / SZ_16M;
@@ -2068,6 +2085,7 @@ static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 	struct parhelia_bo *pbo = container_of(bo, struct parhelia_bo, gbo);
 	struct parhelia_device *pdev = to_parhelia(bo->bo.base.dev);
 	u64 band_pages = SZ_32M >> PAGE_SHIFT;
+	int ret;
 
 	if (pbo->placement_class == PARHELIA_PLACEMENT_WINDOWED &&
 	    pdev->window_count) {
@@ -2092,7 +2110,13 @@ static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 	/* Bank A first: TTM takes free room in either place before it evicts. */
 	if (pbo->placement_class == PARHELIA_PLACEMENT_NATIVE_OFFSCREEN)
 		return parhelia_vram_placement_range(bo, vram_size, true, 0, 0);
-	return parhelia_vram_placement_range(bo, vram_size, split_banks, 0, 0);
+	ret = parhelia_vram_placement_range(bo, vram_size, split_banks, 0, 0);
+	/* Original family: textures fill VRAM from the top, so they leave the
+	 * windows render targets pair colour and depth in (bottom up) free. */
+	if (!ret && pbo->layout == PARHELIA_BO_LAYOUT_TEXTURE &&
+	    parhelia_original_family(pdev))
+		bo->placements[0].flags |= TTM_PL_FLAG_TOPDOWN;
+	return ret;
 }
 
 static int parhelia_vram_placement_static_selftest(void)
@@ -3928,6 +3952,82 @@ static int parhelia_wait_fence(struct parhelia_device *pdev, u32 fence)
 	return -ETIMEDOUT;
 }
 
+#define PARHELIA_CREATE_RENDER_WINDOW_PAIR \
+	(PARHELIA_CREATE_RENDER_WINDOW_COLOR | PARHELIA_CREATE_RENDER_WINDOW_DEPTH)
+
+/* The window a new WINDOW_COLOR/DEPTH target of @file pairs with: below its
+ * latest depth surface or above its latest colour target. */
+static bool parhelia_pair_window(struct parhelia_device *pdev,
+				 struct drm_file *file, u32 flags, u64 *lo)
+{
+	u64 colour, depth;
+
+	spin_lock(&pdev->pair_lock);
+	if (pdev->pair_client != file->client_id) {
+		pdev->pair_client = file->client_id;
+		pdev->pair_colour_gpu = pdev->pair_depth_gpu = ~0ull;
+	}
+	colour = pdev->pair_colour_gpu;
+	depth = pdev->pair_depth_gpu;
+	spin_unlock(&pdev->pair_lock);
+	if (flags & PARHELIA_CREATE_RENDER_WINDOW_DEPTH)
+		return colour != ~0ull &&
+		       parhelia_window_vram(pdev, ALIGN_DOWN(colour, SZ_16M) +
+					    SZ_16M, lo);
+	return depth != ~0ull && depth >= SZ_16M &&
+	       parhelia_window_vram(pdev, ALIGN_DOWN(depth, SZ_16M) - SZ_16M, lo);
+}
+
+/* Place and pin a new target in the VRAM window at @lo if it has room there
+ * without evicting anything, otherwise wherever a windowed target goes. */
+static int parhelia_vram_pin_new_window(struct parhelia_device *pdev,
+					struct drm_gem_vram_object *bo, u64 lo)
+{
+	struct ttm_operation_ctx ctx = { false, false };
+	struct ttm_placement placement;
+	struct ttm_place *places;
+	int ret;
+
+	places = kmalloc_array(pdev->window_count + 1, sizeof(*places),
+			       GFP_KERNEL);
+	if (!places)
+		return -ENOMEM;
+	places[0] = (struct ttm_place){
+		.mem_type = TTM_PL_VRAM, .flags = TTM_PL_FLAG_DESIRED,
+		.fpfn = lo >> PAGE_SHIFT, .lpfn = (lo + SZ_16M) >> PAGE_SHIFT };
+	memcpy(places + 1, pdev->window_places,
+	       pdev->window_count * sizeof(*places));
+	placement.placement = places;
+	placement.num_placement = pdev->window_count + 1;
+	ret = ttm_bo_reserve(&bo->bo, true, false, NULL);
+	if (!ret) {
+		ret = ttm_bo_validate(&bo->bo, &placement, &ctx);
+		if (!ret)
+			ttm_bo_pin(&bo->bo);
+		ttm_bo_unreserve(&bo->bo);
+	}
+	kfree(places);
+	return ret ? parhelia_vram_pin_new(pdev, bo) : 0;
+}
+
+static void parhelia_pair_record(struct parhelia_device *pdev,
+				 struct drm_file *file, u32 flags,
+				 struct drm_gem_vram_object *bo)
+{
+	u32 gpu;
+
+	if (parhelia_vram_gpu_addr(pdev, bo, 0, bo->bo.base.size, &gpu))
+		return;
+	spin_lock(&pdev->pair_lock);
+	if (pdev->pair_client == file->client_id) {
+		if (flags & PARHELIA_CREATE_RENDER_WINDOW_DEPTH)
+			pdev->pair_depth_gpu = gpu;
+		else
+			pdev->pair_colour_gpu = gpu;
+	}
+	spin_unlock(&pdev->pair_lock);
+}
+
 int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 				 struct drm_file *file)
 {
@@ -3936,7 +4036,9 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	struct drm_gem_vram_object *bo;
 	unsigned long align_pages;
 	u8 layout;
-	u32 allocation_height, pitch_pixels, pitch, cpp, tile_width;
+	u32 allocation_height, pitch_pixels, pitch, cpp, tile_width, pair;
+	bool plain;
+	u64 window;
 	size_t bo_size;
 	u32 handle;
 	int ret;
@@ -3947,7 +4049,8 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 			    PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 			    PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
 			    PARHELIA_CREATE_RENDER_NATIVE_SCANOUT |
-			    PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN) ||
+			    PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN |
+			    PARHELIA_CREATE_RENDER_WINDOW_PAIR) ||
 	    hweight32(args->flags) > 1 || (args->cpp && args->cpp != 4 &&
 					   args->cpp != 2) ||
 	    args->handle || args->pitch || args->size || args->mmap_offset)
@@ -3966,6 +4069,11 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 			    PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN)) &&
 	    (pdev->pdev->device != PARHELIA_P690 || pdev->vram_size < SZ_128M))
 		return -EOPNOTSUPP;
+	if ((args->flags & PARHELIA_CREATE_RENDER_WINDOW_PAIR) &&
+	    !parhelia_original_family(pdev))
+		return -EOPNOTSUPP;
+	pair = args->flags & PARHELIA_CREATE_RENDER_WINDOW_PAIR;
+	plain = !(args->flags & ~PARHELIA_CREATE_RENDER_WINDOW_PAIR);
 	/* Legacy flags=0 retains the exact-anchor policy.  Explicit P690 colour
 	 * and depth classes use the vendor allocator's distinct 32 MiB bands and
 	 * hardware-verified 8 KiB in-band surface alignment. */
@@ -4048,9 +4156,10 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	else if (args->flags & PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN)
 		parhelia_bo_set_placement_class(bo,
 			PARHELIA_PLACEMENT_NATIVE_OFFSCREEN);
-	else if (!args->flags && parhelia_original_family(pdev) &&
-		 bo_size <= SZ_16M)
+	else if (plain && parhelia_original_family(pdev) && bo_size <= SZ_16M)
 		parhelia_bo_set_placement_class(bo, PARHELIA_PLACEMENT_WINDOWED);
+	else
+		pair = 0;
 	if (layout == PARHELIA_BO_LAYOUT_TEXTURE) {
 		parhelia_bo_make_unmappable(bo);
 	} else if (args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
@@ -4067,14 +4176,18 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	 * currently points, so the driver zeroes new objects itself.  The pin is
 	 * held for the clear only: parhelia_ttm_move() copies through the
 	 * aperture too, so TTM may evict these objects afterwards. */
-	ret = parhelia_vram_pin_new(pdev, bo);
+	ret = pair && parhelia_pair_window(pdev, file, pair, &window) ?
+		parhelia_vram_pin_new_window(pdev, bo, window) :
+		parhelia_vram_pin_new(pdev, bo);
 	if (ret) {
 		drm_gem_object_put(&bo->bo.base);
 		return ret;
 	}
+	if (pair)
+		parhelia_pair_record(pdev, file, pair, bo);
 	/* the original family has no native classes: its plain targets */
 	if (((args->flags & PARHELIA_CREATE_RENDER_NATIVE_COLOR) ||
-	     (!args->flags && parhelia_original_family(pdev))) && cpp == 4)
+	     (plain && parhelia_original_family(pdev))) && cpp == 4)
 		parhelia_t2_prime_once(pdev, file, bo, args->width, args->height,
 				       pitch_pixels);
 	ret = parhelia_bo_clear(pdev, file, bo);
@@ -4221,6 +4334,9 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 	case PARHELIA_PARAM_INLINE_DRAWS:
 		args->value = READ_ONCE(p690_inline_draws) &&
 			pdev->pdev->device == PARHELIA_P690;
+		break;
+	case PARHELIA_PARAM_WINDOW_PAIRS:
+		args->value = parhelia_original_family(pdev);
 		break;
 	case PARHELIA_PARAM_WARP_PROGRAM_SLOTS:
 		args->value = pdev->warp_user_cpu ?
@@ -4370,7 +4486,6 @@ static int parhelia_pin_depth_window(struct parhelia_device *pdev,
 				     struct drm_gem_vram_object *colour,
 				     struct drm_gem_vram_object *depth)
 {
-	u64 bank_size = pdev->vram_size >> 1;
 	u64 lo, hi;
 	u32 gpu;
 	int ret, tries;
@@ -4378,19 +4493,13 @@ static int parhelia_pin_depth_window(struct parhelia_device *pdev,
 	ret = parhelia_vram_gpu_addr(pdev, colour, 0, colour->bo.base.size, &gpu);
 	if (ret)
 		return ret;
-	lo = ALIGN_DOWN((u64)gpu, SZ_16M) + SZ_16M;
-	hi = lo + SZ_16M;
-	if (lo >= PARHELIA_LOCAL_BANK_B_BASE) {
-		lo = lo - PARHELIA_LOCAL_BANK_B_BASE + bank_size;
-		hi = hi - PARHELIA_LOCAL_BANK_B_BASE + bank_size;
-	} else if (hi > bank_size) {
-		hi = 0;
-	}
-	if (!hi || hi > pdev->vram_size) {
+	if (!parhelia_window_vram(pdev, ALIGN_DOWN((u64)gpu, SZ_16M) + SZ_16M,
+				  &lo)) {
 		dev_warn_ratelimited(&pdev->pdev->dev,
 			"no depth window above colour target %#x\n", gpu);
 		return parhelia_vram_pin(depth);
 	}
+	hi = lo + SZ_16M;
 	if (trace_depth_window) {
 		u64 before = 0;
 
@@ -4457,12 +4566,7 @@ static void parhelia_move_colour_below_depth(struct parhelia_device *pdev,
 	dgpu = dphys < bank_size ? dphys :
 	       PARHELIA_LOCAL_BANK_B_BASE + dphys - bank_size;
 	window = ALIGN_DOWN(dgpu, SZ_16M);
-	if (window < SZ_16M)
-		return;
-	lo = window - SZ_16M;
-	if (lo >= PARHELIA_LOCAL_BANK_B_BASE)
-		lo = lo - PARHELIA_LOCAL_BANK_B_BASE + bank_size;
-	else if (lo + SZ_16M > bank_size)
+	if (window < SZ_16M || !parhelia_window_vram(pdev, window - SZ_16M, &lo))
 		return;
 	if (ttm_bo_reserve(&colour->bo, true, false, NULL))
 		return;
