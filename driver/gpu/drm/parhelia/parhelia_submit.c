@@ -918,21 +918,18 @@ static bool parhelia_span_takes_draws(bool split, u32 draws, bool multi,
  * a run without special cases. Every original packet remains separately
  * validated and parhelia_copy_packet_span() preserves each header byte.
  */
-static void parhelia_span_draws(const u32 *commands,
-				const struct drm_parhelia_packet *packets,
+static void parhelia_span_draws(const struct parhelia_call_plan *plan,
 				u32 first, u32 count, u32 *draws, bool *multi)
 {
 	u32 i;
 
 	*draws = 0;
 	*multi = false;
-	for (i = 0; commands && i < count; i++) {
-		const u32 opcode = commands[packets[first + i].offset] >> 24;
+	for (i = 0; i < count; i++) {
+		const u8 kind = plan->pkt_draw[first + i];
 
-		if (opcode != 0x97 && opcode != 0x9f)
-			continue;
-		(*draws)++;
-		*multi |= parhelia_multi_draw_packet(commands, &packets[first + i]);
+		*draws += kind & PARHELIA_PKT_DRAW;
+		*multi |= kind & PARHELIA_PKT_MULTI;
 	}
 }
 
@@ -956,7 +953,7 @@ parhelia_pack_adjacent_packet_calls(struct parhelia_call_plan *plan,
 		    parhelia_packet_span_dwords(packets, block, run, &words) ||
 		    words > PARHELIA_DMA_BLOCK_DWORDS)
 			goto copy_one;
-		parhelia_span_draws(commands, packets, block, run, &draws, &multi);
+		parhelia_span_draws(plan, block, run, &draws, &multi);
 		while (in + entries < plan->count) {
 			u32 next = plan->blocks[in + entries];
 			u32 next_span = plan->packet_spans[in + entries];
@@ -975,7 +972,7 @@ parhelia_pack_adjacent_packet_calls(struct parhelia_call_plan *plan,
 			    next_words > PARHELIA_DMA_BLOCK_DWORDS - words ||
 			    run > U16_MAX - next_span)
 				break;
-			parhelia_span_draws(commands, packets, next, next_span,
+			parhelia_span_draws(plan, next, next_span,
 					    &next_draws, &next_multi);
 			if (!parhelia_span_takes_draws(split_multi_draws, draws, multi,
 						       next_draws, next_multi))
@@ -5011,6 +5008,8 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 		}
 		plan->stage_modes[i] = parhelia_vertex_bind_mode(commands + packets[i].offset,
 							       packets[i].length);
+		plan->pkt_op[i] = commands[packets[i].offset] >> 24;
+		plan->pkt_draw[i] = 0;
 	}
 	if (end != args->command_dwords) {
 		ret = -EINVAL;
@@ -5627,7 +5626,7 @@ retry_slot:
 	 * Its range operands differ, but no client-controlled bus address survives
 	 * relocation and no BAR0 aperture descriptor is involved. */
 	for (i = 0; i < args->packet_count; i++) {
-		u32 opcode = commands[packets[i].offset] >> 24;
+		u32 opcode = plan->pkt_op[i];
 
 		/* A 0x9f packet is admitted only after the paired stream/index
 		 * relocations snapshot and patch it above, or as an indexed draw
@@ -5689,6 +5688,11 @@ retry_slot:
 			ret = -EINVAL;
 			goto out_unpin;
 		}
+		/* the relocated operands give a draw's range */
+		if (opcode == 0x97 || opcode == 0x9f)
+			plan->pkt_draw[i] = PARHELIA_PKT_DRAW |
+				(parhelia_multi_draw_packet(commands, &packets[i]) ?
+				 PARHELIA_PKT_MULTI : 0);
 	}
 	parhelia_phase(&phase_t, PARHELIA_PHASE_ADMIT, stats);
 	if (defer_packet_packing) {
@@ -5839,8 +5843,8 @@ retry_slot:
 		u32 block_id = plan->blocks[i];
 
 		if (block_id < args->packet_count &&
-		    ((commands[packets[block_id].offset] >> 24) == 0x97 ||
-		     (commands[packets[block_id].offset] >> 24) == 0x8f)) {
+		    (plan->pkt_op[block_id] == 0x97 ||
+		     plan->pkt_op[block_id] == 0x8f)) {
 			first_draw = i;
 			break;
 		}

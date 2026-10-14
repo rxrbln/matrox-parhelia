@@ -32,11 +32,18 @@ static inline __u32 parhelia_vertex_bind_mode(const __u32 *cmd, __u32 length)
 #define PARHELIA_SYNTHETIC_BLOCK_CAPACITY 6u
 #define PARHELIA_PLAN_CAPACITY \
 	(PARHELIA_USER_PACKET_CAPACITY * 2u + PARHELIA_SYNTHETIC_BLOCK_CAPACITY)
+#define PARHELIA_PKT_DRAW	0x1u
+#define PARHELIA_PKT_MULTI	0x2u
+
 struct parhelia_call_plan {
 	__u32 blocks[PARHELIA_PLAN_CAPACITY];
 	__u16 packet_spans[PARHELIA_PLAN_CAPACITY];
 	__u32 stage_modes[PARHELIA_USER_PACKET_CAPACITY];
 	__u32 stage_parent[PARHELIA_USER_PACKET_CAPACITY];
+	/* per packet, so later passes need not reread the commands: the
+	 * opcode (validation) and PARHELIA_PKT_* (after relocation) */
+	__u8 pkt_op[PARHELIA_USER_PACKET_CAPACITY];
+	__u8 pkt_draw[PARHELIA_USER_PACKET_CAPACITY];
 	__u32 count, stages, sync_sections;
 };
 
