@@ -116,9 +116,9 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
                                  unsigned *calls)
 {
    enum { PACK_NONE, PACK_DRAW, PACK_RANGE } run = PACK_NONE;
-   bool draw_packets[PH_BATCH_PACKETS] = {false};
-   bool call_boundaries[PH_BATCH_PACKETS] = {false};
-   uint32_t draw_bytes[PH_BATCH_PACKETS] = {0};
+   bool draw_packets[PH_BATCH_PACKETS];
+   bool call_boundaries[PH_BATCH_PACKETS];
+   uint32_t draw_bytes[PH_BATCH_PACKETS];
    unsigned run_draws = 0;
    bool run_multi = false;
    unsigned opening = first_packet, run_words = 0, count = 3;
@@ -127,8 +127,14 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
 
    if (!batch || !calls || first_packet >= end_packet ||
        end_packet > batch->packet_count ||
+       batch->packet_count > PH_BATCH_PACKETS ||
        batch->reloc_count > PH_BATCH_RELOCS)
       return -EINVAL;
+   /* every index read is below packet_count: clear only those */
+   memset(draw_packets, 0, batch->packet_count * sizeof(draw_packets[0]));
+   memset(call_boundaries, 0,
+          batch->packet_count * sizeof(call_boundaries[0]));
+   memset(draw_bytes, 0, batch->packet_count * sizeof(draw_bytes[0]));
    for (unsigned i = 0; i < batch->reloc_count; i++) {
       const struct drm_parhelia_reloc *reloc = &batch->relocs[i];
 
