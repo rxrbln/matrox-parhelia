@@ -16430,9 +16430,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
     * lose to the extra CALL per packet. */
    ctx->prims_per_packet =
       debug_get_num_option("PARHELIA_PRIMS_PER_PACKET",
-                           !lx ? 8 :
                            ph_screen(screen)->split_multi_draws ?
-                              PH_BATCH_MAX_DRAW_DWORDS : 2);
+                              PH_BATCH_MAX_DRAW_DWORDS : lx ? 2 : 8);
    if (ctx->prims_per_packet < 1)
       ctx->prims_per_packet = 1;
    /* Larger packets need the kernel to keep them out of shared spans. */
