@@ -1680,7 +1680,9 @@ static int parhelia_validate_packet(struct parhelia_device *pdev,
 	if ((header >> 24) == 0x41)
 		return parhelia_validate_constant_group(cmd + packet->offset, packet->length);
 	words = (header & 0xffff) + 2;
-	if (words != packet->length)
+	/* a run of draws repeats one three-dword header */
+	if (words != packet->length &&
+	    ((header >> 24) != 0x97 || words != 3 || packet->length % 3))
 		return -EINVAL;
 
 	switch (header >> 24) {
@@ -1690,6 +1692,9 @@ static int parhelia_validate_packet(struct parhelia_device *pdev,
 	case 0x97:
 		if (words != 3)
 			return -EINVAL;
+		for (u32 k = 3; k < packet->length; k += 3)
+			if (cmd[packet->offset + k] != header)
+				return -EINVAL;
 		parhelia_rebind_draw(vs->rb);
 		return 0;
 	case 0x8f:
@@ -3788,6 +3793,9 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 	case PARHELIA_PARAM_INDEXED_DRAWS:
 		args->value = parhelia_indexed_triangles(pdev);
 		break;
+	case PARHELIA_PARAM_DRAW_RUNS:
+		args->value = parhelia_vertex_objects(pdev);
+		break;
 	case PARHELIA_PARAM_WARP_PROGRAM_SLOTS:
 		args->value = pdev->warp_user_cpu ?
 			PARHELIA_WARP_USER_FILE_SLOTS : 0;
@@ -4544,6 +4552,7 @@ retry_slot:
 		}
 		if (reloc->type == PARHELIA_RELOC_DRAW) {
 			if ((packet_cmd[0] >> 24) != 0x97 || draw_relocated[reloc->packet] ||
+			    packets[reloc->packet].length != 3 ||
 			    (reloc->dword & 3) || !reloc->delta || (reloc->delta & 3) ||
 			    reloc->delta > PARHELIA_MAX_DRAW_DWORDS * sizeof(u32) ||
 			    reloc->handle || reloc->dword > args->vertex_dwords * sizeof(u32) ||
@@ -4603,6 +4612,7 @@ retry_slot:
 			}
 			if (host_vertex_draw || args->vertex_dwords || draw_ranges ||
 			    (packet_cmd[0] >> 24) != 0x97 || draw_relocated[reloc->packet] ||
+			    packets[reloc->packet].length != 3 ||
 			    (reloc->dword & 3) || !reloc->delta || (reloc->delta & 3) ||
 			    reloc->delta > PARHELIA_MAX_DRAW_DWORDS * sizeof(u32) ||
 			    check_add_overflow(reloc->dword, reloc->delta, &range_end)) {
@@ -4920,17 +4930,19 @@ retry_slot:
 			goto out_unpin;
 		}
 		if (opcode == 0x97 && draw_ranges) {
-			u32 *cmd = commands + packets[i].offset;
-			u32 begin = cmd[1], end = cmd[2];
+			for (u32 k = 0; k < packets[i].length; k += 3) {
+				u32 *cmd = commands + packets[i].offset + k;
+				u32 begin = cmd[1], end = cmd[2];
 
-			if (((begin | end) & 3) || end <= begin ||
-			    end - begin > PARHELIA_MAX_DRAW_DWORDS * sizeof(u32) ||
-			    end > draw_ranges) {
-				ret = -EINVAL;
-				goto out_unpin;
+				if (((begin | end) & 3) || end <= begin ||
+				    end - begin > PARHELIA_MAX_DRAW_DWORDS * sizeof(u32) ||
+				    end > draw_ranges) {
+					ret = -EINVAL;
+					goto out_unpin;
+				}
+				cmd[1] = draw_ranges_bus + begin;
+				cmd[2] = draw_ranges_bus + end;
 			}
-			cmd[1] = draw_ranges_bus + begin;
-			cmd[2] = draw_ranges_bus + end;
 			draw_relocated[i] = true;
 		}
 		if (opcode == 0x97 && !draw_relocated[i]) {
