@@ -105,6 +105,8 @@ struct ph_vertex_bounds {
 
 struct parhelia_resource {
    struct pipe_resource base;
+   /* the pending-stream generation that last referenced it */
+   uint64_t pending_stamp;
    /* An S3TC image the texture unit cannot address natively (not 2-D, or
     * a chain of a non-power-of-two base): sampled from this decoded
     * B8G8R8A8 twin, its blocks kept host-side per level and layer for the

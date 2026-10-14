@@ -37,6 +37,7 @@
 #include "util/u_helpers.h"
 #include "util/u_inlines.h"
 #include "util/u_math.h"
+#include "util/u_atomic.h"
 #include "util/u_memory.h"
 #include "util/u_pack_color.h"
 #include "util/u_prim.h"
@@ -633,6 +634,7 @@ struct ph_context {
    unsigned pending_mark_count;
    struct pipe_resource *pending_resources[PH_BATCH_RELOCS];
    unsigned pending_resource_count;
+   uint64_t pending_generation;  /* stamps the resources referenced above */
    /* Raw aliases into pending_resources.  They identify colour/depth writes
     * so a CPU/GPU resolve of an unrelated sampled texture need not publish
     * the whole userspace aggregate first. */
@@ -1681,12 +1683,23 @@ ph_submit_batch_now_untimed(struct ph_context *ctx,
                                 &ctx->fence);
 }
 
+/* Generations are unique across contexts, so a resource stamped by another
+ * context's stream never reads as pending in this one. */
+static uint64_t
+ph_new_pending_generation(void)
+{
+   static uint64_t generations;
+
+   return p_atomic_inc_return(&generations);
+}
+
 static void
 ph_release_pending_resources(struct ph_context *ctx)
 {
    for (unsigned i = 0; i < ctx->pending_resource_count; i++)
       pipe_resource_reference(&ctx->pending_resources[i], NULL);
    ctx->pending_resource_count = 0;
+   ctx->pending_generation = ph_new_pending_generation();
    ctx->pending_write_count = 0;
 }
 
@@ -1905,12 +1918,11 @@ ph_pending_new_resources(const struct ph_context *ctx,
    unsigned count = 0;
 
    for (unsigned i = 0; i < 4; i++) {
-      bool found = !resources[i];
+      bool found = !resources[i] ||
+                   resources[i]->pending_stamp == ctx->pending_generation;
 
       for (unsigned j = 0; !found && j < i; j++)
          found = resources[i] == resources[j];
-      for (unsigned j = 0; !found && j < ctx->pending_resource_count; j++)
-         found = &resources[i]->base == ctx->pending_resources[j];
       count += !found;
    }
    return count;
@@ -1921,14 +1933,13 @@ ph_reference_pending_resources(struct ph_context *ctx,
                                struct parhelia_resource *const resources[4])
 {
    for (unsigned i = 0; i < 4; i++) {
-      bool found = !resources[i];
-
-      for (unsigned j = 0; !found && j < ctx->pending_resource_count; j++)
-         found = &resources[i]->base == ctx->pending_resources[j];
-      if (!found)
-         pipe_resource_reference(
-            &ctx->pending_resources[ctx->pending_resource_count++],
-            &resources[i]->base);
+      if (!resources[i] ||
+          resources[i]->pending_stamp == ctx->pending_generation)
+         continue;
+      resources[i]->pending_stamp = ctx->pending_generation;
+      pipe_resource_reference(
+         &ctx->pending_resources[ctx->pending_resource_count++],
+         &resources[i]->base);
    }
 }
 
@@ -16832,6 +16843,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->pending_vertices = ctx->pending_vertex_store;
    ctx->pending_ring_slot = -1;
    ctx->state_cache = parhelia_state_cache_create();
+   ctx->pending_generation = ph_new_pending_generation();
    parhelia_reg_shadow_init(&ctx->reg_shadow, ph_screen(screen)->chip_id);
    ctx->state_filter = debug_get_bool_option("PARHELIA_STATE_FILTER", false);
    /* All zero, like the state tracker's own initial copy: it only calls
