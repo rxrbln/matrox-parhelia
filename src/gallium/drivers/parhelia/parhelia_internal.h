@@ -65,6 +65,7 @@ struct parhelia_screen {
    bool texture_upload;
    bool native_rt_classes;
    bool window_pairs;
+   bool reglist_runs;	/* 0x00 packets may join register lists */
    unsigned index_dwords;        /* indices one async submit carries */
    uint64_t vertex_bo_max;       /* largest CREATE_VERTEX object */
    bool render_transfer;

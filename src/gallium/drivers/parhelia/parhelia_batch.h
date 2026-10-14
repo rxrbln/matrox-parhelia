@@ -223,6 +223,10 @@ int parhelia_batch_state_run_units(struct parhelia_batch *batch,
  * is byte-identical to parhelia_batch_state_run_units(). */
 struct parhelia_state_cache;
 struct parhelia_state_cache *parhelia_state_cache_create(void);
+/* Join each cached prefix's register lists into runs, for a kernel with
+ * PARHELIA_PARAM_REGLIST_RUNS. */
+void parhelia_state_cache_set_reglist_runs(struct parhelia_state_cache *cache,
+                                           bool enable);
 void parhelia_state_cache_destroy(struct parhelia_state_cache *cache);
 /* The adjacent-packed CALL count of the batch the last cached build made,
  * as if submitted alone, and its vertex-program binds; -1 if unknown. */

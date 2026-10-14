@@ -17028,6 +17028,9 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
        ph_original_family(ph_screen(screen)->chip_id)) &&
       debug_get_bool_option("PARHELIA_PACKED_COLOUR", true);
    ctx->drop_repeats = debug_get_bool_option("PARHELIA_DROP_REPEATS", false);
+   parhelia_state_cache_set_reglist_runs(ctx->state_cache,
+      ph_screen(screen)->reglist_runs && !ctx->state_filter &&
+      !ctx->drop_repeats);
    /* Bounding positions inside the fetch sees every index where the
     * separate scan sees each vertex once: slower on nano (11.21 -> 11.37 ms
     * CPU per ioquake3 frame), faster on the Alpha's EV56 (12.4 -> 13.6 fps),

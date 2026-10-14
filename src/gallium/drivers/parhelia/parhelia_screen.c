@@ -1748,6 +1748,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param vertex_bo_max = {
       .param = PARHELIA_PARAM_VERTEX_BO_MAX,
    };
+   struct drm_parhelia_get_param reglist_runs = {
+      .param = PARHELIA_PARAM_REGLIST_RUNS,
+   };
    struct drm_parhelia_get_param render_transfer = {
       .param = PARHELIA_PARAM_RENDER_TRANSFER,
    };
@@ -1849,6 +1852,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->vertex_bo_max =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &vertex_bo_max) &&
       vertex_bo_max.value ? vertex_bo_max.value : UINT64_C(1) << 20;
+   s->reglist_runs =
+      debug_get_bool_option("PARHELIA_REGLIST_RUNS", true) &&
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &reglist_runs) &&
+      reglist_runs.value == 1;
    s->render_transfer =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &render_transfer) &&
       render_transfer.value == 1;

@@ -215,6 +215,9 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_INDEX_DWORDS	39
 /* Largest CREATE_VERTEX allocation in bytes (1 MiB before this param). */
 #define PARHELIA_PARAM_VERTEX_BO_MAX	40
+/* A 0x00 packet may hold several register lists back to back, each behind
+ * its own header; the engine sees the same stream as from separate packets. */
+#define PARHELIA_PARAM_REGLIST_RUNS	41
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
 /* Retired unsafe generic packing capability; kernels report zero. */

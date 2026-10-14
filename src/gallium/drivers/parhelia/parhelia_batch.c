@@ -1290,6 +1290,7 @@ struct parhelia_state_cache {
    uint8_t *key;                 /* the key being looked up */
    size_t key_len, key_cap;
    bool verify;
+   bool reglist_runs;            /* join prefix lists (PARAM_REGLIST_RUNS) */
    FILE *profile;                /* PARHELIA_STATE_CACHE_PROFILE output */
    unsigned long hits, misses;
    int last_calls;               /* the last batch's entry calls, or -1 */
@@ -1593,6 +1594,64 @@ state_cache_grow(struct parhelia_state_cache *c)
 #define STATE_PACKET_RELOC   0x1u   /* an operand is relocated */
 #define STATE_PACKET_REGLIST 0x2u   /* a plain, 0x21-terminated register list */
 #define STATE_PACKET_EXACT   0x4u   /* a shape the kernel matches exactly */
+#define STATE_PACKET_RUN     0x8u   /* register lists joined into one packet */
+
+/* A joined run stays far below the kernel's 4096-dword packet bound. */
+#define STATE_RUN_DWORDS 1024u
+
+/* Join adjacent register lists of a prefix into one packet each, keeping
+ * every list's header, so the engine runs the same stream while the kernel
+ * validates, plans and packs a few packets instead of ~25.  Exact-shape
+ * packets stay alone, and so does everything from the first packet with a
+ * relocation other than a VRAM operand: the direct-fetch tail is matched
+ * packet by packet.  Commands do not move. */
+static int
+state_cache_join_runs(struct state_cache_entry *e)
+{
+   const unsigned n = e->packet_count;
+   unsigned *map, *shift, tail = n, out = 0;
+   int head = -1;
+
+   map = malloc(2 * (n + 1) * sizeof(*map));
+   if (!map)
+      return -ENOMEM;
+   shift = map + n + 1;
+   for (unsigned r = 0; r < e->reloc_count; r++)
+      if (e->relocs[r].type != PARHELIA_RELOC_VRAM && e->relocs[r].packet < tail)
+         tail = e->relocs[r].packet;
+   for (unsigned i = 0; i < n; i++) {
+      const struct drm_parhelia_packet pk = e->packets[i];
+      const uint32_t header = e->commands[pk.offset];
+      const bool joinable = i < tail && !(header >> 16) &&
+                            (header & 0xffffu) + 2u == pk.length &&
+                            !(e->packet_flags[i] & STATE_PACKET_EXACT);
+
+      if (joinable && head >= 0 &&
+          e->packets[head].offset + e->packets[head].length == pk.offset &&
+          e->packets[head].length + pk.length <= STATE_RUN_DWORDS) {
+         map[i] = head;
+         shift[i] = pk.offset - e->packets[head].offset;
+         e->packets[head].length += pk.length;
+         e->packet_flags[head] |= e->packet_flags[i] | STATE_PACKET_RUN;
+         continue;
+      }
+      map[i] = out;
+      shift[i] = 0;
+      e->packets[out] = pk;
+      e->packet_flags[out] = e->packet_flags[i];
+      head = joinable ? (int)out : -1;
+      out++;
+   }
+   for (unsigned r = 0; r < e->reloc_count; r++) {
+      const unsigned p = e->relocs[r].packet;
+
+      e->relocs[r].packet = map[p];
+      e->relocs[r].dword += shift[p];
+   }
+   e->packet_count = out;
+   free(map);
+   return 0;
+}
 
 /* A register list whose every write can be parsed and repacked. */
 static bool
@@ -2258,6 +2317,11 @@ parhelia_batch_state_run_units_deferred(struct parhelia_state_cache *cache,
          return 0;
       }
    }
+   /* after the searches above, which parse one list per packet */
+   if (cache->reglist_runs && !cache->verify && state_cache_join_runs(e)) {
+      state_cache_entry_free(e);
+      return 0;
+   }
    /* a longer draw run may take one more CALL than the captured one */
    {
       unsigned calls;
@@ -2285,6 +2349,14 @@ parhelia_batch_state_run_units_deferred(struct parhelia_state_cache *cache,
    cache->last_calls = e->calls;
    cache->last_stages = e->stages;
    return 0;
+}
+
+void
+parhelia_state_cache_set_reglist_runs(struct parhelia_state_cache *cache,
+                                      bool enable)
+{
+   if (cache)
+      cache->reglist_runs = enable;
 }
 
 int
