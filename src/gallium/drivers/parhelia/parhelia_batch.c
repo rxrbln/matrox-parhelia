@@ -1198,22 +1198,32 @@ state_key_build(struct parhelia_state_cache *c, const struct p3d_state *input,
           state_key_texture(c, input->tex3);
 }
 
+/* Four independent lanes over the ~1 KiB key: one multiply chain was a
+ * quarter of a cache hit's time. */
 static uint64_t
 state_key_hash(const uint8_t *key, size_t len)
 {
-   uint64_t h = 0x9e3779b97f4a7c15ull ^ len;
+   uint64_t h[4] = {
+      0x9e3779b97f4a7c15ull ^ len, 0xc2b2ae3d27d4eb4full,
+      0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull,
+   };
+   uint64_t r;
    size_t i = 0;
 
-   for (; i + 8 <= len; i += 8) {
-      uint64_t w;
+   for (; i + 32 <= len; i += 32) {
+      for (unsigned l = 0; l < 4; l++) {
+         uint64_t w;
 
-      memcpy(&w, key + i, 8);
-      h = (h ^ w) * 0xff51afd7ed558ccdull;
-      h ^= h >> 32;
+         memcpy(&w, key + i + l * 8, 8);
+         h[l] = (h[l] ^ w) * 0xff51afd7ed558ccdull;
+         h[l] ^= h[l] >> 32;
+      }
    }
+   r = h[0] ^ (h[1] * 0x9e3779b97f4a7c15ull) ^
+       (h[2] * 0xc2b2ae3d27d4eb4full) ^ (h[3] * 0x165667b19e3779f9ull);
    for (; i < len; i++)
-      h = (h ^ key[i]) * 0x100000001b3ull;
-   return h ^ (h >> 29);
+      r = (r ^ key[i]) * 0x100000001b3ull;
+   return r ^ (r >> 29);
 }
 
 static struct state_cache_entry **
