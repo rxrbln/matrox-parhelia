@@ -871,8 +871,10 @@ static bool parhelia_multi_draw_packet(const u32 *commands,
 	if ((cmd[0] >> 24) != 0x97 && (cmd[0] >> 24) != 0x9f)
 		return false;
 	stride = (((cmd[0] >> 17) & 0x3f) + 1) * sizeof(u32);
+	/* a relocated indexed end carries the class-3 tag in bits 1:0 */
 	for (k = 0; k + 3 <= packet->length; k += 3)
-		if (cmd[k + 2] - cmd[k + 1] > PARHELIA_SHARED_SPAN_VERTICES * stride)
+		if ((cmd[k + 2] & ~3u) - cmd[k + 1] >
+		    PARHELIA_SHARED_SPAN_VERTICES * stride)
 			return true;
 	return false;
 }
