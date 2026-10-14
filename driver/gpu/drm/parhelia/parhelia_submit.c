@@ -533,10 +533,11 @@ static void parhelia_local_vertex_streams(u32 *commands,
 	}
 }
 
-/* Multi-primitive draws get CALL spans of their own on the P690. */
+/* Multi-primitive draws get CALL spans of their own on the P690, and on the
+ * original family, whose vendor driver gives every draw its own span too. */
 static bool parhelia_split_multi_draws(const struct parhelia_device *pdev)
 {
-	return pdev->pdev->device == PARHELIA_P690;
+	return pdev->pdev->device == PARHELIA_P690 || parhelia_original_family(pdev);
 }
 
 static bool trace_vram_reloc;
