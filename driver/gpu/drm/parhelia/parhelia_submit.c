@@ -832,6 +832,17 @@ parhelia_packet_span_dwords(const struct drm_parhelia_packet *packets,
 	return 0;
 }
 
+/* The opcodes validation records, for plans the selftests build. */
+static void parhelia_plan_record_ops(struct parhelia_call_plan *plan,
+		const u32 *commands, const struct drm_parhelia_packet *packets,
+		u32 packet_count)
+{
+	u32 i;
+
+	for (i = 0; i < packet_count; i++)
+		plan->pkt_op[i] = commands[packets[i].offset] >> 24;
+}
+
 static void parhelia_coalesce_range_calls(struct parhelia_call_plan *plan,
 		const u32 *commands, const struct drm_parhelia_packet *packets,
 		u32 packet_count, const bool *call_boundaries)
@@ -844,6 +855,7 @@ static void parhelia_coalesce_range_calls(struct parhelia_call_plan *plan,
 		u32 words;
 
 		if (block >= packet_count || run != 1 ||
+		    plan->pkt_op[block] != 0x8f ||
 		    !parhelia_is_coalescible_range_packet(commands, &packets[block]))
 			goto copy_one;
 		words = packets[block].length;
@@ -858,6 +870,7 @@ static void parhelia_coalesce_range_calls(struct parhelia_call_plan *plan,
 					       packets[next - 1].length,
 					       &previous_end) ||
 			    packets[next].offset != previous_end ||
+			    plan->pkt_op[next] != 0x8f ||
 			    !parhelia_is_coalescible_range_packet(commands,
 							 &packets[next]))
 				break;
@@ -1247,6 +1260,7 @@ static int parhelia_range_call_static_selftest(void)
 	plan->stage_modes[2] = 1;
 	if (parhelia_plan_calls(plan, ARRAY_SIZE(packets), 0, 0))
 		goto out;
+	parhelia_plan_record_ops(plan, commands, packets, ARRAY_SIZE(packets));
 	parhelia_coalesce_range_calls(plan, commands, packets,
 		ARRAY_SIZE(packets), NULL);
 	if (plan->count != 8 || plan->blocks[0] != 5 ||
@@ -1279,6 +1293,7 @@ static int parhelia_range_call_static_selftest(void)
 	memset(plan, 0, sizeof(*plan));
 	if (parhelia_plan_calls_stateful(plan, 4, 2, 0, 2))
 		goto out;
+	parhelia_plan_record_ops(plan, commands, packets, 4);
 	parhelia_coalesce_range_calls(plan, commands, packets, 4, NULL);
 	if (plan->count != 8 || plan->blocks[0] != 4 ||
 	    plan->packet_spans[0] || plan->blocks[1] != 0 ||
@@ -1296,6 +1311,7 @@ static int parhelia_range_call_static_selftest(void)
 	memset(plan, 0, sizeof(*plan));
 	parhelia_plan_append(plan, 0, 1);
 	parhelia_plan_append(plan, 1, 1);
+	parhelia_plan_record_ops(plan, gapped_commands, gapped_packets, 2);
 	parhelia_coalesce_range_calls(plan, gapped_commands, gapped_packets, 2,
 				      NULL);
 	if (plan->count != 2 || plan->blocks[0] || plan->packet_spans[0] != 1 ||
@@ -1449,6 +1465,7 @@ static int parhelia_large_range_call_static_selftest(void)
 	    plan->count != PARHELIA_USER_PACKET_CAPACITY + 3u ||
 	    !parhelia_plan_fits_hardware(plan))
 		goto out;
+	parhelia_plan_record_ops(plan, commands, packets, PARHELIA_USER_PACKET_CAPACITY);
 	parhelia_coalesce_range_calls(plan, commands, packets,
 				      PARHELIA_USER_PACKET_CAPACITY, NULL);
 	if (plan->count != 4 || plan->blocks[0] != PARHELIA_USER_PACKET_CAPACITY ||
@@ -1473,6 +1490,7 @@ static int parhelia_large_range_call_static_selftest(void)
 	memset(plan, 0, sizeof(*plan));
 	if (parhelia_plan_calls(plan, PARHELIA_USER_PACKET_CAPACITY, 0, false))
 		goto out;
+	parhelia_plan_record_ops(plan, commands, packets, PARHELIA_USER_PACKET_CAPACITY);
 	parhelia_coalesce_range_calls(plan, commands, packets,
 				      PARHELIA_USER_PACKET_CAPACITY, NULL);
 	if (plan->count != PARHELIA_USER_PACKET_CAPACITY + 3u ||
