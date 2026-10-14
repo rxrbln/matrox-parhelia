@@ -36,6 +36,10 @@
 #define PARHELIA_FENCE_TIMEOUT_US	50000u
 #define PARHELIA_R_DWGCTL		0x1300
 
+static void parhelia_dump_slot_calls(struct parhelia_device *pdev,
+				     const struct parhelia_submit_slot *slot,
+				     u32 get);
+
 /* A single textured full-screen draw can take well over 50 ms (minified
  * without mipmaps); only a request without fence progress for this long is
  * treated as an engine hang. */
@@ -445,6 +449,84 @@ MODULE_PARM_DESC(vram_vertex,
 static bool parhelia_vertex_objects(const struct parhelia_device *pdev)
 {
 	return vram_vertex && pdev->pdev->device == PARHELIA_P690;
+}
+
+/* Experiment for the P690 multi-primitive packet stall: host-vertex draws of
+ * asynchronous requests fetch from a per-slot local-VRAM copy (class 0). */
+static bool local_vertex_draws;
+module_param(local_vertex_draws, bool, 0400);
+MODULE_PARM_DESC(local_vertex_draws,
+		 "P690: fetch host-vertex draw ranges from a local-VRAM copy, class 0 (experimental, default false)");
+
+static int parhelia_local_vertex_prepare(struct parhelia_device *pdev,
+					 struct parhelia_submit_slot *slot)
+{
+	const u32 bytes = PARHELIA_VERTEX_DWORDS * sizeof(u32);
+	struct drm_gem_vram_object *bo;
+	int ret;
+
+	if (slot->local_vertex)
+		return 0;
+	bo = drm_gem_vram_create(&pdev->drm, PAGE_ALIGN(bytes), 1);
+	if (IS_ERR(bo))
+		return PTR_ERR(bo);
+	ret = parhelia_vram_pin(bo);
+	if (ret)
+		goto out_put;
+	ret = parhelia_vram_gpu_addr(pdev, bo, 0, bytes, &slot->local_vertex_gpu);
+	if (ret)
+		goto out_unpin;
+	dev_info(&pdev->pdev->dev, "local vertex copy for slot %td at %#x\n",
+		 slot - pdev->slots, slot->local_vertex_gpu);
+	slot->local_vertex = bo;
+	return 0;
+
+out_unpin:
+	parhelia_vram_unpin(bo);
+out_put:
+	drm_gem_object_put(&bo->bo.base);
+	return ret;
+}
+
+static void parhelia_local_vertex_fini(struct parhelia_submit_slot *slot)
+{
+	struct drm_gem_vram_object *bo = slot->local_vertex;
+
+	if (!bo)
+		return;
+	parhelia_vram_unpin(bo);
+	drm_gem_object_put(&bo->bo.base);
+	slot->local_vertex = NULL;
+}
+
+/* The draw packets' class-3 stream binds become class 0. */
+static void parhelia_local_vertex_streams(u32 *commands,
+					  const struct drm_parhelia_packet *packets,
+					  u32 count)
+{
+	u32 i;
+
+	for (i = 0; i < count; i++) {
+		u32 *cmd = commands + packets[i].offset;
+		u32 pos = 1;
+
+		if (cmd[0] >> 24)
+			continue;
+		while (pos < packets[i].length) {
+			u32 tag = cmd[pos++];
+			unsigned int slot;
+
+			for (slot = 0; slot < 4 && pos < packets[i].length; slot++) {
+				u32 index = (tag >> (slot * 8)) & 0xff;
+
+				if (index == 0x21)
+					break;
+				if (index == 0 && cmd[pos] == 3)
+					cmd[pos] = 0;
+				pos++;
+			}
+		}
+	}
 }
 
 static bool trace_vram_reloc;
@@ -2480,6 +2562,7 @@ static void parhelia_retire_locked(struct parhelia_device *pdev)
 					slot->primary_end, slot->call_count,
 					jiffies_to_msecs(jiffies - slot->submitted));
 		}
+		parhelia_dump_slot_calls(pdev, oldest, parhelia_read(pdev, 0x0404));
 		slot = oldest;
 		pdev->wedged = true;
 		parhelia_state_shadow_invalidate(pdev, "asynchronous submit timeout");
@@ -2539,6 +2622,42 @@ int parhelia_submit_idle_lock(struct parhelia_device *pdev)
 /* An async request owns its compact secondary heap until DWGSYNC retires its
  * slot.  This runs only while the selected slot is free and submit_lock is
  * held, so replacing its heap cannot invalidate an engine-visible address. */
+/* The stalled request's CALLs and the leading dwords of each secondary span;
+ * @get is the primary fetcher's bus address at the stall. */
+static void parhelia_dump_slot_calls(struct parhelia_device *pdev,
+				     const struct parhelia_submit_slot *slot,
+				     u32 get)
+{
+	const u32 *primary = pdev->async_primary_cpu;
+	const u64 sec_bus = slot->secondary_bus;
+	const u64 sec_end = sec_bus + (u64)slot->secondary_dwords * sizeof(u32);
+	u32 get_dword = ((get & ~3u) - lower_32_bits(pdev->async_primary_bus)) / 4;
+	u32 pos, call = 0;
+
+	for (pos = slot->primary_begin; pos + PARHELIA_CALL_DWORDS <= slot->primary_end; pos++) {
+		u32 start, end, words, n;
+		const u32 *span;
+		char line[96];
+		int len = 0;
+
+		if (primary[pos] != PARHELIA_CALL_HEADER)
+			continue;
+		start = primary[pos + 2] & ~3u;
+		end = primary[pos + 3] & ~3u;
+		words = end > start ? (end - start) / 4 : 0;
+		if (start < sec_bus || end > sec_end || end < start)
+			span = NULL;
+		else
+			span = (const u32 *)slot->secondary_cpu + (start - sec_bus) / 4;
+		for (n = 0; span && n < min(words, 6u); n++)
+			len += scnprintf(line + len, sizeof(line) - len, " %08x", span[n]);
+		dev_err(&pdev->pdev->dev, "%s call %u primary %u span %08x-%08x %u dwords:%s\n",
+			get_dword >= pos && get_dword < pos + PARHELIA_CALL_DWORDS ? "->" : "  ",
+			call++, pos, start, end, words, span ? line : " (not in the slot heap)");
+		pos += PARHELIA_CALL_DWORDS - 1;
+	}
+}
+
 static int parhelia_async_slot_prepare(struct parhelia_device *pdev,
 				       struct parhelia_submit_slot *slot, u32 dwords)
 {
@@ -4248,6 +4367,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	dma_addr_t primary_bus = pdev->primary_bus;
 	bool *draw_relocated, *call_boundaries;
 	bool host_vertex_draw = false;
+	struct parhelia_submit_slot *local_vertex = NULL;
 	bool vertex_object_draw = false;
 	u32 draw_ranges = 0, draw_ranges_bus = 0;
 	const u8 *draw_ranges_cpu = NULL;
@@ -4501,6 +4621,14 @@ retry_slot:
 		vertex_bus = async_slot->vertex_bus;
 		writeback_bus = async_slot->writeback_bus;
 		primary_bus = pdev->async_primary_bus + pdev->primary_put * sizeof(u32);
+		if (local_vertex_draws && args->vertex_dwords &&
+		    pdev->pdev->device == PARHELIA_P690) {
+			async_failure_stage = "local vertex copy";
+			ret = parhelia_local_vertex_prepare(pdev, async_slot);
+			if (ret)
+				goto out_unlock;
+			local_vertex = async_slot;
+		}
 	}
 	if (!async && pdev->queued_slots) {
 		parhelia_submit_unlock(pdev);
@@ -4521,6 +4649,12 @@ retry_slot:
 				args->vertex_dwords * sizeof(u32))) {
 		ret = -EFAULT;
 		goto out_unlock;
+	}
+	if (local_vertex) {
+		ret = parhelia_vram_write(pdev, local_vertex->local_vertex, 0,
+					  vertex_cpu, args->vertex_dwords * sizeof(u32));
+		if (ret)
+			goto out_unlock;
 	}
 
 	for (i = 0; i < args->reloc_count; i++) {
@@ -4561,7 +4695,8 @@ retry_slot:
 				ret = -EINVAL;
 				goto out_unpin;
 			}
-			packet_cmd[1] = lower_32_bits(vertex_bus) + reloc->dword;
+			packet_cmd[1] = (local_vertex ? local_vertex->local_vertex_gpu :
+					 lower_32_bits(vertex_bus)) + reloc->dword;
 			packet_cmd[2] = packet_cmd[1] + reloc->delta;
 			draw_relocated[reloc->packet] = true;
 			host_vertex_draw = true;
@@ -4870,6 +5005,8 @@ retry_slot:
 				 pbo->gbo.bo.pin_count);
 		}
 	}
+	if (local_vertex && host_vertex_draw)
+		parhelia_local_vertex_streams(commands, packets, args->packet_count);
 	if (mode7.stream_seen || mode7.index_seen) {
 		ret = parhelia_validate_mode7_contract(commands, packets,
 					       args->packet_count, &mode7, &mode7_state);
@@ -6241,6 +6378,7 @@ void parhelia_submit_fini(struct parhelia_device *pdev)
 			slot->state = PARHELIA_SLOT_QUEUED;
 		parhelia_slot_release_locked(pdev, slot, true);
 		parhelia_async_slot_heap_fini(pdev, slot);
+		parhelia_local_vertex_fini(slot);
 	}
 	list_for_each_entry_safe(entry, tmp, &pdev->vertex_bos, link) {
 		list_del(&entry->link);

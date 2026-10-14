@@ -424,6 +424,9 @@ struct parhelia_submit_slot {
 	u32 secondary_put;
 	void *vertex_cpu;
 	dma_addr_t vertex_bus;
+	/* local_vertex_draws: a class-0 VRAM copy of vertex_cpu */
+	struct drm_gem_vram_object *local_vertex;
+	u32 local_vertex_gpu;
 	void *writeback_cpu;
 	dma_addr_t writeback_bus;
 	struct drm_gem_object **objects;
