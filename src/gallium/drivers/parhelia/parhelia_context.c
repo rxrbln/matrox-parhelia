@@ -9335,7 +9335,8 @@ ph_tcl_constant_colour(struct ph_context *ctx, const struct ph_tcl_layout *lay,
 static bool
 ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
                     const struct ph_tcl_fetch *fetch, const uint32_t *elts,
-                    unsigned ntri, uint32_t entry, unsigned vs_const_vec4s)
+                    unsigned ntri, uint32_t entry, unsigned vs_const_vec4s,
+                    const float *fused_mvp)
 {
    uint32_t lo = UINT32_MAX, hi = 0, *idx;
    unsigned nverts;
@@ -9371,7 +9372,15 @@ ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
    for (unsigned v = 0; v < nverts; v++)
       ctx->tcl_seq[v] = lo + v;
    dst = ctx->vertices;
-   ph_tcl_fetch_run(fetch, ctx->tcl_seq, nverts, dst, lay->dpv);
+   /* a fused box bounds the range while fetching it; outside the volume the
+    * caller clips the expanded triangles */
+   if (fused_mvp) {
+      if (!ph_tcl_fetch_run_boxed(ctx, fetch, ctx->tcl_seq, nverts, dst,
+                                  lay->dpv, fused_mvp))
+         return false;
+   } else {
+      ph_tcl_fetch_run(fetch, ctx->tcl_seq, nverts, dst, lay->dpv);
+   }
    ph_tcl_constant_colour(ctx, lay, dst, nverts);
    idx = (uint32_t *)dst + (size_t)nverts * lay->dpv;
    for (unsigned i = 0; i < ntri * 3; i++)
@@ -9598,11 +9607,14 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
          ctx->tcl_slice_draws++;
    }
    limit = ph_triangle_batch_limit(ctx);
-   if (ph_screen(ctx->base.screen)->indexed_tris && box_fits && fetch.count &&
-       ntri <= limit &&
+   if (ph_screen(ctx->base.screen)->indexed_tris && (box_fits || fused_box) &&
+       fetch.count && ntri <= limit &&
        ph_tcl_draw_indexed(ctx, &lay, &fetch, elts, ntri, entry,
-                           vs_const_vec4s))
+                           vs_const_vec4s, fused_box ? mvp : NULL)) {
+      if (fused_box)
+         ctx->tcl_box_draws++;
       return true;
+   }
    while (done < ntri) {
       unsigned room = ph_logical_vertex_limit(ctx) / (3 * lay.dpv);
       unsigned space = MIN2(limit, room);
