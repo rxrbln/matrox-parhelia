@@ -522,6 +522,12 @@ struct ph_context {
    unsigned tcl_seq_cap;
    /* an indexed draw's unique vertices in clip space with their outcodes,
     * and the triangles crossing the volume set aside for the clipper */
+   /* a triangle list's indices not expanded yet (ph_tcl_expand lazy) */
+   struct {
+      const void *indices;
+      unsigned size, total;
+      uint32_t bias;
+   } tcl_lazy;
    float *tcl_vclip;
    uint8_t *tcl_vcode;
    unsigned tcl_vclip_cap;
@@ -9022,13 +9028,51 @@ ph_tcl_index(const void *indices, unsigned size, unsigned i, int bias)
    return v + bias;
 }
 
+/* A triangle list's elements: its indices plus the bias. */
+static void
+ph_tcl_fill_triangles(uint32_t *elts, const void *indices, unsigned size,
+                      uint32_t bias, unsigned total)
+{
+   if (size == 4) {
+      const uint32_t *in = indices;
+
+      for (unsigned i = 0; i < total; i++)
+         elts[i] = in[i] + bias;
+   } else if (size == 2) {
+      const uint16_t *in = indices;
+
+      for (unsigned i = 0; i < total; i++)
+         elts[i] = in[i] + bias;
+   } else if (size == 1) {
+      const uint8_t *in = indices;
+
+      for (unsigned i = 0; i < total; i++)
+         elts[i] = in[i] + bias;
+   } else {
+      for (unsigned i = 0; i < total; i++)
+         elts[i] = bias + i;
+   }
+}
+
+/* The elements of a lazily expanded triangle list. */
+static uint32_t *
+ph_tcl_materialize(struct ph_context *ctx)
+{
+   uint32_t *elts = ph_tcl_elts(ctx, ctx->tcl_lazy.total);
+
+   if (elts)
+      ph_tcl_fill_triangles(elts, ctx->tcl_lazy.indices, ctx->tcl_lazy.size,
+                            ctx->tcl_lazy.bias, ctx->tcl_lazy.total);
+   return elts;
+}
+
 /* Expand the draw into an independent-triangle index list.  The hardware draws
  * one triangle per packet, so strips, fans and quads are resolved here rather
  * than by a draw-module stage. */
 static unsigned
 ph_tcl_expand(struct ph_context *ctx, const struct pipe_draw_info *info,
               const struct pipe_draw_start_count_bias *draw, uint32_t **out,
-              uint32_t range[2])
+              uint32_t range[2], bool lazy)
 {
    const void *indices = NULL;
    unsigned size = info->index_size, count = draw->count, ntri, n = 0;
@@ -9062,6 +9106,21 @@ ph_tcl_expand(struct ph_context *ctx, const struct pipe_draw_info *info,
          return 0;
       indices = (const uint8_t *)indices + (size_t)draw->start * size;
    }
+   /* An indexed triangle list with known bounds is left to its consumer:
+    * the indexed path rebases the indices straight from the draw. */
+   if (lazy && info->mode == MESA_PRIM_TRIANGLES && size &&
+       info->index_bounds_valid &&
+       (int64_t)info->min_index + draw->index_bias >= 0 &&
+       (int64_t)info->max_index + draw->index_bias <= UINT32_MAX) {
+      ctx->tcl_lazy.indices = indices;
+      ctx->tcl_lazy.size = size;
+      ctx->tcl_lazy.bias = draw->index_bias;
+      ctx->tcl_lazy.total = ntri * 3;
+      range[0] = info->min_index + draw->index_bias;
+      range[1] = info->max_index + draw->index_bias;
+      *out = NULL;
+      return ntri;
+   }
    elts = ph_tcl_elts(ctx, ntri * 3);
    if (!elts)
       return 0;
@@ -9069,33 +9128,12 @@ ph_tcl_expand(struct ph_context *ctx, const struct pipe_draw_info *info,
 #define PH_ELT(i) (size ? ph_tcl_index(indices, size, (i), draw->index_bias) : \
                           draw->start + (i))
    switch (info->mode) {
-   case MESA_PRIM_TRIANGLES: {
+   case MESA_PRIM_TRIANGLES:
       /* locals: the stores through elts may alias the draw */
-      const uint32_t bias = size ? draw->index_bias : draw->start;
-      const unsigned total = ntri * 3;
-
-      if (size == 4) {
-         const uint32_t *in = indices;
-
-         for (unsigned i = 0; i < total; i++)
-            elts[i] = in[i] + bias;
-      } else if (size == 2) {
-         const uint16_t *in = indices;
-
-         for (unsigned i = 0; i < total; i++)
-            elts[i] = in[i] + bias;
-      } else if (size == 1) {
-         const uint8_t *in = indices;
-
-         for (unsigned i = 0; i < total; i++)
-            elts[i] = in[i] + bias;
-      } else {
-         for (unsigned i = 0; i < total; i++)
-            elts[i] = bias + i;
-      }
-      n = total;
+      ph_tcl_fill_triangles(elts, indices, size,
+                            size ? draw->index_bias : draw->start, ntri * 3);
+      n = ntri * 3;
       break;
-   }
    case MESA_PRIM_TRIANGLE_STRIP:
       for (unsigned i = 0; i < ntri; i++) {
          /* An odd strip triangle swaps its first two vertices so the
@@ -9735,7 +9773,7 @@ ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
       if (!ph_tcl_fetch_run_boxed(ctx, fetch, ctx->tcl_seq, nverts, dst,
                                   lay->dpv, fused_mvp,
                                   clip ? ctx->tcl_block_box : NULL)) {
-         if (!clip)
+         if (!clip || (!elts && !(elts = ph_tcl_materialize(ctx))))
             return false;
          ph_tcl_constant_colour(ctx, lay, dst, nverts);
          return ph_tcl_draw_indexed_clipped(ctx, lay, clip, elts, ntri, lo,
@@ -9748,11 +9786,40 @@ ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
    idx = (uint32_t *)dst + (size_t)nverts * lay->dpv;
    {
       /* indices outside the draw's declared range draw expanded */
+      const unsigned total = ntri * 3;
       uint32_t outside = 0;
 
-      for (unsigned i = 0; i < ntri * 3; i++) {
-         idx[i] = elts[i] - lo;
-         outside |= idx[i] >= nverts;
+      if (elts) {
+         for (unsigned i = 0; i < total; i++) {
+            idx[i] = elts[i] - lo;
+            outside |= idx[i] >= nverts;
+         }
+      } else {
+         /* rebased straight from the draw's indices, in one pass */
+         const uint32_t base = ctx->tcl_lazy.bias - lo;
+
+         if (ctx->tcl_lazy.size == 4) {
+            const uint32_t *in = ctx->tcl_lazy.indices;
+
+            for (unsigned i = 0; i < total; i++) {
+               idx[i] = in[i] + base;
+               outside |= idx[i] >= nverts;
+            }
+         } else if (ctx->tcl_lazy.size == 2) {
+            const uint16_t *in = ctx->tcl_lazy.indices;
+
+            for (unsigned i = 0; i < total; i++) {
+               idx[i] = in[i] + base;
+               outside |= idx[i] >= nverts;
+            }
+         } else {
+            const uint8_t *in = ctx->tcl_lazy.indices;
+
+            for (unsigned i = 0; i < total; i++) {
+               idx[i] = in[i] + base;
+               outside |= idx[i] >= nverts;
+            }
+         }
       }
       if (outside)
          return false;
@@ -9856,7 +9923,8 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
             goto fallback;
       }
    }
-   ntri = ph_tcl_expand(ctx, info, draw, &elts, range);
+   ntri = ph_tcl_expand(ctx, info, draw, &elts, range,
+                        ph_screen(ctx->base.screen)->indexed_tris != 0);
    if (!ntri)
       goto fallback;
    if (ctx->stats)
@@ -10008,6 +10076,8 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
          ctx->tcl_box_draws++;
       return true;
    }
+   if (!elts && !(elts = ph_tcl_materialize(ctx)))
+      goto fallback;
    while (done < ntri) {
       unsigned room = ph_logical_vertex_limit(ctx) / (3 * lay.dpv);
       unsigned space = MIN2(limit, room);
