@@ -519,6 +519,13 @@ struct ph_context {
    unsigned deindex_cap;
    uint32_t *tcl_seq;
    unsigned tcl_seq_cap;
+   /* an indexed draw's unique vertices in clip space with their outcodes,
+    * and the triangles crossing the volume set aside for the clipper */
+   float *tcl_vclip;
+   uint8_t *tcl_vcode;
+   unsigned tcl_vclip_cap;
+   float *tcl_cross;
+   size_t tcl_cross_cap;
    /* a submit without its repeated plain register writes */
    bool drop_repeats;
    struct parhelia_batch *repeat_batch;
@@ -9383,11 +9390,133 @@ ph_tcl_constant_colour(struct ph_context *ctx, const struct ph_tcl_layout *lay,
  * its indices, rebased to that range, behind them, all of it one batch.
  * False when indexing would not stage less or does not fit; the caller then
  * expands the triangles. */
+/* Outcode bits of a clip-space vertex: inside the guard band volume, and
+ * one per clipper plane it lies outside of. */
+#define PH_TCL_VCODE_INSIDE 0x80u
+
+static uint8_t
+ph_tcl_vertex_code(const struct ph_tcl_run *r, const float c[4])
+{
+   uint8_t code = c[3] > 1e-6f && fabsf(c[0]) <= r->gx * c[3] &&
+                  fabsf(c[1]) <= r->gy * c[3] && c[2] >= -c[3] &&
+                  c[2] <= c[3] ? PH_TCL_VCODE_INSIDE : 0;
+
+   for (unsigned plane = 0; plane < PH_TCL_CLIP_PLANES; plane++)
+      code |= (ph_tcl_plane_distance(plane, c, r->cx, r->cy) < 0.0f) << plane;
+   return code;
+}
+
+static bool
+ph_tcl_grow(void **buf, size_t *cap, size_t bytes)
+{
+   void *grown;
+
+   if (*cap >= bytes)
+      return true;
+   grown = realloc(*buf, bytes);
+   if (!grown)
+      return false;
+   *buf = grown;
+   *cap = bytes;
+   return true;
+}
+
+/* The staged range of an indexed draw that leaves the clip volume: each
+ * unique vertex is transformed once, triangles inside stay indexed, those
+ * outside one plane go, and the crossing ones are clipped expanded. */
+static bool
+ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
+                            const struct ph_tcl_layout *lay,
+                            const struct ph_tcl_run *r, const uint32_t *elts,
+                            unsigned ntri, uint32_t lo, unsigned nverts)
+{
+   const unsigned dpv = lay->dpv, tri_floats = 3 * (dpv + 4);
+   const float *dst = ctx->vertices;
+   size_t clip_cap = (size_t)ctx->tcl_vclip_cap * 4 * sizeof(float);
+   size_t code_cap = ctx->tcl_vclip_cap;
+   uint32_t *idx = (uint32_t *)ctx->vertices + (size_t)nverts * dpv;
+   unsigned kept = 0, crossing = 0;
+   float *cross;
+
+   if (!ph_tcl_grow((void **)&ctx->tcl_vclip, &clip_cap,
+                    (size_t)nverts * 4 * sizeof(float)) ||
+       !ph_tcl_grow((void **)&ctx->tcl_vcode, &code_cap, nverts))
+      return false;
+   ctx->tcl_vclip_cap = MIN2(clip_cap / (4 * sizeof(float)), code_cap);
+   for (unsigned v = 0; v < nverts; v++) {
+      float *c = ctx->tcl_vclip + (size_t)v * 4;
+
+      ph_tcl_clip_coords(ctx->mvp, dst + (size_t)v * dpv, c);
+      ctx->tcl_vcode[v] = ph_tcl_vertex_code(r, c);
+   }
+   for (unsigned t = 0; t < ntri; t++) {
+      const uint8_t a = ctx->tcl_vcode[elts[t * 3] - lo];
+      const uint8_t b = ctx->tcl_vcode[elts[t * 3 + 1] - lo];
+      const uint8_t c = ctx->tcl_vcode[elts[t * 3 + 2] - lo];
+
+      if (a & b & c & PH_TCL_VCODE_INSIDE)
+         kept++;
+      else if (!(a & b & c & ~PH_TCL_VCODE_INSIDE & 0xff))
+         crossing++;
+   }
+   if (!ph_tcl_grow((void **)&ctx->tcl_cross, &ctx->tcl_cross_cap,
+                    (size_t)crossing * tri_floats * sizeof(float)))
+      return false;
+   /* the crossing triangles leave the staging before the indexed submit
+    * re-points it */
+   cross = ctx->tcl_cross;
+   kept = 0;
+   for (unsigned t = 0; t < ntri; t++) {
+      const uint32_t *e = elts + t * 3;
+      const uint8_t a = ctx->tcl_vcode[e[0] - lo];
+      const uint8_t b = ctx->tcl_vcode[e[1] - lo];
+      const uint8_t c = ctx->tcl_vcode[e[2] - lo];
+
+      if (a & b & c & PH_TCL_VCODE_INSIDE) {
+         idx[kept * 3] = e[0] - lo;
+         idx[kept * 3 + 1] = e[1] - lo;
+         idx[kept * 3 + 2] = e[2] - lo;
+         kept++;
+      } else if (!(a & b & c & ~PH_TCL_VCODE_INSIDE & 0xff)) {
+         for (unsigned v = 0; v < 3; v++) {
+            memcpy(cross + v * dpv, dst + (size_t)(e[v] - lo) * dpv,
+                   dpv * sizeof(float));
+            memcpy(cross + 3 * dpv + v * 4,
+                   ctx->tcl_vclip + (size_t)(e[v] - lo) * 4,
+                   4 * sizeof(float));
+         }
+         cross += tri_floats;
+      }
+   }
+   if (kept) {
+      ctx->triangles = kept;
+      ctx->indexed_verts = nverts;
+      ph_submit_vertices(ctx);
+      if (ctx->submit_error)
+         return true;
+   }
+   for (unsigned t = 0; t < crossing; t++) {
+      const float *base = ctx->tcl_cross + (size_t)t * tri_floats;
+      const float *tri[3] = { base, base + dpv, base + 2 * dpv };
+
+      /* a submit cleared the batch's program state */
+      ctx->transform = true;
+      ctx->warp_program_entry = r->entry;
+      ctx->vs_const_vec4s = r->vs_const_vec4s;
+      ctx->colour_alpha = lay->colour_alpha;
+      ctx->packed_colour = lay->packed_colour;
+      if (!ph_tcl_clip_tri(ctx, r, tri,
+                           (const float (*)[4])(base + 3 * dpv)))
+         return true;
+   }
+   return true;
+}
+
 static bool
 ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
                     const struct ph_tcl_fetch *fetch, const uint32_t *elts,
                     unsigned ntri, uint32_t entry, unsigned vs_const_vec4s,
-                    const float *fused_mvp)
+                    const float *fused_mvp, const struct ph_tcl_run *clip)
 {
    uint32_t lo = UINT32_MAX, hi = 0, *idx;
    unsigned nverts;
@@ -9427,8 +9556,13 @@ ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
     * caller clips the expanded triangles */
    if (fused_mvp) {
       if (!ph_tcl_fetch_run_boxed(ctx, fetch, ctx->tcl_seq, nverts, dst,
-                                  lay->dpv, fused_mvp))
-         return false;
+                                  lay->dpv, fused_mvp)) {
+         if (!clip)
+            return false;
+         ph_tcl_constant_colour(ctx, lay, dst, nverts);
+         return ph_tcl_draw_indexed_clipped(ctx, lay, clip, elts, ntri, lo,
+                                            nverts);
+      }
    } else {
       ph_tcl_fetch_run(fetch, ctx->tcl_seq, nverts, dst, lay->dpv);
    }
@@ -9658,10 +9792,30 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
          ctx->tcl_slice_draws++;
    }
    limit = ph_triangle_batch_limit(ctx);
+   /* the fixed-function clipper's planes, for draws leaving the volume */
+   const struct ph_tcl_run clip_run = {
+      .dpv = lay.dpv, .limit = limit,
+      .vs_const_vec4s = vs_const_vec4s, .entry = entry,
+      .colour_alpha = lay.colour_alpha,
+      .packed_colour = lay.packed_colour ? (int)lay.colour_offset : -1,
+      .gx = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[0])) /
+            MAX2(fabsf(ctx->viewport.scale[0]), 1e-6f),
+      .gy = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[1])) /
+            MAX2(fabsf(ctx->viewport.scale[1]), 1e-6f),
+      .cx = 1.0f + PH_TCL_CLIP_MARGIN /
+            MAX2(fabsf(ctx->viewport.scale[0]), 1e-6f),
+      .cy = 1.0f + PH_TCL_CLIP_MARGIN /
+            MAX2(fabsf(ctx->viewport.scale[1]), 1e-6f),
+   };
+   const bool can_clip = !lay.program && lay.dpv <= PH_TCL_MAX_DPV &&
+                         debug_get_option_tcl_clip() &&
+                         clip_run.gx > clip_run.cx && clip_run.gy > clip_run.cy;
+
    if (ph_screen(ctx->base.screen)->indexed_tris && (box_fits || fused_box) &&
        fetch.count && ntri <= limit &&
        ph_tcl_draw_indexed(ctx, &lay, &fetch, elts, ntri, entry,
-                           vs_const_vec4s, fused_box ? mvp : NULL)) {
+                           vs_const_vec4s, fused_box ? mvp : NULL,
+                           can_clip ? &clip_run : NULL)) {
       if (fused_box)
          ctx->tcl_box_draws++;
       return true;
@@ -16410,6 +16564,9 @@ ph_destroy_context(struct pipe_context *p)
    free(ctx->tcl_clip_copy);
    free(ctx->deindex);
    free(ctx->tcl_seq);
+   free(ctx->tcl_vclip);
+   free(ctx->tcl_vcode);
+   free(ctx->tcl_cross);
    FREE(ctx->slice_batch);
    FREE(ctx->repeat_batch);
    FREE(ctx->pending_vertex_store);
