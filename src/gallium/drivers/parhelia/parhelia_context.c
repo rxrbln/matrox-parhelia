@@ -607,6 +607,7 @@ struct ph_context {
    struct parhelia_batch_replay replay;
    bool defer_replay;
    bool draw_mapped;             /* the draw module holds this draw's buffers */
+   unsigned staged_dpv;          /* the staged batch's dwords per vertex */
    /* registers the pending stream has set, for filtering replayed state */
    struct parhelia_reg_shadow reg_shadow;
    bool state_filter;
@@ -1531,8 +1532,16 @@ ph_stage_evict(struct ph_context *ctx, const void *vertices)
        ((const float *)vertices >= ctx->vertices &&
         (const float *)vertices < ctx->vertices + ctx->stage_room))
       return;
+   /* only the staged batch is live: its primitives' vertices, and the
+    * indices behind an indexed batch's vertices */
+   const size_t live = !ctx->staged_dpv ? ctx->stage_room :
+      ctx->indexed_verts ?
+      (size_t)ctx->indexed_verts * ctx->staged_dpv + ctx->triangles * 3 :
+      ((size_t)ctx->triangles * 3 + ctx->points + ctx->lines * 2) *
+         ctx->staged_dpv;
+
    memcpy(ctx->vertex_store, ctx->vertices,
-          ctx->stage_room * sizeof(ctx->vertex_store[0]));
+          MIN2(live, ctx->stage_room) * sizeof(ctx->vertex_store[0]));
    ctx->vertices = ctx->vertex_store;
    ctx->stage_room = 0;
    ctx->stat.stage_evictions++;
@@ -5834,6 +5843,7 @@ submission_done:
               one_pass_multitexture, ret);
 out:
    ctx->triangles = 0;
+   ctx->staged_dpv = 0;
    ctx->stat_kind = PH_STAT_OTHER;
    ctx->stat_pixels = 0;
 	/* The second colour describes the stream that was just submitted; a
@@ -5950,6 +5960,7 @@ ph_alpha_micro_emit(struct ph_context *ctx, const float vertices[3][9],
       }
    }
    ctx->triangles++;
+   ctx->staged_dpv = dpv;
 }
 
 static void
@@ -6792,6 +6803,7 @@ ph_stage_tri(struct draw_stage *stage, struct prim_header *prim)
       }
    }
    ctx->triangles++;
+   ctx->staged_dpv = dpv;
 }
 
 /* Emit a window-space polygon as a fan through the triangle stage.  Corner i
@@ -7204,6 +7216,7 @@ ph_stage_point(struct draw_stage *stage, struct prim_header *prim)
    *dst++ = c[1];
    *dst++ = c[2];
    ctx->points++;
+   ctx->staged_dpv = dpv;
 }
 
 /* The draw module has already transformed and clipped both endpoints when it
@@ -7333,6 +7346,7 @@ ph_stage_line(struct draw_stage *stage, struct prim_header *prim)
       *dst++ = c[2];
    }
    ctx->lines++;
+   ctx->staged_dpv = dpv;
 }
 static void ph_stage_flush(struct draw_stage *s, unsigned flags)
 {
@@ -8418,6 +8432,7 @@ ph_tcl_append_tri(struct ph_context *ctx, const struct ph_tcl_run *r,
       memcpy(dst + 2 * r->dpv, c, r->dpv * sizeof(float));
    }
    ctx->triangles++;
+   ctx->staged_dpv = r->dpv;
    return true;
 }
 
@@ -9633,6 +9648,7 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
    }
    if (kept) {
       ctx->triangles = kept;
+      ctx->staged_dpv = dpv;
       ctx->indexed_verts = nverts;
       ph_submit_vertices(ctx);
       if (ctx->submit_error)
@@ -9731,6 +9747,7 @@ ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
          return false;
    }
    ctx->triangles = ntri;
+   ctx->staged_dpv = lay->dpv;
    ctx->indexed_verts = nverts;
    ph_submit_vertices(ctx);
    return true;
@@ -10053,6 +10070,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
          return true;
       }
       ctx->triangles += chunk;
+      ctx->staged_dpv = lay.dpv;
       done += chunk;
    }
    if (fused_box && chunks_fit)
