@@ -1109,6 +1109,7 @@ struct state_cache_entry {
    int mvp_offset;               /* the matrix's dwords in commands, or -1 */
    int calls;                    /* packed CALLs of the batch alone, or -1 */
    unsigned stages;              /* its vertex-program binds (stage CALLs) */
+   unsigned long hits;
 };
 
 struct parhelia_state_cache {
@@ -1117,6 +1118,7 @@ struct parhelia_state_cache {
    uint8_t *key;                 /* the key being looked up */
    size_t key_len, key_cap;
    bool verify;
+   FILE *profile;                /* PARHELIA_STATE_CACHE_PROFILE output */
    unsigned long hits, misses;
    int last_calls;               /* the last batch's entry calls, or -1 */
    unsigned last_stages;
@@ -1125,14 +1127,58 @@ struct parhelia_state_cache {
 /* Entries before the cache is flushed and refilled. */
 #define STATE_CACHE_MAX_ENTRIES 4096u
 
+/* PARHELIA_STATE_CACHE_PROFILE=file: every entry's hits, packets and
+ * command dwords, to see what the per-draw state stream consists of. */
+static void
+state_cache_profile(struct parhelia_state_cache *c)
+{
+   for (unsigned i = 0; c->profile && i < c->cap; i++) {
+      const struct state_cache_entry *e = c->slots[i];
+
+      if (!e)
+         continue;
+      fprintf(c->profile, "E %lu %u %u\n", e->hits + 1, e->command_count,
+              e->packet_count);
+      for (unsigned p = 0; p < e->packet_count; p++)
+         fprintf(c->profile, "P %u %u\n", e->packets[p].offset,
+                 e->packets[p].length);
+      fprintf(c->profile, "C");
+      for (unsigned d = 0; d < e->command_count; d++)
+         fprintf(c->profile, " %08x", e->commands[d]);
+      fprintf(c->profile, "\n");
+   }
+}
+
+/* clients often exit without destroying their context */
+static struct parhelia_state_cache *state_cache_profiled;
+
+static void
+state_cache_profile_at_exit(void)
+{
+   struct parhelia_state_cache *c = state_cache_profiled;
+
+   if (c && c->profile) {
+      state_cache_profile(c);
+      fclose(c->profile);
+      c->profile = NULL;
+   }
+}
+
 struct parhelia_state_cache *
 parhelia_state_cache_create(void)
 {
    struct parhelia_state_cache *c = calloc(1, sizeof(*c));
    const char *verify = getenv("PARHELIA_STATE_CACHE_VERIFY");
+   const char *profile = getenv("PARHELIA_STATE_CACHE_PROFILE");
 
-   if (c)
+   if (c) {
       c->verify = verify && strcmp(verify, "0");
+      if (profile && !state_cache_profiled &&
+          (c->profile = fopen(profile, "w"))) {
+         state_cache_profiled = c;
+         atexit(state_cache_profile_at_exit);
+      }
+   }
    return c;
 }
 
@@ -1151,6 +1197,7 @@ state_cache_entry_free(struct state_cache_entry *e)
 static void
 state_cache_flush(struct parhelia_state_cache *c)
 {
+   state_cache_profile(c);
    for (unsigned i = 0; i < c->cap; i++) {
       state_cache_entry_free(c->slots[i]);
       c->slots[i] = NULL;
@@ -1167,6 +1214,10 @@ parhelia_state_cache_destroy(struct parhelia_state_cache *c)
       fprintf(stderr, "parhelia: state cache %lu hits, %lu misses, %u entries\n",
               c->hits, c->misses, c->count);
    state_cache_flush(c);
+   if (c->profile)
+      fclose(c->profile);
+   if (state_cache_profiled == c)
+      state_cache_profiled = NULL;
    free(c->slots);
    free(c->key);
    free(c);
@@ -1524,6 +1575,7 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
               cache->hits, cache->misses, cache->count);
    if (*slot) {
       cache->hits++;
+      (*slot)->hits++;
       ret = state_cache_replay(batch, *slot, state, draws, per_packet,
                                vertices);
       /* under the span rule each large draw may take a CALL */
