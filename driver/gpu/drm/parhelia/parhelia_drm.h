@@ -208,6 +208,9 @@ struct drm_parhelia_upload_render {
 /* Under DRAW_RANGES one packet may carry a run of identical-header 0x97
  * draws back to back, each relocated like a lone one. */
 #define PARHELIA_PARAM_DRAW_RUNS	35
+/* A 0x97 draw of more than six vertices runs in a CALL span without any
+ * other draw, and a run of draws may not carry one. */
+#define PARHELIA_PARAM_SPLIT_MULTI_DRAWS	36
 
 #define PARHELIA_TEXTURE_PIPES_PAIRED	0
 #define PARHELIA_TEXTURE_PIPES_SINGLE	1

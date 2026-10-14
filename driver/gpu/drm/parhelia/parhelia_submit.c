@@ -529,6 +529,12 @@ static void parhelia_local_vertex_streams(u32 *commands,
 	}
 }
 
+/* Multi-primitive draws get CALL spans of their own on the P690. */
+static bool parhelia_split_multi_draws(const struct parhelia_device *pdev)
+{
+	return pdev->pdev->device == PARHELIA_P690;
+}
+
 static bool trace_vram_reloc;
 module_param(trace_vram_reloc, bool, 0400);
 MODULE_PARM_DESC(trace_vram_reloc,
@@ -828,32 +834,81 @@ copy_one:
 	plan->count = out;
 }
 
+/* The P690 stalls when a CALL span holds a 0x97 draw of more than six
+ * vertices together with another draw; the vendor gives every draw its own
+ * span (parhelia-p690-multi-primitive-packet-hang.md, 2026-10-14). */
+#define PARHELIA_SHARED_SPAN_VERTICES	6u
+
+static bool parhelia_multi_draw_packet(const u32 *commands,
+				       const struct drm_parhelia_packet *packet)
+{
+	const u32 *cmd = commands + packet->offset;
+	u32 stride, k;
+
+	if ((cmd[0] >> 24) != 0x97)
+		return false;
+	stride = (((cmd[0] >> 17) & 0x3f) + 1) * sizeof(u32);
+	for (k = 0; k + 3 <= packet->length; k += 3)
+		if (cmd[k + 2] - cmd[k + 1] > PARHELIA_SHARED_SPAN_VERTICES * stride)
+			return true;
+	return false;
+}
+
+/* Whether a span holding @draws draws, @multi of them large, may take
+ * @next_draws more, @next_multi of them large. */
+static bool parhelia_span_takes_draws(bool split, u32 draws, bool multi,
+				      u32 next_draws, bool next_multi)
+{
+	return !split || !draws || !next_draws || (!multi && !next_multi);
+}
+
 /* Pack only adjacent userspace storage entries already present next to each
  * other in the execution plan. Synthetic fence/stage entries therefore split
  * a run without special cases. Every original packet remains separately
  * validated and parhelia_copy_packet_span() preserves each header byte.
  */
+static void parhelia_span_draws(const u32 *commands,
+				const struct drm_parhelia_packet *packets,
+				u32 first, u32 count, u32 *draws, bool *multi)
+{
+	u32 i;
+
+	*draws = 0;
+	*multi = false;
+	for (i = 0; commands && i < count; i++) {
+		if ((commands[packets[first + i].offset] >> 24) != 0x97)
+			continue;
+		(*draws)++;
+		*multi |= parhelia_multi_draw_packet(commands, &packets[first + i]);
+	}
+}
+
 static void
 parhelia_pack_adjacent_packet_calls(struct parhelia_call_plan *plan,
+				    const u32 *commands,
 				    const struct drm_parhelia_packet *packets,
 				    u32 packet_count,
-				    const bool *call_boundaries)
+				    const bool *call_boundaries,
+				    bool split_multi_draws)
 {
 	u32 in = 0, out = 0;
 
 	while (in < plan->count) {
 		u32 block = plan->blocks[in];
 		u32 run = plan->packet_spans[in];
-		u32 entries = 1, words;
+		u32 entries = 1, words, draws;
+		bool multi;
 
 		if (block >= packet_count || !run || run > packet_count - block ||
 		    parhelia_packet_span_dwords(packets, block, run, &words) ||
 		    words > PARHELIA_DMA_BLOCK_DWORDS)
 			goto copy_one;
+		parhelia_span_draws(commands, packets, block, run, &draws, &multi);
 		while (in + entries < plan->count) {
 			u32 next = plan->blocks[in + entries];
 			u32 next_span = plan->packet_spans[in + entries];
-			u32 next_words, previous_end;
+			u32 next_words, previous_end, next_draws;
+			bool next_multi;
 
 			if (next >= packet_count || !next_span ||
 			    next_span > packet_count - next || next != block + run ||
@@ -867,6 +922,13 @@ parhelia_pack_adjacent_packet_calls(struct parhelia_call_plan *plan,
 			    next_words > PARHELIA_DMA_BLOCK_DWORDS - words ||
 			    run > U16_MAX - next_span)
 				break;
+			parhelia_span_draws(commands, packets, next, next_span,
+					    &next_draws, &next_multi);
+			if (!parhelia_span_takes_draws(split_multi_draws, draws, multi,
+						       next_draws, next_multi))
+				break;
+			draws += next_draws;
+			multi |= next_multi;
 			words += next_words;
 			run += next_span;
 			entries++;
@@ -894,7 +956,8 @@ static void
 parhelia_coalesce_draw_calls(struct parhelia_call_plan *plan,
 			     const u32 *commands,
 			     const struct drm_parhelia_packet *packets,
-			     const bool *draw_relocated, u32 packet_count)
+			     const bool *draw_relocated, u32 packet_count,
+			     bool split_multi_draws)
 {
 	u32 in = 0, out = 0;
 
@@ -902,12 +965,14 @@ parhelia_coalesce_draw_calls(struct parhelia_call_plan *plan,
 		u32 block = plan->blocks[in];
 		u32 run = plan->packet_spans[in];
 		u32 words;
+		bool multi;
 
 		if (block >= packet_count || run != 1 || !draw_relocated[block] ||
 		    packets[block].length != 3 ||
 		    (commands[packets[block].offset] >> 24) != 0x97)
 			goto copy_one;
 		words = packets[block].length;
+		multi = parhelia_multi_draw_packet(commands, &packets[block]);
 		while (in + run < plan->count) {
 			u32 next = plan->blocks[in + run];
 			u32 previous_end;
@@ -915,6 +980,9 @@ parhelia_coalesce_draw_calls(struct parhelia_call_plan *plan,
 			if (plan->packet_spans[in + run] != 1 ||
 			    next != block + run || next >= packet_count ||
 			    !draw_relocated[next] || packets[next].length != 3 ||
+			    !parhelia_span_takes_draws(split_multi_draws, run, multi, 1,
+					parhelia_multi_draw_packet(commands,
+								   &packets[next])) ||
 			    (commands[packets[next].offset] >> 24) != 0x97 ||
 			    check_add_overflow(packets[next - 1].offset,
 					       packets[next - 1].length,
@@ -1131,7 +1199,8 @@ static int parhelia_range_call_static_selftest(void)
 	if (plan->count != 2 || plan->blocks[0] || plan->packet_spans[0] != 1 ||
 	    plan->blocks[1] != 1 || plan->packet_spans[1] != 1)
 		goto out;
-	parhelia_pack_adjacent_packet_calls(plan, gapped_packets, 2, NULL);
+	parhelia_pack_adjacent_packet_calls(plan, NULL, gapped_packets, 2, NULL,
+					    false);
 	if (plan->count != 2 || plan->blocks[0] || plan->packet_spans[0] != 1 ||
 	    plan->blocks[1] != 1 || plan->packet_spans[1] != 1)
 		goto out;
@@ -1142,7 +1211,8 @@ static int parhelia_range_call_static_selftest(void)
 	memset(plan, 0, sizeof(*plan));
 	parhelia_plan_append(plan, 0, 1);
 	parhelia_plan_append(plan, 1, 1);
-	parhelia_pack_adjacent_packet_calls(plan, word_limit_packets, 2, NULL);
+	parhelia_pack_adjacent_packet_calls(plan, NULL, word_limit_packets, 2,
+					    NULL, false);
 	if (plan->count != 2 || plan->blocks[0] || plan->packet_spans[0] != 1 ||
 	    plan->blocks[1] != 1 || plan->packet_spans[1] != 1)
 		goto out;
@@ -1156,8 +1226,8 @@ static int parhelia_range_call_static_selftest(void)
 	plan->stage_modes[2] = 1;
 	if (parhelia_plan_calls(plan, ARRAY_SIZE(generic_packets), 1, false))
 		goto out;
-	parhelia_pack_adjacent_packet_calls(plan, generic_packets,
-				    ARRAY_SIZE(generic_packets), NULL);
+	parhelia_pack_adjacent_packet_calls(plan, NULL, generic_packets,
+				    ARRAY_SIZE(generic_packets), NULL, false);
 	if (plan->count != 7 || plan->blocks[0] != 0 ||
 	    plan->packet_spans[0] != 1 ||
 	    plan->blocks[1] != ARRAY_SIZE(generic_packets) ||
@@ -1200,9 +1270,9 @@ static int parhelia_range_call_static_selftest(void)
 		if (parhelia_plan_calls(plan, ARRAY_SIZE(alternating_packets), 1,
 					false))
 			goto out;
-		parhelia_pack_adjacent_packet_calls(plan, alternating_packets,
+		parhelia_pack_adjacent_packet_calls(plan, NULL, alternating_packets,
 						    ARRAY_SIZE(alternating_packets),
-						    logical_boundaries);
+						    logical_boundaries, false);
 		if (plan->count != 10 || plan->blocks[0] != 0 ||
 		    plan->packet_spans[0] != 1 ||
 		    plan->blocks[1] != ARRAY_SIZE(alternating_packets) ||
@@ -1309,7 +1379,7 @@ static int parhelia_large_range_call_static_selftest(void)
 	memset(draw_relocated, 1,
 	       PARHELIA_USER_PACKET_CAPACITY * sizeof(*draw_relocated));
 	parhelia_coalesce_draw_calls(plan, commands, packets, draw_relocated,
-				     PARHELIA_USER_PACKET_CAPACITY);
+				     PARHELIA_USER_PACKET_CAPACITY, false);
 	if (plan->count != 4 || plan->blocks[0] != PARHELIA_USER_PACKET_CAPACITY ||
 	    plan->packet_spans[0] || plan->blocks[1] ||
 	    plan->packet_spans[1] != PARHELIA_USER_PACKET_CAPACITY ||
@@ -1327,7 +1397,7 @@ static int parhelia_large_range_call_static_selftest(void)
 	if (parhelia_plan_calls(plan, PARHELIA_USER_PACKET_CAPACITY, 0, false))
 		goto out;
 	parhelia_coalesce_draw_calls(plan, commands, packets, draw_relocated,
-				     PARHELIA_USER_PACKET_CAPACITY);
+				     PARHELIA_USER_PACKET_CAPACITY, false);
 	if (plan->count != 6 || plan->blocks[1] ||
 	    plan->packet_spans[1] != PARHELIA_USER_PACKET_CAPACITY / 2u ||
 	    plan->blocks[2] != PARHELIA_USER_PACKET_CAPACITY / 2u ||
@@ -1340,8 +1410,9 @@ static int parhelia_large_range_call_static_selftest(void)
 	memset(plan, 0, sizeof(*plan));
 	if (parhelia_plan_calls(plan, PARHELIA_USER_PACKET_CAPACITY, 0, false))
 		goto out;
-	parhelia_pack_adjacent_packet_calls(plan, packets,
-					    PARHELIA_USER_PACKET_CAPACITY, NULL);
+	parhelia_pack_adjacent_packet_calls(plan, NULL, packets,
+					    PARHELIA_USER_PACKET_CAPACITY, NULL,
+					    false);
 	if (plan->count != 4 || plan->blocks[0] != PARHELIA_USER_PACKET_CAPACITY ||
 	    plan->packet_spans[0] || plan->blocks[1] ||
 	    plan->packet_spans[1] != PARHELIA_USER_PACKET_CAPACITY ||
@@ -1356,7 +1427,7 @@ static int parhelia_large_range_call_static_selftest(void)
 	if (parhelia_plan_calls(plan, PARHELIA_USER_PACKET_CAPACITY, 0, false))
 		goto out;
 	parhelia_coalesce_draw_calls(plan, commands, packets, draw_relocated,
-				     PARHELIA_USER_PACKET_CAPACITY);
+				     PARHELIA_USER_PACKET_CAPACITY, false);
 	if (plan->count != 6 || plan->blocks[0] != PARHELIA_USER_PACKET_CAPACITY ||
 	    plan->packet_spans[0] || plan->blocks[1] ||
 	    plan->packet_spans[1] != PARHELIA_USER_PACKET_CAPACITY / 2u ||
@@ -3915,6 +3986,9 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 	case PARHELIA_PARAM_DRAW_RUNS:
 		args->value = parhelia_vertex_objects(pdev);
 		break;
+	case PARHELIA_PARAM_SPLIT_MULTI_DRAWS:
+		args->value = parhelia_split_multi_draws(pdev);
+		break;
 	case PARHELIA_PARAM_WARP_PROGRAM_SLOTS:
 		args->value = pdev->warp_user_cpu ?
 			PARHELIA_WARP_USER_FILE_SLOTS : 0;
@@ -4367,6 +4441,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	dma_addr_t primary_bus = pdev->primary_bus;
 	bool *draw_relocated, *call_boundaries;
 	bool host_vertex_draw = false;
+	const bool split_multi_draws = parhelia_split_multi_draws(pdev);
 	struct parhelia_submit_slot *local_vertex = NULL;
 	bool vertex_object_draw = false;
 	u32 draw_ranges = 0, draw_ranges_bus = 0;
@@ -5067,6 +5142,12 @@ retry_slot:
 			goto out_unpin;
 		}
 		if (opcode == 0x97 && draw_ranges) {
+			/* a run shares one span */
+			if (split_multi_draws && packets[i].length > 3 &&
+			    parhelia_multi_draw_packet(commands, &packets[i])) {
+				ret = -EINVAL;
+				goto out_unpin;
+			}
 			for (u32 k = 0; k < packets[i].length; k += 3) {
 				u32 *cmd = commands + packets[i].offset + k;
 				u32 begin = cmd[1], end = cmd[2];
@@ -5089,13 +5170,16 @@ retry_slot:
 	}
 	if (defer_packet_packing) {
 		if (generic_packet_packing)
-			parhelia_pack_adjacent_packet_calls(plan, packets,
+			parhelia_pack_adjacent_packet_calls(plan, commands,
+							    packets,
 							    args->packet_count,
-							    call_boundaries);
+							    call_boundaries,
+							    split_multi_draws);
 		else
 			parhelia_coalesce_draw_calls(plan, commands, packets,
 						     draw_relocated,
-						     args->packet_count);
+						     args->packet_count,
+						     split_multi_draws);
 		ret = parhelia_plan_fits_hardware(plan);
 		if (ret)
 			goto out_unpin;
