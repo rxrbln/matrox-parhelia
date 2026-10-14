@@ -477,7 +477,7 @@ static u32 warp_user_entry(struct parhelia_device *pdev, u32 slot, u32 image)
 	u32 instruction = (slot - 1) * PARHELIA_WARP_USER_SLOT_INSTRUCTIONS +
 			  image * PARHELIA_WARP_USER_IMAGE_INSTRUCTIONS;
 
-	return ((u32)(pdev->warp_user_bus / 12) * 4 + instruction * 4) | 3u;
+	return (pdev->warp_user_entry_base + instruction * 4) | 3u;
 }
 
 bool parhelia_warp_entry_allowed(struct parhelia_device *pdev,
@@ -1006,6 +1006,8 @@ int parhelia_warp_init(struct parhelia_device *pdev)
 	pad = (384 - allocation_bus % 384) % 384;
 	pdev->warp_cpu = allocation + pad;
 	pdev->warp_bus = allocation_bus + pad;
+	/* warp_bus is aligned to 384 bytes, hence divisible by 12 */
+	pdev->warp_entry_base = (u32)(pdev->warp_bus / 12) * 4;
 	/* A second heap for validated userspace programs.  Instruction fetch is
 	 * a class-3 bus master read, so its entries are formed the same way; a
 	 * failed allocation only disables the upload ioctl. */
@@ -1017,6 +1019,7 @@ int parhelia_warp_init(struct parhelia_device *pdev)
 		pad = (384 - allocation_bus % 384) % 384;
 		pdev->warp_user_cpu = allocation + pad;
 		pdev->warp_user_bus = allocation_bus + pad;
+		pdev->warp_user_entry_base = (u32)(pdev->warp_user_bus / 12) * 4;
 	}
 	ret = warp_load_residents(pdev);
 	if (ret)

@@ -665,11 +665,15 @@ struct parhelia_device {
 	u64 reg_shadow_invalidations;
 	void *warp_cpu;
 	dma_addr_t warp_bus;
+	/* warp_bus / 12 * 4: the entry operand of instruction 0, computed once
+	 * (a 64-bit divide is a library call on Alpha) */
+	u32 warp_entry_base;
 	/* Second instruction heap holding validated userspace WARP programs.
 	 * Instruction fetch is a class-3 bus master read, so a second coherent
 	 * allocation is as good an instruction source as the resident one. */
 	void *warp_user_cpu;
 	dma_addr_t warp_user_bus;
+	u32 warp_user_entry_base;	/* warp_user_bus / 12 * 4 */
 	struct mutex warp_user_lock;
 	struct drm_file *warp_user_owner[PARHELIA_WARP_USER_SLOTS];
 	u8 warp_user_image[PARHELIA_WARP_USER_SLOTS];
@@ -690,8 +694,7 @@ struct parhelia_device {
 
 static inline u32 parhelia_warp_entry(struct parhelia_device *pdev, u32 offset)
 {
-	/* warp_bus is aligned to384 bytes, hence divisible by12. */
-	return ((u32)(pdev->warp_bus / 12) * 4 + offset) | 3u;
+	return (pdev->warp_entry_base + offset) | 3u;
 }
 
 static inline struct parhelia_device *to_parhelia(struct drm_device *drm)
