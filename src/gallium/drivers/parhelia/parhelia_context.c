@@ -509,6 +509,7 @@ struct ph_context {
    bool colour_alpha;	/* the staged colour carries alpha: RGBA, not RGB */
    bool packed_colour;	/* the staged colour is one D3DCOLOR dword */
    bool packed_colour_fetch;	/* the fetch unpacks it (format 6) */
+   bool tcl_fused_box;	/* position box bounded inside the fetch */
    /* An indexed batch: this many vertices staged, then triangles * 3 u32
     * indices into them. */
    unsigned indexed_verts;
@@ -8679,11 +8680,6 @@ struct ph_tcl_layout {
 DEBUG_GET_ONCE_BOOL_OPTION(tcl_rgba, "PARHELIA_TCL_RGBA", false)
 DEBUG_GET_ONCE_BOOL_OPTION(tcl_box, "PARHELIA_TCL_BOX", true)
 DEBUG_GET_ONCE_BOOL_OPTION(tcl_clip, "PARHELIA_TCL_CLIP", true)
-/* Bounding positions in the fetch costs more than the separate scan on nano
- * (11.21 -> 11.37 ms CPU/frame in ioquake3): it sees every index, the scan
- * every referenced vertex once.  Kept for hosts where the second pass over
- * the positions costs more than the arithmetic. */
-DEBUG_GET_ONCE_BOOL_OPTION(tcl_fused_box, "PARHELIA_TCL_FUSED_BOX", false)
 
 static bool
 ph_tcl_no(struct ph_context *ctx, enum ph_tcl_reason reason)
@@ -9498,7 +9494,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
 
       /* A buffer the box cache cannot hold is bounded chunk by chunk while
        * the fixed-function fetch copies its positions. */
-      fused_box = box && debug_get_option_tcl_fused_box() && !lay.program &&
+      fused_box = box && ctx->tcl_fused_box && !lay.program &&
                   fetch.count && fetch.box_elem >= 0 &&
                   ph_tcl_position_uncached(ctx);
       box_fits = box && !fused_box &&
@@ -16396,6 +16392,14 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
        ph_original_family(ph_screen(screen)->chip_id)) &&
       debug_get_bool_option("PARHELIA_PACKED_COLOUR", true);
    ctx->drop_repeats = debug_get_bool_option("PARHELIA_DROP_REPEATS", false);
+   /* Bounding positions inside the fetch sees every index where the
+    * separate scan sees each vertex once: slower on nano (11.21 -> 11.37 ms
+    * CPU per ioquake3 frame), faster on the Alpha's EV56 (12.4 -> 13.6 fps),
+    * whose second pass over the positions costs more than the arithmetic.
+    * Its hosts are the original family's. */
+   ctx->tcl_fused_box =
+      debug_get_bool_option("PARHELIA_TCL_FUSED_BOX",
+                            ph_original_family(ph_screen(screen)->chip_id));
    ctx->batch_calls = -1;
    ctx->pending_call_bound = 2;
    ctx->viewport.scale[0] = ctx->viewport.scale[1] = 1.0f;
