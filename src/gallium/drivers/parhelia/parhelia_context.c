@@ -8997,19 +8997,32 @@ struct ph_tcl_box {
    uint32_t nan;
 };
 
+struct ph_tcl_fetch_elem {
+   const uint8_t *src;             /* buffer start plus element offset */
+   unsigned stride;
+   unsigned shift;                 /* log2 stride when pow2 */
+   unsigned out;                   /* output dword */
+   unsigned comps;
+   bool pow2;
+   bool aligned;                   /* dword loads for a packed colour */
+   bool unorm8;
+   bool packed;                    /* RGBA8 to one D3DCOLOR dword */
+   uint32_t alpha;                 /* or-ed into a packed colour */
+};
+
 struct ph_tcl_fetch {
    unsigned count;
    int box_elem;                   /* the position element, or -1 */
-   struct {
-      const uint8_t *src;          /* buffer start plus element offset */
-      unsigned stride;
-      unsigned out;                /* output dword */
-      unsigned comps;
-      bool unorm8;
-      bool packed;                 /* RGBA8 to one D3DCOLOR dword */
-      uint32_t alpha;              /* or-ed into a packed colour */
-   } e[PIPE_MAX_ATTRIBS];
+   struct ph_tcl_fetch_elem e[PIPE_MAX_ATTRIBS];
 };
+
+/* A shift where the stride allows one: a 64-bit multiply per vertex and
+ * element stalls the EV5 for up to twelve cycles. */
+static ALWAYS_INLINE const uint8_t *
+ph_tcl_vertex_src(const struct ph_tcl_fetch_elem *e, uint32_t elt, bool pow2)
+{
+   return e->src + (pow2 ? (size_t)elt << e->shift : (size_t)elt * e->stride);
+}
 
 static bool
 ph_tcl_fetch_init(struct ph_tcl_fetch *f, const struct translate_key *key,
@@ -9043,6 +9056,12 @@ ph_tcl_fetch_init(struct ph_tcl_fetch *f, const struct translate_key *key,
          return false;
       f->e[f->count].src = src;
       f->e[f->count].stride = strides[el->input_buffer];
+      f->e[f->count].pow2 =
+         util_is_power_of_two_nonzero(strides[el->input_buffer]);
+      f->e[f->count].shift = f->e[f->count].pow2 ?
+         util_logbase2(strides[el->input_buffer]) : 0;
+      f->e[f->count].aligned =
+         !(((uintptr_t)src | strides[el->input_buffer]) & 3);
       f->e[f->count].out = el->output_offset / 4;
       f->e[f->count].comps = out;
       f->e[f->count].unorm8 = unorm8;
@@ -9056,17 +9075,17 @@ ph_tcl_fetch_init(struct ph_tcl_fetch *f, const struct translate_key *key,
 }
 
 /* The position copy, bounding what it copies on the way. */
-static void
-ph_tcl_fetch_position_box(const uint8_t *base, size_t stride,
-                          const uint32_t *elts, unsigned count, uint32_t *d,
-                          unsigned dpv, struct ph_tcl_box *box)
+static ALWAYS_INLINE void
+ph_tcl_fetch_position_box_n(const struct ph_tcl_fetch_elem *e,
+                            const uint32_t *elts, unsigned count, uint32_t *d,
+                            unsigned dpv, struct ph_tcl_box *box, bool pow2)
 {
    int32_t lo0 = box->lo[0], lo1 = box->lo[1], lo2 = box->lo[2];
    int32_t hi0 = box->hi[0], hi1 = box->hi[1], hi2 = box->hi[2];
    uint32_t nan = box->nan;
 
    for (unsigned v = 0; v < count; v++, d += dpv) {
-      const uint32_t *s = (const uint32_t *)(base + elts[v] * stride);
+      const uint32_t *s = (const uint32_t *)ph_tcl_vertex_src(e, elts[v], pow2);
       const uint32_t x = s[0], y = s[1], z = s[2];
       const int32_t kx = ph_float_order_key(x), ky = ph_float_order_key(y);
       const int32_t kz = ph_float_order_key(z);
@@ -9089,6 +9108,17 @@ ph_tcl_fetch_position_box(const uint8_t *base, size_t stride,
    box->nan = nan;
 }
 
+static void
+ph_tcl_fetch_position_box(const struct ph_tcl_fetch_elem *e,
+                          const uint32_t *elts, unsigned count, uint32_t *d,
+                          unsigned dpv, struct ph_tcl_box *box)
+{
+   if (e->pow2)
+      ph_tcl_fetch_position_box_n(e, elts, count, d, dpv, box, true);
+   else
+      ph_tcl_fetch_position_box_n(e, elts, count, d, dpv, box, false);
+}
+
 /* The bits of ubyte_to_float() for every byte: on Alpha each float
  * arithmetic instruction carries a trap barrier, a table load none. */
 static uint32_t ph_unorm8_bits[256];
@@ -9100,6 +9130,78 @@ ph_unorm8_bits_init(void)
       ph_unorm8_bits[i] = fui(ubyte_to_float(i));
 }
 
+static ALWAYS_INLINE void
+ph_tcl_fetch_element(const struct ph_tcl_fetch_elem *e, const uint32_t *elts,
+                     unsigned count, uint32_t *d, unsigned dpv, bool pow2)
+{
+   if (e->packed) {
+      const uint32_t alpha = e->alpha;
+
+      if (e->aligned) {
+         for (unsigned v = 0; v < count; v++, d += dpv) {
+            const uint32_t c = util_le32_to_cpu(
+               *(const uint32_t *)ph_tcl_vertex_src(e, elts[v], pow2));
+
+            d[0] = (c & 0xff00ff00u) | ((c >> 16) & 0xffu) |
+                   ((c & 0xffu) << 16) | alpha;
+         }
+      } else {
+         for (unsigned v = 0; v < count; v++, d += dpv) {
+            const uint8_t *s = ph_tcl_vertex_src(e, elts[v], pow2);
+
+            d[0] = s[2] | (uint32_t)s[1] << 8 | (uint32_t)s[0] << 16 |
+                   (uint32_t)s[3] << 24 | alpha;
+         }
+      }
+      return;
+   }
+   if (e->unorm8) {
+      for (unsigned v = 0; v < count; v++, d += dpv) {
+         const uint8_t *s = ph_tcl_vertex_src(e, elts[v], pow2);
+
+         d[0] = ph_unorm8_bits[s[0]];
+         d[1] = ph_unorm8_bits[s[1]];
+         if (e->comps > 2)
+            d[2] = ph_unorm8_bits[s[2]];
+         if (e->comps > 3)
+            d[3] = ph_unorm8_bits[s[3]];
+      }
+      return;
+   }
+   switch (e->comps) {
+   case 2:
+      for (unsigned v = 0; v < count; v++, d += dpv) {
+         const uint32_t *s =
+            (const uint32_t *)ph_tcl_vertex_src(e, elts[v], pow2);
+
+         d[0] = s[0];
+         d[1] = s[1];
+      }
+      break;
+   case 3:
+      for (unsigned v = 0; v < count; v++, d += dpv) {
+         const uint32_t *s =
+            (const uint32_t *)ph_tcl_vertex_src(e, elts[v], pow2);
+
+         d[0] = s[0];
+         d[1] = s[1];
+         d[2] = s[2];
+      }
+      break;
+   default:
+      for (unsigned v = 0; v < count; v++, d += dpv) {
+         const uint32_t *s =
+            (const uint32_t *)ph_tcl_vertex_src(e, elts[v], pow2);
+
+         d[0] = s[0];
+         d[1] = s[1];
+         d[2] = s[2];
+         d[3] = s[3];
+      }
+      break;
+   }
+}
+
 /* Element-major: one specialised loop per element, so the per-vertex work is
  * the copy alone. */
 static void
@@ -9107,64 +9209,12 @@ ph_tcl_fetch_elements(const struct ph_tcl_fetch *f, const uint32_t *elts,
                       unsigned count, uint32_t *dst, unsigned dpv)
 {
    for (unsigned i = 0; i < f->count; i++) {
-      const uint8_t *base = f->e[i].src;
-      const size_t stride = f->e[i].stride;
-      uint32_t *d = dst + f->e[i].out;
-
-      if (f->e[i].packed) {
-         const uint32_t alpha = f->e[i].alpha;
-
-         for (unsigned v = 0; v < count; v++, d += dpv) {
-            uint32_t c;
-
-            memcpy(&c, base + elts[v] * stride, 4);
-            d[0] = (c & 0xff00ff00u) | ((c >> 16) & 0xffu) |
-                   ((c & 0xffu) << 16) | alpha;
-         }
-         continue;
-      }
-      if (f->e[i].unorm8) {
-         for (unsigned v = 0; v < count; v++, d += dpv) {
-            const uint8_t *s = base + elts[v] * stride;
-
-            d[0] = ph_unorm8_bits[s[0]];
-            d[1] = ph_unorm8_bits[s[1]];
-            if (f->e[i].comps > 2)
-               d[2] = ph_unorm8_bits[s[2]];
-            if (f->e[i].comps > 3)
-               d[3] = ph_unorm8_bits[s[3]];
-         }
-         continue;
-      }
-      switch (f->e[i].comps) {
-      case 2:
-         for (unsigned v = 0; v < count; v++, d += dpv) {
-            const uint32_t *s = (const uint32_t *)(base + elts[v] * stride);
-
-            d[0] = s[0];
-            d[1] = s[1];
-         }
-         break;
-      case 3:
-         for (unsigned v = 0; v < count; v++, d += dpv) {
-            const uint32_t *s = (const uint32_t *)(base + elts[v] * stride);
-
-            d[0] = s[0];
-            d[1] = s[1];
-            d[2] = s[2];
-         }
-         break;
-      default:
-         for (unsigned v = 0; v < count; v++, d += dpv) {
-            const uint32_t *s = (const uint32_t *)(base + elts[v] * stride);
-
-            d[0] = s[0];
-            d[1] = s[1];
-            d[2] = s[2];
-            d[3] = s[3];
-         }
-         break;
-      }
+      if (f->e[i].pow2)
+         ph_tcl_fetch_element(&f->e[i], elts, count, dst + f->e[i].out, dpv,
+                              true);
+      else
+         ph_tcl_fetch_element(&f->e[i], elts, count, dst + f->e[i].out, dpv,
+                              false);
    }
 }
 
@@ -9203,8 +9253,7 @@ ph_tcl_fetch_run_boxed(const struct ph_context *ctx,
       const unsigned n = MIN2(count - b, PH_TCL_FETCH_BLOCK);
       uint32_t *d = (uint32_t *)dst + (size_t)b * dpv;
 
-      ph_tcl_fetch_position_box(f->e[f->box_elem].src,
-                                f->e[f->box_elem].stride, elts + b, n,
+      ph_tcl_fetch_position_box(&f->e[f->box_elem], elts + b, n,
                                 d + f->e[f->box_elem].out, dpv, &box);
       ph_tcl_fetch_elements(&rest, elts + b, n, d, dpv);
    }
