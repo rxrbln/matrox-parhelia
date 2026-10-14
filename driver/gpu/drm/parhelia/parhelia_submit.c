@@ -552,6 +552,21 @@ static void parhelia_local_vertex_fini(struct parhelia_submit_slot *slot)
 	slot->local_vertex = NULL;
 }
 
+/* A 0x00 packet holds one register list or, under PARHELIA_PARAM_REGLIST_RUNS,
+ * several back to back, each behind its own header.  Step @pos over the next
+ * list's header once it reaches @end; false at the end of the packet. */
+static inline bool parhelia_reglist_next(const u32 *cmd, u32 length, u32 *pos,
+					 u32 *end)
+{
+	while (*pos >= *end) {
+		if (*pos >= length)
+			return false;
+		*end = *pos + (cmd[*pos] & 0xffff) + 2;
+		(*pos)++;
+	}
+	return *pos < length;
+}
+
 /* The draw packets' class-3 stream binds become class 0. */
 static void parhelia_local_vertex_streams(u32 *commands,
 					  const struct drm_parhelia_packet *packets,
@@ -561,15 +576,15 @@ static void parhelia_local_vertex_streams(u32 *commands,
 
 	for (i = 0; i < count; i++) {
 		u32 *cmd = commands + packets[i].offset;
-		u32 pos = 1;
+		u32 pos = 0, end = 0;
 
 		if (cmd[0] >> 24)
 			continue;
-		while (pos < packets[i].length) {
+		while (parhelia_reglist_next(cmd, packets[i].length, &pos, &end)) {
 			u32 tag = cmd[pos++];
 			unsigned int slot;
 
-			for (slot = 0; slot < 4 && pos < packets[i].length; slot++) {
+			for (slot = 0; slot < 4 && pos < end; slot++) {
 				u32 index = (tag >> (slot * 8)) & 0xff;
 
 				if (index == 0x21)
@@ -692,12 +707,12 @@ parhelia_shadow_apply_packet(struct parhelia_reg_shadow *shadow,
 		.all_safe = !has_reloc && !(cmd[0] >> 24),
 		.all_same = true,
 	};
-	u32 pos = 1;
+	u32 pos = 0, end = 0;
 
 	if (cmd[0] >> 24)
 		return result;
 
-	while (pos < length) {
+	while (parhelia_reglist_next(cmd, length, &pos, &end)) {
 		u32 tag = cmd[pos++];
 		u32 slot;
 
@@ -1778,14 +1793,26 @@ static int parhelia_validate_reglist(struct parhelia_device *pdev,
 {
 	struct parhelia_rebind *rb = vs->rb;
 	const u32 *cmd = commands + offset;
-	u32 pos = 1;
+	u32 pos = 1, end = (cmd[0] & 0xffff) + 2;
 
+	if (end > length)
+		return -EINVAL;
 	while (pos < length) {
-		u32 tag = cmd[pos++];
+		u32 tag;
 		unsigned int slot;
 
+		/* the next list of a run: a plain register list header */
+		if (pos == end) {
+			if (cmd[pos] >> 16 ||
+			    (cmd[pos] & 0xffff) + 2 > length - pos)
+				return -EINVAL;
+			end = pos + (cmd[pos] & 0xffff) + 2;
+			pos++;
+			continue;
+		}
+		tag = cmd[pos++];
 		/* four plain state writes: nothing to check or track */
-		if (length - pos >= 4 &&
+		if (end - pos >= 4 &&
 		    !(parhelia_reg_class[tag & 0xff] |
 		      parhelia_reg_class[(tag >> 8) & 0xff] |
 		      parhelia_reg_class[(tag >> 16) & 0xff] |
@@ -1800,7 +1827,7 @@ static int parhelia_validate_reglist(struct parhelia_device *pdev,
 
 			if (class == PARHELIA_REG_END)
 				break;
-			if (pos >= length)
+			if (pos >= end)
 				return -EINVAL;
 			if (class == PARHELIA_REG_STATE) {
 				pos++;
@@ -1994,15 +2021,17 @@ static int parhelia_validate_packet(struct parhelia_device *pdev,
 	if ((header >> 24) == 0x41)
 		return parhelia_validate_constant_group(cmd + packet->offset, packet->length);
 	words = (header & 0xffff) + 2;
-	/* a run of draws repeats one three-dword header */
+	/* a run of draws repeats one three-dword header, a run of register
+	 * lists follows the first with headers of their own */
 	if (words != packet->length &&
-	    ((header >> 24) != 0x97 || words != 3 || packet->length % 3))
+	    ((header >> 24) != 0x97 || words != 3 || packet->length % 3) &&
+	    ((header >> 24) != 0x00 || words > packet->length))
 		return -EINVAL;
 
 	switch (header >> 24) {
 	case 0x00:
 		return parhelia_validate_reglist(pdev, file, cmd, packet->offset,
-						 words, vs);
+						 packet->length, vs);
 	case 0x97:
 		if (words != 3)
 			return -EINVAL;
@@ -2056,9 +2085,9 @@ static int parhelia_validate_packet(struct parhelia_device *pdev,
 static bool parhelia_vram_operand_reg(const u32 *cmd, u32 length, u32 dword,
 				      u32 *reg)
 {
-	u32 pos = 1;
+	u32 pos = 0, end = 0;
 
-	while (pos < length) {
+	while (parhelia_reglist_next(cmd, length, &pos, &end)) {
 		u32 tag = cmd[pos++];
 		unsigned int slot;
 
@@ -2205,6 +2234,37 @@ static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 	    parhelia_original_family(pdev))
 		bo->placements[0].flags |= TTM_PL_FLAG_TOPDOWN;
 	return ret;
+}
+
+/* Register-list runs: later lists keep their headers, a header is never an
+ * operand, and malformed or overrunning lists are refused. */
+static int parhelia_reglist_run_static_selftest(void)
+{
+	u32 run[] = { 3, 0x21b4b3b2, 7, 0xff, 0x100, 1, 0x21212188, 0 };
+	u32 flagged[] = { 3, 0x21b4b3b2, 7, 0xff, 0x100, 0x10001, 0x212121b2, 5 };
+	u32 overrun[] = { 3, 0x21b4b3b2, 7, 0xff, 0x100, 2, 0x212121b2, 5 };
+	u32 short_list[] = { 1, 0x2121b3b2, 7, 1, 0x212121b2, 9 };
+	struct drm_parhelia_packet packet = { .length = ARRAY_SIZE(run) };
+	struct parhelia_validate_state vs = { };
+	u32 reg = 0;
+
+	if (parhelia_validate_packet(NULL, NULL, run, &packet, &vs) ||
+	    !parhelia_vram_operand_reg(run, ARRAY_SIZE(run), 7, &reg) ||
+	    reg != 0x1220 ||
+	    parhelia_vram_operand_reg(run, ARRAY_SIZE(run), 5, NULL) ||
+	    parhelia_vram_operand_reg(run, ARRAY_SIZE(run), 6, NULL))
+		return -EINVAL;
+	if (parhelia_validate_packet(NULL, NULL, flagged, &packet, &vs) != -EINVAL ||
+	    parhelia_validate_packet(NULL, NULL, overrun, &packet, &vs) != -EINVAL)
+		return -EINVAL;
+	packet.length = ARRAY_SIZE(short_list);
+	if (parhelia_validate_packet(NULL, NULL, short_list, &packet, &vs) != -EINVAL)
+		return -EINVAL;
+	/* a first header longer than the packet */
+	packet.length = 4;
+	if (parhelia_validate_packet(NULL, NULL, run, &packet, &vs) != -EINVAL)
+		return -EINVAL;
+	return 0;
 }
 
 static int parhelia_vram_placement_static_selftest(void)
@@ -3270,6 +3330,8 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 	if (!ret)
 		ret = parhelia_vram_placement_static_selftest();
 	if (!ret)
+		ret = parhelia_reglist_run_static_selftest();
+	if (!ret)
 		ret = parhelia_shadow_static_selftest();
 	if (!ret)
 		ret = parhelia_shadow_plan_static_selftest();
@@ -3490,9 +3552,9 @@ struct parhelia_mode7_state {
 static int parhelia_reglist_operand_index(const u32 *cmd, u32 length,
 					  u32 dword, u32 *index_out)
 {
-	u32 pos = 1;
+	u32 pos = 0, end = 0;
 
-	while (pos < length) {
+	while (parhelia_reglist_next(cmd, length, &pos, &end)) {
 		u32 tag = cmd[pos++];
 		unsigned int slot;
 
@@ -3501,7 +3563,7 @@ static int parhelia_reglist_operand_index(const u32 *cmd, u32 length,
 
 			if (index == 0x21)
 				break;
-			if (pos >= length)
+			if (pos >= end)
 				return -EINVAL;
 			if (pos == dword) {
 				*index_out = index;
@@ -3524,11 +3586,12 @@ static int parhelia_mode7_final_stream_operand(
 
 	for (i = mode7->stream_packet; i < mode7->index_packet; i++) {
 		const u32 *cmd = commands + packets[i].offset;
-		u32 pos = 1;
+		u32 pos = 0, end = 0;
 
 		if (cmd[0] >> 24)
 			continue;
-		while (pos < packets[i].length) {
+		while (parhelia_reglist_next(cmd, packets[i].length, &pos,
+					     &end)) {
 			u32 tag = cmd[pos++];
 			unsigned int slot;
 
@@ -3558,9 +3621,9 @@ static int parhelia_mode7_final_stream_operand(
 static void parhelia_mode7_state_packet(struct parhelia_mode7_state *state,
 					const u32 *cmd, u32 length)
 {
-	u32 pos = 1;
+	u32 pos = 0, end = 0;
 
-	while (pos < length) {
+	while (parhelia_reglist_next(cmd, length, &pos, &end)) {
 		u32 tag = cmd[pos++];
 		unsigned int slot;
 
@@ -3570,7 +3633,7 @@ static void parhelia_mode7_state_packet(struct parhelia_mode7_state *state,
 
 			if (index == 0x21)
 				break;
-			if (pos >= length) {
+			if (pos >= end) {
 				state->invalid = true;
 				return;
 			}
@@ -4115,11 +4178,12 @@ static u32 parhelia_batch_dwgctl_range(const u32 *commands,
 
 	for (i = begin; i < end; i++) {
 		const u32 *cmd = commands + packets[i].offset;
-		u32 pos = 1;
+		u32 pos = 0, end = 0;
 
 		if (cmd[0] >> 24)
 			continue;
-		while (pos < packets[i].length) {
+		while (parhelia_reglist_next(cmd, packets[i].length, &pos,
+					     &end)) {
 			u32 tag = cmd[pos++], slot;
 
 			for (slot = 0; slot < 4; slot++) {
@@ -4578,6 +4642,9 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 	case PARHELIA_PARAM_VERTEX_BO_MAX:
 		args->value = parhelia_vertex_objects(pdev) ?
 			      PARHELIA_VERTEX_BO_MAX_SIZE : 0;
+		break;
+	case PARHELIA_PARAM_REGLIST_RUNS:
+		args->value = 1;
 		break;
 	case PARHELIA_PARAM_WARP_PROGRAM_SLOTS:
 		args->value = pdev->warp_user_cpu ?
