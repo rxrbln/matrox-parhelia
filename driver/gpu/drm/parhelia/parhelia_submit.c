@@ -1812,14 +1812,31 @@ static int parhelia_validate_reglist(struct parhelia_device *pdev,
 			continue;
 		}
 		tag = cmd[pos++];
-		/* four plain state writes: nothing to check or track */
-		if (end - pos >= 4 &&
-		    !(parhelia_reg_class[tag & 0xff] |
-		      parhelia_reg_class[(tag >> 8) & 0xff] |
-		      parhelia_reg_class[(tag >> 16) & 0xff] |
-		      parhelia_reg_class[tag >> 24])) {
-			pos += 4;
-			continue;
+		/* plain state writes up to the first pad: nothing to check or
+		 * track */
+		{
+			const u8 c0 = parhelia_reg_class[tag & 0xff];
+			const u8 c1 = parhelia_reg_class[(tag >> 8) & 0xff];
+			const u8 c2 = parhelia_reg_class[(tag >> 16) & 0xff];
+			const u8 c3 = parhelia_reg_class[tag >> 24];
+			u32 writes = 5;
+
+			if (!(c0 | c1 | c2 | c3))
+				writes = 4;
+			else if (!(c0 | c1 | c2) && c3 == PARHELIA_REG_END)
+				writes = 3;
+			else if (!(c0 | c1) && c2 == PARHELIA_REG_END)
+				writes = 2;
+			else if (!c0 && c1 == PARHELIA_REG_END)
+				writes = 1;
+			else if (c0 == PARHELIA_REG_END)
+				writes = 0;
+			if (writes <= 4) {
+				if (writes > end - pos)
+					return -EINVAL;
+				pos += writes;
+				continue;
+			}
 		}
 		for (slot = 0; slot < 4; slot++) {
 			u32 index = (tag >> (slot * 8)) & 0xff;
