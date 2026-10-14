@@ -228,29 +228,36 @@ void parhelia_state_cache_destroy(struct parhelia_state_cache *cache);
  * as if submitted alone, and its vertex-program binds; -1 if unknown. */
 int parhelia_state_cache_last_calls(const struct parhelia_state_cache *cache,
                                     unsigned *stages);
-struct state_cache_entry;
 
-/* The register values the pending stream leaves behind, for dropping a
- * replayed write that would store the same value again.  Only registers in
- * @cacheable are tracked; @valid is cleared whenever the stream may have
- * lost them (a new submit, an untracked batch). */
-struct parhelia_reg_shadow {
-   uint64_t valid[4];
-   uint64_t cacheable[4];
-   uint32_t value[256];
+/* The state groups the pending stream has written, for dropping a replayed
+ * group whose writes repeat the last ones exactly (the vendor's register
+ * shadow emits whole groups the same way).  @group_of maps a register-list
+ * index to its group, 0 for registers that are never dropped. */
+struct parhelia_reg_group {
+   uint32_t *seq, *cur;          /* index, value pairs: last sent, this replay */
+   unsigned len, cur_len, cap;
+   bool valid, droppable, drop;
 };
 
-void parhelia_reg_shadow_init(struct parhelia_reg_shadow *shadow,
-                              uint32_t chip_id);
+struct parhelia_reg_shadow {
+   uint8_t group_of[256];
+   unsigned groups;
+   struct parhelia_reg_group *group;   /* [groups + 1], 0 unused */
+};
+
+int parhelia_reg_shadow_init(struct parhelia_reg_shadow *shadow,
+                             uint32_t chip_id);
+void parhelia_reg_shadow_fini(struct parhelia_reg_shadow *shadow);
 
 static inline void
 parhelia_reg_shadow_reset(struct parhelia_reg_shadow *shadow)
 {
-   memset(shadow->valid, 0, sizeof(shadow->valid));
+   for (unsigned g = 1; g <= shadow->groups; g++)
+      shadow->group[g].valid = false;
 }
 
-/* A state-cache hit not yet copied anywhere: its prefix and draw packets go
- * straight into the stream they are appended to. */
+struct state_cache_entry;
+
 struct parhelia_batch_replay {
    const struct state_cache_entry *entry;   /* NULL: nothing deferred */
    const float *mvp;

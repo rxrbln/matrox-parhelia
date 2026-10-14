@@ -2060,7 +2060,7 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
          &ctx->pending_batch, ctx->pending_vertices,
          &ctx->pending_vertex_dwords, &replay_entry, vertices, vertex_dwords,
          &ctx->batch_limits, ctx->pack_adjacent_packets,
-         ctx->state_filter ? &ctx->reg_shadow : NULL) :
+         ctx->state_filter && ctx->reg_shadow.groups ? &ctx->reg_shadow : NULL) :
       ctx->aggregate_state_stream ?
       ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
       ctx->aggregate_state_batches ?
@@ -2084,7 +2084,7 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
             &ctx->pending_batch, ctx->pending_vertices,
             &ctx->pending_vertex_dwords, &replay_entry, vertices,
             vertex_dwords, &ctx->batch_limits, ctx->pack_adjacent_packets,
-            ctx->state_filter ? &ctx->reg_shadow : NULL) :
+            ctx->state_filter && ctx->reg_shadow.groups ? &ctx->reg_shadow : NULL) :
          ctx->aggregate_state_stream ?
          ph_append_state_stream(ctx, batch, vertices, vertex_dwords) :
          ctx->aggregate_state_batches ?
@@ -16665,6 +16665,7 @@ ph_destroy_context(struct pipe_context *p)
    FREE(ctx->repeat_batch);
    FREE(ctx->pending_vertex_store);
    parhelia_state_cache_destroy(ctx->state_cache);
+   parhelia_reg_shadow_fini(&ctx->reg_shadow);
    free(ctx->vs_const);
    free(ctx->vs_const_pending);
    free(ctx->fs_const_snap);

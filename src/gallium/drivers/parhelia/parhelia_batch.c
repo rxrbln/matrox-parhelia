@@ -1614,51 +1614,150 @@ state_reglist_plain(const uint32_t *cmd, unsigned length)
    return pos == length;
 }
 
-/* Raster and depth scalars: pure state the vendor caches in its register
- * shadow (the kernel's state_shadow_cache list). */
-static const uint8_t reg_shadow_original[] = {
-   0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb9, 0xba, 0xbe, 0xbf,
-   0xc9, 0xca, 0xcb,
+/* The original family's state groups the vendor driver omits when their
+ * writes repeat and rewrites whole otherwise (0528 MTXPARD dirty groups,
+ * campaign/results/vendor-dirty-registers-0528-20261014.md): depth, alpha
+ * and blend, raster and scissor, colour/depth masks, depth range, the
+ * colour write mask, the pixel-pipe flags and the combiner.  Texture, WARP,
+ * vertex fetch and surface registers are never dropped. */
+static const uint8_t reg_groups_original[][11] = {
+   { 0xb2, 0xb3, 0xb4 },
+   { 0xb9, 0xba, 0xbb, 0xbc },
+   { 0xbe, 0xbf, 0xca, 0xcb },
+   { 0xb0, 0xb1 },
+   { 0xb5, 0xb6, 0xb7 },
+   { 0xc9 },
+   { 0xbd },
+   { 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1 },
 };
 
-void
+int
 parhelia_reg_shadow_init(struct parhelia_reg_shadow *shadow, uint32_t chip_id)
 {
+   const unsigned groups = sizeof(reg_groups_original) /
+                           sizeof(reg_groups_original[0]);
+
    memset(shadow, 0, sizeof(*shadow));
    if (chip_id != 0x0527 && chip_id != 0x0528)
-      return;
-   for (unsigned i = 0; i < sizeof(reg_shadow_original); i++)
-      shadow->cacheable[reg_shadow_original[i] >> 6] |=
-         UINT64_C(1) << (reg_shadow_original[i] & 63);
+      return 0;
+   shadow->group = calloc(groups + 1, sizeof(*shadow->group));
+   if (!shadow->group)
+      return -ENOMEM;
+   shadow->groups = groups;
+   for (unsigned g = 0; g < groups; g++)
+      for (unsigned i = 0; i < sizeof(reg_groups_original[g]) &&
+                           reg_groups_original[g][i]; i++)
+         shadow->group_of[reg_groups_original[g][i]] = g + 1;
+   return 0;
 }
 
-static inline bool
-reg_shadow_has(const uint64_t *bits, unsigned index)
+void
+parhelia_reg_shadow_fini(struct parhelia_reg_shadow *shadow)
 {
-   return bits[index >> 6] >> (index & 63) & 1;
+   for (unsigned g = 1; shadow->group && g <= shadow->groups; g++) {
+      free(shadow->group[g].seq);
+      free(shadow->group[g].cur);
+   }
+   free(shadow->group);
+   memset(shadow, 0, sizeof(*shadow));
 }
 
-/* Record @value in @shadow; true when it was there already. */
-static inline bool
-reg_shadow_store(struct parhelia_reg_shadow *shadow, unsigned index,
-                 uint32_t value)
+static bool
+reg_group_push(struct parhelia_reg_group *g, unsigned index, uint32_t value)
 {
-   const uint64_t bit = UINT64_C(1) << (index & 63);
-   bool same;
+   if (g->cur_len + 2 > g->cap) {
+      const unsigned cap = g->cap ? g->cap * 2 : 32;
+      uint32_t *seq = realloc(g->seq, cap * sizeof(*seq));
+      uint32_t *cur;
 
-   if (!(shadow->cacheable[index >> 6] & bit))
-      return false;
-   same = (shadow->valid[index >> 6] & bit) && shadow->value[index] == value;
-   shadow->value[index] = value;
-   shadow->valid[index >> 6] |= bit;
-   return same;
+      if (!seq)
+         return false;
+      g->seq = seq;
+      cur = realloc(g->cur, cap * sizeof(*cur));
+      if (!cur)
+         return false;
+      g->cur = cur;
+      g->cap = cap;
+   }
+   g->cur[g->cur_len++] = index;
+   g->cur[g->cur_len++] = value;
+   return true;
 }
 
-/* Copy register list @cmd to @out without the writes @shadow already holds;
- * @limit replaces the operand at @limit_pos.  Returns the dwords written,
- * 0 when every write was dropped. */
+/* Decide per group whether the prefix's writes repeat the last ones sent:
+ * gather each group's writes in order, then compare.  A group written by a
+ * packet that stays byte-exact is never dropped. */
+static void
+reg_shadow_judge(struct parhelia_reg_shadow *shadow,
+                 const struct state_cache_entry *e, uint32_t limit)
+{
+   bool parsed = true;
+
+   for (unsigned g = 1; g <= shadow->groups; g++) {
+      shadow->group[g].cur_len = 0;
+      shadow->group[g].droppable = true;
+      shadow->group[g].drop = false;
+   }
+   for (unsigned i = 0; i < e->packet_count; i++) {
+      const uint32_t *cmd = e->commands + e->packets[i].offset;
+      const unsigned len = e->packets[i].length;
+      const uint8_t flags = e->packet_flags[i];
+      unsigned pos = 1;
+
+      if (cmd[0] >> 24)
+         continue;
+      if (!(flags & STATE_PACKET_REGLIST)) {
+         parsed = false;
+         continue;
+      }
+      while (pos < len) {
+         const uint32_t tag = cmd[pos++];
+
+         for (unsigned s = 0; s < 4 && pos < len; s++) {
+            const unsigned index = (tag >> (s * 8)) & 0xff;
+            const unsigned g = shadow->group_of[index];
+            const uint32_t value =
+               limit && (int)(e->packets[i].offset + pos) == e->limit_offset ?
+               limit : cmd[pos];
+
+            if (index == 0x21)
+               break;
+            pos++;
+            if (!g)
+               continue;
+            if (flags != STATE_PACKET_REGLIST)
+               shadow->group[g].droppable = false;
+            if (!reg_group_push(&shadow->group[g], index, value)) {
+               shadow->group[g].droppable = false;
+               shadow->group[g].valid = false;
+            }
+         }
+      }
+   }
+   for (unsigned g = 1; g <= shadow->groups; g++) {
+      struct parhelia_reg_group *grp = &shadow->group[g];
+      uint32_t *swap;
+
+      if (!grp->cur_len)
+         continue;
+      grp->drop = parsed && grp->droppable && grp->valid &&
+                  grp->cur_len == grp->len &&
+                  !memcmp(grp->cur, grp->seq, grp->len * sizeof(uint32_t));
+      if (grp->drop)
+         continue;
+      /* what this replay sends becomes the last sent */
+      swap = grp->seq;
+      grp->seq = grp->cur;
+      grp->cur = swap;
+      grp->len = grp->cur_len;
+      grp->valid = parsed;
+   }
+}
+
+/* Copy register list @cmd to @out without the writes of dropped groups.
+ * Returns the dwords written, 0 when every write was dropped. */
 static unsigned
-reg_shadow_filter(struct parhelia_reg_shadow *shadow, uint32_t *out,
+reg_shadow_filter(const struct parhelia_reg_shadow *shadow, uint32_t *out,
                   const uint32_t *cmd, unsigned length, int limit_pos,
                   uint32_t limit)
 {
@@ -1669,13 +1768,14 @@ reg_shadow_filter(struct parhelia_reg_shadow *shadow, uint32_t *out,
 
       for (unsigned s = 0; s < 4; s++) {
          const unsigned index = (tag >> (s * 8)) & 0xff;
+         const unsigned g = shadow->group_of[index & 0xff];
          uint32_t value;
 
          if (index == 0x21)
             break;
          value = (int)pos == limit_pos ? limit : cmd[pos];
          pos++;
-         if (reg_shadow_store(shadow, index, value))
+         if (g && shadow->group[g].drop)
             continue;
          if (slot == 4) {
             tag_at = w++;
@@ -1692,26 +1792,6 @@ reg_shadow_filter(struct parhelia_reg_shadow *shadow, uint32_t *out,
       return 0;
    out[0] = w - 2;
    return w;
-}
-
-/* Note the writes of a register list copied verbatim. */
-static void
-reg_shadow_track(struct parhelia_reg_shadow *shadow, const uint32_t *cmd,
-                 unsigned length)
-{
-   unsigned pos = 1;
-
-   while (pos < length) {
-      const uint32_t tag = cmd[pos++];
-
-      for (unsigned s = 0; s < 4 && pos < length; s++) {
-         const unsigned index = (tag >> (s * 8)) & 0xff;
-
-         if (index == 0x21)
-            break;
-         reg_shadow_store(shadow, index, cmd[pos++]);
-      }
-   }
 }
 
 /* The prefix of a freshly built batch: its packets before the first draw,
@@ -1918,6 +1998,8 @@ state_cache_replay_at(struct parhelia_batch *dst,
       uint16_t map[PH_BATCH_PACKETS];
       unsigned packets = packet_base;
 
+      reg_shadow_judge(shadow, e, r->limit);
+
       for (unsigned i = 0; i < e->packet_count; i++) {
          const uint32_t *cmd = e->commands + e->packets[i].offset;
          const unsigned len = e->packets[i].length;
@@ -1943,8 +2025,6 @@ state_cache_replay_at(struct parhelia_batch *dst,
             if (r->limit && e->limit_offset >= (int)e->packets[i].offset &&
                 e->limit_offset < (int)(e->packets[i].offset + len))
                out[e->limit_offset - e->packets[i].offset] = r->limit;
-            if (flags & STATE_PACKET_REGLIST)
-               reg_shadow_track(shadow, out, len);
             written = len;
          }
          map[i] = packets;
