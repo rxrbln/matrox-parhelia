@@ -1766,6 +1766,7 @@ struct parhelia_validate_state {
 	u32 dwgctl, dwgctl_packet;
 	bool dwgctl_seen;
 	struct parhelia_indexed_draw fetch;	/* current direct-fetch state */
+	unsigned long *vram_ops;	/* command dwords that are VRAM operands */
 	struct parhelia_indexed_draw *indexed;	/* one per 0x9f packet */
 	u32 indexed_count, indexed_cap;
 };
@@ -1843,6 +1844,8 @@ static int parhelia_validate_reglist(struct parhelia_device *pdev,
 				/* This operand must be populated by a GEM relocation. */
 				if (value)
 					return -EACCES;
+				if (vs->vram_ops)
+					__set_bit(offset + pos, vs->vram_ops);
 				break;
 			case PARHELIA_REG_WARP_ENTRY:
 				if (!parhelia_warp_entry_allowed(pdev, file, value))
@@ -2107,11 +2110,6 @@ static bool parhelia_vram_operand_reg(const u32 *cmd, u32 length, u32 dword,
 		}
 	}
 	return false;
-}
-
-static bool parhelia_is_vram_operand(const u32 *cmd, u32 length, u32 dword)
-{
-	return parhelia_vram_operand_reg(cmd, length, dword, NULL);
 }
 
 /* Keep one engine-visible allocation wholly inside either physical VRAM bank.
@@ -4919,10 +4917,24 @@ struct parhelia_reloc_map {
 	} *entry;
 	u32 *first;
 	u32 mask, capacity, gen;
+	/* validation marks the VRAM operands, so a relocation's target
+	 * register is a bit test instead of a walk of its packet */
+	unsigned long *vram_ops;
+	u32 vram_ops_bits;
 };
 
+static void parhelia_reloc_map_free(struct parhelia_reloc_map *map)
+{
+	if (!map)
+		return;
+	kvfree(map->entry);
+	kvfree(map->first);
+	kvfree(map->vram_ops);
+	kfree(map);
+}
+
 static struct parhelia_reloc_map *
-parhelia_reloc_map_get(struct parhelia_device *pdev, u32 count)
+parhelia_reloc_map_get(struct parhelia_device *pdev, u32 count, u32 dwords)
 {
 	struct parhelia_reloc_map *map = xchg(&pdev->reloc_map_cache, NULL);
 	u32 size = roundup_pow_of_two(max(2 * count, 16u));
@@ -4942,12 +4954,21 @@ parhelia_reloc_map_get(struct parhelia_device *pdev, u32 count)
 		map->capacity = size / 2;
 		map->gen = 0;
 		if (!map->entry || !map->first) {
-			kvfree(map->entry);
-			kvfree(map->first);
-			kfree(map);
+			parhelia_reloc_map_free(map);
 			return NULL;
 		}
 	}
+	if (dwords > map->vram_ops_bits) {
+		kvfree(map->vram_ops);
+		map->vram_ops_bits = roundup_pow_of_two(dwords);
+		map->vram_ops = kvmalloc_array(BITS_TO_LONGS(map->vram_ops_bits),
+					       sizeof(long), GFP_KERNEL);
+		if (!map->vram_ops) {
+			parhelia_reloc_map_free(map);
+			return NULL;
+		}
+	}
+	bitmap_zero(map->vram_ops, dwords);
 	if (!++map->gen) {
 		memset(map->entry, 0, (map->mask + 1) * sizeof(*map->entry));
 		map->gen = 1;
@@ -4960,12 +4981,7 @@ static void parhelia_reloc_map_put(struct parhelia_device *pdev,
 {
 	if (!map)
 		return;
-	map = xchg(&pdev->reloc_map_cache, map);
-	if (map) {
-		kvfree(map->entry);
-		kvfree(map->first);
-		kfree(map);
-	}
+	parhelia_reloc_map_free(xchg(&pdev->reloc_map_cache, map));
 }
 
 /* The first relocation of @key, or @index after recording it as such. */
@@ -5279,7 +5295,8 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 		ret = -ENOMEM;
 		goto out_relocs;
 	}
-	reloc_map = parhelia_reloc_map_get(pdev, args->reloc_count);
+	reloc_map = parhelia_reloc_map_get(pdev, args->reloc_count,
+					   args->command_dwords);
 	if (!reloc_map) {
 		ret = -ENOMEM;
 		goto out_relocs;
@@ -5312,6 +5329,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 		};
 		validate.rb = &rebind_state;
 	}
+	validate.vram_ops = reloc_map->vram_ops;
 	for (i = 0; i < args->packet_count; i++) {
 		if (packets[i].offset != end ||
 		    check_add_overflow(end, packets[i].length, &end) ||
@@ -5863,8 +5881,8 @@ retry_slot:
 		if (reloc->type == PARHELIA_RELOC_KERNEL_BUS) {
 			if (!kernel_objects || reloc->dword >= packet->length ||
 			    (packet_cmd[0] >> 24) != 0x00 ||
-			    !parhelia_is_vram_operand(packet_cmd, packet->length,
-						      reloc->dword)) {
+			    !test_bit(packet->offset + reloc->dword,
+				      reloc_map->vram_ops)) {
 				ret = -EINVAL;
 				goto out_unpin;
 			}
@@ -5873,7 +5891,7 @@ retry_slot:
 		}
 		if (reloc->type != PARHELIA_RELOC_VRAM || reloc->dword >= packet->length ||
 		    (packet_cmd[0] >> 24) != 0x00 ||
-		    !parhelia_is_vram_operand(packet_cmd, packet->length, reloc->dword)) {
+		    !test_bit(packet->offset + reloc->dword, reloc_map->vram_ops)) {
 			ret = -EINVAL;
 			goto out_unpin;
 		}
@@ -7346,19 +7364,13 @@ bool parhelia_submit_quiesce(struct parhelia_device *pdev)
 
 void parhelia_submit_fini(struct parhelia_device *pdev)
 {
-	struct parhelia_reloc_map *reloc_map;
 	struct parhelia_vertex_bo *entry, *tmp;
 	struct parhelia_upload_span *span;
 	u32 i;
 
 	cancel_delayed_work_sync(&pdev->retire_work);
 	kvfree(xchg(&pdev->plan_cache, NULL));
-	reloc_map = xchg(&pdev->reloc_map_cache, NULL);
-	if (reloc_map) {
-		kvfree(reloc_map->entry);
-		kvfree(reloc_map->first);
-		kfree(reloc_map);
-	}
+	parhelia_reloc_map_free(xchg(&pdev->reloc_map_cache, NULL));
 	parhelia_submit_lock(pdev);
 	pdev->wedged = true;
 	parhelia_state_shadow_invalidate(pdev, "submit teardown");
