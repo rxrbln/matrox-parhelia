@@ -1123,18 +1123,17 @@ ph_create_vertex_ring(struct ph_context *ctx)
 
    parhelia_batch_negotiate_limits(screen->kernel_max_packets, true,
                                    &mapped_limits);
-   /* A larger object takes larger slots: a submit then carries a whole
-    * q3 frame's vertices instead of draining at every slot boundary. */
+   /* Slots large enough that a submit is not cut at a slot boundary, in a
+    * ring that stays cache-sized. */
    mapped_limits.vertex_dwords =
       MIN2(PH_BATCH_VERTEX_DWORDS,
-           MAX2(mapped_limits.vertex_dwords,
-                screen->vertex_bo_max / sizeof(uint32_t) /
-                   PH_VRAM_VERTEX_RING_SLOTS));
+           MAX2(mapped_limits.vertex_dwords, PH_VRAM_VERTEX_SLOT_DWORDS));
    slot_bytes = (uint64_t)mapped_limits.vertex_dwords * sizeof(uint32_t);
    /* Leave queue headroom, and keep the mapped allocation inside the
     * CREATE_VERTEX ABI even when a kernel reports sixteen async slots. */
    slot_count = ph_vertex_ring_slot_count(screen->async_slots, slot_bytes,
-                                          screen->vertex_bo_max);
+                                          MIN2(screen->vertex_bo_max,
+                                               PH_VRAM_VERTEX_RING_BYTES));
    if (!slot_count)
       return;
    create.size = slot_count * slot_bytes;

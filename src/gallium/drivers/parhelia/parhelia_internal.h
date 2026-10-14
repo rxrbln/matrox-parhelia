@@ -26,8 +26,11 @@
 
 #define PH_VRAM_VERTEX_LEGACY_SLOTS 3
 #define PH_VRAM_VERTEX_SLOTS_MAX 16
-/* slots a CREATE_VERTEX ring of the kernel's largest size is cut into */
-#define PH_VRAM_VERTEX_RING_SLOTS 8
+/* Vertex ring footprint: CPU writes into a ring larger than the board cache
+ * miss on every line.  64 Ki-dword slots hold a q3 frame's part between its
+ * clear, fill and present drains. */
+#define PH_VRAM_VERTEX_RING_BYTES (1u << 20)
+#define PH_VRAM_VERTEX_SLOT_DWORDS (64u * 1024u)
 
 /* 0x2537, 0x2538 and 0x2539 are the LX/P650/P750/P690 family: the vendor's
  * class mask 0x7fc00 covers exactly these three device ids. */
