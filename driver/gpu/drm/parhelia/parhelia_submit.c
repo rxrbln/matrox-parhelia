@@ -444,11 +444,15 @@ MODULE_PARM_DESC(mode3_bound_range,
 static bool vram_vertex = true;
 module_param(vram_vertex, bool, 0400);
 MODULE_PARM_DESC(vram_vertex,
-		 "Enable hardware-tested dedicated DMA32 P690 vertex buffers (default true)");
+		 "Enable dedicated DMA32 vertex buffers (default true)");
 
+/* A dedicated DMA32 vertex object is the same class-3 source the kernel's own
+ * vertex slots are: on the P690 and on the original family, whose draws
+ * fetch their ranges from those slots today. */
 static bool parhelia_vertex_objects(const struct parhelia_device *pdev)
 {
-	return vram_vertex && pdev->pdev->device == PARHELIA_P690;
+	return vram_vertex && (pdev->pdev->device == PARHELIA_P690 ||
+			       parhelia_original_family(pdev));
 }
 
 /* Experiment for the P690 multi-primitive packet stall: host-vertex draws of
@@ -3871,7 +3875,7 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	return 0;
 }
 
-/* This allocation is intentionally narrow: it is a P690 class-3 source, not
+/* This allocation is intentionally narrow: it is a class-3 vertex source, not
  * a generic GEM pin ioctl.  DMA32 backing gives the engine a stable bus address
  * while keeping every CPU mapping out of the programmable BAR0 aperture. */
 int parhelia_create_vertex_ioctl(struct drm_device *drm, void *data,
