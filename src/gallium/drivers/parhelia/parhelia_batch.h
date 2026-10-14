@@ -72,6 +72,16 @@ int parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
                                      bool pack_adjacent_packets,
                                      unsigned *calls);
 
+/* The longest run of marks from @first_mark whose packets, submitted as
+ * one, stay within @limit CALLs (at least one mark), as repeated
+ * parhelia_batch_packed_call_count() calls would find it, in one pass. */
+int parhelia_batch_packed_call_group(const struct parhelia_batch *batch,
+                                     const struct parhelia_batch_mark *marks,
+                                     unsigned first_mark, unsigned mark_count,
+                                     bool pack_adjacent_packets,
+                                     unsigned limit, unsigned *end_mark,
+                                     unsigned *calls);
+
 /* No physical addresses or MMIO callbacks cross this interface. */
 struct parhelia_batch {
    uint32_t commands[PH_BATCH_DWORDS];

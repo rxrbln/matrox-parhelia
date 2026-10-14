@@ -108,28 +108,15 @@ batch_packet_multi_draw(const uint32_t *cmd, unsigned length,
    return false;
 }
 
-int
-parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
-                                 unsigned first_packet,
-                                 unsigned end_packet,
-                                 bool pack_adjacent_packets,
-                                 unsigned *calls)
+/* The packet-indexed facts of a batch's relocations the CALL estimate
+ * reads: CALL boundaries, DRAW packets and their byte ranges. */
+static int
+call_count_relocs(const struct parhelia_batch *batch, bool *draw_packets,
+                  bool *call_boundaries, uint32_t *draw_bytes)
 {
-   enum { PACK_NONE, PACK_DRAW, PACK_RANGE } run = PACK_NONE;
-   bool draw_packets[PH_BATCH_PACKETS];
-   bool call_boundaries[PH_BATCH_PACKETS];
-   uint32_t draw_bytes[PH_BATCH_PACKETS];
-   unsigned run_draws = 0;
-   bool run_multi = false;
-   unsigned opening = first_packet, run_words = 0, count = 3;
    unsigned last_call_boundary = 0;
    bool call_boundary_seen = false;
 
-   if (!batch || !calls || first_packet >= end_packet ||
-       end_packet > batch->packet_count ||
-       batch->packet_count > PH_BATCH_PACKETS ||
-       batch->reloc_count > PH_BATCH_RELOCS)
-      return -EINVAL;
    /* every index read is below packet_count: clear only those */
    memset(draw_packets, 0, batch->packet_count * sizeof(draw_packets[0]));
    memset(call_boundaries, 0,
@@ -157,83 +144,145 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
          draw_bytes[reloc->packet] = reloc->delta;
       }
    }
+   return 0;
+}
+
+static bool
+call_count_packet_valid(const struct parhelia_batch *batch, unsigned i)
+{
+   const struct drm_parhelia_packet *packet = &batch->packets[i];
+
+   return packet->offset <= batch->command_count && packet->length &&
+          packet->length <= PH_BATCH_MAX_DRAW_DWORDS &&
+          packet->length <= batch->command_count - packet->offset;
+}
+
+/* The kernel's adjacent-packet packing, one packet at a time. */
+struct call_pack {
+   unsigned first, opening, count, previous, run_words, run_draws;
+   bool active, run_multi;
+};
+
+static void
+call_pack_step(struct call_pack *st, const struct parhelia_batch *batch,
+               unsigned i, const bool *call_boundaries,
+               const uint32_t *draw_bytes)
+{
+   const struct drm_parhelia_packet *packet = &batch->packets[i];
+   const uint32_t *cmd = batch->commands + packet->offset;
+   const bool is_draw = (cmd[0] >> 24) == 0x97 || (cmd[0] >> 24) == 0x9f;
+   const bool multi = is_draw && batch_packet_multi_draw(
+      cmd, packet->length, draw_bytes[i]);
+
+   if (i != st->first && call_boundaries[i]) {
+      st->count += st->active;
+      st->active = false;
+      st->run_words = 0;
+   }
+   /* the kernel's span rule for large draws */
+   if (st->active && is_draw &&
+       ((st->run_draws && (multi || st->run_multi)) ||
+        (inline_draws && multi))) {
+      st->count++;
+      st->active = false;
+      st->run_words = 0;
+   }
+   if (!st->active) {
+      st->run_draws = 0;
+      st->run_multi = false;
+   }
+   if (i == st->opening) {
+      st->count += st->active;
+      st->active = false;
+      st->run_words = 0;
+      st->count++; /* Kernel-owned opening fence CALL. */
+   }
+   if (st->active && batch->packets[st->previous].offset +
+                        batch->packets[st->previous].length ==
+                        packet->offset &&
+       packet->length <= PH_BATCH_MAX_DRAW_DWORDS - st->run_words) {
+      st->run_words += packet->length;
+   } else {
+      st->count += st->active;
+      st->active = true;
+      st->run_words = packet->length;
+      st->run_draws = 0;
+      st->run_multi = false;
+   }
+   st->run_draws += is_draw;
+   st->run_multi |= multi;
+   st->previous = i;
+   if (batch_packet_adds_stage_call(cmd, packet->length)) {
+      st->count++; /* Flush the run ending in its parent bind. */
+      st->count++; /* Synthetic WARP-stage CALL. */
+      st->active = false;
+      st->run_words = 0;
+   }
+}
+
+/* EOB and terminal drain close the plan. */
+static unsigned
+call_pack_calls(const struct call_pack *st)
+{
+   return st->count + st->active + 2;
+}
+
+/* The first opening watermark in [first_packet, end_packet), or end_packet. */
+static int
+call_count_opening(const struct parhelia_batch *batch, unsigned first_packet,
+                   unsigned end_packet, unsigned *opening)
+{
    for (unsigned i = first_packet; i < end_packet; i++) {
       const struct drm_parhelia_packet *packet = &batch->packets[i];
 
-      if (packet->offset > batch->command_count || !packet->length ||
-          packet->length > PH_BATCH_MAX_DRAW_DWORDS ||
-          packet->length > batch->command_count - packet->offset)
+      if (!call_count_packet_valid(batch, i))
          return -EINVAL;
       if (batch_packet_is_opening_watermark(batch->commands + packet->offset,
                                             packet->length)) {
-         opening = i;
-         break;
+         *opening = i;
+         return 0;
       }
    }
+   *opening = end_packet;
+   return 0;
+}
+
+int
+parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
+                                 unsigned first_packet,
+                                 unsigned end_packet,
+                                 bool pack_adjacent_packets,
+                                 unsigned *calls)
+{
+   enum { PACK_NONE, PACK_DRAW, PACK_RANGE } run = PACK_NONE;
+   bool draw_packets[PH_BATCH_PACKETS];
+   bool call_boundaries[PH_BATCH_PACKETS];
+   uint32_t draw_bytes[PH_BATCH_PACKETS];
+   bool run_multi = false;
+   unsigned opening, run_words = 0, count = 3;
+   int ret;
+
+   if (!batch || !calls || first_packet >= end_packet ||
+       end_packet > batch->packet_count ||
+       batch->packet_count > PH_BATCH_PACKETS ||
+       batch->reloc_count > PH_BATCH_RELOCS)
+      return -EINVAL;
+   ret = call_count_relocs(batch, draw_packets, call_boundaries, draw_bytes);
+   if (!ret)
+      ret = call_count_opening(batch, first_packet, end_packet, &opening);
+   if (ret)
+      return ret;
+   if (opening == end_packet)
+      opening = first_packet;
    if (pack_adjacent_packets) {
-      bool active = false;
-      unsigned previous = 0;
+      struct call_pack st = { .first = first_packet, .opening = opening };
 
-      count = 0;
       for (unsigned i = first_packet; i < end_packet; i++) {
-         const struct drm_parhelia_packet *packet = &batch->packets[i];
-         const uint32_t *cmd;
-
-         if (packet->offset > batch->command_count || !packet->length ||
-             packet->length > PH_BATCH_MAX_DRAW_DWORDS ||
-             packet->length > batch->command_count - packet->offset)
+         if (!call_count_packet_valid(batch, i))
             return -EINVAL;
-         cmd = batch->commands + packet->offset;
-         const bool is_draw = (cmd[0] >> 24) == 0x97 ||
-                              (cmd[0] >> 24) == 0x9f;
-         const bool multi = is_draw && batch_packet_multi_draw(
-            cmd, packet->length, draw_bytes[i]);
-
-         if (i != first_packet && call_boundaries[i]) {
-            count += active;
-            active = false;
-            run_words = 0;
-         }
-         /* the kernel's span rule for large draws */
-         if (active && is_draw && ((run_draws && (multi || run_multi)) ||
-                                   (inline_draws && multi))) {
-            count++;
-            active = false;
-            run_words = 0;
-         }
-         if (!active) {
-            run_draws = 0;
-            run_multi = false;
-         }
-         if (i == opening) {
-            count += active;
-            active = false;
-            run_words = 0;
-            count++; /* Kernel-owned opening fence CALL. */
-         }
-         if (active && batch->packets[previous].offset +
-                          batch->packets[previous].length == packet->offset &&
-             packet->length <= PH_BATCH_MAX_DRAW_DWORDS - run_words) {
-            run_words += packet->length;
-         } else {
-            count += active;
-            active = true;
-            run_words = packet->length;
-            run_draws = 0;
-            run_multi = false;
-         }
-         run_draws += is_draw;
-         run_multi |= multi;
-         previous = i;
-         if (batch_packet_adds_stage_call(cmd, packet->length)) {
-            count++; /* Flush the run ending in its parent bind. */
-            count++; /* Synthetic WARP-stage CALL. */
-            active = false;
-            run_words = 0;
-         }
+         call_pack_step(&st, batch, i, call_boundaries, draw_bytes);
       }
-      count += active;
-      *calls = count + 2; /* EOB and terminal drain. */
+      *calls = call_pack_calls(&st);
       return 0;
    }
    for (unsigned i = first_packet; i < end_packet; i++) {
@@ -283,6 +332,84 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
 }
 
 int
+parhelia_batch_packed_call_group(const struct parhelia_batch *batch,
+                                 const struct parhelia_batch_mark *marks,
+                                 unsigned first_mark, unsigned mark_count,
+                                 bool pack_adjacent_packets, unsigned limit,
+                                 unsigned *end_mark, unsigned *calls)
+{
+   bool draw_packets[PH_BATCH_PACKETS];
+   bool call_boundaries[PH_BATCH_PACKETS];
+   uint32_t draw_bytes[PH_BATCH_PACKETS];
+   unsigned first_packet, opening, end = first_mark, group_calls = 0, i;
+   int ret;
+
+   if (!batch || !marks || !end_mark || !calls || first_mark >= mark_count ||
+       batch->packet_count > PH_BATCH_PACKETS ||
+       batch->reloc_count > PH_BATCH_RELOCS)
+      return -EINVAL;
+   first_packet = first_mark ? marks[first_mark - 1].packets : 0;
+   if (!pack_adjacent_packets) {
+      while (end < mark_count) {
+         unsigned candidate;
+
+         ret = parhelia_batch_packed_call_count(batch, first_packet,
+                                                marks[end].packets, false,
+                                                &candidate);
+         if (ret)
+            return ret;
+         if (end > first_mark && candidate > limit)
+            break;
+         group_calls = candidate;
+         end++;
+         if (group_calls >= limit)
+            break;
+      }
+      *end_mark = end;
+      *calls = group_calls;
+      return 0;
+   }
+   if (marks[mark_count - 1].packets > batch->packet_count)
+      return -EINVAL;
+   ret = call_count_relocs(batch, draw_packets, call_boundaries, draw_bytes);
+   if (!ret)
+      ret = call_count_opening(batch, first_packet,
+                               marks[mark_count - 1].packets, &opening);
+   if (ret)
+      return ret;
+   /* a range ending at or before the watermark opens at its first packet,
+    * one reaching past it at the watermark: count both ways at once */
+   struct call_pack before = { .first = first_packet, .opening = first_packet };
+   struct call_pack after = { .first = first_packet, .opening = opening };
+
+   for (i = first_packet; end < mark_count; end++) {
+      const unsigned end_packet = marks[end].packets;
+      unsigned candidate;
+
+      if (end_packet < i || end_packet <= first_packet)
+         return -EINVAL;
+      for (; i < end_packet; i++) {
+         if (!call_count_packet_valid(batch, i))
+            return -EINVAL;
+         if (i < opening)
+            call_pack_step(&before, batch, i, call_boundaries, draw_bytes);
+         call_pack_step(&after, batch, i, call_boundaries, draw_bytes);
+      }
+      candidate = call_pack_calls(end_packet > opening ? &after : &before);
+      if (end > first_mark && candidate > limit)
+         break;
+      group_calls = candidate;
+      if (group_calls >= limit) {
+         end++;
+         break;
+      }
+   }
+   *end_mark = end;
+   *calls = group_calls;
+   return 0;
+}
+
+int
 parhelia_batch_slice(struct parhelia_batch *dst,
                      const struct parhelia_batch *src,
                      const struct parhelia_batch_mark *begin,
@@ -303,7 +430,6 @@ parhelia_batch_slice(struct parhelia_batch *dst,
       return -EINVAL;
    vertex_begin = (uint64_t)begin->vertex_dwords * sizeof(uint32_t);
    vertex_end = (uint64_t)end->vertex_dwords * sizeof(uint32_t);
-   memset(dst, 0, sizeof(*dst));
    dst->command_count = end->command_dwords - begin->command_dwords;
    dst->packet_count = end->packets - begin->packets;
    dst->reloc_count = 0;

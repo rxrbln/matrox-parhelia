@@ -592,6 +592,7 @@ struct ph_context {
    /* Reused per-draw builder storage keeps the expanded aggregate command
     * allocation off the hot draw-call stack. */
    struct parhelia_batch build_batch;
+   struct parhelia_batch *slice_batch;	/* a pending group's submit */
    /* The aggregate's vertices: in the ring slot it will be submitted from
     * while a ring is mapped, else in pending_vertex_store. */
    uint32_t *pending_vertices;
@@ -1746,45 +1747,40 @@ ph_submit_state_stream_range(struct ph_context *ctx,
 static int
 ph_submit_state_stream_groups(struct ph_context *ctx)
 {
-   struct parhelia_batch *slice = CALLOC_STRUCT(parhelia_batch);
    unsigned first = 0;
-   int ret = -ENOMEM;
+   int ret = 0;
 
-   if (!slice)
-      return ret;
+   /* kept for the context: every field read is written by the slice */
+   if (!ctx->slice_batch &&
+       !(ctx->slice_batch = MALLOC_STRUCT(parhelia_batch)))
+      return -ENOMEM;
    while (first < ctx->pending_mark_count) {
-      const bool pack_adjacent =
-         ctx->pack_adjacent_packets;
-      unsigned first_packet = first ? ctx->pending_marks[first - 1].packets : 0;
-      unsigned end = first, calls = 0;
+      unsigned end, calls;
 
-      while (end < ctx->pending_mark_count) {
-         unsigned candidate_calls;
-
-         ret = parhelia_batch_packed_call_count(
-            &ctx->pending_batch, first_packet,
-            ctx->pending_marks[end].packets, pack_adjacent,
-            &candidate_calls);
-         if (ret)
-            goto out;
-         if (end > first && candidate_calls > PH_BATCH_HW_CALLS)
-            break;
-         calls = candidate_calls;
-         end++;
-         if (calls >= PH_BATCH_HW_CALLS)
-            break;
-      }
+      ret = parhelia_batch_packed_call_group(
+         &ctx->pending_batch, ctx->pending_marks, first,
+         ctx->pending_mark_count, ctx->pack_adjacent_packets,
+         PH_BATCH_HW_CALLS, &end, &calls);
+      if (ret)
+         return ret;
       if (ph_env("PARHELIA_TRACE_BATCH"))
          fprintf(stderr,
                  "parhelia: aggregate group marks=%u..%u estimated_calls=%u\n",
                  first, end, calls);
-      ret = ph_submit_state_stream_range(ctx, slice, first, end);
+      /* a whole aggregate within the bound needs no slice */
+      if (!first && end == ctx->pending_mark_count) {
+         ret = ph_submit_batch_now(ctx, &ctx->pending_batch,
+                                   ctx->pending_vertex_dwords ?
+                                      ctx->pending_vertices : NULL,
+                                   ctx->pending_vertex_dwords);
+         if (ret != -E2BIG)
+            return ret;
+      }
+      ret = ph_submit_state_stream_range(ctx, ctx->slice_batch, first, end);
       if (ret)
-         goto out;
+         return ret;
       first = end;
    }
-out:
-   FREE(slice);
    return ret;
 }
 
@@ -1792,7 +1788,7 @@ static int
 ph_drain_batch_at(struct ph_context *ctx, unsigned line)
 {
    unsigned packed_calls = 0;
-   bool packed_calls_valid;
+   bool packed_calls_valid, split;
    int ret;
 
    if (!ctx->pending_batch.packet_count)
@@ -1812,11 +1808,10 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
       if (line < ph_drain_sites.cap)
          ph_drain_sites.count[line]++;
    }
-   /* the exact count only where the bound cannot rule out a split */
-   packed_calls_valid =
-      (ph_env("PARHELIA_TRACE_BATCH") ||
-       (ctx->aggregate_state_stream && ctx->pending_mark_count > 1 &&
-        ctx->pending_call_bound > PH_BATCH_HW_CALLS)) &&
+   /* where the bound cannot rule out a split, the groups count exactly */
+   split = ctx->aggregate_state_stream && ctx->pending_mark_count > 1 &&
+           ctx->pending_call_bound > PH_BATCH_HW_CALLS;
+   packed_calls_valid = ph_env("PARHELIA_TRACE_BATCH") &&
       !parhelia_batch_packed_call_count(
          &ctx->pending_batch, 0, ctx->pending_batch.packet_count,
          ctx->pack_adjacent_packets, &packed_calls);
@@ -1832,9 +1827,7 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
               ctx->pending_resource_count,
               packed_calls_valid ? packed_calls : 0,
               ctx->pending_call_bound);
-   if (ctx->aggregate_state_stream && ctx->pending_mark_count > 1 &&
-       packed_calls_valid &&
-       packed_calls > PH_BATCH_HW_CALLS)
+   if (split)
       ret = ph_submit_state_stream_groups(ctx);
    else
       ret = ph_submit_batch_now(ctx, &ctx->pending_batch,
@@ -1846,7 +1839,7 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
     * ordered groups within the hardware CALL bound.  The recursive range
     * helper can still reach individual marks when userspace and kernel packet
     * packing capabilities differ. */
-   if (ret == -E2BIG && ctx->aggregate_state_stream &&
+   if (ret == -E2BIG && !split && ctx->aggregate_state_stream &&
        ctx->pending_mark_count > 1)
       ret = ph_submit_state_stream_groups(ctx);
    ph_release_pending_resources(ctx);
@@ -16357,6 +16350,7 @@ ph_destroy_context(struct pipe_context *p)
    free(ctx->tcl_clip_copy);
    free(ctx->deindex);
    free(ctx->tcl_seq);
+   FREE(ctx->slice_batch);
    FREE(ctx->repeat_batch);
    FREE(ctx->pending_vertex_store);
    parhelia_state_cache_destroy(ctx->state_cache);
