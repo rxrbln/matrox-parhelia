@@ -69,7 +69,11 @@ p3d_dwgctl(const struct p3d_state *st)
 
 	/* [7:4] is the raster op; 0xC is GXcopy, the engine's default and the
 	 * only code that leaves blending enabled. */
-	return (0x00a60ec4u & ~0xffu) | (rop << 4) | nibble;
+	const uint32_t base = st->lx_vendor_dwgctl ?
+			      (0x00a60ec4u & ~0x00200000u) | 0x00100000u :
+			      0x00a60ec4u;
+
+	return (base & ~0xffu) | (rop << 4) | nibble;
 }
 
 uint32_t
@@ -1458,7 +1462,9 @@ p3d_emit_draws(struct p3d_cs *cs, const struct p3d_state *st, unsigned nprim)
 	struct p3d_rw rw[2];
 	unsigned k;
 
-	rw[0].reg = P3D_R_PRIMWORD; rw[0].val = p3d_primword(st->prim);
+	rw[0].reg = P3D_R_PRIMWORD;
+	rw[0].val = p3d_primword(st->prim) &
+		    ~(st->lx_vendor_primword ? 0x00040000u : 0u);
 	p3d_reglist(cs, rw, 1);
 
 	rw[0].reg = P3D_R_STREAM0; rw[0].val = 3;	/* class 3: PCI bus master */

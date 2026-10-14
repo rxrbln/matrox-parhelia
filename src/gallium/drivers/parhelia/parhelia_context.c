@@ -5363,6 +5363,11 @@ ph_submit_vertices_staged(struct ph_context *ctx)
     * PARHELIA_NO_LX_GUARD_BAND=1 emits the original family's 32.0. */
    state.lx_family = !ph_env("PARHELIA_NO_LX_GUARD_BAND") &&
       ph_lx_family(ph_screen(ctx->base.screen)->chip_id);
+   /* PARHELIA_LX_VENDOR_DRAW=1: the vendor PSER primitive word and DWGCTL
+    * on the LX family (faaemu P690 capture). */
+   state.lx_vendor_primword = state.lx_vendor_dwgctl =
+      ph_lx_family(ph_screen(ctx->base.screen)->chip_id) &&
+      ph_env("PARHELIA_LX_VENDOR_DRAW");
    /* The 0x11e8 latch is an LX-family register; writing it on the original
     * Parhelia stops its texture engine retiring. */
    state.tex_cache_latch =
