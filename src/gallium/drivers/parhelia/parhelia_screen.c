@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright 2026 René Rebe <rene@exactco.de> */
 /* Gallium screen and GEM resources for the kernel-owned Parhelia render path. */
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -17,6 +18,7 @@
 #include "pipe/p_screen.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "drm-uapi/drm_mode.h"
+#include "util/os_time.h"
 #include "util/format/u_format.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
@@ -627,6 +629,8 @@ ph_resource_shadow_transfer(struct parhelia_resource *r, unsigned long request,
                             uint64_t size)
 {
    struct drm_parhelia_upload_render transfer;
+   const bool trace = ph_env("PARHELIA_TRACE_TRANSFERS");
+   int64_t start = trace ? os_time_get_nano() : 0;
 
    if (!r || !r->transfer_shadow || !r->handle || !r->map || !r->size ||
        offset > r->size || size > r->size - offset)
@@ -651,6 +655,19 @@ ph_resource_shadow_transfer(struct parhelia_resource *r, unsigned long request,
       fprintf(stderr, "parhelia: %s handle=%u offset=%llu size=%llu\n",
               operation, r->handle, (unsigned long long)offset,
               (unsigned long long)size);
+   /* PARHELIA_TRACE_TRANSFERS: every CPU shadow transfer with its caller */
+   if (trace) {
+      Dl_info info = { 0 };
+      const void *caller = __builtin_return_address(0);
+
+      dladdr(caller, &info);
+      fprintf(stderr, "parhelia: %s %ux%u %s size=%llu %.3f ms caller=+%#lx\n",
+              operation, r->base.width0, r->base.height0,
+              util_format_short_name(r->base.format),
+              (unsigned long long)size,
+              (os_time_get_nano() - start) / 1e6,
+              (unsigned long)((uintptr_t)caller - (uintptr_t)info.dli_fbase));
+   }
    return 0;
 }
 

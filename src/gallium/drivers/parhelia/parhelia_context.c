@@ -733,6 +733,7 @@ struct ph_context {
       unsigned waits, stage_evictions;
       uint64_t repeats_dropped;
       uint64_t vertex_dwords, in_place_dwords, clear_pixels, wait_ns, start_ns;
+      uint64_t submit_ns, cpu_start_ns;
       unsigned kind_count[PH_STAT_KINDS];
       uint64_t kind_ns[PH_STAT_KINDS];
       double kind_pixels[PH_STAT_KINDS];
@@ -941,6 +942,15 @@ ph_now_ns(void)
 
 static void ph_hang_write(void);
 
+static uint64_t
+ph_cpu_ns(void)
+{
+   struct timespec ts;
+
+   clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+   return ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
 static int
 ph_wait_fence_counted(struct ph_context *ctx, uint32_t fence)
 {
@@ -1023,8 +1033,15 @@ ph_stats_frame(struct ph_context *ctx)
                  ctx->stat.kind_pixels[k] / n / 1e6,
                  ctx->stat.kind_ns[k] ?
                     ctx->stat.kind_pixels[k] * 1e3 / ctx->stat.kind_ns[k] : 0);
+   if (ctx->stat.start_ns)
+      fprintf(stderr, "parhelia stats/frame: %.2f ms process CPU, %.2f ms in "
+              "submits (%s)\n",
+              (ph_cpu_ns() - ctx->stat.cpu_start_ns) / n / 1e6,
+              ctx->stat.submit_ns / n / 1e6,
+              ctx->async_submit ? "async" : "synchronous");
    memset(&ctx->stat, 0, sizeof(ctx->stat));
    ctx->stat.start_ns = now;
+   ctx->stat.cpu_start_ns = ph_cpu_ns();
 }
 
 /* A queued class-3 submission owns its command and vertex copies in the
@@ -1359,7 +1376,10 @@ ph_submit_batch_now(struct ph_context *ctx, struct parhelia_batch *batch,
       ph_dump_batch(batch, vertices, vertex_dwords);
 
    if (!ctx->stats_sync) {
+      start = ctx->stats ? ph_now_ns() : 0;
       ret = ph_submit_batch_now_untimed(ctx, batch, vertices, vertex_dwords);
+      if (ctx->stats)
+         ctx->stat.submit_ns += ph_now_ns() - start;
       if (!ret)
          ph_hang_record(batch, vertices, vertex_dwords, ctx->fence);
    } else {
@@ -4979,10 +4999,10 @@ static void
 ph_submit_vertices_staged(struct ph_context *ctx)
 {
    struct parhelia_batch *batch = &ctx->build_batch;
-   struct p3d_state state = {0};
+   struct p3d_state state;
    struct parhelia_resource *color, *depth = NULL;
    struct parhelia_resource *texture = NULL, *texture1 = NULL;
-   struct p3d_texture tex = {0}, tex1 = {0};
+   struct p3d_texture tex, tex1;
    uint32_t texture_handle = 0, texture1_handle = 0;
    const struct pipe_sampler_state *sampler = NULL, *sampler1 = NULL;
    const struct pipe_rt_blend_state *blend;
@@ -5008,6 +5028,11 @@ ph_submit_vertices_staged(struct ph_context *ctx)
    }
    if (!ctx->triangles || ctx->submit_error)
       goto out;
+   /* cleared only for a batch to build: half the calls find none; the
+    * state, padding included, is the state cache's key */
+   memset(&state, 0, sizeof(state));
+   memset(&tex, 0, sizeof(tex));
+   memset(&tex1, 0, sizeof(tex1));
    ctx->stat.triangles += ctx->triangles;
    if (!ctx->fb.nr_cbufs || !ctx->fb.cbufs[0].texture) {
       PH_REFUSE("a draw without a colour buffer is dropped\n");
@@ -9203,12 +9228,15 @@ ph_tcl_fetch_element(const struct ph_tcl_fetch_elem *e, const uint32_t *elts,
 }
 
 /* Element-major: one specialised loop per element, so the per-vertex work is
- * the copy alone. */
+ * the copy alone.  Element @skip (or none, -1) is fetched by the caller. */
 static void
-ph_tcl_fetch_elements(const struct ph_tcl_fetch *f, const uint32_t *elts,
-                      unsigned count, uint32_t *dst, unsigned dpv)
+ph_tcl_fetch_elements_but(const struct ph_tcl_fetch *f, int skip,
+                          const uint32_t *elts, unsigned count, uint32_t *dst,
+                          unsigned dpv)
 {
    for (unsigned i = 0; i < f->count; i++) {
+      if ((int)i == skip)
+         continue;
       if (f->e[i].pow2)
          ph_tcl_fetch_element(&f->e[i], elts, count, dst + f->e[i].out, dpv,
                               true);
@@ -9216,6 +9244,13 @@ ph_tcl_fetch_elements(const struct ph_tcl_fetch *f, const uint32_t *elts,
          ph_tcl_fetch_element(&f->e[i], elts, count, dst + f->e[i].out, dpv,
                               false);
    }
+}
+
+static void
+ph_tcl_fetch_elements(const struct ph_tcl_fetch *f, const uint32_t *elts,
+                      unsigned count, uint32_t *dst, unsigned dpv)
+{
+   ph_tcl_fetch_elements_but(f, -1, elts, count, dst, dpv);
 }
 
 /* Vertices per element-major block: the block's output stays cached between
@@ -9245,17 +9280,15 @@ ph_tcl_fetch_run_boxed(const struct ph_context *ctx,
       .hi = { INT32_MIN, INT32_MIN, INT32_MIN },
    };
    float lo[3], hi[3];
-   struct ph_tcl_fetch rest = *f;
 
    /* the bounded copy replaces the position element's plain one */
-   rest.e[f->box_elem] = rest.e[--rest.count];
    for (unsigned b = 0; b < count; b += PH_TCL_FETCH_BLOCK) {
       const unsigned n = MIN2(count - b, PH_TCL_FETCH_BLOCK);
       uint32_t *d = (uint32_t *)dst + (size_t)b * dpv;
 
       ph_tcl_fetch_position_box(&f->e[f->box_elem], elts + b, n,
                                 d + f->e[f->box_elem].out, dpv, &box);
-      ph_tcl_fetch_elements(&rest, elts + b, n, d, dpv);
+      ph_tcl_fetch_elements_but(f, f->box_elem, elts + b, n, d, dpv);
    }
    if (box.nan)
       return false;
@@ -9352,7 +9385,9 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
             const struct pipe_draw_start_count_bias *draw)
 {
    struct ph_tcl_layout lay;
-   struct translate_key key = {0};
+   /* the cache compares the header and the used elements only, and
+    * ph_tcl_add_element() writes every field of those */
+   struct translate_key key;
    struct translate *translate = NULL;
    struct ph_tcl_fetch fetch;
    const uint8_t *maps[PIPE_MAX_ATTRIBS];
@@ -9391,7 +9426,10 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
       }
    }
 
+   /* the cache compares the header and the used elements only, and
+    * ph_tcl_add_element() writes every field of those */
    key.output_stride = lay.dpv * sizeof(float);
+   key.nr_elements = 0;
    if (lay.program) {
       /* One element per fetch slot the compiled program reads. */
       for (unsigned i = 0; i < PIPE_MAX_ATTRIBS; i++) {

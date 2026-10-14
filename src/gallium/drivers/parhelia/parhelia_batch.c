@@ -1200,17 +1200,18 @@ state_key_put(struct parhelia_state_cache *c, const void *data, size_t len)
 static bool
 state_key_texture(struct parhelia_state_cache *c, const struct p3d_texture *t)
 {
-   struct p3d_texture copy;
    const uint8_t present = !!t;
+   size_t at;
 
    if (!state_key_put(c, &present, 1))
       return false;
    if (!t)
       return true;
-   copy = *t;
-   copy.aux = NULL;
-   return state_key_put(c, &copy, sizeof(copy)) &&
-          (!t->aux || state_key_put(c, t->aux, 5 * sizeof(uint32_t)));
+   at = c->key_len;
+   if (!state_key_put(c, t, sizeof(*t)))
+      return false;
+   ((struct p3d_texture *)(c->key + at))->aux = NULL;
+   return !t->aux || state_key_put(c, t->aux, 5 * sizeof(uint32_t));
 }
 
 static bool
@@ -1239,17 +1240,20 @@ state_key_build(struct parhelia_state_cache *c, const struct p3d_state *input,
                 uint32_t colour_handle, uint32_t depth_handle,
                 const uint32_t texture_handles[P3D_MAX_TEXTURE_UNITS])
 {
-   struct p3d_state s = *input;
    const uint8_t fog = !!input->fog_table, comb = !!input->comb;
+   struct p3d_state *s;
 
-   s.fence = 0;
-   s.fog_table = NULL;
-   s.mvp = s.vs_const = s.aux_const = NULL;
-   s.comb = NULL;
-   s.tex = s.tex1 = s.tex2 = s.tex3 = NULL;
    c->key_len = 0;
-   return state_key_put(c, &s, sizeof(s)) &&
-          state_key_put(c, &colour_handle, sizeof(colour_handle)) &&
+   if (!state_key_put(c, input, sizeof(*input)))
+      return false;
+   /* the pointed-to data follows below; the key buffer is malloc-aligned */
+   s = (struct p3d_state *)c->key;
+   s->fence = 0;
+   s->fog_table = NULL;
+   s->mvp = s->vs_const = s->aux_const = NULL;
+   s->comb = NULL;
+   s->tex = s->tex1 = s->tex2 = s->tex3 = NULL;
+   return state_key_put(c, &colour_handle, sizeof(colour_handle)) &&
           state_key_put(c, &depth_handle, sizeof(depth_handle)) &&
           state_key_put(c, texture_handles,
                         P3D_MAX_TEXTURE_UNITS * sizeof(uint32_t)) &&
