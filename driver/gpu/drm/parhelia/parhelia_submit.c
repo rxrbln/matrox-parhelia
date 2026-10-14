@@ -1903,6 +1903,12 @@ static int parhelia_relocate_indexed(struct parhelia_device *pdev,
 	    (u64)base + (u64)d->limit * d->stride > range_bytes)
 		return -EINVAL;
 	count = (end - begin) / 4;
+	/* land the copy at the source's 8-byte parity, one dword apart if
+	 * need be, so it moves two ordinals at a time */
+	if ((((uintptr_t)(range_cpu + begin) ^
+	      (uintptr_t)(index_cpu + *index_used)) & 7) &&
+	    *index_used < index_capacity)
+		(*index_used)++;
 	if (count > index_capacity - *index_used)
 		return -E2BIG;
 	{
@@ -1911,8 +1917,26 @@ static int parhelia_relocate_indexed(struct parhelia_device *pdev,
 		const u32 floor = d->floor, span = d->limit - d->floor;
 		u32 outside = 0;
 
+		i = 0;
+		/* two ordinals a quadword where both ends share the alignment */
+		if (!(((uintptr_t)src ^ (uintptr_t)dst) & 7)) {
+			if ((uintptr_t)src & 7 && count) {
+				const u32 ordinal = READ_ONCE(src[0]);
+
+				dst[0] = ordinal;
+				outside |= (ordinal - floor) >= span;
+				i = 1;
+			}
+			for (; i + 2 <= count; i += 2) {
+				const u64 pair = READ_ONCE(*(const u64 *)&src[i]);
+
+				*(u64 *)&dst[i] = pair;
+				outside |= ((u32)pair - floor) >= span;
+				outside |= ((u32)(pair >> 32) - floor) >= span;
+			}
+		}
 		/* the copy is what gets fetched: check that, not the source */
-		for (i = 0; i < count; i++) {
+		for (; i < count; i++) {
 			const u32 ordinal = READ_ONCE(src[i]);
 
 			dst[i] = ordinal;
@@ -4473,8 +4497,10 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		args->value = parhelia_original_family(pdev);
 		break;
 	case PARHELIA_PARAM_INDEX_DWORDS:
-		args->value = pdev->slots[0].index_cpu ? PARHELIA_INDEX_DWORDS :
-			      PARHELIA_VERTEX_DWORDS;
+		/* half the buffer: each indexed packet may skip a dword to
+		 * keep the copy quadword-aligned */
+		args->value = pdev->slots[0].index_cpu ? PARHELIA_INDEX_DWORDS / 2 :
+			      PARHELIA_VERTEX_DWORDS / 2;
 		break;
 	case PARHELIA_PARAM_VERTEX_BO_MAX:
 		args->value = parhelia_vertex_objects(pdev) ?
