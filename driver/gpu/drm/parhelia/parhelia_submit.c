@@ -1728,7 +1728,7 @@ struct parhelia_validate_state {
 	bool dwgctl_seen;
 	struct parhelia_indexed_draw fetch;	/* current direct-fetch state */
 	struct parhelia_indexed_draw *indexed;	/* one per 0x9f packet */
-	u32 indexed_count;
+	u32 indexed_count, indexed_cap;
 };
 
 static void parhelia_rebind_apply(struct parhelia_device *pdev, u32 *commands,
@@ -1983,12 +1983,18 @@ static int parhelia_validate_packet(struct parhelia_device *pdev,
 		 * once the relocations name the vertex range. */
 		if (words != 3 || header != 0x9f000001u)
 			return -EINVAL;
-		if (!vs->indexed) {
-			vs->indexed = kvmalloc_array(vs->packet_count,
-						     sizeof(*vs->indexed),
-						     GFP_KERNEL);
-			if (!vs->indexed)
+		/* grown with the indexed packets: sizing it for every packet
+		 * of a large submit took a high-order or vmalloc allocation */
+		if (vs->indexed_count == vs->indexed_cap) {
+			u32 cap = max(vs->indexed_cap * 2, 64u);
+			struct parhelia_indexed_draw *grown =
+				kvrealloc(vs->indexed, array_size(cap,
+					  sizeof(*vs->indexed)), GFP_KERNEL);
+
+			if (!grown)
 				return -ENOMEM;
+			vs->indexed = grown;
+			vs->indexed_cap = cap;
 		}
 		vs->fetch.packet = vs->packet;
 		vs->indexed[vs->indexed_count++] = vs->fetch;
