@@ -613,6 +613,7 @@ struct ph_context {
    /* packed CALLs of the batch being submitted (-1 unknown), and an upper
     * bound for the pending aggregate (UINT_MAX unknown) */
    int batch_calls;
+   unsigned batch_stages;	/* its vertex-program binds, with batch_calls */
    unsigned pending_call_bound;
    int pending_ring_slot;        /* -1: not in the ring */
    uint32_t pending_ring_fence;  /* last submit that read the slot */
@@ -1909,12 +1910,11 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
                 struct parhelia_resource *r2, struct parhelia_resource *r3)
 {
    struct parhelia_resource *resources[4] = {r0, r1, r2, r3};
-   unsigned stage_calls;
    bool draw_batch;
    int ret;
-
    int batch_calls = ctx->batch_calls;
-   unsigned calls;
+   const bool cached = batch_calls >= 0;
+   unsigned calls, stage_calls;
 
    ctx->batch_calls = -1;
    /* uncached batches (clears, copies) are short: count them here */
@@ -1945,7 +1945,7 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
          return ret;
    }
 
-   stage_calls = ph_batch_stage_calls(batch);
+   stage_calls = cached ? ctx->batch_stages : ph_batch_stage_calls(batch);
    draw_batch = ph_batch_has_draw(batch);
    if (ctx->aggregate_state_stream && ctx->pending_batch.packet_count &&
        ph_batch_has_draw(&ctx->pending_batch) && !draw_batch) {
@@ -4438,7 +4438,8 @@ ph_batch_primitives_units(struct ph_context *ctx, struct parhelia_batch *batch,
                                                primitives * per_prim);
 
       ctx->batch_calls = ret ? -1 :
-                         parhelia_state_cache_last_calls(ctx->state_cache);
+                         parhelia_state_cache_last_calls(ctx->state_cache,
+                                                         &ctx->batch_stages);
       return ret;
    }
 }

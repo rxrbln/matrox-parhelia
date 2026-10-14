@@ -1040,6 +1040,7 @@ struct state_cache_entry {
    unsigned command_count, packet_count, reloc_count;
    int mvp_offset;               /* the matrix's dwords in commands, or -1 */
    int calls;                    /* packed CALLs of the batch alone, or -1 */
+   unsigned stages;              /* its vertex-program binds (stage CALLs) */
 };
 
 struct parhelia_state_cache {
@@ -1050,6 +1051,7 @@ struct parhelia_state_cache {
    bool verify;
    unsigned long hits, misses;
    int last_calls;               /* the last batch's entry calls, or -1 */
+   unsigned last_stages;
 };
 
 /* Entries before the cache is flushed and refilled. */
@@ -1434,6 +1436,7 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
       ret = state_cache_replay(batch, *slot, state, draws, per_packet,
                                vertices);
       cache->last_calls = ret ? -1 : (*slot)->calls;
+      cache->last_stages = (*slot)->stages;
       if (ret || !cache->verify)
          return ret;
       /* PARHELIA_STATE_CACHE_VERIFY=1: rebuild and compare every hit */
@@ -1486,6 +1489,11 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
                                                   batch->packet_count, true,
                                                   &calls) ? -1 :
                  (int)calls + 1;
+      e->stages = 0;
+      for (unsigned i = 0; i < batch->packet_count; i++)
+         e->stages += batch_packet_adds_stage_call(
+            batch->commands + batch->packets[i].offset,
+            batch->packets[i].length);
    }
    e->hash = hash;
    e->key = malloc(cache->key_len);
@@ -1498,12 +1506,16 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
    *slot = e;
    cache->count++;
    cache->last_calls = e->calls;
+   cache->last_stages = e->stages;
    return 0;
 }
 
 int
-parhelia_state_cache_last_calls(const struct parhelia_state_cache *cache)
+parhelia_state_cache_last_calls(const struct parhelia_state_cache *cache,
+                                 unsigned *stages)
 {
+   if (cache && cache->last_calls >= 0)
+      *stages = cache->last_stages;
    return cache ? cache->last_calls : -1;
 }
 
