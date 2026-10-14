@@ -1470,8 +1470,11 @@ p3d_emit_draws(struct p3d_cs *cs, const struct p3d_state *st, unsigned nprim)
 	 * Overlapping primitives may share one - the P690 keeps the depth
 	 * interlock and the rasterisation order inside a packet (see the
 	 * primitive notes in parhelia3d.h). */
-	for (k = 0; k < (nprim ? nprim : 1); k++)
+	for (k = 0; k < (nprim ? nprim : 1); k++) {
+		if (k && st->stream_bind_per_draw)
+			p3d_reglist(cs, rw, 2);
 		p3d_drawpacket(cs, st->dw_per_vertex);
+	}
 
 	/* End of batch, then the NEXT fence.  Without this the 3D pipeline
 	 * never completes and the following 2D fill draws nothing even though
