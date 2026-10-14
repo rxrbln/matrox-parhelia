@@ -8332,9 +8332,15 @@ ph_tcl_append_tri(struct ph_context *ctx, const struct ph_tcl_run *r,
    ctx->vs_const_vec4s = r->vs_const_vec4s;
    ctx->colour_alpha = r->colour_alpha;
    dst = &ctx->vertices[ctx->triangles * 3 * r->dpv];
-   memcpy(dst, a, r->dpv * sizeof(float));
-   memcpy(dst + r->dpv, b, r->dpv * sizeof(float));
-   memcpy(dst + 2 * r->dpv, c, r->dpv * sizeof(float));
+   /* a staged triangle moves as one piece, or already sits in its slot */
+   if (b == a + r->dpv && c == b + r->dpv) {
+      if (a != dst)
+         memcpy(dst, a, 3 * r->dpv * sizeof(float));
+   } else {
+      memcpy(dst, a, r->dpv * sizeof(float));
+      memcpy(dst + r->dpv, b, r->dpv * sizeof(float));
+      memcpy(dst + 2 * r->dpv, c, r->dpv * sizeof(float));
+   }
    ctx->triangles++;
    return true;
 }
@@ -8430,17 +8436,46 @@ ph_tcl_clip_tri(struct ph_context *ctx, const struct ph_tcl_run *r,
    return true;
 }
 
+/* Where the unread triangles of a chunk being clipped are: [first, end) in
+ * the side buffer, the others still in their staged slots. */
+struct ph_tcl_clip_src {
+   const float *staged;
+   unsigned tri_floats, first, end;
+};
+
+/* Move staged triangles [next, to) that appends are about to overwrite, or
+ * that a submit would release, to the side buffer (sized for the whole
+ * chunk); @next is the first unread one. */
+static void
+ph_tcl_clip_evacuate(struct ph_context *ctx, struct ph_tcl_clip_src *s,
+                     unsigned next, unsigned to)
+{
+   if (s->end <= next)
+      s->first = s->end = next;
+   if (to <= s->end)
+      return;
+   memcpy(ctx->tcl_clip_copy + (size_t)(s->end - s->first) * s->tri_floats,
+          s->staged + (size_t)s->end * s->tri_floats,
+          (size_t)(to - s->end) * s->tri_floats * sizeof(float));
+   s->end = to;
+}
+
 /* A fixed-function chunk with vertices outside the transform's planes: keep
  * the triangles that fit as they are and clip the others, all on the
- * hardware transform. */
+ * hardware transform.  Appends overwrite the staged chunk in order, so only
+ * triangles an append is about to overtake are moved aside first. */
 static bool
 ph_tcl_clip_chunk(struct ph_context *ctx, const struct ph_tcl_run *r,
                   const float *staged, unsigned ntri)
 {
-   const unsigned bytes = ntri * 3 * r->dpv * sizeof(float);
-   float *copy;
+   struct ph_tcl_clip_src src = {
+      .staged = staged, .tri_floats = 3 * r->dpv,
+   };
+   const unsigned start = ctx->triangles;
+   const size_t bytes = (size_t)ntri * src.tri_floats * sizeof(float);
+   bool staged_live = true;
 
-   /* the staged chunk is overwritten by what gets appended */
+   /* sized up front: nothing is appended when this fails */
    if (ctx->tcl_clip_cap < bytes) {
       float *grown = realloc(ctx->tcl_clip_copy, bytes);
 
@@ -8449,15 +8484,16 @@ ph_tcl_clip_chunk(struct ph_context *ctx, const struct ph_tcl_run *r,
       ctx->tcl_clip_copy = grown;
       ctx->tcl_clip_cap = bytes;
    }
-   copy = ctx->tcl_clip_copy;
-   memcpy(copy, staged, bytes);
    for (unsigned t = 0; t < ntri; t++) {
+      const float *base = t >= src.first && t < src.end ?
+         ctx->tcl_clip_copy + (size_t)(t - src.first) * src.tri_floats :
+         staged + (size_t)t * src.tri_floats;
       const float *tri[3];
       float c[3][4];
       bool inside = true, outside = false;
 
       for (unsigned v = 0; v < 3; v++) {
-         tri[v] = copy + (t * 3 + v) * r->dpv;
+         tri[v] = base + v * r->dpv;
          ph_tcl_clip_coords(ctx->mvp, tri[v], c[v]);
          if (!(c[v][3] > 1e-6f) || !(fabsf(c[v][0]) <= r->gx * c[v][3]) ||
              !(fabsf(c[v][1]) <= r->gy * c[v][3]) || !(c[v][2] >= -c[v][3]) ||
@@ -8472,6 +8508,20 @@ ph_tcl_clip_chunk(struct ph_context *ctx, const struct ph_tcl_run *r,
                    ph_tcl_plane_distance(plane, c[2], r->cx, r->cy) < 0.0f;
       if (outside)
          continue;
+      if (staged_live) {
+         const unsigned outputs = inside ? 1 : PH_TCL_CLIP_MAX - 2;
+         const unsigned cap =
+            MIN2(r->limit, ph_logical_vertex_limit(ctx) / src.tri_floats);
+         const unsigned out = ctx->triangles - start;
+
+         /* a submit re-points staging: keep all the unread rest */
+         if (ctx->triangles + outputs > cap) {
+            ph_tcl_clip_evacuate(ctx, &src, t + 1, ntri);
+            staged_live = false;
+         } else if (out + outputs > t + 1) {
+            ph_tcl_clip_evacuate(ctx, &src, t + 1, MIN2(out + outputs, ntri));
+         }
+      }
       if (!(inside ? ph_tcl_append_tri(ctx, r, tri[0], tri[1], tri[2]) :
                      ph_tcl_clip_tri(ctx, r, tri, (const float (*)[4])c)))
          return false;
