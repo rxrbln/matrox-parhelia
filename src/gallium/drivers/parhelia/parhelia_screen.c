@@ -1742,6 +1742,12 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param window_pairs = {
       .param = PARHELIA_PARAM_WINDOW_PAIRS,
    };
+   struct drm_parhelia_get_param index_dwords = {
+      .param = PARHELIA_PARAM_INDEX_DWORDS,
+   };
+   struct drm_parhelia_get_param vertex_bo_max = {
+      .param = PARHELIA_PARAM_VERTEX_BO_MAX,
+   };
    struct drm_parhelia_get_param render_transfer = {
       .param = PARHELIA_PARAM_RENDER_TRANSFER,
    };
@@ -1837,6 +1843,12 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->window_pairs =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &window_pairs) &&
       window_pairs.value == 1;
+   s->index_dwords =
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &index_dwords) &&
+      index_dwords.value ? (unsigned)index_dwords.value : 4096;
+   s->vertex_bo_max =
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &vertex_bo_max) &&
+      vertex_bo_max.value ? vertex_bo_max.value : UINT64_C(1) << 20;
    s->render_transfer =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &render_transfer) &&
       render_transfer.value == 1;

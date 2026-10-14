@@ -26,6 +26,8 @@
 
 #define PH_VRAM_VERTEX_LEGACY_SLOTS 3
 #define PH_VRAM_VERTEX_SLOTS_MAX 16
+/* slots a CREATE_VERTEX ring of the kernel's largest size is cut into */
+#define PH_VRAM_VERTEX_RING_SLOTS 8
 
 /* 0x2537, 0x2538 and 0x2539 are the LX/P650/P750/P690 family: the vendor's
  * class mask 0x7fc00 covers exactly these three device ids. */
@@ -57,6 +59,8 @@ struct parhelia_screen {
    bool texture_upload;
    bool native_rt_classes;
    bool window_pairs;
+   unsigned index_dwords;        /* indices one async submit carries */
+   uint64_t vertex_bo_max;       /* largest CREATE_VERTEX object */
    bool render_transfer;
    bool draw_ranges;
    bool draw_runs;	/* one packet entry per run of draws */

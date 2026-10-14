@@ -1097,12 +1097,12 @@ ph_destroy_vertex_ring(struct ph_context *ctx)
 /* CREATE_VERTEX has a 1 MiB allocation ABI on supported kernels.  A
  * deeper async queue cannot enlarge that allocation; retain complete slots. */
 static unsigned
-ph_vertex_ring_slot_count(unsigned async_slots, uint64_t slot_bytes)
+ph_vertex_ring_slot_count(unsigned async_slots, uint64_t slot_bytes,
+                          uint64_t max_bytes)
 {
    unsigned wanted = async_slots > PH_VRAM_VERTEX_LEGACY_SLOTS &&
                      async_slots <= PH_VRAM_VERTEX_SLOTS_MAX ?
                      async_slots - 1 : PH_VRAM_VERTEX_LEGACY_SLOTS;
-   const uint64_t max_bytes = UINT64_C(1) << 20;
 
    if (!slot_bytes || slot_bytes > max_bytes)
       return 0;
@@ -1123,10 +1123,18 @@ ph_create_vertex_ring(struct ph_context *ctx)
 
    parhelia_batch_negotiate_limits(screen->kernel_max_packets, true,
                                    &mapped_limits);
+   /* A larger object takes larger slots: a submit then carries a whole
+    * q3 frame's vertices instead of draining at every slot boundary. */
+   mapped_limits.vertex_dwords =
+      MIN2(PH_BATCH_VERTEX_DWORDS,
+           MAX2(mapped_limits.vertex_dwords,
+                screen->vertex_bo_max / sizeof(uint32_t) /
+                   PH_VRAM_VERTEX_RING_SLOTS));
    slot_bytes = (uint64_t)mapped_limits.vertex_dwords * sizeof(uint32_t);
    /* Leave queue headroom, and keep the mapped allocation inside the
     * CREATE_VERTEX ABI even when a kernel reports sixteen async slots. */
-   slot_count = ph_vertex_ring_slot_count(screen->async_slots, slot_bytes);
+   slot_count = ph_vertex_ring_slot_count(screen->async_slots, slot_bytes,
+                                          screen->vertex_bo_max);
    if (!slot_count)
       return;
    create.size = slot_count * slot_bytes;
@@ -2000,9 +2008,10 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
       if (ret)
          return ret;
    }
-   /* the kernel copies a submit's indices into 4096 dwords of its own */
+   /* the kernel copies a submit's indices into a buffer of its own */
    if (ctx->batch_index_dwords && ctx->pending_index_dwords &&
-       ctx->pending_index_dwords + ctx->batch_index_dwords > 4096) {
+       ctx->pending_index_dwords + ctx->batch_index_dwords >
+          ph_screen(ctx->base.screen)->index_dwords) {
       ret = ph_drain_batch(ctx);
       if (ret)
          return ret;

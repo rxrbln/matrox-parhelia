@@ -211,6 +211,10 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_INLINE_DRAWS	37
 /* CREATE_RENDER accepts the WINDOW_COLOR and WINDOW_DEPTH hints. */
 #define PARHELIA_PARAM_WINDOW_PAIRS	38
+/* Index dwords one async submit may carry (4096 before this param). */
+#define PARHELIA_PARAM_INDEX_DWORDS	39
+/* Largest CREATE_VERTEX allocation in bytes (1 MiB before this param). */
+#define PARHELIA_PARAM_VERTEX_BO_MAX	40
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
 /* Retired unsafe generic packing capability; kernels report zero. */
