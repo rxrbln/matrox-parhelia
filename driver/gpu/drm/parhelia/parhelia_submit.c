@@ -850,7 +850,8 @@ static bool parhelia_multi_draw_packet(const u32 *commands,
 	const u32 *cmd = commands + packet->offset;
 	u32 stride, k;
 
-	if ((cmd[0] >> 24) != 0x97)
+	/* an indexed packet's size field is zero: four bytes per index */
+	if ((cmd[0] >> 24) != 0x97 && (cmd[0] >> 24) != 0x9f)
 		return false;
 	stride = (((cmd[0] >> 17) & 0x3f) + 1) * sizeof(u32);
 	for (k = 0; k + 3 <= packet->length; k += 3)
@@ -881,7 +882,9 @@ static void parhelia_span_draws(const u32 *commands,
 	*draws = 0;
 	*multi = false;
 	for (i = 0; commands && i < count; i++) {
-		if ((commands[packets[first + i].offset] >> 24) != 0x97)
+		const u32 opcode = commands[packets[first + i].offset] >> 24;
+
+		if (opcode != 0x97 && opcode != 0x9f)
 			continue;
 		(*draws)++;
 		*multi |= parhelia_multi_draw_packet(commands, &packets[first + i]);
@@ -1769,10 +1772,15 @@ static void parhelia_rebind_draw(struct parhelia_rebind *rb)
 /* Triangles one indexed (0x9f) packet may draw: the P690's direct fetch
  * takes one primitive per packet (a two-triangle packet draws wrongly, and
  * stalled the engine on 2026-09-10); not yet measured elsewhere. */
+/* The P690 draws one triangle per indexed packet correctly; the original
+ * family takes runs, each in a CALL span of its own (span rule). */
 static u32 parhelia_indexed_triangles(const struct parhelia_device *pdev)
 {
-	return parhelia_vertex_objects(pdev) &&
-	       pdev->pdev->device == PARHELIA_P690 ? 1 : 0;
+	if (!parhelia_vertex_objects(pdev))
+		return 0;
+	if (pdev->pdev->device == PARHELIA_P690)
+		return 1;
+	return parhelia_original_family(pdev) ? 64 : 0;
 }
 
 /* Relocate an indexed packet drawing from the submit's vertex range.  Its
