@@ -606,6 +606,7 @@ struct ph_context {
     * without being copied there first */
    struct parhelia_batch_replay replay;
    bool defer_replay;
+   bool draw_mapped;             /* the draw module holds this draw's buffers */
    /* registers the pending stream has set, for filtering replayed state */
    struct parhelia_reg_shadow reg_shadow;
    bool state_filter;
@@ -9134,6 +9135,9 @@ ph_tcl_expand(struct ph_context *ctx, const struct pipe_draw_info *info,
 
 /* Draw the triangles [first, ntri) of an expanded list through the software
  * pipeline, used when a chunk does not fit the hardware clip volume. */
+static const void *ph_draw_map(struct ph_context *ctx,
+                               const struct pipe_draw_info *info);
+
 static void
 ph_tcl_software_tail(struct ph_context *ctx, const uint32_t *elts,
                      unsigned first, unsigned ntri)
@@ -9150,6 +9154,7 @@ ph_tcl_software_tail(struct ph_context *ctx, const uint32_t *elts,
    draw.count = (ntri - first) * 3;
    ctx->tcl_clip_fallbacks++;
    ctx->tcl_clip_verts += draw.count;
+   ph_draw_map(ctx, NULL);
    draw_set_indexes(ctx->draw, elts, 4, ~0u);
    draw_vbo(ctx->draw, &info, 0, NULL, &draw, 1, 0);
    draw_flush(ctx->draw);
@@ -12553,6 +12558,47 @@ ph_draw_ramped(struct ph_context *ctx, const struct pipe_draw_info *info,
    return true;
 }
 
+/* Map the draw's buffers and constants into the draw module, once per draw
+ * and only for the paths that run it: the hardware transform needs none of
+ * it, and setting the constants flushes the draw pipeline.  Returns the
+ * mapped indices. */
+static const void *
+ph_draw_map(struct ph_context *ctx, const struct pipe_draw_info *info)
+{
+   const void *indices = NULL;
+
+   if (info && info->index_size)
+      indices = info->has_user_indices ? info->index.user :
+                (info->index.resource ?
+                 ph_resource(info->index.resource)->malloc_data : NULL);
+   if (ctx->draw_mapped)
+      return indices;
+   ctx->draw_mapped = true;
+   for (unsigned i = 0; i < ctx->draw->pt.nr_vertex_buffers; i++) {
+      const struct pipe_vertex_buffer *vb = &ctx->draw->pt.vertex_buffer[i];
+      const void *map = vb->is_user_buffer ? vb->buffer.user :
+                        (vb->buffer.resource ?
+                         ph_resource(vb->buffer.resource)->malloc_data : NULL);
+      draw_set_mapped_vertex_buffer(ctx->draw, i, map, ~0u);
+   }
+   if (indices)
+      draw_set_indexes(ctx->draw, indices, info->index_size, ~0u);
+   if (ctx->user_constants[MESA_SHADER_VERTEX]) {
+      draw_set_mapped_constant_buffer(ctx->draw, MESA_SHADER_VERTEX, 0,
+         (const uint8_t *)ctx->user_constants[MESA_SHADER_VERTEX] +
+            ctx->constant_offset[MESA_SHADER_VERTEX],
+         ctx->constant_size[MESA_SHADER_VERTEX]);
+   } else if (ctx->constants[MESA_SHADER_VERTEX]) {
+      draw_set_mapped_constant_buffer(ctx->draw, MESA_SHADER_VERTEX, 0,
+         (const uint8_t *)ph_resource(ctx->constants[MESA_SHADER_VERTEX])->malloc_data +
+            ctx->constant_offset[MESA_SHADER_VERTEX],
+         ctx->constant_size[MESA_SHADER_VERTEX]);
+   } else {
+      draw_set_mapped_constant_buffer(ctx->draw, MESA_SHADER_VERTEX, 0, NULL, 0);
+   }
+   return indices;
+}
+
 static void
 ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
             unsigned drawid_offset, const struct pipe_draw_indirect_info *indirect,
@@ -12621,37 +12667,12 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
          break;
       }
    }
-   ph_fs_snapshot_constants(ctx);
    ph_update_effective_views(ctx);
-   for (unsigned i = 0; i < ctx->draw->pt.nr_vertex_buffers; i++) {
-      const struct pipe_vertex_buffer *vb = &ctx->draw->pt.vertex_buffer[i];
-      const void *map = vb->is_user_buffer ? vb->buffer.user :
-                        (vb->buffer.resource ?
-                         ph_resource(vb->buffer.resource)->malloc_data : NULL);
-      draw_set_mapped_vertex_buffer(ctx->draw, i, map, ~0u);
+   if (ctx->fs && ctx->fs->depth_from_texture) {
+      indices = ph_draw_map(ctx, info);
+      if (ph_draw_depth_points(ctx, info, drawid_offset, draws))
+         goto unbind;
    }
-   if (info->index_size) {
-      indices = info->has_user_indices ? info->index.user :
-                (info->index.resource ?
-                 ph_resource(info->index.resource)->malloc_data : NULL);
-      draw_set_indexes(ctx->draw, indices, info->index_size, ~0u);
-   }
-   if (ctx->user_constants[MESA_SHADER_VERTEX]) {
-      draw_set_mapped_constant_buffer(ctx->draw, MESA_SHADER_VERTEX, 0,
-         (const uint8_t *)ctx->user_constants[MESA_SHADER_VERTEX] +
-            ctx->constant_offset[MESA_SHADER_VERTEX],
-         ctx->constant_size[MESA_SHADER_VERTEX]);
-   } else if (ctx->constants[MESA_SHADER_VERTEX]) {
-      draw_set_mapped_constant_buffer(ctx->draw, MESA_SHADER_VERTEX, 0,
-         (const uint8_t *)ph_resource(ctx->constants[MESA_SHADER_VERTEX])->malloc_data +
-            ctx->constant_offset[MESA_SHADER_VERTEX],
-         ctx->constant_size[MESA_SHADER_VERTEX]);
-   } else {
-      draw_set_mapped_constant_buffer(ctx->draw, MESA_SHADER_VERTEX, 0, NULL, 0);
-   }
-   if (ctx->fs && ctx->fs->depth_from_texture &&
-       ph_draw_depth_points(ctx, info, drawid_offset, draws))
-      goto unbind;
    derived = u_reduced_prim(info->mode) != MESA_PRIM_TRIANGLES ||
              (ctx->rasterizer &&
               (ctx->rasterizer->fill_front != PIPE_POLYGON_MODE_FILL ||
@@ -12702,6 +12723,7 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       }
       draw_set_rasterize_stage(ctx->draw, ctx->quant_stage);
    }
+   indices = ph_draw_map(ctx, info);
    draw_vbo(ctx->draw, info, drawid_offset, NULL, draws, num_draws, 0);
    draw_flush(ctx->draw);
    if (fix) {
@@ -12709,10 +12731,13 @@ ph_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       draw_remove_extra_vertex_attribs(ctx->draw);
    }
 unbind:
-   for (unsigned i = 0; i < ctx->draw->pt.nr_vertex_buffers; i++)
-      draw_set_mapped_vertex_buffer(ctx->draw, i, NULL, 0);
-   if (indices)
-      draw_set_indexes(ctx->draw, NULL, 0, 0);
+   if (ctx->draw_mapped) {
+      for (unsigned i = 0; i < ctx->draw->pt.nr_vertex_buffers; i++)
+         draw_set_mapped_vertex_buffer(ctx->draw, i, NULL, 0);
+      if (indices)
+         draw_set_indexes(ctx->draw, NULL, 0, 0);
+      ctx->draw_mapped = false;
+   }
    if (ctx->proxy_count) {
       ph_submit_vertices(ctx);
       ph_proxy_writeback(ctx);
