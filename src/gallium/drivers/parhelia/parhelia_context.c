@@ -16399,10 +16399,11 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
     * never hangs, at transform_multitex_ops 0 and 2. */
    ctx->tcl_multitexture =
       debug_get_bool_option("PARHELIA_HW_TCL_MULTITEX", true);
-   /* --packed-colour-probe: the P690 fetch unpacks a D3DCOLOR dword
-    * exactly; the original family is not measured yet. */
+   /* --packed-colour-probe: the P690 and the 0528 fetch unpack a D3DCOLOR
+    * dword exactly (flat c0804010 read back at every sample). */
    ctx->packed_colour_fetch =
-      ph_lx_family(ph_screen(screen)->chip_id) &&
+      (ph_lx_family(ph_screen(screen)->chip_id) ||
+       ph_original_family(ph_screen(screen)->chip_id)) &&
       debug_get_bool_option("PARHELIA_PACKED_COLOUR", true);
    ctx->drop_repeats = debug_get_bool_option("PARHELIA_DROP_REPEATS", false);
    ctx->batch_calls = -1;
