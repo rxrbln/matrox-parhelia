@@ -2930,6 +2930,8 @@ parhelia_batch_submit_ranges_async(
    }
    if (draw_runs && batch->packet_count <= PH_BATCH_PACKETS) {
       unsigned head = 0;
+      /* members join only when not multi: the head alone decides the run */
+      bool head_multi = false;
 
       packet_count = 0;
       for (unsigned i = 0; i < batch->packet_count; i++) {
@@ -2946,13 +2948,12 @@ parhelia_batch_submit_ranges_async(
              run->offset + run->length == p->offset &&
              run->length + 3 <= PH_RUN_MAX_DWORDS &&
              batch->commands[run->offset] == pc[0] &&
-             !batch_multi_draw(pc[0], pc[2] - pc[1]) &&
-             !batch_packet_multi_draw(batch->commands + run->offset,
-                                      run->length, 0)) {
+             !batch_multi_draw(pc[0], pc[2] - pc[1]) && !head_multi) {
             run->length += 3;
          } else {
             runs[packet_count++] = *p;
             head = i;
+            head_multi = batch_packet_multi_draw(pc, p->length, 0);
          }
          run_map[i] = packet_count - 1;
       }
