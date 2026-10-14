@@ -427,6 +427,23 @@ module_param(mode7_screen_test, bool, 0400);
 MODULE_PARM_DESC(mode7_screen_test,
 		 "Enable the isolated P690 mode-7 indexed screen test (default false)");
 
+/* Triangles one indexed (0x9f) packet may draw on the P690: 8 is measured
+ * clean with shared vertices; 21 sharing a quad across packets stalled. */
+static unsigned int p690_indexed_triangles = 8;
+module_param(p690_indexed_triangles, uint, 0644);
+MODULE_PARM_DESC(p690_indexed_triangles,
+		 "Triangles per indexed packet on the P690 (default 8, 0 disables)");
+
+/* The vendor PSER draw layout on the P690: a CALL span that opens with a
+ * single 0x97 draw gets the draw's vertices copied right before its header,
+ * outside every span, with end == the header's address. */
+static bool p690_inline_draws;
+module_param(p690_inline_draws, bool, 0644);
+MODULE_PARM_DESC(p690_inline_draws, "P690 vertices inline before their draw header (experimental, default false)");
+static unsigned long p690_inline_draw_count;
+module_param(p690_inline_draw_count, ulong, 0444);
+MODULE_PARM_DESC(p690_inline_draw_count, "Draws emitted with inline vertices (read only)");
+
 static bool mode3_screen_test;
 module_param(mode3_screen_test, bool, 0400);
 MODULE_PARM_DESC(mode3_screen_test,
@@ -897,7 +914,7 @@ parhelia_pack_adjacent_packet_calls(struct parhelia_call_plan *plan,
 				    const struct drm_parhelia_packet *packets,
 				    u32 packet_count,
 				    const bool *call_boundaries,
-				    bool split_multi_draws)
+				    bool split_multi_draws, bool inline_draws)
 {
 	u32 in = 0, out = 0;
 
@@ -934,6 +951,9 @@ parhelia_pack_adjacent_packet_calls(struct parhelia_call_plan *plan,
 					    &next_draws, &next_multi);
 			if (!parhelia_span_takes_draws(split_multi_draws, draws, multi,
 						       next_draws, next_multi))
+				break;
+			/* an inline draw's vertices go right before its header */
+			if (inline_draws && next_multi)
 				break;
 			draws += next_draws;
 			multi |= next_multi;
@@ -1014,6 +1034,55 @@ copy_one:
 		in++;
 	}
 	plan->count = out;
+}
+
+/* Upper bound of the vertex dwords inline draws may copy into one request:
+ * host draws by their relocation, draw-range ones by their operands. */
+#define PARHELIA_MAX_INLINE_DWORDS	(256u * 1024u)
+
+static u32 parhelia_inline_draw_bound(const u32 *commands,
+				      const struct drm_parhelia_packet *packets,
+				      u32 packet_count,
+				      const struct drm_parhelia_reloc *relocs,
+				      u32 reloc_count)
+{
+	u64 total = 0;
+	u32 i;
+
+	for (i = 0; i < reloc_count; i++)
+		if (relocs[i].type == PARHELIA_RELOC_DRAW)
+			total += relocs[i].delta / sizeof(u32);
+	for (i = 0; i < packet_count; i++) {
+		const u32 *cmd = commands + packets[i].offset;
+
+		if (packets[i].length == 3 && (cmd[0] >> 24) == 0x97 &&
+		    cmd[2] > cmd[1])
+			total += (cmd[2] - cmd[1]) / sizeof(u32);
+	}
+	return total > PARHELIA_MAX_INLINE_DWORDS ? 0 : total;
+}
+
+/* The CPU copy of a span's opening 0x97 draw, or NULL when the span cannot
+ * take its vertices inline. */
+static const void *parhelia_inline_draw_source(const u32 *commands,
+		const struct drm_parhelia_packet *packet, bool relocated,
+		const void *host_cpu, u32 host_bus, u32 host_bytes,
+		const u8 *ranges_cpu, u32 ranges_bus, u32 ranges_bytes,
+		u32 *dwords)
+{
+	const u32 *cmd = commands + packet->offset;
+	const u32 bytes = cmd[2] - cmd[1];
+
+	if (packet->length != 3 || (cmd[0] >> 24) != 0x97 || !relocated ||
+	    cmd[2] <= cmd[1] || (bytes & 3))
+		return NULL;
+	*dwords = bytes / sizeof(u32);
+	if (ranges_cpu && cmd[1] >= ranges_bus &&
+	    cmd[2] - ranges_bus <= ranges_bytes)
+		return ranges_cpu + (cmd[1] - ranges_bus);
+	if (host_cpu && cmd[1] >= host_bus && cmd[2] - host_bus <= host_bytes)
+		return (const u8 *)host_cpu + (cmd[1] - host_bus);
+	return NULL;
 }
 
 static u32 parhelia_copy_packet_span(u32 *dst, const u32 *commands,
@@ -1208,7 +1277,7 @@ static int parhelia_range_call_static_selftest(void)
 	    plan->blocks[1] != 1 || plan->packet_spans[1] != 1)
 		goto out;
 	parhelia_pack_adjacent_packet_calls(plan, NULL, gapped_packets, 2, NULL,
-					    false);
+					    false, false);
 	if (plan->count != 2 || plan->blocks[0] || plan->packet_spans[0] != 1 ||
 	    plan->blocks[1] != 1 || plan->packet_spans[1] != 1)
 		goto out;
@@ -1220,7 +1289,7 @@ static int parhelia_range_call_static_selftest(void)
 	parhelia_plan_append(plan, 0, 1);
 	parhelia_plan_append(plan, 1, 1);
 	parhelia_pack_adjacent_packet_calls(plan, NULL, word_limit_packets, 2,
-					    NULL, false);
+					    NULL, false, false);
 	if (plan->count != 2 || plan->blocks[0] || plan->packet_spans[0] != 1 ||
 	    plan->blocks[1] != 1 || plan->packet_spans[1] != 1)
 		goto out;
@@ -1235,7 +1304,7 @@ static int parhelia_range_call_static_selftest(void)
 	if (parhelia_plan_calls(plan, ARRAY_SIZE(generic_packets), 1, false))
 		goto out;
 	parhelia_pack_adjacent_packet_calls(plan, NULL, generic_packets,
-				    ARRAY_SIZE(generic_packets), NULL, false);
+				    ARRAY_SIZE(generic_packets), NULL, false, false);
 	if (plan->count != 7 || plan->blocks[0] != 0 ||
 	    plan->packet_spans[0] != 1 ||
 	    plan->blocks[1] != ARRAY_SIZE(generic_packets) ||
@@ -1280,7 +1349,7 @@ static int parhelia_range_call_static_selftest(void)
 			goto out;
 		parhelia_pack_adjacent_packet_calls(plan, NULL, alternating_packets,
 						    ARRAY_SIZE(alternating_packets),
-						    logical_boundaries, false);
+						    logical_boundaries, false, false);
 		if (plan->count != 10 || plan->blocks[0] != 0 ||
 		    plan->packet_spans[0] != 1 ||
 		    plan->blocks[1] != ARRAY_SIZE(alternating_packets) ||
@@ -1420,7 +1489,7 @@ static int parhelia_large_range_call_static_selftest(void)
 		goto out;
 	parhelia_pack_adjacent_packet_calls(plan, NULL, packets,
 					    PARHELIA_USER_PACKET_CAPACITY, NULL,
-					    false);
+					    false, false);
 	if (plan->count != 4 || plan->blocks[0] != PARHELIA_USER_PACKET_CAPACITY ||
 	    plan->packet_spans[0] || plan->blocks[1] ||
 	    plan->packet_spans[1] != PARHELIA_USER_PACKET_CAPACITY ||
@@ -1769,17 +1838,14 @@ static void parhelia_rebind_draw(struct parhelia_rebind *rb)
 		rb->bind.no_colour = true;
 }
 
-/* Triangles one indexed (0x9f) packet may draw: the P690's direct fetch
- * takes one primitive per packet (a two-triangle packet draws wrongly, and
- * stalled the engine on 2026-09-10); not yet measured elsewhere. */
-/* The P690 draws one triangle per indexed packet correctly; the original
- * family takes runs, each in a CALL span of its own (span rule). */
+/* Triangles one indexed (0x9f) packet may draw; the original family takes
+ * runs, each in a CALL span of its own (span rule). */
 static u32 parhelia_indexed_triangles(const struct parhelia_device *pdev)
 {
 	if (!parhelia_vertex_objects(pdev))
 		return 0;
 	if (pdev->pdev->device == PARHELIA_P690)
-		return 1;
+		return min(READ_ONCE(p690_indexed_triangles), 64u);
 	return parhelia_original_family(pdev) ? 64 : 0;
 }
 
@@ -4152,6 +4218,10 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 	case PARHELIA_PARAM_SPLIT_MULTI_DRAWS:
 		args->value = parhelia_split_multi_draws(pdev);
 		break;
+	case PARHELIA_PARAM_INLINE_DRAWS:
+		args->value = READ_ONCE(p690_inline_draws) &&
+			pdev->pdev->device == PARHELIA_P690;
+		break;
 	case PARHELIA_PARAM_WARP_PROGRAM_SLOTS:
 		args->value = pdev->warp_user_cpu ?
 			PARHELIA_WARP_USER_FILE_SLOTS : 0;
@@ -4621,6 +4691,9 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	u32 first_draw;
 	bool defer_packet_packing, generic_packet_packing;
 	bool boundary_aware = args->flags & PARHELIA_SUBMIT_CALL_BOUNDARIES;
+	bool inline_draws = READ_ONCE(p690_inline_draws) &&
+		pdev->pdev->device == PARHELIA_P690;
+	u32 inline_dwords = 0, inline_used = 0;
 	const char *async_failure_stage = "request setup";
 	int ret = 0;
 
@@ -4772,6 +4845,11 @@ retry_slot:
 			goto out_relocs;
 		goto retry_slot;
 	}
+	if (inline_draws) {
+		inline_dwords = parhelia_inline_draw_bound(commands, packets,
+				args->packet_count, relocs, args->reloc_count);
+		inline_draws = inline_dwords;
+	}
 	if (async) {
 		u32 slot_index;
 		u32 needed, reserved_calls, secondary_dwords;
@@ -4786,6 +4864,8 @@ retry_slot:
 		    check_add_overflow(args->command_dwords, stage_dwords,
 				       &secondary_dwords) ||
 		    check_add_overflow(secondary_dwords, sync_dwords,
+				       &secondary_dwords) ||
+		    check_add_overflow(secondary_dwords, inline_dwords,
 				       &secondary_dwords)) {
 			ret = -EOVERFLOW;
 			goto out_unlock;
@@ -5337,7 +5417,8 @@ retry_slot:
 							    packets,
 							    args->packet_count,
 							    call_boundaries,
-							    split_multi_draws);
+							    split_multi_draws,
+							    inline_draws);
 		else
 			parhelia_coalesce_draw_calls(plan, commands, packets,
 						     draw_relocated,
@@ -5495,6 +5576,7 @@ retry_slot:
 
 		if (block_id < args->packet_count) {
 			u32 packet_span = plan->packet_spans[i];
+			const void *inline_src = NULL;
 
 			if (!packet_span || packet_span > args->packet_count - block_id) {
 				ret = -EINVAL;
@@ -5506,6 +5588,25 @@ retry_slot:
 				if (!ret)
 					ret = -EINVAL;
 				goto out_unpin;
+			}
+			if (inline_draws)
+				inline_src = parhelia_inline_draw_source(commands,
+					&packets[block_id], draw_relocated[block_id],
+					local_vertex ? NULL : vertex_cpu,
+					lower_32_bits(vertex_bus),
+					args->vertex_dwords * sizeof(u32),
+					draw_ranges_cpu, draw_ranges_bus, draw_ranges,
+					&inline_used);
+			if (inline_src && (inline_used > inline_dwords ||
+			    inline_used > PARHELIA_DMA_BLOCK_DWORDS - words))
+				inline_src = NULL;
+			if (inline_src) {
+				inline_dwords -= inline_used;
+				words += inline_used;
+				WRITE_ONCE(p690_inline_draw_count,
+					   p690_inline_draw_count + 1);
+			} else {
+				inline_used = 0;
 			}
 			if (async)
 				ret = parhelia_async_block_assign(async_slot, block,
@@ -5519,8 +5620,20 @@ retry_slot:
 			}
 			if (ret)
 				goto out_unpin;
-			parhelia_copy_packet_span(block->cpu, commands, packets,
-						 block_id, packet_span);
+			/* vertices, then the header whose end is its own address */
+			if (inline_used) {
+				u32 *header = block->cpu + inline_used;
+
+				memcpy(block->cpu, inline_src, inline_used * sizeof(u32));
+				parhelia_copy_packet_span(header, commands, packets,
+							 block_id, packet_span);
+				header[1] = lower_32_bits(block->bus);
+				header[2] = lower_32_bits(block->bus) +
+					    inline_used * sizeof(u32);
+			} else {
+				parhelia_copy_packet_span(block->cpu, commands, packets,
+							 block_id, packet_span);
+			}
 		} else if (block_id >= stage_base) {
 			u32 parent = plan->stage_parent[block_id - stage_base];
 
@@ -5537,8 +5650,9 @@ retry_slot:
 				sync_index % 3 == 1 ?
 					(post_draw_wb && sync_index == 1 ? 7 : 3) : 6;
 		}
-		start = block->bus;
-		finish = start + words * sizeof(u32);
+		start = block->bus + inline_used * sizeof(u32);
+		finish = block->bus + words * sizeof(u32);
+		inline_used = 0;
 		primary[primary_slot * call_words + 0] = PARHELIA_CALL_HEADER;
 		primary[primary_slot * call_words + 1] = 0;
 		primary[primary_slot * call_words + 2] = lower_32_bits(start) | 2;
