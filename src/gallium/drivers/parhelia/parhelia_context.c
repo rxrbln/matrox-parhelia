@@ -2045,9 +2045,11 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
       if (ret)
          return ret;
    }
-   /* A filtered stream must reach the kernel as one submit: a later
-    * group's state could follow another client's 2-D writes. */
-   if (ctx->state_filter && ctx->pending_batch.packet_count &&
+   /* Drain before the CALL bound is exceeded: call boundaries keep the
+    * batches' counts exact, so the stream goes out whole without being
+    * sliced and copied into CALL groups, and a filtered stream's state
+    * cannot be split from it by another client's 2-D writes. */
+   if (ctx->pending_batch.packet_count &&
        ctx->pack_adjacent_packets && ctx->pending_call_bound != UINT_MAX &&
        batch_calls >= 2 &&
        ctx->pending_call_bound + (unsigned)batch_calls - 2 >
