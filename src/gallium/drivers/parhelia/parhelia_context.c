@@ -9014,10 +9014,33 @@ ph_tcl_expand(struct ph_context *ctx, const struct pipe_draw_info *info,
 #define PH_ELT(i) (size ? ph_tcl_index(indices, size, (i), draw->index_bias) : \
                           draw->start + (i))
    switch (info->mode) {
-   case MESA_PRIM_TRIANGLES:
-      for (unsigned i = 0; i < ntri * 3; i++)
-         elts[n++] = PH_ELT(i);
+   case MESA_PRIM_TRIANGLES: {
+      /* locals: the stores through elts may alias the draw */
+      const uint32_t bias = size ? draw->index_bias : draw->start;
+      const unsigned total = ntri * 3;
+
+      if (size == 4) {
+         const uint32_t *in = indices;
+
+         for (unsigned i = 0; i < total; i++)
+            elts[i] = in[i] + bias;
+      } else if (size == 2) {
+         const uint16_t *in = indices;
+
+         for (unsigned i = 0; i < total; i++)
+            elts[i] = in[i] + bias;
+      } else if (size == 1) {
+         const uint8_t *in = indices;
+
+         for (unsigned i = 0; i < total; i++)
+            elts[i] = in[i] + bias;
+      } else {
+         for (unsigned i = 0; i < total; i++)
+            elts[i] = bias + i;
+      }
+      n = total;
       break;
+   }
    case MESA_PRIM_TRIANGLE_STRIP:
       for (unsigned i = 0; i < ntri; i++) {
          /* An odd strip triangle swaps its first two vertices so the
@@ -9426,15 +9449,20 @@ ph_tcl_constant_colour(struct ph_context *ctx, const struct ph_tcl_layout *lay,
  * one per clipper plane it lies outside of. */
 #define PH_TCL_VCODE_INSIDE 0x80u
 
-static uint8_t
+static inline uint8_t
 ph_tcl_vertex_code(const struct ph_tcl_run *r, const float c[4])
 {
-   uint8_t code = c[3] > 1e-6f && fabsf(c[0]) <= r->gx * c[3] &&
-                  fabsf(c[1]) <= r->gy * c[3] && c[2] >= -c[3] &&
-                  c[2] <= c[3] ? PH_TCL_VCODE_INSIDE : 0;
+   /* ph_tcl_plane_distance() < 0 for each plane, its products once */
+   const float x = c[0], y = c[1], z = c[2], w = c[3];
+   const float iw = (1.0f - 1.0f / 65536.0f) * w;
+   const float px = r->cx * iw, py = r->cy * iw;
+   const float gx = r->gx * w, gy = r->gy * w;
+   uint8_t code = (w < 2e-6f) | (z < -iw) << 1 | (z > iw) << 2 |
+                  (x > px) << 3 | (x < -px) << 4 | (y > py) << 5 |
+                  (y < -py) << 6;
 
-   for (unsigned plane = 0; plane < PH_TCL_CLIP_PLANES; plane++)
-      code |= (ph_tcl_plane_distance(plane, c, r->cx, r->cy) < 0.0f) << plane;
+   if (w > 1e-6f && fabsf(x) <= gx && fabsf(y) <= gy && z >= -w && z <= w)
+      code |= PH_TCL_VCODE_INSIDE;
    return code;
 }
 
@@ -9475,6 +9503,9 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
        !ph_tcl_grow((void **)&ctx->tcl_vcode, &code_cap, nverts))
       return false;
    ctx->tcl_vclip_cap = MIN2(clip_cap / (4 * sizeof(float)), code_cap);
+   for (unsigned i = 0; i < ntri * 3; i++)
+      if (elts[i] - lo >= nverts)
+         return false;
    for (unsigned v = 0; v < nverts; v++) {
       float *c = ctx->tcl_vclip + (size_t)v * 4;
 
@@ -9547,17 +9578,18 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
 static bool
 ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
                     const struct ph_tcl_fetch *fetch, const uint32_t *elts,
-                    unsigned ntri, uint32_t entry, unsigned vs_const_vec4s,
-                    const float *fused_mvp, const struct ph_tcl_run *clip)
+                    unsigned ntri, const uint32_t range[2], uint32_t entry,
+                    unsigned vs_const_vec4s, const float *fused_mvp,
+                    const struct ph_tcl_run *clip)
 {
-   uint32_t lo = UINT32_MAX, hi = 0, *idx;
+   /* the expansion's range bounds every element */
+   const uint32_t lo = range[0], hi = range[1];
+   uint32_t *idx;
    unsigned nverts;
    float *dst;
 
-   for (unsigned i = 0; i < ntri * 3; i++) {
-      lo = MIN2(lo, elts[i]);
-      hi = MAX2(hi, elts[i]);
-   }
+   if (lo > hi)
+      return false;
    nverts = hi - lo + 1;
    if (nverts >= ntri * 3)
       return false;
@@ -9600,8 +9632,17 @@ ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
    }
    ph_tcl_constant_colour(ctx, lay, dst, nverts);
    idx = (uint32_t *)dst + (size_t)nverts * lay->dpv;
-   for (unsigned i = 0; i < ntri * 3; i++)
-      idx[i] = elts[i] - lo;
+   {
+      /* indices outside the draw's declared range draw expanded */
+      uint32_t outside = 0;
+
+      for (unsigned i = 0; i < ntri * 3; i++) {
+         idx[i] = elts[i] - lo;
+         outside |= idx[i] >= nverts;
+      }
+      if (outside)
+         return false;
+   }
    ctx->triangles = ntri;
    ctx->indexed_verts = nverts;
    ph_submit_vertices(ctx);
@@ -9845,7 +9886,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
 
    if (ph_screen(ctx->base.screen)->indexed_tris && (box_fits || fused_box) &&
        fetch.count && ntri <= limit &&
-       ph_tcl_draw_indexed(ctx, &lay, &fetch, elts, ntri, entry,
+       ph_tcl_draw_indexed(ctx, &lay, &fetch, elts, ntri, range, entry,
                            vs_const_vec4s, fused_box ? mvp : NULL,
                            can_clip ? &clip_run : NULL)) {
       if (fused_box)
