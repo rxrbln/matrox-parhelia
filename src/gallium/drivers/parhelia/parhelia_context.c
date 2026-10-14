@@ -8490,17 +8490,18 @@ ph_tcl_position_uncached(const struct ph_context *ctx)
  * buffer's cache while its contents are unchanged, else one min/max pass
  * over the referenced vertex range. */
 static bool
-ph_tcl_position_box(struct ph_context *ctx, const uint32_t *elts, unsigned n,
+ph_tcl_position_box(struct ph_context *ctx, const uint32_t range[2],
                     float lo_out[3], float hi_out[3])
 {
    const struct pipe_vertex_element *e;
    const struct pipe_vertex_buffer *vb;
    struct parhelia_resource *res = NULL;
    const uint8_t *map;
-   unsigned comps, offset, stride, lo = UINT_MAX, hi = 0;
+   const unsigned lo = range[0], hi = range[1];
+   unsigned comps, offset, stride;
 
    if (!ctx->vs || ctx->vs->pos_input < 0 ||
-       (unsigned)ctx->vs->pos_input >= ctx->velems->count || !n)
+       (unsigned)ctx->vs->pos_input >= ctx->velems->count || lo > hi)
       return false;
    e = &ctx->velems->elem[ctx->vs->pos_input];
    if (e->src_format == PIPE_FORMAT_R32G32B32_FLOAT)
@@ -8522,10 +8523,6 @@ ph_tcl_position_box(struct ph_context *ctx, const uint32_t *elts, unsigned n,
       return false;
    offset = vb->buffer_offset + e->src_offset;
    stride = e->src_stride;
-   for (unsigned i = 0; i < n; i++) {
-      lo = MIN2(lo, elts[i]);
-      hi = MAX2(hi, elts[i]);
-   }
    if (res && (uint64_t)hi * stride + offset + comps * 4u > res->base.width0)
       return false;
    if (res && !res->data_volatile) {
@@ -8826,7 +8823,8 @@ ph_tcl_index(const void *indices, unsigned size, unsigned i, int bias)
  * than by a draw-module stage. */
 static unsigned
 ph_tcl_expand(struct ph_context *ctx, const struct pipe_draw_info *info,
-              const struct pipe_draw_start_count_bias *draw, uint32_t **out)
+              const struct pipe_draw_start_count_bias *draw, uint32_t **out,
+              uint32_t range[2])
 {
    const void *indices = NULL;
    unsigned size = info->index_size, count = draw->count, ntri, n = 0;
@@ -8915,6 +8913,23 @@ ph_tcl_expand(struct ph_context *ctx, const struct pipe_draw_info *info,
       return 0;
    }
 #undef PH_ELT
+   /* the vertices the elements can reference, from the draw where it knows */
+   if (!size) {
+      range[0] = draw->start;
+      range[1] = draw->start + count - 1;
+   } else if (info->index_bounds_valid &&
+              (int64_t)info->min_index + draw->index_bias >= 0 &&
+              (int64_t)info->max_index + draw->index_bias <= UINT32_MAX) {
+      range[0] = info->min_index + draw->index_bias;
+      range[1] = info->max_index + draw->index_bias;
+   } else {
+      range[0] = UINT32_MAX;
+      range[1] = 0;
+      for (unsigned i = 0; i < n; i++) {
+         range[0] = MIN2(range[0], elts[i]);
+         range[1] = MAX2(range[1], elts[i]);
+      }
+   }
    *out = elts;
    return ntri;
 }
@@ -9264,7 +9279,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
    struct ph_tcl_fetch fetch;
    const uint8_t *maps[PIPE_MAX_ATTRIBS];
    unsigned strides[PIPE_MAX_ATTRIBS];
-   uint32_t *elts = NULL;
+   uint32_t *elts = NULL, range[2];
    unsigned ntri, done = 0, limit;
    unsigned vs_const_vec4s = 0;
    uint32_t entry = 0;
@@ -9338,18 +9353,11 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
             goto fallback;
       }
    }
-   ntri = ph_tcl_expand(ctx, info, draw, &elts);
+   ntri = ph_tcl_expand(ctx, info, draw, &elts, range);
    if (!ntri)
       goto fallback;
-   if (ctx->stats) {
-      uint32_t lo = UINT32_MAX, hi = 0;
-
-      for (unsigned i = 0; i < ntri * 3; i++) {
-         lo = MIN2(lo, elts[i]);
-         hi = MAX2(hi, elts[i]);
-      }
-      ctx->tcl_range_verts += hi - lo + 1;
-   }
+   if (ctx->stats)
+      ctx->tcl_range_verts += range[1] - range[0] + 1;
    if (!ctx->tcl_cache) {
       ctx->tcl_cache = translate_cache_create();
       if (!ctx->tcl_cache)
@@ -9461,7 +9469,7 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
                   fetch.count && fetch.box_elem >= 0 &&
                   ph_tcl_position_uncached(ctx);
       box_fits = box && !fused_box &&
-                 ph_tcl_position_box(ctx, elts, ntri * 3, lo, hi) &&
+                 ph_tcl_position_box(ctx, range, lo, hi) &&
                  ph_tcl_box_fits(ctx, mvp, slice, lo, hi);
       if (box_fits)
          ctx->tcl_box_draws++;
