@@ -56,6 +56,7 @@ struct parhelia_screen {
    bool native_share;
    bool texture_upload;
    bool native_rt_classes;
+   bool window_pairs;
    bool render_transfer;
    bool draw_ranges;
    bool draw_runs;	/* one packet entry per run of draws */

@@ -1108,6 +1108,11 @@ ph_resource_create_class(struct pipe_screen *pscreen,
       create.flags = PARHELIA_CREATE_RENDER_NATIVE_DEPTH;
    else if (native_color)
       create.flags = PARHELIA_CREATE_RENDER_NATIVE_COLOR;
+   /* original family: let the kernel pair colour and depth windows */
+   else if (screen->window_pairs && (templ->bind & PIPE_BIND_DEPTH_STENCIL))
+      create.flags = PARHELIA_CREATE_RENDER_WINDOW_DEPTH;
+   else if (screen->window_pairs && (templ->bind & PIPE_BIND_RENDER_TARGET))
+      create.flags = PARHELIA_CREATE_RENDER_WINDOW_COLOR;
    /* The X front buffer is the one front-rendered scanout image: its
     * display refresh belongs in bank B, away from colour and textures. */
    /* With page flipping the image the CRTC refreshes is a *client* colour
@@ -1734,6 +1739,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param native_rt_classes = {
       .param = PARHELIA_PARAM_NATIVE_RT_CLASSES,
    };
+   struct drm_parhelia_get_param window_pairs = {
+      .param = PARHELIA_PARAM_WINDOW_PAIRS,
+   };
    struct drm_parhelia_get_param render_transfer = {
       .param = PARHELIA_PARAM_RENDER_TRANSFER,
    };
@@ -1826,6 +1834,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->native_rt_classes =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &native_rt_classes) &&
       native_rt_classes.value == 1;
+   s->window_pairs =
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &window_pairs) &&
+      window_pairs.value == 1;
    s->render_transfer =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &render_transfer) &&
       render_transfer.value == 1;

@@ -71,6 +71,13 @@
  * third 32 MiB band (bank B) so display refresh does not compete with the
  * colour and texture traffic of bank A. */
 #define PARHELIA_CREATE_RENDER_NATIVE_SCANOUT	(1u << 5)
+/* Original family: a plain target that is a client's colour or depth
+ * surface.  The depth unit takes Z from the 16 MiB window above the colour
+ * target, so the kernel places a depth surface above the file's latest
+ * colour target and a colour target below its latest depth surface where
+ * that window has room.  Storage and mapping are those of flags 0. */
+#define PARHELIA_CREATE_RENDER_WINDOW_COLOR	(1u << 7)
+#define PARHELIA_CREATE_RENDER_WINDOW_DEPTH	(1u << 8)
 
 /* Bring-up tiled render allocation, deliberately separate from linear dumb
  * scanout. Both 32-bit colour and S8Z24 use this storage. The kernel reserves
@@ -202,6 +209,8 @@ struct drm_parhelia_upload_render {
 /* A 0x97 draw of more than six vertices also opens its CALL span: the
  * kernel copies its vertices in front of its header (P690 inline draws). */
 #define PARHELIA_PARAM_INLINE_DRAWS	37
+/* CREATE_RENDER accepts the WINDOW_COLOR and WINDOW_DEPTH hints. */
+#define PARHELIA_PARAM_WINDOW_PAIRS	38
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
 /* Retired unsafe generic packing capability; kernels report zero. */
