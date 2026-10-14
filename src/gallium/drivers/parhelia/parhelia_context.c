@@ -4397,7 +4397,8 @@ ph_batch_primitives_units(struct ph_context *ctx, struct parhelia_batch *batch,
    unsigned group = state->prim == P3D_TRIANGLES ? ctx->prims_per_packet : 1;
 
    if (state->indexed_vertices)
-      group = ph_screen(ctx->base.screen)->indexed_tris;
+      group = MIN2(ph_screen(ctx->base.screen)->indexed_tris,
+                   MAX2(ctx->prims_per_packet, 1u));
 
    if (!per_prim || !primitives)
       return -EINVAL;

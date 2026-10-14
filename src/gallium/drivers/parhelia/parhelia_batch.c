@@ -85,7 +85,8 @@ static bool
 batch_packet_multi_draw(const uint32_t *cmd, unsigned length,
                         uint32_t reloc_bytes)
 {
-   if ((cmd[0] >> 24) != 0x97)
+   /* an indexed packet's size field is zero: four bytes per index */
+   if ((cmd[0] >> 24) != 0x97 && (cmd[0] >> 24) != 0x9f)
       return false;
    for (unsigned k = 0; k + 3 <= length; k += 3) {
       const uint32_t bytes = reloc_bytes ? reloc_bytes :
@@ -167,7 +168,8 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
              packet->length > batch->command_count - packet->offset)
             return -EINVAL;
          cmd = batch->commands + packet->offset;
-         const bool is_draw = (cmd[0] >> 24) == 0x97;
+         const bool is_draw = (cmd[0] >> 24) == 0x97 ||
+                              (cmd[0] >> 24) == 0x9f;
          const bool multi = is_draw && batch_packet_multi_draw(
             cmd, packet->length, draw_bytes[i]);
 
@@ -2766,7 +2768,9 @@ parhelia_batch_submit_ranges_async(
          /* a draw no other relocation names joins the run before it */
          const uint32_t *pc = batch->commands + p->offset;
 
+         /* the kernel takes runs of 0x97 draws only */
          if (run && draw[head] && draw[i] && !other[i] &&
+             (pc[0] >> 24) == 0x97 &&
              run->offset + run->length == p->offset &&
              run->length + 3 <= PH_RUN_MAX_DWORDS &&
              batch->commands[run->offset] == pc[0] &&
