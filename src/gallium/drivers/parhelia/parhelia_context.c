@@ -4417,6 +4417,12 @@ ph_batch_primitives_units(struct ph_context *ctx, struct parhelia_batch *batch,
       if (entry)
          state->warp_entry = entry;
    }
+   /* Each large packet is a CALL of its own: a long draw takes larger
+    * packets, like the vendor's, so one batch stays within half the CALLs. */
+   if (ph_screen(ctx->base.screen)->split_multi_draws &&
+       !state->indexed_vertices && group * per_prim > 6 &&
+       primitives > group * (PH_BATCH_HW_CALLS / 2))
+      group = DIV_ROUND_UP(primitives, PH_BATCH_HW_CALLS / 2);
    if (group > PH_BATCH_MAX_PACKET_VERTICES / per_prim)
       group = PH_BATCH_MAX_PACKET_VERTICES / per_prim;
    if (group > primitives)
@@ -16413,36 +16419,32 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->aggregate_batches = ctx->aggregate_state_stream ||
                             ctx->aggregate_state_batches ||
                             ph_env("PARHELIA_BATCH_AGGREGATE");
-   /* One packet per primitive until the depth-interlock comparison of
-    * overlapping primitives inside one packet has run on this silicon.
-    * PARHELIA_PRIMS_PER_PACKET selects the run length; the vendor's own
-    * packets hold 24 vertices, i.e. eight triangles. */
-   /* Two is measured stable over repeated timedemo runs and every GL test
-    * (+6% at 24 bpp, +2.5% at 16 bpp, half the draw packets); four and eight
-    * render correctly in the probes but hang ioquake3 in its level load. */
-   /* Two triangles per packet is the largest shape that has never produced
-    * the P690's probabilistic command-fetcher stall, over every probe run,
-    * every GL test and repeated timedemos; three and more wedge the engine
-    * within a few thousand packets and need a machine reboot to recover.
-    * Raising it buys 0.1-0.2 fps, which is inside run-to-run noise, so the
-    * knob exists for experiments and the shipped value stays at the proven
-    * shape.  parhelia-p690-multi-primitive-packet-hang.md carries the bisect,
-    * the two vendor candidates that were tested and refuted, and what is
-    * still unexplained. */
-   /* The original family takes the vendor's eight triangles per packet:
-    * its captures carry 24-vertex packets throughout
-    * (parhelia-p690-multi-primitive-packets-re.md section 5). */
+   /* Triangles per 0x97 packet.  The P690 stalls when a CALL span holds a
+    * draw of more than two triangles next to another draw, and on 9- and
+    * 18-vertex packets; the kernel's span rule (PARHELIA_PARAM_SPLIT_MULTI_
+    * DRAWS) and the packet traps cover both
+    * (parhelia-p690-multi-primitive-packet-hang.md).  Without that rule the
+    * P690 keeps two.  The original family takes the vendor's eight: its
+    * captures carry 24-vertex packets throughout. */
    const bool lx = ph_lx_family(ph_screen(screen)->chip_id);
 
    ph_unorm8_bits_init();
+   /* With the kernel's span rule the P690 takes the largest packets the
+    * batch allows: 21 triangles cut ioquake3's CPU per frame 11.7 -> 9.6 ms
+    * on nano, where four (12.5 ms) lose to the extra CALL per packet. */
    ctx->prims_per_packet =
-      debug_get_num_option("PARHELIA_PRIMS_PER_PACKET", lx ? 2 : 8);
+      debug_get_num_option("PARHELIA_PRIMS_PER_PACKET",
+                           !lx ? 8 :
+                           ph_screen(screen)->split_multi_draws ?
+                              PH_BATCH_MAX_PACKET_VERTICES / 3 : 2);
    if (ctx->prims_per_packet < 1)
       ctx->prims_per_packet = 1;
+   /* Larger packets need the kernel to keep them out of shared spans. */
    if (lx && ctx->prims_per_packet > 2 &&
+       !ph_screen(screen)->split_multi_draws &&
        !ph_env("PARHELIA_PRIMS_PER_PACKET_UNSAFE")) {
       fprintf(stderr,
-              "parhelia: %u primitives per packet wedges this chip; using 2. "
+              "parhelia: %u primitives per packet stall this chip without the kernel span rule; using 2. "
               "Set PARHELIA_PRIMS_PER_PACKET_UNSAFE=1 to measure it anyway.\n",
               ctx->prims_per_packet);
       ctx->prims_per_packet = 2;

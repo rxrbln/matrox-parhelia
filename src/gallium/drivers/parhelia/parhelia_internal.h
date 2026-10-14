@@ -46,6 +46,7 @@ struct parhelia_screen {
    bool render_transfer;
    bool draw_ranges;
    bool draw_runs;	/* one packet entry per run of draws */
+   bool split_multi_draws;	/* large draws get CALL spans of their own */
    /* Triangles per indexed (0x9f) packet, 0 without indexed draws. */
    unsigned indexed_tris;
    /* Native 8- and 16-bit sampler storage. */

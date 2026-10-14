@@ -63,6 +63,40 @@ batch_packet_is_opening_watermark(const uint32_t *cmd, unsigned length)
           (cmd[2] == 0x3fff8842u || cmd[2] == 0x3fff9084u);
 }
 
+static bool split_multi_draws;
+
+void
+parhelia_batch_set_split_multi_draws(bool enable)
+{
+   split_multi_draws = enable;
+}
+
+/* A 0x97 draw whose range of @bytes needs a CALL span of its own. */
+static bool
+batch_multi_draw(uint32_t header, uint32_t bytes)
+{
+   return split_multi_draws &&
+          bytes > 6u * ((((header >> 17) & 0x3f) + 1) * 4);
+}
+
+/* A draw packet the kernel keeps out of shared spans; host-vertex draws
+ * carry their range in the DRAW relocation (@reloc_bytes). */
+static bool
+batch_packet_multi_draw(const uint32_t *cmd, unsigned length,
+                        uint32_t reloc_bytes)
+{
+   if ((cmd[0] >> 24) != 0x97)
+      return false;
+   for (unsigned k = 0; k + 3 <= length; k += 3) {
+      const uint32_t bytes = reloc_bytes ? reloc_bytes :
+                             cmd[k + 2] - cmd[k + 1];
+
+      if (batch_multi_draw(cmd[0], bytes))
+         return true;
+   }
+   return false;
+}
+
 int
 parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
                                  unsigned first_packet,
@@ -73,6 +107,9 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
    enum { PACK_NONE, PACK_DRAW, PACK_RANGE } run = PACK_NONE;
    bool draw_packets[PH_BATCH_PACKETS] = {false};
    bool call_boundaries[PH_BATCH_PACKETS] = {false};
+   uint32_t draw_bytes[PH_BATCH_PACKETS] = {0};
+   unsigned run_draws = 0;
+   bool run_multi = false;
    unsigned opening = first_packet, run_words = 0, count = 3;
    unsigned last_call_boundary = 0;
    bool call_boundary_seen = false;
@@ -98,8 +135,10 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
          last_call_boundary = reloc->packet;
          call_boundary_seen = true;
       }
-      if (reloc->type == PARHELIA_RELOC_DRAW)
+      if (reloc->type == PARHELIA_RELOC_DRAW) {
          draw_packets[reloc->packet] = true;
+         draw_bytes[reloc->packet] = reloc->delta;
+      }
    }
    for (unsigned i = first_packet; i < end_packet; i++) {
       const struct drm_parhelia_packet *packet = &batch->packets[i];
@@ -128,10 +167,24 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
              packet->length > batch->command_count - packet->offset)
             return -EINVAL;
          cmd = batch->commands + packet->offset;
+         const bool is_draw = (cmd[0] >> 24) == 0x97;
+         const bool multi = is_draw && batch_packet_multi_draw(
+            cmd, packet->length, draw_bytes[i]);
+
          if (i != first_packet && call_boundaries[i]) {
             count += active;
             active = false;
             run_words = 0;
+         }
+         /* the kernel's span rule for large draws */
+         if (active && is_draw && run_draws && (multi || run_multi)) {
+            count++;
+            active = false;
+            run_words = 0;
+         }
+         if (!active) {
+            run_draws = 0;
+            run_multi = false;
          }
          if (i == opening) {
             count += active;
@@ -147,7 +200,11 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
             count += active;
             active = true;
             run_words = packet->length;
+            run_draws = 0;
+            run_multi = false;
          }
+         run_draws += is_draw;
+         run_multi |= multi;
          previous = i;
          if (batch_packet_adds_stage_call(cmd, packet->length)) {
             count++; /* Flush the run ending in its parent bind. */
@@ -177,16 +234,23 @@ parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
 
       /* The kernel packs only consecutive packet storage and never crosses
        * its 4096-dword secondary-fetch limit. */
+      const bool multi = kind == PACK_DRAW &&
+                         batch_packet_multi_draw(cmd, packet->length,
+                                                 draw_bytes[i]);
+
       if (kind != PACK_NONE && run == kind && i > first_packet &&
           batch->packets[i - 1].offset +
              batch->packets[i - 1].length == packet->offset &&
-          packet->length <= PH_BATCH_MAX_DRAW_DWORDS - run_words) {
+          packet->length <= PH_BATCH_MAX_DRAW_DWORDS - run_words &&
+          !(kind == PACK_DRAW && (multi || run_multi))) {
          run_words += packet->length;
       } else {
          count++;
          run = kind;
          run_words = packet->length;
+         run_multi = false;
       }
+      run_multi |= multi;
       /* Vertex-program binds acquire a separate synthetic stage CALL after
        * their parent packet, which also terminates any packable run. */
       if (batch_packet_adds_stage_call(cmd, packet->length)) {
@@ -730,8 +794,9 @@ packet_vertex_trap(unsigned run)
    }
    if (allow && strcmp(allow, "0"))
       return false;
+   /* 18 stalls the P690 engine even alone in a CALL span */
    if (!traps)
-      return run == 9;
+      return run == 9 || (split_multi_draws && run == 18);
    for (const char *p = traps; *p;) {
       char *end;
       unsigned long value = strtoul(p, &end, 0);
@@ -1435,7 +1500,10 @@ parhelia_batch_state_run_units_cached(struct parhelia_state_cache *cache,
       cache->hits++;
       ret = state_cache_replay(batch, *slot, state, draws, per_packet,
                                vertices);
-      cache->last_calls = ret ? -1 : (*slot)->calls;
+      /* under the span rule each large draw may take a CALL */
+      cache->last_calls = ret || (*slot)->calls < 0 ? -1 :
+                          (*slot)->calls +
+                          (split_multi_draws ? (int)draws : 0);
       cache->last_stages = (*slot)->stages;
       if (ret || !cache->verify)
          return ret;
@@ -2695,10 +2763,15 @@ parhelia_batch_submit_ranges_async(
             &runs[packet_count - 1] : NULL;
 
          /* a draw no other relocation names joins the run before it */
+         const uint32_t *pc = batch->commands + p->offset;
+
          if (run && draw[head] && draw[i] && !other[i] &&
              run->offset + run->length == p->offset &&
              run->length + 3 <= PH_RUN_MAX_DWORDS &&
-             batch->commands[run->offset] == batch->commands[p->offset]) {
+             batch->commands[run->offset] == pc[0] &&
+             !batch_multi_draw(pc[0], pc[2] - pc[1]) &&
+             !batch_packet_multi_draw(batch->commands + run->offset,
+                                      run->length, 0)) {
             run->length += 3;
          } else {
             runs[packet_count++] = *p;
