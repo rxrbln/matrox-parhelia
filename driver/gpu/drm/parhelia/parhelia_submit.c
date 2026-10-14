@@ -1908,12 +1908,21 @@ static int parhelia_relocate_indexed(struct parhelia_device *pdev,
 	count = (end - begin) / 4;
 	if (count > index_capacity - *index_used)
 		return -E2BIG;
-	for (i = 0; i < count; i++) {
-		const u32 ordinal = READ_ONCE(((const u32 *)(range_cpu + begin))[i]);
+	{
+		const u32 *src = (const u32 *)(range_cpu + begin);
+		u32 *dst = index_cpu + *index_used;
+		const u32 floor = d->floor, span = d->limit - d->floor;
+		u32 outside = 0;
 
-		if (ordinal < d->floor || ordinal >= d->limit)
+		/* the copy is what gets fetched: check that, not the source */
+		for (i = 0; i < count; i++) {
+			const u32 ordinal = READ_ONCE(src[i]);
+
+			dst[i] = ordinal;
+			outside |= (ordinal - floor) >= span;
+		}
+		if (outside)
 			return -EINVAL;
-		index_cpu[*index_used + i] = ordinal;
 	}
 	/* an untagged start and a class-3 tagged exclusive end */
 	cmd[1] = index_bus + *index_used * 4;
