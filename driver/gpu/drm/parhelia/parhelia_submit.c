@@ -88,6 +88,25 @@ static void parhelia_submit_high_water(struct parhelia_device *pdev, u32 depth)
 	}
 }
 
+static const char *const parhelia_phase_names[PARHELIA_SUBMIT_PHASES] = {
+	"copyin", "pin", "validate", "plan", "lockwait", "retire", "lock",
+	"reloc", "admit", "pack",
+	"sync", "heap", "fence",
+	"kick", "exit", "total",
+};
+
+static void parhelia_phase(u64 *t, enum parhelia_submit_phase phase,
+			   struct parhelia_submit_stats *st)
+{
+	u64 now;
+
+	if (!submit_stats)
+		return;
+	now = ktime_get_ns();
+	atomic64_add(now - *t, &st->phase_ns[phase]);
+	*t = now;
+}
+
 static int parhelia_submit_stats_show(struct seq_file *m, void *data)
 {
 	struct drm_info_node *node = m->private;
@@ -112,6 +131,10 @@ static int parhelia_submit_stats_show(struct seq_file *m, void *data)
 		   atomic64_read(&stats->slot_waits));
 	seq_printf(m, "async_slot_wait_ns %lld\n",
 		   atomic64_read(&stats->slot_wait_ns));
+	seq_printf(m, "primary_idle_waits %lld\n",
+		   atomic64_read(&stats->idle_waits));
+	seq_printf(m, "primary_idle_wait_ns %lld\n",
+		   atomic64_read(&stats->idle_wait_ns));
 	seq_printf(m, "primary_tail_waits %lld\n",
 		   atomic64_read(&stats->tail_waits));
 	seq_printf(m, "primary_tail_wait_ns %lld\n",
@@ -128,6 +151,9 @@ static int parhelia_submit_stats_show(struct seq_file *m, void *data)
 	seq_printf(m, "gpu_busy_ns %lld\n", atomic64_read(&stats->gpu_busy_ns));
 	seq_printf(m, "fence_wait_ns %lld\n",
 		   atomic64_read(&stats->fence_wait_ns));
+	for (int i = 0; i < PARHELIA_SUBMIT_PHASES; i++)
+		seq_printf(m, "phase_%s_ns %lld\n", parhelia_phase_names[i],
+			   atomic64_read(&stats->phase_ns[i]));
 	return 0;
 }
 
@@ -1861,8 +1887,8 @@ static int parhelia_relocate_indexed(struct parhelia_device *pdev,
 				     const struct parhelia_indexed_draw *d,
 				     const u8 *range_cpu, u32 range_bytes,
 				     u32 range_bus, u32 *index_cpu,
-				     u32 index_bus, u32 *index_used,
-				     u32 *stream0_patched)
+				     u32 index_bus, u32 index_capacity,
+				     u32 *index_used, u32 *stream0_patched)
 {
 	const u32 begin = cmd[1], end = cmd[2];
 	u32 base, count, i;
@@ -1880,7 +1906,7 @@ static int parhelia_relocate_indexed(struct parhelia_device *pdev,
 	    (u64)base + (u64)d->limit * d->stride > range_bytes)
 		return -EINVAL;
 	count = (end - begin) / 4;
-	if (count > PARHELIA_VERTEX_DWORDS - *index_used)
+	if (count > index_capacity - *index_used)
 		return -E2BIG;
 	for (i = 0; i < count; i++) {
 		const u32 ordinal = READ_ONCE(((const u32 *)(range_cpu + begin))[i]);
@@ -2519,6 +2545,13 @@ static void parhelia_async_file_claim(struct parhelia_device *pdev,
  * at every ioctl.  Once the lease expires, the oldest contender stops owner
  * appends and DWGSYNC retirement drains the queue.  TTM can then preserve and
  * evict the old targets before pinning the new file's surfaces. */
+/* The lease protects the P690's native placement bands; the original family
+ * places by window and lets every file append in submission order. */
+static bool parhelia_file_lease(const struct parhelia_device *pdev)
+{
+	return pdev->pdev->device == PARHELIA_P690;
+}
+
 static bool parhelia_async_file_turn(struct parhelia_device *pdev,
 				     struct drm_file *file,
 				     struct parhelia_file_waiter *waiter)
@@ -2844,12 +2877,64 @@ static void parhelia_dump_slot_calls(struct parhelia_device *pdev,
 	}
 }
 
+/* A spare max-size command heap, if one is free. */
+static bool parhelia_heap_take(struct parhelia_device *pdev,
+			       struct parhelia_cmd_heap *heap)
+{
+	bool found = false;
+
+	spin_lock(&pdev->spare_lock);
+	if (pdev->spare_count) {
+		*heap = pdev->spare_heaps[--pdev->spare_count];
+		found = true;
+	}
+	spin_unlock(&pdev->spare_lock);
+	return found;
+}
+
+/* Keep a max-size heap as a spare, free anything else. */
+static void parhelia_heap_put(struct parhelia_device *pdev,
+			      struct parhelia_cmd_heap *heap)
+{
+	bool kept = false;
+
+	if (!heap->cpu)
+		return;
+	if (heap->dwords == PARHELIA_ASYNC_SECONDARY_DWORDS) {
+		spin_lock(&pdev->spare_lock);
+		if (pdev->spare_count < PARHELIA_SPARE_HEAPS) {
+			pdev->spare_heaps[pdev->spare_count++] = *heap;
+			kept = true;
+		}
+		spin_unlock(&pdev->spare_lock);
+	}
+	if (!kept)
+		dma_free_coherent(&pdev->pdev->dev, heap->dwords * sizeof(u32),
+				  heap->cpu, heap->bus);
+	heap->cpu = NULL;
+}
+
+/* @heap, when set, already holds the request's commands at its start: the
+ * slot takes it and hands back its previous heap in its place. */
 static int parhelia_async_slot_prepare(struct parhelia_device *pdev,
-				       struct parhelia_submit_slot *slot, u32 dwords)
+				       struct parhelia_submit_slot *slot, u32 dwords,
+				       struct parhelia_cmd_heap *heap)
 {
 	if (!dwords || dwords > PARHELIA_ASYNC_SECONDARY_DWORDS)
 		return -EINVAL;
-	if (!slot->secondary_cpu || slot->secondary_dwords < dwords) {
+	if (heap) {
+		struct parhelia_cmd_heap previous = {
+			.cpu = slot->secondary_cpu, .bus = slot->secondary_bus,
+			.dwords = slot->secondary_dwords,
+		};
+
+		if (heap->dwords < dwords)
+			return -EINVAL;
+		slot->secondary_cpu = heap->cpu;
+		slot->secondary_bus = heap->bus;
+		slot->secondary_dwords = heap->dwords;
+		*heap = previous;
+	} else if (!slot->secondary_cpu || slot->secondary_dwords < dwords) {
 		if (slot->secondary_cpu)
 			dma_free_coherent(&pdev->pdev->dev,
 				slot->secondary_dwords * sizeof(u32), slot->secondary_cpu,
@@ -2884,6 +2969,22 @@ static int parhelia_async_block_assign(struct parhelia_submit_slot *slot,
 	block->bus = slot->secondary_bus + slot->secondary_put * sizeof(u32);
 	block->dwords = dwords;
 	slot->secondary_put += dwords;
+	slot->blocks_used = max_t(u32, slot->blocks_used, block - slot->blocks + 1);
+	return 0;
+}
+
+/* A block of commands that already sit in the slot's heap at @offset. */
+static int parhelia_async_block_place(struct parhelia_submit_slot *slot,
+				      struct parhelia_dma_block *block,
+				      u32 offset, u32 dwords)
+{
+	if (!dwords || dwords > PARHELIA_DMA_BLOCK_DWORDS || block->cpu ||
+	    offset > slot->secondary_dwords ||
+	    dwords > slot->secondary_dwords - offset)
+		return -EINVAL;
+	block->cpu = (u32 *)slot->secondary_cpu + offset;
+	block->bus = slot->secondary_bus + offset * sizeof(u32);
+	block->dwords = dwords;
 	slot->blocks_used = max_t(u32, slot->blocks_used, block - slot->blocks + 1);
 	return 0;
 }
@@ -3019,6 +3120,18 @@ static void parhelia_dma_preallocate(struct parhelia_device *pdev)
 		slot->secondary_dwords = PARHELIA_ASYNC_SECONDARY_DWORDS;
 		slots++;
 	}
+	for (i = 0; i < PARHELIA_SPARE_HEAPS; i++) {
+		struct parhelia_cmd_heap heap = {
+			.dwords = PARHELIA_ASYNC_SECONDARY_DWORDS,
+		};
+
+		heap.cpu = dma_alloc_coherent(&pdev->pdev->dev,
+			heap.dwords * sizeof(u32), &heap.bus,
+			GFP_KERNEL | __GFP_NOWARN);
+		if (!heap.cpu)
+			break;
+		parhelia_heap_put(pdev, &heap);
+	}
 	for (i = 0; parhelia_vertex_objects(pdev) &&
 		    i < PARHELIA_VERTEX_POOL_PREALLOC; i++) {
 		dma_addr_t bus;
@@ -3033,9 +3146,9 @@ static void parhelia_dma_preallocate(struct parhelia_device *pdev)
 		chunks++;
 	}
 	dev_info(&pdev->pdev->dev,
-		 "preallocated: staging %zu KiB, upload ring %zu KiB, %u/%u async command heaps, %u vertex chunks\n",
+		 "preallocated: staging %zu KiB, upload ring %zu KiB, %u/%u async command heaps + %u spare, %u vertex chunks\n",
 		 pdev->staging_size / SZ_1K, pdev->upload_size / SZ_1K, slots,
-		 PARHELIA_ASYNC_SLOTS, chunks);
+		 PARHELIA_ASYNC_SLOTS, pdev->spare_count, chunks);
 }
 
 int parhelia_submit_init(struct parhelia_device *pdev)
@@ -3043,6 +3156,7 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 	u32 i;
 	int ret;
 
+	spin_lock_init(&pdev->spare_lock);
 	ret = parhelia_async_file_turn_static_selftest();
 	if (!ret)
 		ret = parhelia_vram_placement_static_selftest();
@@ -3090,6 +3204,9 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 		}
 		slot->vertex_cpu = dmam_alloc_coherent(&pdev->pdev->dev,
 			PARHELIA_VERTEX_DWORDS * sizeof(u32), &slot->vertex_bus, GFP_KERNEL);
+		slot->index_cpu = dmam_alloc_coherent(&pdev->pdev->dev,
+			PARHELIA_INDEX_DWORDS * sizeof(u32), &slot->index_bus,
+			GFP_KERNEL | __GFP_NOWARN);
 		slot->writeback_cpu = dmam_alloc_coherent(&pdev->pdev->dev, PAGE_SIZE,
 			&slot->writeback_bus, GFP_KERNEL);
 		slot->objects = devm_kcalloc(&pdev->pdev->dev, PARHELIA_MAX_RELOCS,
@@ -3910,6 +4027,9 @@ static u32 parhelia_batch_dwgctl_range(const u32 *commands,
 	return value;
 }
 
+/* Busy-wait budget for the primary-idle bit before sleeping on it. */
+#define PARHELIA_IDLE_POLL_US	100u
+
 static int parhelia_wait_dma_idle(struct parhelia_device *pdev)
 {
 	u32 waited;
@@ -4340,6 +4460,14 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 	case PARHELIA_PARAM_WINDOW_PAIRS:
 		args->value = parhelia_original_family(pdev);
 		break;
+	case PARHELIA_PARAM_INDEX_DWORDS:
+		args->value = pdev->slots[0].index_cpu ? PARHELIA_INDEX_DWORDS :
+			      PARHELIA_VERTEX_DWORDS;
+		break;
+	case PARHELIA_PARAM_VERTEX_BO_MAX:
+		args->value = parhelia_vertex_objects(pdev) ?
+			      PARHELIA_VERTEX_BO_MAX_SIZE : 0;
+		break;
 	case PARHELIA_PARAM_WARP_PROGRAM_SLOTS:
 		args->value = pdev->warp_user_cpu ?
 			PARHELIA_WARP_USER_FILE_SLOTS : 0;
@@ -4753,7 +4881,8 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 			       u32 *commands,
 			       struct drm_parhelia_reloc *relocs,
 			       struct drm_gem_object **kernel_objects,
-			       const u32 *kernel_vertices)
+			       const u32 *kernel_vertices,
+			       struct parhelia_cmd_heap *heap)
 {
 	struct parhelia_submit_stats *stats = &pdev->submit_stats;
 	struct drm_gem_object **objects = NULL;
@@ -4787,6 +4916,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	const u8 *draw_ranges_cpu = NULL;
 	u32 index_used = 0, indexed_next = 0, stream0_patched = U32_MAX;
 	bool async = args->flags & PARHELIA_SUBMIT_ASYNC;
+	const bool lease = async && parhelia_file_lease(pdev);
 	u32 i, end = 0, fence, dma_tag, primary_words, waited, opening_slot;
 	u32 boundary_packet = 0, boundary_count = 0, call_boundary_count = 0;
 	u32 call_words = trace_submit ? 8 : PARHELIA_CALL_DWORDS;
@@ -4801,6 +4931,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 		pdev->pdev->device == PARHELIA_P690;
 	u32 inline_dwords = 0, inline_used = 0;
 	const char *async_failure_stage = "request setup";
+	u64 phase_t = submit_stats ? ktime_get_ns() : 0;
 	int ret = 0;
 
 	static_assert(PARHELIA_MAX_USER_PACKETS == PARHELIA_USER_PACKET_CAPACITY);
@@ -4843,6 +4974,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 					 args->reloc_count, objects, pinned);
 	if (ret)
 		goto out_relocs;
+	parhelia_phase(&phase_t, PARHELIA_PHASE_PIN, stats);
 
 	if (pdev->pdev->device == PARHELIA_P690) {
 		rebind_state = (struct parhelia_rebind){
@@ -4877,6 +5009,7 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	}
 	if (validate.rb)
 		parhelia_rebind_apply(pdev, commands, &validate.rb->bind);
+	parhelia_phase(&phase_t, PARHELIA_PHASE_VALIDATE, stats);
 	ret = parhelia_collect_call_boundaries(relocs, args->reloc_count,
 					       args->packet_count, generic_packet_packing,
 					       call_boundaries, &call_boundary_count);
@@ -4924,16 +5057,19 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 			goto out_relocs;
 	}
 	total_calls = plan->count;
+	parhelia_phase(&phase_t, PARHELIA_PHASE_PLAN, stats);
 
 
 retry_slot:
 	parhelia_submit_lock(pdev);
+	parhelia_phase(&phase_t, PARHELIA_PHASE_LOCKWAIT, stats);
 	parhelia_retire_locked(pdev);
+	parhelia_phase(&phase_t, PARHELIA_PHASE_RETIRE, stats);
 	if (pdev->wedged) {
 		ret = -EIO;
 		goto out_unlock;
 	}
-	if (async && !parhelia_async_file_turn(pdev, file, &file_waiter)) {
+	if (lease && !parhelia_async_file_turn(pdev, file, &file_waiter)) {
 		parhelia_submit_unlock(pdev);
 		ret = wait_event_interruptible_timeout(pdev->submit_waitq,
 			pdev->wedged || parhelia_async_file_turn_ready(pdev, file),
@@ -5001,11 +5137,21 @@ retry_slot:
 		 * Once the queue drains, require the proven primary-idle bit before
 		 * restarting at its base. */
 		if (!pdev->queued_slots && pdev->primary_armed) {
+			/* The bit follows the last fence within microseconds,
+			 * and nothing wakes the queue for it: a sleep cost a
+			 * whole jiffy on most submits into an idle queue. */
+			for (waited = 0; waited < PARHELIA_IDLE_POLL_US &&
+			     !(parhelia_read(pdev, 0x08f0) & BIT(17)); waited++)
+				udelay(1);
 			if (!(parhelia_read(pdev, 0x08f0) & BIT(17))) {
+				u64 wait_begin =
+					parhelia_submit_wait_begin(&stats->idle_waits);
+
 				parhelia_submit_unlock(pdev);
 				ret = wait_event_interruptible_timeout(pdev->submit_waitq,
 					pdev->wedged || (parhelia_read(pdev, 0x08f0) & BIT(17)),
 					msecs_to_jiffies(1));
+				parhelia_submit_wait_end(&stats->idle_wait_ns, wait_begin);
 				if (ret < 0)
 					goto out_relocs;
 				goto retry_slot;
@@ -5037,9 +5183,15 @@ retry_slot:
 		}
 		async_slot = &pdev->slots[slot_index];
 		async_failure_stage = "secondary coherent heap";
-		ret = parhelia_async_slot_prepare(pdev, async_slot, secondary_dwords);
+		ret = parhelia_async_slot_prepare(pdev, async_slot, secondary_dwords,
+						  heap);
 		if (ret)
 			goto out_unlock;
+		/* the request's commands now open the slot's heap */
+		if (heap) {
+			async_slot->secondary_put = args->command_dwords;
+			commands = async_slot->secondary_cpu;
+		}
 		blocks = async_slot->blocks;
 		vertex_cpu = async_slot->vertex_cpu;
 		vertex_bus = async_slot->vertex_bus;
@@ -5062,6 +5214,7 @@ retry_slot:
 			goto out_relocs;
 		goto retry_slot;
 	}
+	parhelia_phase(&phase_t, PARHELIA_PHASE_LOCK, stats);
 	ret = parhelia_engine_init(pdev);
 	if (ret)
 		goto out_unlock;
@@ -5429,6 +5582,7 @@ retry_slot:
 				 pbo->gbo.bo.pin_count);
 		}
 	}
+	parhelia_phase(&phase_t, PARHELIA_PHASE_RELOC, stats);
 	if (local_vertex && host_vertex_draw)
 		parhelia_local_vertex_streams(commands, packets, args->packet_count);
 	if (mode7.stream_seen || mode7.index_seen) {
@@ -5475,12 +5629,22 @@ retry_slot:
 				ret = -EINVAL;
 				goto out_unpin;
 			}
-			ret = parhelia_relocate_indexed(pdev, commands,
+			ret = async_slot && async_slot->index_cpu ?
+				parhelia_relocate_indexed(pdev, commands,
+					commands + packets[i].offset,
+					&validate.indexed[indexed_next++],
+					draw_ranges_cpu, draw_ranges,
+					draw_ranges_bus, async_slot->index_cpu,
+					lower_32_bits(async_slot->index_bus),
+					PARHELIA_INDEX_DWORDS, &index_used,
+					&stream0_patched) :
+				parhelia_relocate_indexed(pdev, commands,
 					commands + packets[i].offset,
 					&validate.indexed[indexed_next++],
 					draw_ranges_cpu, draw_ranges,
 					draw_ranges_bus, vertex_cpu,
-					lower_32_bits(vertex_bus), &index_used,
+					lower_32_bits(vertex_bus),
+					PARHELIA_VERTEX_DWORDS, &index_used,
 					&stream0_patched);
 			if (ret)
 				goto out_unpin;
@@ -5517,6 +5681,7 @@ retry_slot:
 			goto out_unpin;
 		}
 	}
+	parhelia_phase(&phase_t, PARHELIA_PHASE_ADMIT, stats);
 	if (defer_packet_packing) {
 		if (generic_packet_packing)
 			parhelia_pack_adjacent_packet_calls(plan, commands,
@@ -5541,6 +5706,7 @@ retry_slot:
 			args->packet_count, relocs, args->reloc_count, plan, shadow_txn);
 		total_calls = plan->count;
 	}
+	parhelia_phase(&phase_t, PARHELIA_PHASE_PACK, stats);
 	fence_span = plan->sync_sections * fence_step +
 		(plan->sync_sections - 1) * 8;
 
@@ -5658,6 +5824,7 @@ retry_slot:
 		}
 		pdev->next_dma_tag = dma_tag + total_calls;
 	}
+	parhelia_phase(&phase_t, PARHELIA_PHASE_SYNC, stats);
 	first_draw = total_calls;
 	for (i = 0; i < total_calls; i++) {
 		u32 block_id = plan->blocks[i];
@@ -5714,7 +5881,10 @@ retry_slot:
 			} else {
 				inline_used = 0;
 			}
-			if (async)
+			if (async && heap && !inline_used)
+				ret = parhelia_async_block_place(async_slot, block,
+					packets[block_id].offset, words);
+			else if (async)
 				ret = parhelia_async_block_assign(async_slot, block,
 					words);
 			else if (!block->cpu) {
@@ -5736,7 +5906,7 @@ retry_slot:
 				header[1] = lower_32_bits(block->bus);
 				header[2] = lower_32_bits(block->bus) +
 					    inline_used * sizeof(u32);
-			} else {
+			} else if (!heap) {
 				parhelia_copy_packet_span(block->cpu, commands, packets,
 							 block_id, packet_span);
 			}
@@ -5784,6 +5954,7 @@ retry_slot:
 	 * Keep the writeback target inside the kernel's status page. This also
 	 * distinguishes a fetched primary span from executed register packets.
 	 */
+	parhelia_phase(&phase_t, PARHELIA_PHASE_HEAP, stats);
 	primary_words = total_calls * call_words;
 	if (full_sync) {
 		memcpy(primary + primary_words,
@@ -5812,6 +5983,7 @@ retry_slot:
 		if (ret)
 			goto out_unpin;
 	}
+	parhelia_phase(&phase_t, PARHELIA_PHASE_FENCE, stats);
 	if (args->vertex_dwords)
 		parhelia_warp_trace_vertex(pdev, "before");
 	root_probe = parhelia_root_probe_prepare(pdev, args, packets, relocs,
@@ -5875,6 +6047,7 @@ retry_slot:
 			pdev->first_fence = fence;
 		args->fence = fence;
 		mod_delayed_work(system_wq, &pdev->retire_work, msecs_to_jiffies(1));
+		parhelia_phase(&phase_t, PARHELIA_PHASE_KICK, stats);
 		goto out_unpin;
 	}
 	parhelia_write(pdev, PARHELIA_MMIO_RING_START, lower_32_bits(primary_bus));
@@ -6039,7 +6212,8 @@ out_unpin:
 out_unlock:
 	parhelia_submit_unlock(pdev);
 out_relocs:
-	parhelia_async_file_turn_cancel(pdev, &file_waiter);
+	if (lease)
+		parhelia_async_file_turn_cancel(pdev, &file_waiter);
 	/* Every exit after pinning lands here, including a slot wait interrupted
 	 * by a signal: the restarted ioctl pins its targets again. */
 	if (mode7.index_copy) {
@@ -6063,8 +6237,13 @@ out_commands:
 	kvfree(relocs);
 	kfree(shadow_txn);
 	parhelia_plan_put(pdev, plan);
-	kvfree(commands);
+	/* the heap holds the commands, or the slot's previous heap */
+	if (heap)
+		parhelia_heap_put(pdev, heap);
+	else
+		kvfree(commands);
 	kvfree(packets);
+	parhelia_phase(&phase_t, PARHELIA_PHASE_EXIT, stats);
 	return ret;
 }
 
@@ -6072,8 +6251,12 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 			  struct drm_file *file)
 {
 	struct drm_parhelia_submit *args = data;
+	struct parhelia_submit_stats *stats = &to_parhelia(drm)->submit_stats;
 	struct drm_parhelia_packet *packets;
 	struct drm_parhelia_reloc *relocs = NULL;
+	u64 start = submit_stats ? ktime_get_ns() : 0, t = start;
+	struct parhelia_cmd_heap heap = { };
+	bool in_place;
 	u32 *commands;
 	int ret;
 
@@ -6084,8 +6267,24 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 			      array_size(args->packet_count, sizeof(*packets)));
 	if (IS_ERR(packets))
 		return PTR_ERR(packets);
-	commands = memdup_user(u64_to_user_ptr(args->commands),
-			       array_size(args->command_dwords, sizeof(*commands)));
+	/* An async request's commands go straight into a spare command heap,
+	 * where they are validated and fetched in place. */
+	in_place = (args->flags & PARHELIA_SUBMIT_ASYNC) &&
+		   !READ_ONCE(p690_inline_draws) &&
+		   parhelia_heap_take(to_parhelia(drm), &heap);
+	if (in_place) {
+		commands = heap.cpu;
+		if (copy_from_user(commands, u64_to_user_ptr(args->commands),
+				   args->command_dwords * sizeof(*commands))) {
+			parhelia_heap_put(to_parhelia(drm), &heap);
+			kvfree(packets);
+			return -EFAULT;
+		}
+	} else {
+		commands = memdup_user(u64_to_user_ptr(args->commands),
+				       array_size(args->command_dwords,
+						  sizeof(*commands)));
+	}
 	if (IS_ERR(commands)) {
 		kvfree(packets);
 		return PTR_ERR(commands);
@@ -6094,13 +6293,20 @@ int parhelia_submit_ioctl(struct drm_device *drm, void *data,
 		relocs = memdup_user(u64_to_user_ptr(args->relocs),
 				     array_size(args->reloc_count, sizeof(*relocs)));
 		if (IS_ERR(relocs)) {
-			kvfree(commands);
+			if (in_place)
+				parhelia_heap_put(to_parhelia(drm), &heap);
+			else
+				kvfree(commands);
 			kvfree(packets);
 			return PTR_ERR(relocs);
 		}
 	}
-	return parhelia_submit_run(to_parhelia(drm), file, args, packets,
-				   commands, relocs, NULL, NULL);
+	parhelia_phase(&t, PARHELIA_PHASE_COPYIN, stats);
+	ret = parhelia_submit_run(to_parhelia(drm), file, args, packets,
+				  commands, relocs, NULL, NULL,
+				  in_place ? &heap : NULL);
+	parhelia_phase(&start, PARHELIA_PHASE_TOTAL, stats);
+	return ret;
 }
 
 /* The largest power-of-two width up to @max_width pixels whose whole tile
@@ -6195,7 +6401,7 @@ int parhelia_bo_clear(struct parhelia_device *pdev, struct drm_file *file,
 	ret = parhelia_submit_check(&args);
 	if (!ret)
 		ret = parhelia_submit_run(pdev, file, &args, packets, commands,
-					  relocs, objects, NULL);
+					  relocs, objects, NULL, NULL);
 	else {
 		kvfree(packets);
 		kvfree(commands);
@@ -6334,7 +6540,7 @@ static int parhelia_t2_prime(struct parhelia_device *pdev, struct drm_file *file
 	ret = parhelia_submit_check(&args);
 	if (!ret)
 		return parhelia_submit_run(pdev, file, &args, packets, commands,
-					   relocs, objects, vertices);
+					   relocs, objects, vertices, NULL);
 	kvfree(packets);
 	kvfree(commands);
 	kvfree(relocs);
@@ -6493,7 +6699,7 @@ static int parhelia_engine_blit_submit(struct parhelia_device *pdev,
 	ret = parhelia_submit_check(&args);
 	if (!ret)
 		ret = parhelia_submit_run(pdev, file, &args, packets,
-					  commands, relocs, objects, NULL);
+					  commands, relocs, objects, NULL, NULL);
 	else {
 		kvfree(packets);
 		kvfree(commands);
@@ -6852,6 +7058,13 @@ void parhelia_submit_fini(struct parhelia_device *pdev)
 		drm_gem_object_put(&entry->dma.base);
 	}
 	parhelia_submit_unlock(pdev);
+	while (pdev->spare_count) {
+		struct parhelia_cmd_heap *heap =
+			&pdev->spare_heaps[--pdev->spare_count];
+
+		dma_free_coherent(&pdev->pdev->dev, heap->dwords * sizeof(u32),
+				  heap->cpu, heap->bus);
+	}
 	parhelia_vertex_pool_fini(pdev);
 	mutex_lock(&pdev->upload_lock);
 	while ((span = list_first_entry_or_null(&pdev->upload_busy,

@@ -336,7 +336,11 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 /* Largest vertex interval proven through one class-3 0x97 fetch.  A submit
  * may contain many independently relocated intervals from the same object. */
 #define PARHELIA_MAX_DRAW_DWORDS	4096u
-#define PARHELIA_VERTEX_BO_MAX_SIZE	(1u << 20)
+/* The original family's draws fetch every vertex of a q3 frame from one
+ * ring object; 4 MiB holds eight 512 KiB submit slots. */
+#define PARHELIA_VERTEX_BO_MAX_SIZE	(4u << 20)
+/* Indices one async submit may carry, copied to the slot's own buffer. */
+#define PARHELIA_INDEX_DWORDS		(32u * 1024u)
 #define PARHELIA_VERTEX_POOL_PREALLOC	2u
 #define PARHELIA_VERTEX_POOL_BYTES	(8u * PARHELIA_VERTEX_BO_MAX_SIZE)
 #define PARHELIA_ASYNC_SECONDARY_DWORDS	(PARHELIA_MAX_COMMAND_DWORDS + \
@@ -428,6 +432,9 @@ struct parhelia_submit_slot {
 	u32 secondary_put;
 	void *vertex_cpu;
 	dma_addr_t vertex_bus;
+	/* PARHELIA_INDEX_DWORDS for indexed draws, NULL if unavailable */
+	u32 *index_cpu;
+	dma_addr_t index_bus;
 	/* local_vertex_draws: a class-0 VRAM copy of vertex_cpu */
 	struct drm_gem_vram_object *local_vertex;
 	u32 local_vertex_gpu;
@@ -440,6 +447,14 @@ struct parhelia_submit_slot {
 	struct parhelia_submit_fence *out_fence;
 	struct parhelia_root_probe_trace *root_probe;
 };
+
+struct parhelia_cmd_heap {
+	void *cpu;
+	dma_addr_t bus;
+	u32 dwords;
+};
+
+#define PARHELIA_SPARE_HEAPS	2u
 
 /* CREATE_VERTEX is a dedicated class-3 DMA object.  It must never be backed by
  * the programmable BAR0 host aperture: a raw linear TTM mapping can alias an
@@ -477,6 +492,15 @@ struct parhelia_reg_shadow {
  * Default-off submit telemetry. Atomic storage keeps debugfs reads coherent
  * without taking submit_lock or perturbing the producer critical section.
  */
+enum parhelia_submit_phase {
+	PARHELIA_PHASE_COPYIN, PARHELIA_PHASE_PIN, PARHELIA_PHASE_VALIDATE,
+	PARHELIA_PHASE_PLAN, PARHELIA_PHASE_LOCKWAIT, PARHELIA_PHASE_RETIRE,
+	PARHELIA_PHASE_LOCK, PARHELIA_PHASE_RELOC,
+	PARHELIA_PHASE_ADMIT, PARHELIA_PHASE_PACK, PARHELIA_PHASE_SYNC,
+	PARHELIA_PHASE_HEAP, PARHELIA_PHASE_FENCE, PARHELIA_PHASE_KICK,
+	PARHELIA_PHASE_EXIT, PARHELIA_PHASE_TOTAL, PARHELIA_SUBMIT_PHASES
+};
+
 struct parhelia_submit_stats {
 	atomic64_t async_flips;
 	atomic64_t async_submits;
@@ -484,6 +508,8 @@ struct parhelia_submit_stats {
 	atomic64_t slot_wait_ns;
 	atomic64_t tail_waits;
 	atomic64_t tail_wait_ns;
+	atomic64_t idle_waits;
+	atomic64_t idle_wait_ns;
 	atomic64_t ring_start_writes;
 	atomic64_t ring_end_writes;
 	atomic64_t queue_high_water;
@@ -494,6 +520,8 @@ struct parhelia_submit_stats {
 	 * retirement to retirement, as observed by the retire path. */
 	atomic64_t gpu_busy_ns;
 	u64 last_retire_ns;
+	/* CPU time per submit phase (enum parhelia_submit_phase) */
+	atomic64_t phase_ns[PARHELIA_SUBMIT_PHASES];
 };
 
 struct parhelia_bo;
@@ -648,6 +676,12 @@ struct parhelia_device {
 	void *async_primary_cpu;
 	dma_addr_t async_primary_bus;
 	struct parhelia_submit_slot slots[PARHELIA_ASYNC_SLOTS];
+	/* Max-size command heaps no slot owns: an async submit copies its
+	 * commands straight into one and the slot it queues on swaps it for
+	 * its own (parhelia_heap_take()), under spare_lock. */
+	struct parhelia_cmd_heap spare_heaps[PARHELIA_SPARE_HEAPS];
+	u32 spare_count;
+	spinlock_t spare_lock;
 	wait_queue_head_t submit_waitq;
 	struct delayed_work retire_work;
 	/* The task holding submit_lock, so a TTM move called from inside a

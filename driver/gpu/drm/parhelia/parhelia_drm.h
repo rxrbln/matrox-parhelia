@@ -229,6 +229,10 @@ struct drm_parhelia_upload_render {
 #define PARHELIA_PARAM_INLINE_DRAWS	37
 /* CREATE_RENDER accepts the WINDOW_COLOR and WINDOW_DEPTH hints. */
 #define PARHELIA_PARAM_WINDOW_PAIRS	38
+/* Index dwords one async submit may carry (4096 before this param). */
+#define PARHELIA_PARAM_INDEX_DWORDS	39
+/* Largest CREATE_VERTEX allocation in bytes (1 MiB before this param). */
+#define PARHELIA_PARAM_VERTEX_BO_MAX	40
 
 #define PARHELIA_TEXTURE_PIPES_PAIRED	0
 #define PARHELIA_TEXTURE_PIPES_SINGLE	1
