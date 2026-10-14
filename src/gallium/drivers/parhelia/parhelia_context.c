@@ -8816,6 +8816,41 @@ ph_tcl_box_fits(const struct ph_context *ctx, const float *m,
          constant_size = ctx->constant_size[MESA_SHADER_VERTEX];
       }
    }
+   if (!slice) {
+      /* Each condition is linear in the position, so its minimum over the
+       * box is f(centre) - |f| . half-extent: seven planes instead of
+       * eight transformed corners. */
+      const float c[3] = { (lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f,
+                           (lo[2] + hi[2]) * 0.5f };
+      const float e[3] = { (hi[0] - lo[0]) * 0.5f, (hi[1] - lo[1]) * 0.5f,
+                           (hi[2] - lo[2]) * 0.5f };
+      const float *rx = m, *ry = m + 4, *rz = m + 8, *rw = m + 12;
+      const float planes[7][4] = {
+         { rw[0], rw[1], rw[2], rw[3] - 1e-6f },
+         { gx * rw[0] - rx[0], gx * rw[1] - rx[1], gx * rw[2] - rx[2],
+           gx * rw[3] - rx[3] },
+         { gx * rw[0] + rx[0], gx * rw[1] + rx[1], gx * rw[2] + rx[2],
+           gx * rw[3] + rx[3] },
+         { gy * rw[0] - ry[0], gy * rw[1] - ry[1], gy * rw[2] - ry[2],
+           gy * rw[3] - ry[3] },
+         { gy * rw[0] + ry[0], gy * rw[1] + ry[1], gy * rw[2] + ry[2],
+           gy * rw[3] + ry[3] },
+         { rw[0] + rz[0], rw[1] + rz[1], rw[2] + rz[2], rw[3] + rz[3] },
+         { rw[0] - rz[0], rw[1] - rz[1], rw[2] - rz[2], rw[3] - rz[3] },
+      };
+
+      for (unsigned i = 0; i < 7; i++) {
+         const float *f = planes[i];
+         const float lowest = f[0] * c[0] + f[1] * c[1] + f[2] * c[2] + f[3] -
+                              (fabsf(f[0]) * e[0] + fabsf(f[1]) * e[1] +
+                               fabsf(f[2]) * e[2]);
+
+         /* w strictly positive, the others at or above zero */
+         if (i ? !(lowest >= 0.0f) : !(lowest > 0.0f))
+            return false;
+      }
+      return true;
+   }
    for (unsigned k = 0; k < 8; k++) {
       const float p[3] = { k & 1 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1],
                            k & 4 ? hi[2] : lo[2] };
