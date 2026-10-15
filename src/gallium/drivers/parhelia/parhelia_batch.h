@@ -89,6 +89,12 @@ int parhelia_call_counter_update(struct parhelia_call_counter *c,
                                  const struct parhelia_batch *batch);
 /* including the stream's EOB and terminal drain */
 unsigned parhelia_call_counter_calls(const struct parhelia_call_counter *c);
+struct parhelia_batch_replay;
+/* As parhelia_call_counter_update() after appending @replay, its prefix
+ * taken from the cache entry's packing summary. */
+int parhelia_call_counter_update_replay(struct parhelia_call_counter *c,
+                                        const struct parhelia_batch *batch,
+                                        const struct parhelia_batch_replay *r);
 
 /* The longest run of marks from @first_mark whose packets, submitted as
  * one, stay within @limit CALLs (at least one mark), as repeated
