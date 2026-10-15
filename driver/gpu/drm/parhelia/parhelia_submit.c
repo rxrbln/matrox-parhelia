@@ -512,6 +512,24 @@ bool parhelia_p690_faa(const struct parhelia_device *pdev)
 	       pdev->raw_aperture_owned && pdev->vram_size >= SZ_128M;
 }
 
+static bool original_faa;
+module_param(original_faa, bool, 0400);
+MODULE_PARM_DESC(original_faa, "Parhelia-512/8X fragment antialiasing: FAA fragment buffers, FAA sync packets and their bank placement (default off)");
+
+/* The 0527/0528 fragment buffer takes a 16 MiB window in the bank opposite
+ * depth, while colour and depth share the other bank's window pair. */
+bool parhelia_original_faa(const struct parhelia_device *pdev)
+{
+	return original_faa && parhelia_original_family(pdev) &&
+	       pdev->raw_aperture_owned && pdev->window_count &&
+	       (pdev->vram_size >> 1) >= SZ_32M;
+}
+
+static bool parhelia_faa(const struct parhelia_device *pdev)
+{
+	return parhelia_p690_faa(pdev) || parhelia_original_faa(pdev);
+}
+
 /* A dedicated DMA32 vertex object is the same class-3 source the kernel's own
  * vertex slots are: on the P690 and on the original family, whose draws
  * fetch their ranges from those slots today. */
@@ -2011,9 +2029,10 @@ static void parhelia_faa_patch_fences(u32 *commands,
 	}
 }
 
-/* DWGSYNC, the padding pairs, then the drain's own armed tag and finish. */
+/* DWGSYNC @sync, the padding pairs, then the drain's own armed tag and
+ * finish. */
 static void parhelia_faa_drain(u32 *drain, u32 begin, u32 faa_fences,
-			       u32 dwgctl)
+			       u32 sync, u32 dwgctl)
 {
 	const u32 pads = parhelia_faa_fence_pads(faa_fences);
 	const u32 finish = begin + parhelia_faa_fence_step(faa_fences);
@@ -2021,7 +2040,7 @@ static void parhelia_faa_drain(u32 *drain, u32 begin, u32 faa_fences,
 	u8 regs[8];
 
 	regs[writes] = 0xc0;
-	values[writes++] = 0x307;
+	values[writes++] = sync;
 	for (i = 0; i < pads; i++) {
 		u32 tag = begin + 8 + 8 * (faa_fences + i);
 
@@ -2046,6 +2065,39 @@ static void parhelia_faa_drain(u32 *drain, u32 begin, u32 faa_fences,
 		for (j = 0; j < 4 && i + j < writes; j++)
 			drain[pos++] = values[i + j];
 	}
+}
+
+/* Original family: the batch leaves FAA armed, its last 0x12fc has mode
+ * bits [1:0]; the vendor then drains with 0x707, never 0x307 (MTXPARD
+ * 0x10e78d/0x110244). */
+static bool parhelia_faa_armed(const u32 *commands,
+			       const struct drm_parhelia_packet *packets,
+			       u32 count)
+{
+	u32 i, raster = 0;
+
+	for (i = 0; i < count; i++) {
+		const u32 *cmd = commands + packets[i].offset;
+		u32 pos = 0, end = 0;
+
+		if (cmd[0] >> 24)
+			continue;
+		while (parhelia_reglist_next(cmd, packets[i].length, &pos,
+					     &end)) {
+			u32 tag = cmd[pos++], slot;
+
+			for (slot = 0; slot < 4; slot++) {
+				u32 index = (tag >> (slot * 8)) & 0xff;
+
+				if (index == 0x21)
+					break;
+				if (index == 0xbf)
+					raster = cmd[pos];
+				pos++;
+			}
+		}
+	}
+	return raster & 3;
 }
 
 /* A draw packet: note whether its bound textured entry has a colour fetch. */
@@ -2259,7 +2311,7 @@ static int parhelia_validate_packet(struct parhelia_device *pdev,
 		const u32 *c = cmd + packet->offset;
 		u32 tags[2], resume;
 
-		if (pdev && parhelia_p690_faa(pdev) &&
+		if (pdev && parhelia_faa(pdev) &&
 		    parhelia_faa_fence_form(c, packet->length, tags, &resume)) {
 			if (!vs->faa_fences++)
 				vs->faa_first = vs->packet;
@@ -2445,7 +2497,9 @@ static int parhelia_vram_placement_class(struct drm_gem_vram_object *bo,
 	u64 band_pages = SZ_32M >> PAGE_SHIFT;
 	int ret;
 
-	if (pbo->placement_class == PARHELIA_PLACEMENT_WINDOWED &&
+	if ((pbo->placement_class == PARHELIA_PLACEMENT_WINDOWED ||
+	     (pbo->placement_class == PARHELIA_PLACEMENT_FAA_FRAGMENT &&
+	      parhelia_original_family(pdev))) &&
 	    pdev->window_count) {
 		bo->placement.placement = pdev->window_places;
 		bo->placement.num_placement = pdev->window_count;
@@ -2613,8 +2667,9 @@ static int parhelia_faa_fence_static_selftest(void)
 		u32 step = parhelia_faa_fence_step(i);
 		u32 words = parhelia_faa_drain_words(i);
 		u32 last = 0x100 + 8 * i + 8;	/* completed after the syncs */
+		u32 sync = i & 1 ? 0x307 : 0x707;
 
-		parhelia_faa_drain(drain, 0x100, i, 0x960ec4);
+		parhelia_faa_drain(drain, 0x100, i, sync, 0x960ec4);
 		if ((step - 16) % 24 || step < 16 + 8 * i || words > 11 ||
 		    drain[0] != words - 2)
 			return -EINVAL;
@@ -2632,7 +2687,7 @@ static int parhelia_faa_fence_static_selftest(void)
 				seq[n++] = drain[pos++];
 			}
 		}
-		if (n < 4 || regs[0] != 0xc0 || seq[0] != 0x307 ||
+		if (n < 4 || regs[0] != 0xc0 || seq[0] != sync ||
 		    regs[n - 1] != 0xc0 || seq[n - 1] != 0x960ec4 ||
 		    seq[n - 2] != 0x100 + step ||
 		    seq[n - 3] != ((0x100 + step - 8) | 1))
@@ -2644,6 +2699,18 @@ static int parhelia_faa_fence_static_selftest(void)
 				return -EINVAL;
 			last = (seq[slot] & ~7u) + 8;
 		}
+	}
+	/* the last 0x12fc decides: the vendor's armed word, then a disarm */
+	{
+		static const u32 raster[] = { 2, 0x2121c0bf, 0x04868027, 0xc4,
+					      1, 0x212121bf, 0 };
+		static const struct drm_parhelia_packet lists[] = {
+			{ .offset = 0, .length = 4 }, { .offset = 4, .length = 3 },
+		};
+
+		if (!parhelia_faa_armed(raster, lists, 1) ||
+		    parhelia_faa_armed(raster, lists, 2))
+			return -EINVAL;
 	}
 	return 0;
 }
@@ -4596,7 +4663,7 @@ static int parhelia_bound_range_validate_and_patch(
 }
 
 static void parhelia_emit_fences(struct parhelia_dma_block *blocks, u32 slot,
-				 u32 begin, u32 finish, u32 dwgctl)
+				 u32 begin, u32 finish, u32 sync, u32 dwgctl)
 {
 	u32 *start = blocks[slot].cpu;
 	u32 *eob = blocks[slot + 1].cpu;
@@ -4606,6 +4673,7 @@ static void parhelia_emit_fences(struct parhelia_dma_block *blocks, u32 slot,
 	 * a DWGSYNC bracketed by the following counter. */
 	parhelia_reference_fences(start, eob, drain, begin, finish, dwgctl,
 				  replay_fences);
+	drain[2] = sync;
 	if (full_sync) {
 		/* mtx3144 .text+31c67..31ceb: these nine bare words are
 		 * copied into the PRIMARY below, not called as a secondary.
@@ -4825,7 +4893,7 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	    !parhelia_original_family(pdev))
 		return -EOPNOTSUPP;
 	if ((args->flags & PARHELIA_CREATE_RENDER_FAA_FRAGMENT) &&
-	    (!parhelia_p690_faa(pdev) || cpp != 4))
+	    (!parhelia_faa(pdev) || cpp != 4))
 		return -EOPNOTSUPP;
 	pair = args->flags & PARHELIA_CREATE_RENDER_WINDOW_PAIR;
 	plain = !(args->flags & ~PARHELIA_CREATE_RENDER_WINDOW_PAIR);
@@ -5116,7 +5184,7 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		args->value = 1;
 		break;
 	case PARHELIA_PARAM_FAA:
-		args->value = parhelia_p690_faa(pdev);
+		args->value = parhelia_faa(pdev);
 		break;
 	case PARHELIA_PARAM_INDEX16:
 		args->value = parhelia_index16(pdev);
@@ -5511,6 +5579,78 @@ static bool parhelia_submit_pin_pair(struct parhelia_device *pdev,
 	return false;
 }
 
+/* parhelia_submit_pin_range() into the 16 MiB window at VRAM offset @lo,
+ * draining queued work that still holds @bo elsewhere. */
+static int parhelia_submit_pin_window(struct parhelia_device *pdev,
+				      struct drm_gem_vram_object *bo, u64 lo)
+{
+	int ret, tries;
+
+	for (tries = 0; tries < 4; tries++) {
+		ret = parhelia_submit_pin_range(bo, lo >> PAGE_SHIFT,
+						(lo + SZ_16M) >> PAGE_SHIFT);
+		if (ret != -EBUSY)
+			return ret;
+		ret = parhelia_submit_idle_lock(pdev);
+		if (ret)
+			return ret;
+		parhelia_submit_unlock(pdev);
+	}
+	return -EBUSY;
+}
+
+static bool parhelia_faa_fragment_bo(struct drm_gem_object *obj)
+{
+	return container_of(drm_gem_vram_of_gem(obj), struct parhelia_bo,
+			    gbo)->placement_class ==
+	       PARHELIA_PLACEMENT_FAA_FRAGMENT;
+}
+
+/* Original-family FAA placement (MEASURED 0528, 2026-10-04): fragments and
+ * depth in opposite banks, depth in the window above colour.  The same bank
+ * corrupted the resolve or locked it up, depth outside that window put the
+ * draws and the resolve on different addresses, so there is no fallback.
+ * The fragment buffer moves first: its own allocation may hold the window
+ * depth needs.  @depth_lo receives depth's VRAM window. */
+static int parhelia_pin_faa_fragment(struct parhelia_device *pdev,
+				     struct drm_gem_vram_object *colour,
+				     struct drm_gem_vram_object *depth,
+				     struct drm_gem_vram_object *fragment,
+				     bool paired, u64 *depth_lo)
+{
+	u64 bank_size = pdev->vram_size >> 1, lo, current_lo = ~0ull, gpu64;
+	u32 windows = bank_size / SZ_16M, gpu, j;
+	int ret;
+
+	ret = parhelia_vram_gpu_addr(pdev, paired ? depth : colour, 0,
+				     paired ? depth->bo.base.size :
+					      colour->bo.base.size, &gpu);
+	if (ret)
+		return ret;
+	if (!parhelia_window_vram(pdev, ALIGN_DOWN((u64)gpu, SZ_16M) +
+				  (paired ? 0 : SZ_16M), depth_lo))
+		return -ENOSPC;
+	lo = *depth_lo < bank_size ? bank_size : 0;
+	/* a window of the right bank the fragments already hold stays */
+	if (!parhelia_vram_resident_gpu(pdev, fragment, &gpu64) &&
+	    parhelia_window_vram(pdev, ALIGN_DOWN(gpu64, SZ_16M), &current_lo) &&
+	    (current_lo < bank_size) == (lo < bank_size)) {
+		ret = parhelia_submit_pin_window(pdev, fragment, current_lo);
+		if (ret != -ENOSPC && ret != -ENOMEM && ret != -EBUSY)
+			return ret;
+	}
+	for (j = 0; j < windows; j++) {
+		u64 window = lo + (u64)((j + 1) % windows) * SZ_16M;
+
+		if (window == current_lo)
+			continue;
+		ret = parhelia_submit_pin_window(pdev, fragment, window);
+		if (ret != -ENOSPC && ret != -ENOMEM && ret != -EBUSY)
+			return ret;
+	}
+	return ret;
+}
+
 /* Look up and pin each distinct VRAM target once.  objects[] and pinned[]
  * hold a reference and a pin at the first relocation naming an object only;
  * first[] maps every VRAM relocation to that entry. */
@@ -5526,9 +5666,12 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 				      struct drm_gem_vram_object **pinned)
 {
 	struct drm_gem_object *colour = NULL, *depth = NULL, *last_colour = NULL;
+	struct drm_gem_object *fragment = NULL;
 	const bool pairs = pdev->pdev->device == PARHELIA_512 ||
 			   pdev->pdev->device == PARHELIA_8X;
+	const bool faa = pairs && parhelia_original_faa(pdev);
 	bool paired = false;
+	u64 depth_lo = 0;
 	u32 i, f, reg;
 	int ret;
 
@@ -5553,6 +5696,8 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 				ret = -ENOENT;
 				goto unwind;
 			}
+			if (faa && parhelia_faa_fragment_bo(objects[i]))
+				fragment = objects[i];
 		}
 		obj = objects[f];
 		/* Pair a draw's depth with the colour bound before it.  A clear
@@ -5570,6 +5715,12 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 			}
 		}
 	}
+	/* fragments only with their colour/depth pair */
+	if (fragment && (!colour || !depth || fragment == colour ||
+			 fragment == depth)) {
+		ret = -EINVAL;
+		goto unwind;
+	}
 	if (colour && depth) {
 		paired = parhelia_submit_pin_pair(pdev, drm_gem_vram_of_gem(colour),
 						  drm_gem_vram_of_gem(depth));
@@ -5579,7 +5730,8 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 					drm_gem_vram_of_gem(depth));
 	}
 	for (i = 0; i < count; i++) {
-		if (!objects[i] || (depth && objects[i] == depth))
+		if (!objects[i] || (depth && objects[i] == depth) ||
+		    objects[i] == fragment)
 			continue;
 		if (paired && objects[i] == colour) {
 			pinned[i] = drm_gem_vram_of_gem(colour);
@@ -5590,10 +5742,23 @@ static int parhelia_pin_reloc_targets(struct parhelia_device *pdev,
 			goto unwind;
 		pinned[i] = drm_gem_vram_of_gem(objects[i]);
 	}
+	if (fragment) {
+		ret = parhelia_pin_faa_fragment(pdev, drm_gem_vram_of_gem(colour),
+						drm_gem_vram_of_gem(depth),
+						drm_gem_vram_of_gem(fragment),
+						paired, &depth_lo);
+		if (ret)
+			goto unwind;
+		for (i = 0; objects[i] != fragment; i++)
+			;
+		pinned[i] = drm_gem_vram_of_gem(fragment);
+	}
 	if (depth) {
 		for (i = 0; objects[i] != depth; i++)
 			;
-		ret = paired ? 0 : colour ?
+		ret = paired ? 0 : fragment ?
+			parhelia_submit_pin_window(pdev, drm_gem_vram_of_gem(depth),
+						   depth_lo) : colour ?
 			parhelia_pin_depth_window(pdev, drm_gem_vram_of_gem(colour),
 						  drm_gem_vram_of_gem(depth)) :
 			parhelia_submit_pin(drm_gem_vram_of_gem(depth));
@@ -6605,6 +6770,10 @@ retry_slot:
 		 * the register only when it writes none. */
 		u32 last = validate.dwgctl_seen ? validate.dwgctl :
 			   parhelia_read(pdev, PARHELIA_R_DWGCTL);
+		u32 sync = !boundary_count && !full_sync &&
+			   parhelia_original_faa(pdev) &&
+			   parhelia_faa_armed(commands, packets,
+					      args->packet_count) ? 0x707 : 0x307;
 
 		for (i = 0; i < plan->sync_sections; i++) {
 			u32 dwgctl = last;
@@ -6616,12 +6785,12 @@ retry_slot:
 					packets, 0, boundary_packet,
 					parhelia_read(pdev, PARHELIA_R_DWGCTL));
 			parhelia_emit_fences(blocks, args->packet_count + i * 3,
-				fence, fence + fence_step, dwgctl);
+				fence, fence + fence_step, sync, dwgctl);
 			if (validate.faa_fences) {
 				parhelia_faa_patch_fences(commands, packets,
 					args->packet_count, fence);
 				parhelia_faa_drain(blocks[args->packet_count + i * 3 + 2].cpu,
-					fence, validate.faa_fences, dwgctl);
+					fence, validate.faa_fences, sync, dwgctl);
 			}
 			fence += fence_step;
 			if (i + 1 < plan->sync_sections)

@@ -85,10 +85,11 @@
  * that window has room.  Storage and mapping are those of flags 0. */
 #define PARHELIA_CREATE_RENDER_WINDOW_COLOR	(1u << 7)
 #define PARHELIA_CREATE_RENDER_WINDOW_DEPTH	(1u << 8)
-/* P690 FAA fragment buffer (PARHELIA_PARAM_FAA): linear storage of
- * pitch * height bytes, zero-filled, in a 32 MiB band apart from native
- * colour and depth.  It has no CPU view; the engine binds it as surface
- * slot 2. */
+/* FAA fragment buffer (PARHELIA_PARAM_FAA): linear storage of
+ * pitch * height bytes, zero-filled; on the P690 in a 32 MiB band apart
+ * from native colour and depth, on the original family inside one 16 MiB
+ * window that a submit binding it moves to the bank opposite its depth
+ * surface.  It has no CPU view; the engine binds it as surface slot 2. */
 #define PARHELIA_CREATE_RENDER_FAA_FRAGMENT	(1u << 9)
 /* The three native classes report mmap_offset 0, yet their GEM mmap offset
  * (MAP_DUMB) is a CPU-linear view with GET_BO_INFO's host_pitch. */
@@ -241,9 +242,11 @@ struct drm_parhelia_upload_render {
 /* A 0x00 packet may hold several register lists back to back, each behind
  * its own header; the engine sees the same stream as from separate packets. */
 #define PARHELIA_PARAM_REGLIST_RUNS	41
-/* P690 fragment antialiasing: CREATE_RENDER_FAA_FRAGMENT and the
+/* Fragment antialiasing: CREATE_RENDER_FAA_FRAGMENT and the
  * kernel-countered FAA sync packets (parhelia_faa_fence_form()) are
- * accepted.  Zero unless the module was loaded with p690_faa=1. */
+ * accepted.  Zero unless the module was loaded with p690_faa=1 (P690) or
+ * original_faa=1 (0527/0528, which also places the fragment buffer in the
+ * bank opposite depth at submit and drains FAA-armed batches with 0x707). */
 #define PARHELIA_PARAM_FAA		42
 /* An indexed draw may also be the 16-bit 0x9b packet: its operands are the
  * byte range of its u16 indices inside the vertex range, starting on a dword,
