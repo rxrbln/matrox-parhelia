@@ -5,6 +5,7 @@
  */
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,31 @@ batch_packet_is_opening_watermark(const uint32_t *cmd, unsigned length)
 {
    return length == 3 && cmd[0] == 1 && cmd[1] == 0x212121acu &&
           (cmd[2] == 0x3fff8842u || cmd[2] == 0x3fff9084u);
+}
+
+/* An FAA sync packet: a register list writing the 0x12bc counter pair,
+ * which only P690 FAA streams carry (the kernel owns every other one). */
+static bool
+batch_packet_is_faa_sync(const uint32_t *cmd, unsigned length)
+{
+   unsigned pos = 1;
+
+   if (length < 4 || (cmd[0] >> 16) || (cmd[0] & 0xffffu) + 2 != length)
+      return false;
+   while (pos < length) {
+      const uint32_t tag = cmd[pos++];
+
+      for (unsigned slot = 0; slot < 4 && pos <= length; slot++) {
+         const unsigned index = (tag >> (slot * 8)) & 0xff;
+
+         if (index == 0x21)
+            break;
+         if (index == (P3D_R_FENCE - P3D_REG_BASE) / 4)
+            return true;
+         pos++;
+      }
+   }
+   return false;
 }
 
 static bool split_multi_draws;
@@ -241,6 +267,12 @@ call_count_opening(const struct parhelia_batch *batch, unsigned first_packet,
       if (batch_packet_is_opening_watermark(batch->commands + packet->offset,
                                             packet->length)) {
          *opening = i;
+         return 0;
+      }
+      /* the kernel opens ahead of FAA sync counters */
+      if (batch_packet_is_faa_sync(batch->commands + packet->offset,
+                                   packet->length)) {
+         *opening = first_packet;
          return 0;
       }
    }
@@ -701,6 +733,121 @@ batch_zclear(struct parhelia_batch *batch, uint32_t colour_handle,
                           P3D_DWGCTL_SOLID);
    return batch_finish(batch, &cs, calls, colour_handle, depth_handle, NULL,
                        NULL, 0, 0, 0, P3D_TRIANGLES, 0, 0, false, 0);
+}
+
+/* The vendor's FAA budget: FragSize 5.4 MiB (LX) per 1024x768 pixels or per
+ * 1280-pixel diagonal, whichever is more, at most 32 MiB (mtxpserd 0xa1160,
+ * 0x10b6d3, 0x9fcb6), and at most @limit, the allocation available: the size
+ * field tells the unit what it has, as after the vendor's retries. */
+uint64_t
+parhelia_faa_budget(unsigned width, unsigned height, uint64_t limit)
+{
+   const double area = (double)width * height / (1024.0 * 768.0);
+   const double diagonal = sqrt((double)width * width +
+                                (double)height * height) / 1280.0;
+   uint64_t bytes = (uint64_t)(5.4 * (area > diagonal ? area : diagonal) *
+                               1048576.0);
+
+   if (bytes > (uint64_t)32 << 20)
+      bytes = (uint64_t)32 << 20;
+   return bytes < limit ? bytes : limit;
+}
+
+/* The armed 0x12fc: [31:14] the budget / 256, [1:0] = 3 and bit 2 of the
+ * ordinary word; bits 3 and 6:5 are the 0528's only. */
+uint32_t
+parhelia_faa_raster(uint64_t bytes)
+{
+   return (uint32_t)(bytes >> 8) << 14 | (0x0bb80024u & 0x4u) | 3u;
+}
+
+/* Merge the fragment buffer into the colour target and disarm: the P690
+ * vendor's resolve (mtxpserd 0x9fe10 with the LX helper 0x2f960, the twin
+ * of MTXPARD sub_9E860), stream for stream as faaemu captured it.  The
+ * counters of its stamps and of the disarm are the kernel's. */
+int
+parhelia_batch_faa_resolve(struct parhelia_batch *batch,
+                           uint32_t colour_handle, uint32_t depth_handle,
+                           uint32_t fragment_handle,
+                           const struct parhelia_faa_snapshot *s)
+{
+   /* the setup planes in the vendor's order, all ending at zero; two of
+    * them pass through 1/16 inside the packet */
+   static const uint16_t planes[28] = {
+      0x116c, 0x1174, 0x1178, 0x1180, 0x116c, 0x1178, 0x1180, 0x1164,
+      0x1180, 0x1168, 0x1178, 0x1180, 0x116c, 0x1174, 0x1178, 0x118c,
+      0x116c, 0x1174, 0x1178, 0x1190, 0x116c, 0x1174, 0x1178, 0x1194,
+      0x116c, 0x1174, 0x117c, 0x1198,
+   };
+   struct p3d_reloc calls[PH_BATCH_PACKETS];
+   uint32_t ring[PH_BATCH_PACKETS * 5];
+   struct p3d_rw rw[28];
+   struct p3d_cs cs;
+
+   if (!batch || !s || !colour_handle || !depth_handle || !fragment_handle ||
+       !(s->raster & 3))
+      return -EINVAL;
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
+               PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
+
+   /* the state the last FAA draw left: primitive, our class-3 stream with
+    * every other stream cleared, slots 0, 2 and 1 */
+   rw[0] = (struct p3d_rw){P3D_R_PRIMWORD, s->primword};
+   p3d_reglist(&cs, rw, 1);
+   for (unsigned i = 0; i < 8; i++)
+      rw[i] = (struct p3d_rw){P3D_R_STREAM0 + 4 * i, i ? 0 : 3};
+   for (unsigned i = 0; i < 4; i++)
+      rw[8 + i] = (struct p3d_rw){P3D_R_STRIDE0 + 4 * i, i ? 0 : 4};
+   p3d_reglist(&cs, rw, 12);
+   rw[0] = (struct p3d_rw){P3D_R_SURF0_BASE, 0};
+   rw[1] = (struct p3d_rw){P3D_R_SURF0_BASE + 4, p3d_surface_cfg(&s->colour)};
+   rw[2] = (struct p3d_rw){P3D_R_SURF0_BASE + 16, 0};
+   rw[3] = (struct p3d_rw){P3D_R_SURF0_BASE + 20, P3D_FAA_SLOT2_CFG};
+   rw[4] = (struct p3d_rw){P3D_R_SURF0_BASE + 8, 0};
+   rw[5] = (struct p3d_rw){P3D_R_SURF0_BASE + 12, p3d_surface_cfg(&s->depth)};
+   p3d_reglist(&cs, rw, 6);
+
+   rw[0] = (struct p3d_rw){P3D_R_COLMASK, 0xffffffffu};
+   rw[1] = (struct p3d_rw){P3D_R_STENCIL_REF, s->zs[1]};
+   rw[2] = (struct p3d_rw){P3D_R_ZWRITE, s->zs[2]};
+   p3d_reglist(&cs, rw, 3);
+   rw[0] = (struct p3d_rw){P3D_R_DWGCTL, P3D_FAA_RESOLVE_DWGCTL};
+   rw[1] = (struct p3d_rw){P3D_R_SCISSOR_MAX, 0x0fff0fffu};
+   rw[2] = (struct p3d_rw){P3D_R_SCISSOR_MIN, 0};
+   rw[3] = (struct p3d_rw){P3D_R_ZFUNC, s->zs[0]};
+   rw[4] = (struct p3d_rw){P3D_R_RASTERMODE, s->raster};
+   rw[5] = (struct p3d_rw){P3D_R_GUARDBAND, P3D_FAA_RESOLVE_GUARD};
+   p3d_reglist(&cs, rw, 6);
+   for (unsigned i = 0; i < 28; i++)
+      rw[i] = (struct p3d_rw){planes[i], (i == 8 || i == 10) ?
+                                         0x3d800000u : 0};
+   p3d_reglist(&cs, rw, 28);
+
+   rw[0] = (struct p3d_rw){P3D_R_DWGCTL, P3D_FAA_RESOLVE};
+   rw[1] = (struct p3d_rw){P3D_R_DWGCTL, P3D_FAA_RESOLVE_DWGCTL};
+   p3d_reglist(&cs, rw, 2);
+   /* the colour and depth stamps */
+   for (unsigned i = 1; i <= 2; i++) {
+      rw[0] = (struct p3d_rw){P3D_R_DWGCTL, 0x007u | i << 8};
+      rw[1] = (struct p3d_rw){P3D_R_FENCE, 0};
+      rw[2] = (struct p3d_rw){P3D_R_FENCE, 0};
+      rw[3] = (struct p3d_rw){P3D_R_DWGCTL, P3D_FAA_RESOLVE_DWGCTL};
+      p3d_reglist(&cs, rw, 4);
+   }
+   /* disarm: mode bits off, MemLevels back behind a drained pixel pipe */
+   rw[0] = (struct p3d_rw){P3D_R_RASTERMODE, s->raster & ~3u};
+   p3d_reglist(&cs, rw, 1);
+   rw[0] = (struct p3d_rw){P3D_R_DWGCTL, P3D_DWGCTL_SYNC};
+   rw[1] = (struct p3d_rw){P3D_R_FENCE, 0};
+   rw[2] = (struct p3d_rw){P3D_R_FENCE, 0};
+   rw[3] = (struct p3d_rw){P3D_R_WATERMARK, 0x3fff8842u};
+   p3d_reglist(&cs, rw, 4);
+   return batch_finish(batch, &cs, calls, colour_handle, depth_handle, NULL,
+                       NULL, fragment_handle, 0, 0, P3D_TRIANGLES, 0, 0,
+                       false, 0);
 }
 
 int
@@ -1181,6 +1328,11 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
        /* The two surface slots carry independent pitches; a 16 bpp colour
         * target aligns to 128 pixels where a 32 bpp depth one aligns to 64,
         * so they need not agree. */
+       /* FAA binds its fragment buffer and owns depth bit 24 */
+       (input->faa_raster && (!(input->faa_raster & 3) ||
+                              !input->faa_fragment || !input->has_depth ||
+                              input->depth.fmt != 0x36 ||
+                              input->stencil_test)) ||
        (input->has_depth && (!depth_handle || input->depth.base ||
          (input->depth.fmt != 0x36 && input->depth.fmt != 0x2a) ||
          input->depth.pitch < input->screen_w ||
@@ -1217,7 +1369,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
 
    ret = batch_finish(batch, &cs, calls, colour_handle,
                       state.has_depth ? depth_handle : 0,
-                      texture_handles, texture_offsets, 0,
+                      texture_handles, texture_offsets,
+                      state.faa_raster ? state.faa_fragment : 0,
                       triangle_count, state.dw_per_vertex, state.prim,
                       per_packet, vertices, !!state.bound_ranges,
                       state.indexed_vertices);

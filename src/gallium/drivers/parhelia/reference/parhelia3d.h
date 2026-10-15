@@ -167,6 +167,7 @@ void	 p3d_cs_init(struct p3d_cs *cs,
 
 /* Packet builders.  Each appends one packet and one ring CALL. */
 void	 p3d_reglist(struct p3d_cs *cs, const struct p3d_rw *rw, size_t n);
+void	 p3d_faa_draw_sync(struct p3d_cs *cs, uint32_t dwgctl);
 void	 p3d_blockload(struct p3d_cs *cs, uint32_t first,
 		       const uint32_t *vec4s, size_t nvec);
 void	 p3d_drawpacket(struct p3d_cs *cs, unsigned dw_per_vertex);
@@ -819,6 +820,13 @@ struct p3d_state {
 	int		   zclip_set;
 	uint32_t	   zclip_min, zclip_max;
 	uint32_t	   guard_band_bits;
+	/* P690 fragment antialiasing, zero when off: the armed 0x12fc word.
+	 * Slot 2 then binds the fragment buffer, stencil bit 0 belongs to the
+	 * FAA unit, MemLevels is armed in a kernel-countered 0x307 packet and
+	 * every draw call ends in the vendor's counter-bracketed 0x307 sync
+	 * (faaemu P690 capture, campaign/results/faa-p690-faaemu-20261015.md). */
+	uint32_t	   faa_raster;
+	uint32_t	   faa_fragment;	/* its GEM handle (batch builder) */
 	/* A depth-bound RGBA stream has a different descriptor and source stride.
 	 * The batch validator accepts it only for the verified one-texture,
 	 * MODULATE, source-alpha, depth-test shape. */
@@ -1096,8 +1104,22 @@ unsigned p3d_minimum_vertices(enum p3d_prim prim);
 uint32_t p3d_surface_cfg(const struct p3d_surface *s);
 uint32_t p3d_blendctl(const struct p3d_state *st);
 uint32_t p3d_dwgctl(const struct p3d_state *st);
+void	 p3d_depth_words(const struct p3d_state *st, uint32_t zs[3]);
+uint32_t p3d_colour_mask(const struct p3d_state *st);
+uint32_t p3d_faa_blendctl(const struct p3d_state *st);
+int	 p3d_faa_mask_ok(const struct p3d_state *st);
 /* DWGCTL nibble 6/7 is the DWGSYNC family; 0x307 drains the pixel pipeline */
 #define P3D_DWGCTL_SYNC	0x00000307u
+/* FAA: the slot-2 descriptor of the fragment buffer (format 0x10, pitch 32),
+ * MemLevels while armed - (MemLevels & ~0x18000) | 0xe0000 of the P690
+ * vendor's 0x3fff8842 - and the resolve's DWGCTL, its trigger and the
+ * guard bands of the LX helper (mtxpserd 0x2f960) and of armed draws. */
+#define P3D_FAA_SLOT2_CFG	0x10000020u
+#define P3D_FAA_MEMLEVELS	((0x3fff8842u & ~0x18000u) | 0xe0000u)
+#define P3D_FAA_RESOLVE_DWGCTL	0x002000c4u
+#define P3D_FAA_RESOLVE		0x00000009u
+#define P3D_FAA_RESOLVE_GUARD	0x41f80000u	/* 31.0f */
+#define P3D_FAA_DRAW_GUARD	0x41700000u	/* 15.0f */
 void	 p3d_raw(struct p3d_cs *cs, const uint32_t *dw, size_t n);
 void	 p3d_emit_constants(struct p3d_cs *cs, uint32_t first_slot,
 			    const float *vec4s, size_t nvec);

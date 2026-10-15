@@ -294,7 +294,7 @@ p3d_tex_wrap(const struct p3d_texture *t)
  * own replicate helper (MTXPARD 0x9b320, Linux mtx3347 @0xffc0) passes a
  * four-byte surface's mask through verbatim and leaves the channel split to
  * the caller. */
-static uint32_t
+uint32_t
 p3d_colour_mask(const struct p3d_state *st)
 {
 	uint32_t mask;
@@ -589,6 +589,86 @@ p3d_attr_present(const struct p3d_rw *desc, size_t n)
  * immediately disarmed, 0x41c reads back the last tag that RETIRED, and the
  * capture steps it by 8 every sync.  0x1374 is the strobe the vendor writes
  * between the opcode and the pair. */
+/* FAA masks colour writes in the blender and leaves the plane mask all
+ * ones: masked channels take source ZERO, destination ONE, ADD (faaemu
+ * P690: RGB-only writes as 0x01802003).  Only the masks p3d_faa_mask_ok()
+ * accepts get here. */
+uint32_t
+p3d_faa_blendctl(const struct p3d_state *st)
+{
+	const uint32_t word = p3d_blendctl(st);
+	const uint32_t mask = p3d_colour_mask(st);
+	const uint32_t keep = 1u << 13;	/* src ZERO, dst ONE */
+
+	if (!st->faa_raster || mask == 0xffffffffu)
+		return word;
+	if (!mask)
+		return (word & ~0x007fffffu) | 1u | keep | 1u << 5;
+	/* RGB written, alpha kept */
+	return (word & ~(0xfu << 9 | 0xfu << 13 | 0x7u << 20)) | 1u | keep;
+}
+
+/* The colour masks FAA can express through the blender: all, none, or
+ * RGB without alpha on a 32-bit target. */
+int
+p3d_faa_mask_ok(const struct p3d_state *st)
+{
+	const uint32_t mask = p3d_colour_mask(st);
+
+	return mask == 0xffffffffu || !mask ||
+	       (mask == 0x00ffffffu && st->colour.fmt == 0x32 &&
+		(!st->blend || !st->blend_eq_alpha_separate));
+}
+
+/* 0x12c8, 0x12cc and 0x12d0 of a draw.  FAA owns stencil bit 0 (field 7,
+ * masks without bit 0); without a depth test the vendor keeps the unit on,
+ * ALWAYS, writes off (faaemu P690 capture, as on the 0528). */
+void
+p3d_depth_words(const struct p3d_state *st, uint32_t zs[3])
+{
+	zs[0]  = st->depth_raw ? st->depth_raw :
+		     p3d_depth_stencil_bits(st->depth.fmt) << 17 |
+		     ((uint32_t)(st->depth_test ? st->depth_func
+					        : P3D_CMP_LESS) << 1) |
+		     (st->depth_test ? 1u : 0u) |
+		     (st->stencil_test ? 1u << 4 : 0u) |
+		     ((uint32_t)(st->stencil_test ? st->stencil_func :
+		                                      P3D_CMP_ALWAYS) << 5) |
+		     ((uint32_t)(st->stencil_test ? st->stencil_fail :
+		                                      P3D_STENCIL_KEEP) << 8) |
+		     ((uint32_t)(st->stencil_test ? st->stencil_zfail :
+		                                      P3D_STENCIL_KEEP) << 11) |
+		     ((uint32_t)(st->stencil_test ? st->stencil_zpass :
+		                                      P3D_STENCIL_KEEP) << 14);
+	zs[1] = (st->stencil_test ? st->stencil_value_mask : 0xffu) |
+		((uint32_t)(st->stencil_test ? st->stencil_ref : 0u) << 8);
+	zs[2]  = (st->stencil_test ? st->stencil_write_mask : 0xffu) |
+		 (st->depth_write ? 0x100u : 0u);
+	if (!st->faa_raster)
+		return;
+	zs[0] = (zs[0] & ~0x1e0000u) | 7u << 17;
+	if (!st->depth_test) {
+		zs[0] = (zs[0] & ~0xfu) | (uint32_t)P3D_CMP_ALWAYS << 1 | 1u;
+		zs[2] &= ~0x100u;
+	}
+	zs[1] &= ~1u;
+	zs[2] &= ~1u;
+}
+
+/* The vendor's sync after every FAA draw call: DWGSYNC 0x307 bracketed by
+ * a counter pair the kernel fills, then the draw's DWGCTL again. */
+void
+p3d_faa_draw_sync(struct p3d_cs *cs, uint32_t dwgctl)
+{
+	struct p3d_rw rw[4];
+
+	rw[0].reg = P3D_R_DWGCTL; rw[0].val = P3D_DWGCTL_SYNC;
+	rw[1].reg = P3D_R_FENCE;  rw[1].val = 0;
+	rw[2].reg = P3D_R_FENCE;  rw[2].val = 0;
+	rw[3].reg = P3D_R_DWGCTL; rw[3].val = dwgctl;
+	p3d_reglist(cs, rw, 4);
+}
+
 static void
 p3d_fence_block(struct p3d_cs *cs, uint32_t tag)
 {
@@ -864,9 +944,12 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	/* The vendor's own unit-point draw uses the class-0 raster image.  The
 	 * ordinary triangle/line surface image is different even though the
 	 * decoded low control bits agree. */
-	rw[2].val = st->point_rastermode ? st->point_rastermode :
+	rw[2].val = st->faa_raster ? st->faa_raster :
+		    st->point_rastermode ? st->point_rastermode :
 		    st->prim == P3D_POINTS ? 0x04000024u : 0x0bb80024u;
-	rw[3].reg = 0x12f8;            rw[3].val = 0x007fe000u;	/* AA threshold */
+	/* AA threshold; FAA takes the vendor's ThresholdAA default */
+	rw[3].reg = 0x12f8;
+	rw[3].val = st->faa_raster ? 0x007fffffu : 0x007fe000u;
 	p3d_reglist(cs, rw, 4);
 
 	/* Line stipple.  Every state image states it, because a register this
@@ -923,7 +1006,7 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 		}
 	}
 
-	rw[0].reg = P3D_R_BLEND; rw[0].val = p3d_blendctl(st);
+	rw[0].reg = P3D_R_BLEND; rw[0].val = p3d_faa_blendctl(st);
 	/* the alpha test shares the depth test's compare encoding; a disabled
 	 * test carries ALWAYS, which is what the vendor's baseline holds */
 	rw[1].reg = P3D_R_ALPHATEST;
@@ -938,27 +1021,14 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	/* Depth and stencil share the 0x12c8 control word and S8Z24 surface.
 	 * The stencil masks/reference occupy 0x12cc/0x12d0; depth write remains
 	 * independent in 0x12d0 bit 8. */
-	rw[0].reg = P3D_R_ZFUNC;
-	rw[0].val  = st->depth_raw ? st->depth_raw :
-		     p3d_depth_stencil_bits(st->depth.fmt) << 17 |
-		     ((uint32_t)(st->depth_test ? st->depth_func
-					        : P3D_CMP_LESS) << 1) |
-		     (st->depth_test ? 1u : 0u) |
-		     (st->stencil_test ? 1u << 4 : 0u) |
-		     ((uint32_t)(st->stencil_test ? st->stencil_func :
-		                                      P3D_CMP_ALWAYS) << 5) |
-		     ((uint32_t)(st->stencil_test ? st->stencil_fail :
-		                                      P3D_STENCIL_KEEP) << 8) |
-		     ((uint32_t)(st->stencil_test ? st->stencil_zfail :
-		                                      P3D_STENCIL_KEEP) << 11) |
-		     ((uint32_t)(st->stencil_test ? st->stencil_zpass :
-		                                      P3D_STENCIL_KEEP) << 14);
-	rw[1].reg = P3D_R_STENCIL_REF;
-	rw[1].val = (st->stencil_test ? st->stencil_value_mask : 0xffu) |
-		    ((uint32_t)(st->stencil_test ? st->stencil_ref : 0u) << 8);
-	rw[2].reg = P3D_R_ZWRITE;
-	rw[2].val  = (st->stencil_test ? st->stencil_write_mask : 0xffu) |
-		     (st->depth_write ? 0x100u : 0u);
+	{
+		uint32_t zs[3];
+
+		p3d_depth_words(st, zs);
+		rw[0].reg = P3D_R_ZFUNC;       rw[0].val = zs[0];
+		rw[1].reg = P3D_R_STENCIL_REF; rw[1].val = zs[1];
+		rw[2].reg = P3D_R_ZWRITE;      rw[2].val = zs[2];
+	}
 	rw[3].reg = 0x12c0; rw[3].val = st->zclip_set ? st->zclip_min : 0x80000000u;
 	rw[4].reg = 0x12c4; rw[4].val = st->zclip_set ? st->zclip_max : 0x7fffffffu;
 	p3d_reglist(cs, rw, 5);
@@ -1107,7 +1177,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	rw[0].reg = P3D_R_SURF0_BASE;     rw[0].val = st->colour.base;
 	rw[1].reg = P3D_R_SURF0_BASE + 4; rw[1].val = p3d_surface_cfg(&st->colour);
 	rw[2].reg = 0x1230;               rw[2].val = 0;
-	rw[3].reg = 0x1234;               rw[3].val = 0x32020000u;
+	rw[3].reg = 0x1234;
+	rw[3].val = st->faa_raster ? P3D_FAA_SLOT2_CFG : 0x32020000u;
 	p3d_reglist(cs, rw, 4);
 
 	if (st->has_depth) {
@@ -1121,7 +1192,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 
 	rw[0].reg = 0x1318; rw[0].val = 0;
 	rw[1].reg = P3D_R_FCOL; rw[1].val = 0;
-	rw[2].reg = P3D_R_COLMASK; rw[2].val = p3d_colour_mask(st);
+	rw[2].reg = P3D_R_COLMASK;
+	rw[2].val = st->faa_raster ? 0xffffffffu : p3d_colour_mask(st);
 	p3d_reglist(cs, rw, 3);
 
 	/* -- the batch fence, then the draw arm ---------------------------- */
@@ -1130,10 +1202,20 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 
 	/* Both vendor drivers raise MemLevels for targets above 250,000 pixels.
 	 * Q3's 640x480 buffer crosses that exact threshold. */
-	rw[0].reg = P3D_R_WATERMARK;
-	rw[0].val = (uint64_t)st->screen_w * st->screen_h > 250000u ?
-		    0x3fff9084u : 0x3fff8842u;
-	p3d_reglist(cs, rw, 1);
+	if (st->faa_raster) {
+		/* armed behind a drained pixel pipe; the kernel fills the
+		 * counters */
+		rw[0].reg = P3D_R_DWGCTL;    rw[0].val = P3D_DWGCTL_SYNC;
+		rw[1].reg = P3D_R_FENCE;     rw[1].val = 0;
+		rw[2].reg = P3D_R_FENCE;     rw[2].val = 0;
+		rw[3].reg = P3D_R_WATERMARK; rw[3].val = P3D_FAA_MEMLEVELS;
+		p3d_reglist(cs, rw, 4);
+	} else {
+		rw[0].reg = P3D_R_WATERMARK;
+		rw[0].val = (uint64_t)st->screen_w * st->screen_h > 250000u ?
+			    0x3fff9084u : 0x3fff8842u;
+		p3d_reglist(cs, rw, 1);
+	}
 	rw[0].reg = P3D_R_DWGCTL; rw[0].val = dwgctl;
 	p3d_reglist(cs, rw, 1);
 	/* 32.0f, or the LX family's 31.0f when the caller asks for it: the
@@ -1141,7 +1223,8 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	 * (KRN mtx2572, emitted by mtx2393). */
 	rw[0].reg = P3D_R_GUARDBAND;
 	/* 16.0f with three or more P690 units (KRN mtx958). */
-	rw[0].val = st->guard_band_bits ? st->guard_band_bits :
+	rw[0].val = st->faa_raster ? P3D_FAA_DRAW_GUARD :
+		    st->guard_band_bits ? st->guard_band_bits :
 		    st->single_texture_pipe && p3d_state_units(st) > 2 ?
 		    0x41800000u :
 		    st->lx_family ? 0x41f80000u : 0x42000000u;
@@ -1481,6 +1564,9 @@ p3d_emit_draws(struct p3d_cs *cs, const struct p3d_state *st, unsigned nprim)
 			p3d_reglist(cs, rw, 2);
 		p3d_drawpacket(cs, st->dw_per_vertex);
 	}
+	/* the vendor syncs after each draw call, whatever its packets */
+	if (st->faa_raster)
+		p3d_faa_draw_sync(cs, p3d_dwgctl(st));
 
 	/* End of batch, then the NEXT fence.  Without this the 3D pipeline
 	 * never completes and the following 2D fill draws nothing even though
@@ -1584,6 +1670,8 @@ p3d_emit_indexed(struct p3d_cs *cs, const struct p3d_state *st,
 	p3d_emit_direct_fetch(cs, st, st->indexed_vertices, 3);
 	for (unsigned i = 0; i < npackets; i++)
 		p3d_indexpacket_u32(cs);
+	if (st->faa_raster)
+		p3d_faa_draw_sync(cs, p3d_dwgctl(st));
 }
 
 void
