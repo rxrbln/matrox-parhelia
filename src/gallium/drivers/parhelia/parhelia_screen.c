@@ -1171,17 +1171,20 @@ ph_resource_create_class(struct pipe_screen *pscreen,
    if (r->upload_texture) {
       if (create.mmap_offset)
          PH_CREATE_FAIL();
-      r->map = align_malloc(r->size, 64);
-      if (!r->map)
-         PH_CREATE_FAIL();
-      memset(r->map, 0, r->size);
-      /* PARHELIA_TEX_ADDRESS_FILL=1 (diagnostic): every unwritten dword
-       * names its own offset, so a sampler read outside the stored texels
-       * shows where it went instead of black. */
-      if (ph_env("PARHELIA_TEX_ADDRESS_FILL"))
-         for (size_t i = 0; i < r->size / 4; i++)
-            ((uint32_t *)r->map)[i] = 0xfff00000u | (uint32_t)(i & 0xfffff);
-      r->upload_dirty = true;
+      /* Storage the GPU fills has no host image and nothing to upload. */
+      if (!(templ->flags & PH_RESOURCE_FLAG_GPU_FILLED)) {
+         r->map = align_malloc(r->size, 64);
+         if (!r->map)
+            PH_CREATE_FAIL();
+         memset(r->map, 0, r->size);
+         /* PARHELIA_TEX_ADDRESS_FILL=1 (diagnostic): every unwritten dword
+          * names its own offset, so a sampler read outside the stored
+          * texels shows where it went instead of black. */
+         if (ph_env("PARHELIA_TEX_ADDRESS_FILL"))
+            for (size_t i = 0; i < r->size / 4; i++)
+               ((uint32_t *)r->map)[i] = 0xfff00000u | (uint32_t)(i & 0xfffff);
+         r->upload_dirty = true;
+      }
    } else if (native_depth || native_color) {
       /* Compact P690 target classes live above the raw 16-MiB host window.
        * Their zero mmap offset is intentional.  Imported/present resources
@@ -1555,6 +1558,7 @@ ph_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *pres)
    }
 
    free(r->bounds);
+   pipe_resource_reference(&r->sampler_copy, NULL);
    /* Nothing can consume an outstanding hardware depth clear once the surface
     * is gone; only the resolve target's reference has to be released. */
    r->zinit_pending = false;

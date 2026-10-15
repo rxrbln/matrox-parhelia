@@ -109,6 +109,9 @@ struct ph_vertex_bounds {
    float min[4], max[4];
 };
 
+/* resource_create: sampler storage the GPU fills, without a host image */
+#define PH_RESOURCE_FLAG_GPU_FILLED PIPE_RESOURCE_FLAG_DRV_PRIV
+
 struct parhelia_resource {
    struct pipe_resource base;
    /* the pending-stream generation that last referenced it */
@@ -118,6 +121,9 @@ struct parhelia_resource {
     * B8G8R8A8 twin, its blocks kept host-side per level and layer for the
     * transfers.  Such a resource has no storage of its own. */
    struct pipe_resource *decoded;
+   /* The GPU-filled sampler-order copy a P690 render target is sampled
+    * through, kept across views: compositors recreate theirs per frame. */
+   struct pipe_resource *sampler_copy;
    uint8_t **blocks;
    uint32_t handle;
    bool handle_owned;

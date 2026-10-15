@@ -234,6 +234,8 @@ struct ph_sampler_view {
    struct pipe_sampler_view base;
    struct pipe_sampler_view *shadow_view;
    uint64_t shadow_generation;
+   /* The GPU could not fill the copy: it keeps a host image. */
+   bool shadow_cpu;
    /* A copy written with its source view's swizzle: the border colour
     * needs the same swizzle. */
    bool baked, baked_depth;
@@ -7841,6 +7843,70 @@ ph_view_swizzled(const struct pipe_sampler_view *view)
           view->swizzle_a != PIPE_SWIZZLE_W;
 }
 
+/* A swizzle that only pins alpha to one over an alpha-less format with its
+ * own sampler code (XRGB client buffers): that sampler returns alpha one. */
+static bool
+ph_view_swizzle_native(const struct pipe_sampler_view *view)
+{
+   return view->swizzle_r == PIPE_SWIZZLE_X &&
+          view->swizzle_g == PIPE_SWIZZLE_Y &&
+          view->swizzle_b == PIPE_SWIZZLE_Z &&
+          (view->swizzle_a == PIPE_SWIZZLE_W ||
+           (view->swizzle_a == PIPE_SWIZZLE_1 &&
+            !util_format_has_alpha(view->format) &&
+            ph_sampler_format(view->format, NULL)));
+}
+
+/* P690: the VRAM bytes of a 32-bit render target's level 0 are exactly the
+ * sampler-order image at the same pitch (MEASURED, tools/parhelia-gl-rtt-test
+ * byte exact at 256x64 and 1920x1080), so one linear 2-D copy over whole
+ * 4 KiB tiles fills the sampler copy.  The exchanged y bits between
+ * p3d_tile_offset_layout() and p3d_texture_tile_offset_64x16_at() describe
+ * the CPU view, not these bytes (inferred). */
+static bool
+ph_copy_render_to_sampler(struct ph_context *ctx,
+                          struct parhelia_resource *dst,
+                          struct parhelia_resource *src)
+{
+   const struct ph_mip_level *l0 = &dst->mip.level[0];
+   const unsigned tiles = DIV_ROUND_UP(src->base.height0, 16) *
+                          (src->stride / 64);
+   int ret;
+
+   if (ph_screen(ctx->base.screen)->chip_id != 0x2539 ||
+       src->tile_layout != PARHELIA_TILE_64X16_4K || src->cpp != 4 ||
+       !src->handle || src->linear_dirty || src->decoded ||
+       !dst->handle || dst->map || !dst->mip.levels || !dst->mip.tiled ||
+       dst->mip.cpp != 4 || dst->mip.block_bytes || dst->mip.slices > 1 ||
+       l0->offset || l0->half || l0->pitch != src->stride ||
+       src->stride % 64 || dst->base.width0 != src->base.width0 ||
+       dst->base.height0 != src->base.height0 || tiles > 0xffff ||
+       (uint64_t)tiles * 4096 > MIN2(src->size, dst->size))
+      return false;
+   ph_submit_vertices(ctx);
+   if (ctx->aggregate_batches && ph_drain_batch(ctx))
+      return false;
+   /* one 4 KiB tile per row of a linear 1024-pixel surface */
+   ret = parhelia_batch_blit_format(&ctx->build_batch, dst->handle, 1024,
+                                    0x32, 1, 0, 0, src->handle, 1024, 0x32,
+                                    1, 0, 0, 1024, tiles);
+   if (!ret)
+      ret = ph_submit_batch_now_untimed(ctx, &ctx->build_batch, NULL, 0);
+   if (ph_env("PARHELIA_TRACE"))
+      fprintf(stderr, "parhelia: GPU sampler copy src=%u dst=%u %ux%u ret=%d\n",
+              src->handle, dst->handle, src->base.width0,
+              src->base.height0, ret);
+   /* A refused request falls back to the CPU copy; anything else is fatal. */
+   if (ret) {
+      if (ret != -EINVAL)
+         ctx->submit_error = ret;
+      return false;
+   }
+   dst->mip_defined |= BITFIELD_BIT(0);
+   dst->content_generation++;
+   return true;
+}
+
 /* Level @src_level of @view's colour image written into level @dst_level of
  * @dst (same format) with the view's swizzle applied: the sampler has no
  * channel swizzle, and st emulates luminance, intensity and alpha formats in
@@ -7893,9 +7959,14 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
     * and are copied like the others. */
    const unsigned last = MIN2(v->base.u.tex.last_level, r->base.last_level);
    const bool depth = util_format_has_depth(util_format_description(r->base.format));
-   const bool swizzled = !depth && ph_view_swizzled(&v->base) &&
+   const bool swizzled = !depth && !ph_view_swizzle_native(&v->base) &&
       util_format_get_blocksize(v->base.format) ==
       util_format_get_blocksize(r->base.format);
+   /* A plain copy of one P690 32-bit level: the 2-D engine can fill it. */
+   const bool gpu_fill = !depth && !swizzled && !first && !last &&
+      !v->shadow_cpu && ph_screen(ctx->base.screen)->chip_id == 0x2539 &&
+      r->tile_layout == PARHELIA_TILE_64X16_4K && r->cpp == 4 &&
+      !(r->stride % 64);
 
    /* A 16-bit target copies into the 16-bit sampler storage of its format. */
    if ((!depth && util_format_get_blocksize(r->base.format) != 4 &&
@@ -7903,7 +7974,7 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
         !ph_sampler_format(r->base.format, NULL)) || first > last)
       return NULL;
    if (!v->shadow_view) {
-      struct pipe_resource templ = r->base, *shadow;
+      struct pipe_resource templ = r->base, *shadow = NULL;
       struct pipe_sampler_view view = v->base;
 
       /* A depth image is sampled as the colour its view's swizzle makes of
@@ -7930,9 +8001,29 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
       templ.height0 = u_minify(r->base.height0, first);
       templ.last_level = last - first;
       templ.bind = PIPE_BIND_SAMPLER_VIEW;
-      shadow = ctx->base.screen->resource_create(ctx->base.screen, &templ);
+      if (gpu_fill)
+         templ.flags |= PH_RESOURCE_FLAG_GPU_FILLED;
+      /* Compositors recreate their views every frame: reuse the storage. */
+      if (gpu_fill && r->sampler_copy &&
+          r->sampler_copy->format == templ.format &&
+          r->sampler_copy->width0 == templ.width0 &&
+          r->sampler_copy->height0 == templ.height0 &&
+          !r->sampler_copy->last_level)
+         pipe_resource_reference(&shadow, r->sampler_copy);
+      else
+         shadow = ctx->base.screen->resource_create(ctx->base.screen, &templ);
       if (!shadow)
          return NULL;
+      if (gpu_fill)
+         pipe_resource_reference(&r->sampler_copy, shadow);
+      if (ph_env("PARHELIA_TRACE"))
+         fprintf(stderr, "parhelia: shadow view %p of %p %s as %s swizzle %u%u%u%u %s (layout %u cpp %u pitch %u)\n",
+                 (void *)v, (void *)r, util_format_short_name(r->base.format),
+                 util_format_short_name(v->base.format), v->base.swizzle_r,
+                 v->base.swizzle_g, v->base.swizzle_b, v->base.swizzle_a,
+                 depth ? "depth" : swizzled ? "CPU swizzle" :
+                 gpu_fill ? "GPU copy" : "copy", r->tile_layout, r->cpp,
+                 r->stride);
       view.u.tex.first_level = 0;
       view.u.tex.last_level = last - first;
       v->shadow_view = ctx->base.create_sampler_view(&ctx->base, shadow,
@@ -7951,6 +8042,20 @@ ph_shadow_view(struct ph_context *ctx, struct ph_sampler_view *v)
          sv->baked_swizzle[3] = v->base.swizzle_a;
       }
       v->shadow_generation = ~0ull;
+   }
+   if (v->shadow_generation != r->content_generation &&
+       (v->shadow_view->texture->flags & PH_RESOURCE_FLAG_GPU_FILLED)) {
+      if ((r->mip_defined & BITFIELD_BIT(0)) &&
+          !ph_copy_render_to_sampler(ctx, ph_resource(v->shadow_view->texture),
+                                     r)) {
+         if (ctx->submit_error)
+            return NULL;
+         /* not this time: an ordinary copy with a host image */
+         pipe_sampler_view_reference(&v->shadow_view, NULL);
+         v->shadow_cpu = true;
+         return ph_shadow_view(ctx, v);
+      }
+      v->shadow_generation = r->content_generation;
    }
    if (v->shadow_generation != r->content_generation) {
       for (unsigned l = first; l <= last; l++) {
