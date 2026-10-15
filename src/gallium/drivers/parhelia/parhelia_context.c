@@ -622,12 +622,13 @@ struct ph_context {
    /* The one depth resource whose hardware clear is still outstanding.  The
     * Z unit tracks a single surface, so arming another resolves this one. */
    struct parhelia_resource *zinit_res;
-   /* P690 fragment antialiasing, see ph_faa_prepare() */
+   /* Fragment antialiasing, see ph_faa_prepare() */
    struct {
       uint32_t handle;           /* fragment buffer, 0 for none */
       uint64_t bytes;            /* its budget, the 0x12fc size field */
       unsigned width, height;    /* the target size it was budgeted for */
       bool pending;              /* fragments not yet resolved */
+      bool original;             /* the 0527/0528 form */
       struct pipe_resource *colour, *depth;  /* the epoch's pair */
       struct parhelia_faa_snapshot snap;
       struct parhelia_batch batch;
@@ -985,6 +986,7 @@ ph_logical_vertex_limit(const struct ph_context *ctx)
 }
 
 static int ph_drain_batch_at(struct ph_context *ctx, unsigned line);
+static void ph_faa_resolve(struct ph_context *ctx);
 /* PARHELIA_TRACE_DRAIN=1 counts aggregate drains per call site. */
 #define ph_drain_batch(ctx) ph_drain_batch_at((ctx), __LINE__)
 static struct {
@@ -2873,6 +2875,8 @@ ph_copy_present_quad(struct ph_context *ctx,
        (!src->linear_map && !ph_present_tiled_source(ctx, src, dst)) ||
        (!dst->map && !dst->linear_map))
       return false;
+   if (ctx->faa.original)
+      ph_faa_resolve(ctx);
    /* Only the plain XY[ZW]/RGB/ST stream, and no fragment state which
     * would make the result differ from a copy. */
    if (ctx->vertex_alpha || ctx->alpha_micro || ctx->alpha_micro_cutout ||
@@ -4549,7 +4553,8 @@ static void ph_submit_vertices(struct ph_context *ctx);
 
 /* ------------------------------------------------ fragment antialiasing
  *
- * P690 FAA-16x, opt-in (PARHELIA_FAA=1 with the kernel's p690_faa=1).  While
+ * FAA-16x, opt-in (PARHELIA_FAA=1 with the kernel's p690_faa=1 on the P690,
+ * original_faa=1 on the 0527/0528).  While
  * 0x12fc is armed, draws into the bound colour/depth pair leave their edge
  * fragments in a fragment buffer bound as surface slot 2, and stencil bit 0
  * marks the pixels that have some; a resolve merges them into the colour
@@ -4557,6 +4562,9 @@ static void ph_submit_vertices(struct ph_context *ctx);
  * campaign/results/faa-p690-faaemu-20261015.md); every address, size and
  * state word is this context's own.  One epoch is open at a time: a draw FAA
  * cannot take, a clear, a flush or any other access to the pair resolves it.
+ * The original family's form is the one measured on the 0528 on 2026-10-04:
+ * an epoch clears the marks of its depth surface first, its first draw arms
+ * MemLevels, and any other engine work resolves it, whatever its target.
  */
 
 /* the largest CREATE_RENDER_FAA_FRAGMENT allocation: 2048 rows of 8 KiB */
@@ -4623,19 +4631,36 @@ ph_faa_resolve_for(struct ph_context *ctx, struct pipe_resource *res)
    }
 }
 
+/* The original family resolves before any engine work outside the epoch's
+ * own draws (clears, copies, blits, uploads), and hands the resolve to the
+ * kernel at once, as measured on the 0528. */
+static void
+ph_faa_handover(struct ph_context *ctx)
+{
+   if (ctx->faa.pending && ctx->faa.original) {
+      ph_submit_vertices(ctx);
+      ph_faa_resolve(ctx);
+      ph_drain_batch(ctx);
+   }
+}
+
 /* A fragment buffer budgeted for a @width x @height target. */
 static bool
 ph_faa_fragment(struct ph_context *ctx, unsigned width, unsigned height)
 {
-   const uint64_t bytes = parhelia_faa_budget(width, height, PH_FAA_MAX_BYTES);
+   /* the 0527/0528: the vendor's 16 MiB family cap, a whole engine window,
+    * the size measured on the 0528 */
+   const uint64_t bytes = ctx->faa.original ? PH_FAA_MAX_BYTES :
+      parhelia_faa_budget(width, height, PH_FAA_MAX_BYTES);
    struct drm_parhelia_create_render create = {
       .width = PH_FAA_PITCH_BYTES / 4, .cpp = 4,
       .height = DIV_ROUND_UP(bytes, PH_FAA_PITCH_BYTES),
       .flags = PARHELIA_CREATE_RENDER_FAA_FRAGMENT,
    };
 
-   if (ctx->faa.handle && ctx->faa.width == width &&
-       ctx->faa.height == height)
+   if (ctx->faa.handle && (ctx->faa.original ||
+                           (ctx->faa.width == width &&
+                            ctx->faa.height == height)))
       return true;
    ph_faa_resolve(ctx);
    /* the old buffer may still be bound by queued work */
@@ -4658,6 +4683,22 @@ ph_faa_fragment(struct ph_context *ctx, unsigned width, unsigned height)
    return true;
 }
 
+/* The original family keeps the plane mask (all channels, or RGB of a
+ * target without alpha), no alpha test, and none of the CPU or two-pass
+ * colour paths: the draws measured on the 0528. */
+static bool
+ph_faa_original_admits(const struct ph_context *ctx, const struct p3d_state *st)
+{
+   const uint32_t mask = p3d_colour_mask(st);
+
+   return !st->alpha_test && !ctx->rgb_alpha_two_pass &&
+          !ctx->cpu_alpha_cutout &&
+          !ph_resource(ctx->fb.zsbuf.texture)->linear_dirty &&
+          (mask == 0xffffffffu ||
+           (mask == 0x00ffffffu &&
+            !(ph_target_channels(ctx->fb.cbufs[0].format) & PIPE_MASK_A)));
+}
+
 /* Whether a draw into @colour_handle/@depth_handle can take FAA: triangles
  * into the bound 32-bit colour and S8Z24 depth pair with a colour mask the
  * blender can apply (the vendor masks through blend factors instead of the
@@ -4678,7 +4719,40 @@ ph_faa_admit(const struct ph_context *ctx, const struct p3d_state *st,
           st->has_depth && st->colour.fmt == 0x32 && st->depth.fmt == 0x36 &&
           !st->stencil_test && !st->logicop_enable && !st->depth_raw &&
           !ph_resource(ctx->fb.zsbuf.texture)->stencil_live &&
-          p3d_faa_mask_ok(st);
+          (ctx->faa.original ? ph_faa_original_admits(ctx, st) :
+                               p3d_faa_mask_ok(st));
+}
+
+/* Original-family FAA clears its depth surface's stencil bit 0, the edge
+ * marks, before an epoch, as the measured 0528 path did: a resolve leaves
+ * them, and stale marks merge into the next epoch (P690, MEASURED). */
+static bool
+ph_faa_clear_marks(struct ph_context *ctx, struct parhelia_resource *depth)
+{
+   const unsigned rows =
+      ALIGN_POT(depth->base.height0,
+                depth->tile_layout == PARHELIA_TILE_64X16_4K ? 16 : 32);
+   int ret;
+
+   ret = parhelia_batch_clear_rect_surface(&ctx->faa.batch, depth->handle,
+                                           depth->base.width0, rows,
+                                           depth->stride, depth->surf_fmt,
+                                           0, 1u << 24, 0, 0,
+                                           depth->base.width0,
+                                           depth->base.height0);
+   if (!ret) {
+      /* a drain must not move a staged draw's vertices */
+      ph_stage_evict(ctx, NULL);
+      ret = ph_submit_batch(ctx, &ctx->faa.batch, NULL, 0, depth, NULL,
+                            NULL, NULL);
+   }
+   if (ret) {
+      ctx->submit_error = ret;
+      return false;
+   }
+   depth->tiled_dirty = true;
+   depth->content_generation++;
+   return true;
 }
 
 /* Arm a draw for FAA, or resolve the epoch a draw it cannot take would
@@ -4709,7 +4783,8 @@ ph_faa_prepare(struct ph_context *ctx, struct p3d_state *st,
                  st->colour.fmt, st->depth.fmt, st->stencil_test,
                  st->logicop_enable, st->depth_raw, p3d_colour_mask(st));
       if (ctx->faa.pending &&
-          (ph_resource(ctx->faa.colour)->handle == colour_handle ||
+          (ctx->faa.original ||
+           ph_resource(ctx->faa.colour)->handle == colour_handle ||
            ph_resource(ctx->faa.depth)->handle == depth_handle))
          ph_faa_resolve(ctx);
       return;
@@ -4721,13 +4796,19 @@ ph_faa_prepare(struct ph_context *ctx, struct p3d_state *st,
       ph_faa_resolve(ctx);
    if (!ph_faa_fragment(ctx, colour->width0, colour->height0))
       return;
-   st->faa_raster = parhelia_faa_raster(ctx->faa.bytes, false);
+   if (ctx->faa.original && !ctx->faa.pending &&
+       !ph_faa_clear_marks(ctx, ph_resource(depth)))
+      return;
+   st->faa_raster = parhelia_faa_raster(ctx->faa.bytes, ctx->faa.original);
    st->faa_fragment = ctx->faa.handle;
+   st->faa_original = ctx->faa.original;
+   st->faa_arm = ctx->faa.original && !ctx->faa.pending;
    ctx->faa.snap = (struct parhelia_faa_snapshot){
       .colour = st->colour, .depth = st->depth,
       .raster = st->faa_raster,
       .primword = p3d_primword(st->prim) &
                   ~(st->lx_vendor_primword ? 0x00040000u : 0u),
+      .original = ctx->faa.original,
    };
    p3d_depth_words(st, ctx->faa.snap.zs);
    if (!ctx->faa.pending) {
@@ -5419,6 +5500,9 @@ ph_submit_vertices_staged(struct ph_context *ctx)
    }
    if (!ctx->triangles || ctx->submit_error)
       goto out;
+   /* the CPU and two-pass colour paths run after the FAA hand-over */
+   if (ctx->faa.original && (ctx->rgb_alpha_two_pass || ctx->cpu_alpha_cutout))
+      ph_faa_resolve(ctx);
    /* cleared only for a batch to build: half the calls find none; the
     * state, padding included, is the state cache's key */
    memset(&state, 0, sizeof(state));
@@ -15331,8 +15415,9 @@ ph_zinit_clear(struct ph_context *ctx, struct parhelia_resource *r,
    unsigned tail;
    int ret;
 
+   /* the original family's FAA path was measured with plane-fill clears */
    if (!ph_zinit_enabled() || !coverage || !r || !r->handle ||
-       ctx->submit_error)
+       ctx->submit_error || ctx->faa.original)
       return false;
    if (x || y || width != r->base.width0 || height != r->base.height0 ||
        write_mask != 0xffffffffu || r->upload_texture)
@@ -15775,6 +15860,7 @@ ph_clear_render_target(struct pipe_context *p, struct pipe_surface *dst,
    (void)render_condition_enabled;
    ph_submit_vertices(ctx);
    ph_faa_resolve_for(ctx, dst->texture);
+   ph_faa_handover(ctx);
    if (!ph_surface_is_base(dst) || ph_resource(dst->texture)->upload_texture) {
       util_clear_render_target(p, dst, color, dstx, dsty, width, height);
       return;
@@ -15795,6 +15881,7 @@ ph_clear_depth_stencil(struct pipe_context *p, struct pipe_surface *dst,
    (void)render_condition_enabled;
    ph_submit_vertices(ctx);
    ph_faa_resolve_for(ctx, dst->texture);
+   ph_faa_handover(ctx);
    if (!ph_surface_is_base(dst) || ph_resource(dst->texture)->upload_texture) {
       util_clear_depth_stencil(p, dst, clear_flags, depth, stencil, dstx,
                                dsty, width, height);
@@ -15856,6 +15943,7 @@ ph_flush_resource(struct pipe_context *p, struct pipe_resource *resource)
 
    ph_zinit_resolve(ctx, ph_resource(resource));
    ph_submit_vertices(ctx);
+   ph_faa_handover(ctx);
    /* Export/present consumers can observe only work already handed to the
     * kernel.  Keep it asynchronous for native resources, then rely on the
     * server's ordered blit; CPU-visible resources wait below. */
@@ -16136,6 +16224,8 @@ ph_resource_copy_region(struct pipe_context *p,
 
    ph_zinit_resolve(ctx, ph_resource(src));
    ph_zinit_resolve(ctx, ph_resource(dst));
+   if (dst->target != PIPE_BUFFER || src->target != PIPE_BUFFER)
+      ph_faa_handover(ctx);
    if (dst->target == PIPE_BUFFER && src->target == PIPE_BUFFER) {
       struct parhelia_resource *dr = ph_resource(dst);
       struct parhelia_resource *sr = ph_resource(src);
@@ -16476,6 +16566,7 @@ ph_blit(struct pipe_context *p, const struct pipe_blit_info *info)
       return;
    ph_faa_resolve_for(ctx, info->src.resource);
    ph_faa_resolve_for(ctx, info->dst.resource);
+   ph_faa_handover(ctx);
    ph_zinit_resolve(ctx, ph_resource(info->src.resource));
    ph_zinit_resolve(ctx, ph_resource(info->dst.resource));
    if (ph_env("PARHELIA_TRACE_COPY"))
@@ -16905,6 +16996,8 @@ ph_map(struct pipe_context *p, struct pipe_resource *res, unsigned level,
       ph_format_texel_order(res->format, &order_storage);
 
    ph_zinit_resolve(ctx, r);
+   if (texture)
+      ph_faa_handover(ctx);
    /* an engine upload must not run while FAA is armed */
    if (ctx->faa.pending && texture && (usage & PIPE_MAP_WRITE)) {
       ph_submit_vertices(ctx);
@@ -17511,6 +17604,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       ctx->tcl_available = debug_get_bool_option("PARHELIA_HW_TCL", true);
    }
    ctx->tcl_forced_off = ph_env("PARHELIA_NO_HW_TCL");
+   ctx->faa.original = ph_screen(screen)->faa &&
+                       ph_original_family(ph_screen(screen)->chip_id);
    /* A vertex shader the WARP compiler accepts runs from an uploaded program
     * slot.  It needs the same constant loader the fixed-function transform
     * uses, plus the kernel's WARP_PROGRAM upload path. */

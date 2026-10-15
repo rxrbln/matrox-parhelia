@@ -1865,7 +1865,7 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->render_transfer =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &render_transfer) &&
       render_transfer.value == 1;
-   s->faa = s->chip_id == 0x2539 &&
+   s->faa = (s->chip_id == 0x2539 || ph_original_family(s->chip_id)) &&
       debug_get_bool_option("PARHELIA_FAA", false) &&
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &faa) && faa.value == 1;
    s->draw_ranges = s->async_submit &&
