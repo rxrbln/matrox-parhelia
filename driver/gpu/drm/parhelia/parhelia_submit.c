@@ -2067,12 +2067,14 @@ static u32 parhelia_indexed_triangles(const struct parhelia_device *pdev)
 }
 
 /* 16-bit address-mode index lists (0x9b, draw mode 6), on the families
- * parhelia-drm-test --indexed-run-probe INDEX16=1 measured: the P690. */
+ * parhelia-drm-test --indexed-run-probe INDEX16=1 measured: the P690 and
+ * the original Parhelia. */
 static bool parhelia_index16(const struct parhelia_device *pdev)
 {
 	if (!parhelia_indexed_triangles(pdev))
 		return false;
-	return pdev->pdev->device == PARHELIA_P690;
+	return pdev->pdev->device == PARHELIA_P690 ||
+	       parhelia_original_family(pdev);
 }
 
 /* Copy @n 16-bit indices from @src (dword aligned) to @dst, the odd last
