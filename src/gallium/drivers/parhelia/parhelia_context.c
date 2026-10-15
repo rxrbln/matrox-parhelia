@@ -104,6 +104,9 @@ enum ph_serial_op {
    PH_SERIAL_REPLACE1,
 };
 
+#define PH_TC_STATS_DPV 16
+#define PH_TC_STATS_LOG2 32
+
 /* Why a draw stayed off the hardware transform (PARHELIA_STATS). */
 enum ph_tcl_reason {
    PH_TCL_NO_UNAVAILABLE,     /* no WARP transform, no or uncompiled program */
@@ -592,6 +595,17 @@ struct ph_context {
    uint64_t tcl_classified;
    unsigned tcl_plane_blocks[128];
    uint64_t tcl_range_verts;    /* vertices the draws' index ranges span */
+   /* PARHELIA_TC_STATS: transformed vertex records and coordinate ranges */
+   bool tc_stats;
+   unsigned tc_frames;
+   struct {
+      uint64_t dpv_verts[PH_TC_STATS_DPV];
+      uint64_t span_verts[2][PH_TC_STATS_LOG2];  /* log2 texels of max-floor(min) */
+      uint64_t mag_verts[2][PH_TC_STATS_LOG2];   /* log2 texels of max |c| */
+      uint64_t unit_verts[2], verts[2];          /* inside [0,1]; all */
+      float lo[2], hi[2];
+      unsigned draws;
+   } tc;
    unsigned tcl_clip_why[4];	/* w <= 0, guard band, near, far */
    unsigned tcl_clipped_tris;   /* clipped on the CPU, kept transforming */
    float *tcl_clip_copy;
@@ -9863,6 +9877,105 @@ ph_tcl_fetch_run_boxed(const struct ph_context *ctx,
    return ph_tcl_box_fits(ctx, mvp, NULL, lo, hi);
 }
 
+/* PARHELIA_TC_STATS: the record size of the draw's vertex range and, per
+ * coordinate set, its span after an integer bias and its magnitude, in texels. */
+static unsigned
+ph_tc_stats_bucket(double texels)
+{
+   unsigned b = 0;
+
+   while (b + 1 < PH_TC_STATS_LOG2 && texels >= (double)(1ull << b))
+      b++;
+   return b;
+}
+
+static void
+ph_tcl_coord_stats(struct ph_context *ctx, const struct ph_tcl_layout *lay,
+                   const struct ph_tcl_fetch *f, const uint32_t range[2])
+{
+   const uint64_t n = range[1] >= range[0] ? range[1] - range[0] + 1 : 0;
+
+   if (!n)
+      return;
+   ctx->tc.draws++;
+   ctx->tc.dpv_verts[MIN2(lay->dpv, PH_TC_STATS_DPV - 1)] += n;
+   for (unsigned u = 0; u < 2; u++) {
+      const struct ph_tcl_fetch_elem *e = NULL;
+      const struct pipe_resource *t;
+      float lo[2] = { INFINITY, INFINITY }, hi[2] = { -INFINITY, -INFINITY };
+      double span = 0, mag = 0;
+
+      if (!(u ? lay->multitextured : lay->textured) ||
+          !ctx->sampler_views[u] || !(t = ctx->sampler_views[u]->texture))
+         continue;
+      for (unsigned i = 0; i < f->count; i++)
+         if (f->e[i].out == lay->tex_offset[u] && !f->e[i].unorm8)
+            e = &f->e[i];
+      if (!e)
+         continue;
+      for (uint64_t v = range[0]; v <= range[1]; v++) {
+         const float *c = (const float *)(e->src + v * e->stride);
+
+         for (unsigned k = 0; k < 2; k++) {
+            lo[k] = MIN2(lo[k], c[k]);
+            hi[k] = MAX2(hi[k], c[k]);
+         }
+      }
+      for (unsigned k = 0; k < 2; k++) {
+         const double size = k ? t->height0 : t->width0;
+
+         span = MAX2(span, (hi[k] - floorf(lo[k])) * size);
+         mag = MAX2(mag, MAX2(fabsf(lo[k]), fabsf(hi[k])) * size);
+         ctx->tc.lo[u] = MIN2(ctx->tc.lo[u], lo[k]);
+         ctx->tc.hi[u] = MAX2(ctx->tc.hi[u], hi[k]);
+      }
+      ctx->tc.span_verts[u][ph_tc_stats_bucket(span)] += n;
+      ctx->tc.mag_verts[u][ph_tc_stats_bucket(mag)] += n;
+      ctx->tc.verts[u] += n;
+      if (lo[0] >= 0 && lo[1] >= 0 && hi[0] <= 1 && hi[1] <= 1)
+         ctx->tc.unit_verts[u] += n;
+   }
+}
+
+static void
+ph_tc_stats_frame(struct ph_context *ctx)
+{
+   uint64_t total = 0, dwords = 0;
+
+   for (unsigned d = 0; d < PH_TC_STATS_DPV; d++) {
+      total += ctx->tc.dpv_verts[d];
+      dwords += ctx->tc.dpv_verts[d] * d;
+   }
+   fprintf(stderr, "parhelia tc/frame: %.1f draws, %.0f range vertices, "
+           "%.0f dwords;", ctx->tc.draws / 100.0, total / 100.0,
+           dwords / 100.0);
+   for (unsigned d = 0; d < PH_TC_STATS_DPV; d++)
+      if (ctx->tc.dpv_verts[d])
+         fprintf(stderr, " dpv%u:%.0f", d, ctx->tc.dpv_verts[d] / 100.0);
+   fputc('\n', stderr);
+   for (unsigned u = 0; u < 2; u++) {
+      if (!ctx->tc.verts[u])
+         continue;
+      fprintf(stderr, "  set %u: %.0f vertices, %.1f%% in [0,1], range "
+              "[%g, %g]\n    span log2 texels:", u, ctx->tc.verts[u] / 100.0,
+              100.0 * ctx->tc.unit_verts[u] / ctx->tc.verts[u],
+              ctx->tc.lo[u], ctx->tc.hi[u]);
+      for (unsigned b = 0; b < PH_TC_STATS_LOG2; b++)
+         if (ctx->tc.span_verts[u][b])
+            fprintf(stderr, " <%u:%.0f", b, ctx->tc.span_verts[u][b] / 100.0);
+      fprintf(stderr, "\n    magnitude log2 texels:");
+      for (unsigned b = 0; b < PH_TC_STATS_LOG2; b++)
+         if (ctx->tc.mag_verts[u][b])
+            fprintf(stderr, " <%u:%.0f", b, ctx->tc.mag_verts[u][b] / 100.0);
+      fputc('\n', stderr);
+   }
+   memset(&ctx->tc, 0, sizeof(ctx->tc));
+   for (unsigned u = 0; u < 2; u++) {
+      ctx->tc.lo[u] = INFINITY;
+      ctx->tc.hi[u] = -INFINITY;
+   }
+}
+
 /* A stream without a colour input takes the fragment stage's constant one. */
 static void
 ph_tcl_constant_colour(struct ph_context *ctx, const struct ph_tcl_layout *lay,
@@ -10321,6 +10434,8 @@ ph_draw_tcl(struct ph_context *ctx, const struct pipe_draw_info *info,
          lay.dpv -= saved;
       }
    }
+   if (ctx->tc_stats && fetch.count)
+      ph_tcl_coord_stats(ctx, &lay, &fetch, range);
 
    /* Mixed primitive kinds keep their order, and a batch carrying
     * window-space or differently transformed vertices ends here.  A batch
@@ -15635,8 +15750,13 @@ ph_flush(struct pipe_context *p, struct pipe_fence_handle **fence,
 
    ph_submit_vertices(ctx);
    ph_faa_resolve(ctx);
-   if (flags & PIPE_FLUSH_END_OF_FRAME)
+   if (flags & PIPE_FLUSH_END_OF_FRAME) {
       ph_stats_frame(ctx);
+      if (ctx->tc_stats && ++ctx->tc_frames == 100) {
+         ph_tc_stats_frame(ctx);
+         ctx->tc_frames = 0;
+      }
+   }
    /* The following X-server blit can order against an async kernel request,
     * but it cannot see an aggregate still owned by this userspace context. */
    if (ctx->aggregate_batches && ph_drain_batch(ctx)) {
@@ -17389,6 +17509,11 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
                      !strcmp(getenv("PARHELIA_STATS"), "sync");
    ctx->stats = ctx->stats_sync ||
                 debug_get_bool_option("PARHELIA_STATS", false);
+   ctx->tc_stats = debug_get_bool_option("PARHELIA_TC_STATS", false);
+   for (unsigned u = 0; u < 2; u++) {
+      ctx->tc.lo[u] = INFINITY;
+      ctx->tc.hi[u] = -INFINITY;
+   }
    ctx->pack_adjacent_packets = ph_screen(screen)->pack_adjacent_packets;
    ctx->aggregate_state_batches =
       ph_screen(screen)->stateful_submit &&
