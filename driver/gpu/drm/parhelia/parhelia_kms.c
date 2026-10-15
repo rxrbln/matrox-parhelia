@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2026 René Rebe <rene@exactco.de> */
 #include <linux/delay.h>
+#include <linux/dma-resv.h>
 #include <linux/interrupt.h>
 
 #include <drm/drm_atomic.h>
@@ -25,6 +26,7 @@
 static bool parhelia_clock_solve(struct parhelia_device *pdev, u32 clock,
 				 u32 *word, u32 *actual);
 static u32 parhelia_vblank_mask(struct parhelia_device *pdev);
+static void parhelia_flip_event_flush(struct parhelia_device *pdev);
 
 static u32 parhelia_common_read(void *cookie, u32 reg)
 {
@@ -884,7 +886,7 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	u32 dc;
 	u32 dct;
 	u32 format;
-	unsigned int head;
+	unsigned int head, i;
 	u32 pitch;
 
 	/* Drive the connector this commit enabled, not whichever one happens
@@ -954,8 +956,14 @@ static void parhelia_pipe_enable(struct drm_simple_display_pipe *pipe,
 	parhelia_write(pdev, dc + PARHELIA_DC_HDISP, (m->hdisplay - 1) << 16);
 	parhelia_write(pdev, dc + PARHELIA_DC_YPAN, 0);
 	parhelia_write(pdev, dc + PARHELIA_DC_VDISP, m->vdisplay - 1);
-	parhelia_write(pdev, dc + PARHELIA_DC_START,
-		       address & parhelia_dc_start_mask(pdev));
+	/* Every START slot gets the new surface, so it is fetched whichever
+	 * slot a previous flip left the controller on until slot 0 latches. */
+	for (i = 0; i < 4; i++)
+		parhelia_write(pdev, dc + PARHELIA_DC_START_SLOT(i),
+			       address & parhelia_dc_start_mask(pdev));
+	pdev->flip_slot = 0;
+	pdev->flip_vdisplay = m->vdisplay;
+	pdev->flip_vtotal = m->vtotal;
 	parhelia_write(pdev, dc + PARHELIA_DC_FORMAT, format);
 	parhelia_pipe_load_gamma(pipe, crtc_state->gamma_lut);
 	/* Do not mirror this into MMIO 0x0004/0x0008.  The complete engine
@@ -1002,45 +1010,152 @@ static void parhelia_pipe_disable_hw(struct drm_simple_display_pipe *pipe)
 
 static void parhelia_pipe_disable(struct drm_simple_display_pipe *pipe)
 {
+	parhelia_flip_event_flush(to_parhelia(pipe->crtc.dev));
 	matrox_kms_pipe_disable(pipe, parhelia_pipe_disable_hw);
 }
 
-static void
-parhelia_pipe_update_scanout(struct drm_simple_display_pipe *pipe,
-			     struct drm_plane_state *old_state)
+/* Select @fb in a START slot the controller is neither fetching nor about to
+ * take, the vendor's order (mtx3863, mtx2073): with @immediate the slot is
+ * taken at once, otherwise at line vtotal - 1. */
+static int parhelia_flip_select(struct parhelia_device *pdev,
+				struct drm_framebuffer *fb, bool immediate)
 {
-	struct drm_plane_state *state = pipe->plane.state;
-	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
+	struct drm_gem_object *gem = drm_gem_fb_get_obj(fb, 0);
+	u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
+	u32 address, format, slot;
+	int ret;
 
-	/* A dirty update only publishes WC writes already made through the
-	 * surface's linear aperture.  A real framebuffer change selects the new
-	 * native surface and is latched by the normal atomic/vblank path.
-	 */
-	if (!old_state->fb || old_state->fb != state->fb) {
-		struct drm_gem_object *gem = drm_gem_fb_get_obj(state->fb, 0);
-		struct parhelia_bo *bo = gem ? to_parhelia_bo(gem) : NULL;
-		u32 address;
+	if (!gem)
+		return -EINVAL;
+	ret = parhelia_scanout_address(pdev, gem, &address);
+	if (ret)
+		return ret;
+	format = parhelia_dc_surface_code(fb->format->format) | 0x00030000u |
+		 (to_parhelia_bo(gem)->gpu_pitch / fb->format->cpp[0]);
+	if (parhelia_read(pdev, dc + PARHELIA_DC_FORMAT) != format)
+		parhelia_write(pdev, dc + PARHELIA_DC_FORMAT, format);
+	/* round robin over three: the last selected slot may still be pending
+	 * with the one before it active */
+	slot = (pdev->flip_slot + 1) % 3;
+	parhelia_write(pdev, dc + PARHELIA_DC_START_SLOT(slot),
+		       address & parhelia_dc_start_mask(pdev));
+	parhelia_write(pdev, dc + PARHELIA_DC_CTRL, parhelia_dc_ctrl_on(pdev) |
+		       slot << PARHELIA_DC_CTRL_SLOT_SHIFT |
+		       (immediate ? PARHELIA_DC_CTRL_IMMEDIATE : 0));
+	pdev->flip_slot = slot;
+	return 0;
+}
 
-		if (gem && !parhelia_scanout_address(pdev, gem, &address)) {
-			u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
-			u32 cpp = state->fb->format->cpp[0];
-			u32 format =
-				parhelia_dc_surface_code(state->fb->format->format) |
-				0x00030000u | (bo->gpu_pitch / cpp);
+/* An immediate selection is taken within microseconds (3-21 us measured). */
+static void parhelia_flip_wait_immediate(struct parhelia_device *pdev)
+{
+	u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
+	unsigned int us;
 
-			parhelia_write(pdev, dc + PARHELIA_DC_START,
-				       address & parhelia_dc_start_mask(pdev));
-			parhelia_write(pdev, dc + PARHELIA_DC_FORMAT, format);
+	for (us = 0; us < 1000; us++) {
+		if (PARHELIA_DC_CTRL_ACTIVE(parhelia_read(pdev, dc + PARHELIA_DC_CTRL)) ==
+		    pdev->flip_slot)
+			return;
+		udelay(1);
+	}
+	dev_warn_ratelimited(&pdev->pdev->dev,
+			     "START slot %u not taken after an immediate flip\n",
+			     pdev->flip_slot);
+}
+
+/* The selected slot has been taken, or is taken at the end of the blanking
+ * the counter is in: the previous surface is no longer fetched. */
+static bool parhelia_flip_retiring(struct parhelia_device *pdev)
+{
+	unsigned int head = parhelia_kms_head(pdev);
+	u32 line = parhelia_read(pdev, PARHELIA_DCT(head) + PARHELIA_DCT_VCOUNT);
+	u32 ctrl = parhelia_read(pdev, PARHELIA_DC(head) + PARHELIA_DC_CTRL);
+
+	return PARHELIA_DC_CTRL_ACTIVE(ctrl) == pdev->flip_slot ||
+	       (line >= pdev->flip_vdisplay && line + 1 < pdev->flip_vtotal);
+}
+
+/* Complete the pending flip event from the vblank interrupt. */
+static void parhelia_flip_irq(struct parhelia_device *pdev)
+{
+	struct drm_crtc *crtc = &pdev->pipe.crtc;
+
+	spin_lock(&pdev->drm.event_lock);
+	if (pdev->flip_event) {
+		if (parhelia_flip_retiring(pdev)) {
+			drm_crtc_send_vblank_event(crtc, pdev->flip_event);
+			pdev->flip_event = NULL;
+			drm_crtc_vblank_put(crtc);
+		} else {
+			atomic64_inc(&pdev->submit_stats.flip_late_events);
 		}
 	}
+	spin_unlock(&pdev->drm.event_lock);
+}
+
+static void parhelia_flip_event_flush(struct parhelia_device *pdev)
+{
+	struct drm_crtc *crtc = &pdev->pipe.crtc;
+
+	spin_lock_irq(&pdev->drm.event_lock);
+	if (pdev->flip_event) {
+		drm_crtc_send_vblank_event(crtc, pdev->flip_event);
+		pdev->flip_event = NULL;
+		drm_crtc_vblank_put(crtc);
+	}
+	spin_unlock_irq(&pdev->drm.event_lock);
+}
+
+/* Hand the commit's event to the vblank interrupt after a synchronised flip,
+ * send it now after an immediate one, else arm it for the next vblank. */
+static void parhelia_flip_event(struct parhelia_device *pdev, bool flipped,
+				bool immediate)
+{
+	struct drm_crtc *crtc = &pdev->pipe.crtc;
+	struct drm_pending_vblank_event *event;
+
+	spin_lock_irq(&pdev->drm.event_lock);
+	event = crtc->state->event;
+	crtc->state->event = NULL;
+	if (event && flipped && !immediate && !drm_crtc_vblank_get(crtc)) {
+		if (WARN_ON(pdev->flip_event)) {
+			drm_crtc_send_vblank_event(crtc, pdev->flip_event);
+			drm_crtc_vblank_put(crtc);
+		}
+		pdev->flip_event = event;
+	} else if (event && !immediate && !drm_crtc_vblank_get(crtc)) {
+		drm_crtc_arm_vblank_event(crtc, event);
+	} else if (event) {
+		drm_crtc_send_vblank_event(crtc, event);
+	}
+	spin_unlock_irq(&pdev->drm.event_lock);
 }
 
 static void parhelia_pipe_update(struct drm_simple_display_pipe *pipe,
 				  struct drm_plane_state *old_state)
 {
-	matrox_kms_pipe_update(pipe, old_state,
-				 parhelia_pipe_update_scanout,
-				 parhelia_pipe_load_gamma);
+	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
+	struct drm_crtc_state *crtc_state = pipe->crtc.state;
+	struct drm_plane_state *state = pipe->plane.state;
+	bool immediate = crtc_state->async_flip;
+	bool flipped = false;
+
+	/* A dirty update only publishes WC writes already made through the
+	 * surface's linear aperture; a modeset already selected its surface. */
+	if (state->fb && crtc_state->active && old_state->fb != state->fb &&
+	    !drm_atomic_crtc_needs_modeset(crtc_state)) {
+		/* Publish CPU writes before selecting an updated scanout BO. */
+		wmb();
+		flipped = !parhelia_flip_select(pdev, state->fb, immediate);
+		if (flipped && immediate)
+			parhelia_flip_wait_immediate(pdev);
+		if (flipped)
+			atomic64_inc(immediate ? &pdev->submit_stats.async_flips :
+				     &pdev->submit_stats.sync_flips);
+	}
+	if (crtc_state->color_mgmt_changed)
+		parhelia_pipe_load_gamma(pipe, crtc_state->gamma_lut);
+	parhelia_flip_event(pdev, flipped, flipped && immediate);
 }
 
 static int parhelia_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
@@ -1071,8 +1186,10 @@ irqreturn_t parhelia_irq_handler(int irq, void *arg)
 	 * legitimately remain pending and a shared IRQ handler must not consume
 	 * another owner's status. */
 	parhelia_write(pdev, PARHELIA_MMIO_IRQ_ACK, active);
-	if (active & irq_desc.vblank_mask)
+	if (active & irq_desc.vblank_mask) {
 		drm_crtc_handle_vblank(&pdev->pipe.crtc);
+		parhelia_flip_irq(pdev);
+	}
 	/* Fence waiters re-read FENCE_DONE themselves; retirement needs the
 	 * submit mutex and runs from the workqueue. */
 	if (active & PARHELIA_IRQ_ENGINE) {
@@ -1132,19 +1249,18 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	return 0;
 }
 
-/* An asynchronous flip only reprograms the surface address.  The P690 latches
- * DC_START at the next retrace, so the image never changes mid-scanline; the
- * tearing an asynchronous flip permits comes from releasing the old buffer to
- * the client at once.  Everything else must already match the committed state. */
+/* An asynchronous flip only selects another surface; everything else must
+ * match the committed state.  The display pitch is the GPU pitch: the fb
+ * pitch is the CPU view's, which differs between host-view and plain
+ * objects of one layout.  The surface address is validated by prepare_fb
+ * once the object is pinned where the controller can fetch it. */
 static int parhelia_plane_async_check(struct drm_plane *plane,
 				      struct drm_atomic_commit *state,
 				      bool flip)
 {
 	struct drm_plane_state *new_state =
 		drm_atomic_get_new_plane_state(state, plane);
-	struct parhelia_device *pdev = to_parhelia(plane->dev);
 	struct drm_gem_object *gem, *old_gem;
-	u32 address;
 
 	if (!new_state->fb || !plane->state->fb || !plane->state->crtc ||
 	    new_state->crtc != plane->state->crtc ||
@@ -1158,15 +1274,14 @@ static int parhelia_plane_async_check(struct drm_plane *plane,
 	    new_state->src_w != plane->state->src_w ||
 	    new_state->src_h != plane->state->src_h ||
 	    new_state->rotation != plane->state->rotation ||
-	    new_state->fb->format != plane->state->fb->format ||
-	    new_state->fb->pitches[0] != plane->state->fb->pitches[0])
+	    new_state->fb->format != plane->state->fb->format)
 		return -EINVAL;
 	gem = drm_gem_fb_get_obj(new_state->fb, 0);
 	old_gem = drm_gem_fb_get_obj(plane->state->fb, 0);
 	if (!gem || !old_gem ||
 	    to_parhelia_bo(gem)->gpu_pitch != to_parhelia_bo(old_gem)->gpu_pitch)
 		return -EINVAL;
-	return parhelia_scanout_address(pdev, gem, &address);
+	return 0;
 }
 
 static void parhelia_plane_async_update(struct drm_plane *plane,
@@ -1178,21 +1293,15 @@ static void parhelia_plane_async_update(struct drm_plane *plane,
 	struct drm_crtc *crtc = plane->state->crtc;
 	struct drm_crtc_state *crtc_state =
 		drm_atomic_get_new_crtc_state(state, crtc);
-	struct drm_gem_object *gem = drm_gem_fb_get_obj(new_state->fb, 0);
-	u32 dc = PARHELIA_DC(parhelia_kms_head(pdev));
-	u32 address;
 
 	swap(plane->state->fb, new_state->fb);
-	if (gem && !parhelia_scanout_address(pdev, gem, &address)) {
-		wmb();
-		parhelia_write(pdev, dc + PARHELIA_DC_START,
-			       address & parhelia_dc_start_mask(pdev));
+	wmb();
+	if (!parhelia_flip_select(pdev, plane->state->fb, true)) {
+		parhelia_flip_wait_immediate(pdev);
 		atomic64_inc(&pdev->submit_stats.async_flips);
 	}
-	/* The asynchronous helper does not process events.  Report completion as
-	 * soon as the address is programmed: that is what the caller asked for by
-	 * setting DRM_MODE_PAGE_FLIP_ASYNC, and it is what releases the old buffer
-	 * to the client.  The visible change still happens at the next retrace. */
+	/* The asynchronous helper does not process events.  The previous surface
+	 * is no longer fetched once the immediate selection is taken. */
 	if (crtc_state && crtc_state->event) {
 		spin_lock_irq(&plane->dev->event_lock);
 		drm_crtc_send_vblank_event(crtc, crtc_state->event);
@@ -1201,26 +1310,87 @@ static void parhelia_plane_async_update(struct drm_plane *plane,
 	}
 }
 
+/* Rendering into @fb that has not retired yet. */
+static bool parhelia_fb_busy(struct drm_framebuffer *fb)
+{
+	struct drm_gem_object *gem = fb ? drm_gem_fb_get_obj(fb, 0) : NULL;
+
+	return gem && !dma_resv_test_signaled(gem->resv, DMA_RESV_USAGE_WRITE);
+}
+
 /* drm_atomic_helper_page_flip() and the atomic ioctl only record
- * drm_crtc_state.async_flip; without a driver commit tail that acts on it an
- * asynchronous flip would be committed like any other one and completed at the
- * next vblank.  Promote such a commit to the helper's asynchronous path when
- * the plane accepts it, so the flip is programmed and reported immediately. */
+ * drm_crtc_state.async_flip, which the commit tail acts on.  A flip whose
+ * framebuffer has retired its rendering takes the helper's asynchronous path
+ * from the ioctl; one still rendering goes through the commit worker, which
+ * waits for the render fence first. */
 static int parhelia_atomic_commit(struct drm_device *drm,
 				  struct drm_atomic_commit *state, bool nonblock)
 {
+	struct drm_plane_state *plane_state;
 	struct drm_crtc_state *crtc_state;
 	struct drm_crtc *crtc;
-	int i;
+	struct drm_plane *plane;
+	bool busy = false;
+	int i, j;
 
 	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
 		if (!crtc_state->async_flip)
 			continue;
-		if (!drm_atomic_helper_async_check(drm, state))
+		for_each_new_plane_in_state(state, plane, plane_state, j)
+			busy |= parhelia_fb_busy(plane_state->fb);
+		if (busy)
+			atomic64_inc(&to_parhelia(drm)->submit_stats.flip_fence_waits);
+		else if (!drm_atomic_helper_async_check(drm, state))
 			state->async_update = true;
 		break;
 	}
 	return drm_atomic_helper_commit(drm, state, nonblock);
+}
+
+/* The default tail, waiting for the flip events instead of one more vblank:
+ * an event is sent only once the old surface is no longer fetched. */
+static void parhelia_atomic_commit_tail(struct drm_atomic_commit *state)
+{
+	struct drm_device *dev = state->dev;
+
+	drm_atomic_helper_commit_modeset_disables(dev, state);
+	drm_atomic_helper_commit_planes(dev, state, 0);
+	drm_atomic_helper_commit_modeset_enables(dev, state);
+	drm_atomic_helper_fake_vblank(state);
+	drm_atomic_helper_commit_hw_done(state);
+	drm_atomic_helper_wait_for_flip_done(dev, state);
+	drm_atomic_helper_cleanup_planes(dev, state);
+}
+
+static const struct drm_mode_config_helper_funcs parhelia_mode_config_helpers = {
+	.atomic_commit_tail = parhelia_atomic_commit_tail,
+};
+
+/* Pin the framebuffer where the display controller can fetch it and check
+ * the address there, then take its render fence like the VRAM helper. */
+static int parhelia_pipe_prepare_fb(struct drm_simple_display_pipe *pipe,
+				    struct drm_plane_state *plane_state)
+{
+	struct parhelia_device *pdev = to_parhelia(pipe->crtc.dev);
+	struct drm_framebuffer *fb = plane_state->fb;
+	struct drm_gem_object *gem;
+	u32 address;
+	int ret;
+
+	if (!fb)
+		return 0;
+	gem = drm_gem_fb_get_obj(fb, 0);
+	if (!gem)
+		return -EINVAL;
+	ret = parhelia_vram_pin_scanout(pdev, drm_gem_vram_of_gem(gem));
+	if (ret)
+		return ret;
+	ret = parhelia_scanout_address(pdev, gem, &address);
+	if (!ret)
+		ret = drm_gem_plane_helper_prepare_fb(&pipe->plane, plane_state);
+	if (ret)
+		parhelia_vram_unpin(drm_gem_vram_of_gem(gem));
+	return ret;
 }
 
 static const struct drm_simple_display_pipe_funcs parhelia_pipe_funcs = {
@@ -1231,7 +1401,7 @@ static const struct drm_simple_display_pipe_funcs parhelia_pipe_funcs = {
 	.update = parhelia_pipe_update,
 	.enable_vblank = parhelia_pipe_enable_vblank,
 	.disable_vblank = parhelia_pipe_disable_vblank,
-	.prepare_fb = matrox_kms_pipe_prepare_fb,
+	.prepare_fb = parhelia_pipe_prepare_fb,
 	.cleanup_fb = matrox_kms_pipe_cleanup_fb,
 };
 
@@ -1444,6 +1614,7 @@ int parhelia_modeset_init(struct parhelia_device *pdev)
 	if (ret)
 		return ret;
 	drm->mode_config.funcs = &parhelia_mode_config_funcs;
+	drm->mode_config.helper_private = &parhelia_mode_config_helpers;
 	/* Framebuffer limits apply to cursor framebuffers as well as scanout.
 	 * Keep the lower bound small enough for the 64x64 ARGB cursor BO; mode
 	 * limits are enforced separately by the connector/pipe checks. */

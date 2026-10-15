@@ -208,6 +208,14 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
  * address carrying bit 10 would be truncated; the P690 latches [27:10]. */
 #define PARHELIA_DC_START_MASK_ORIGINAL	0x07fff800u
 #define PARHELIA_DC_START_MASK		0x0ffffc00u
+/* Four START slots per controller (DC_START is slot 0).  DC_CTRL[8:7]
+ * selects one, latched when the line counter reaches vtotal - 1 unless bit 6
+ * asks for it at once; [17:16] reports the slot being fetched (vendor
+ * mtx3863/mtx2073/mtx416, measured on the 0528 and the P690). */
+#define PARHELIA_DC_START_SLOT(n)	(PARHELIA_DC_START + 4 * (n))
+#define PARHELIA_DC_CTRL_SLOT_SHIFT	7
+#define PARHELIA_DC_CTRL_IMMEDIATE	BIT(6)
+#define PARHELIA_DC_CTRL_ACTIVE(ctrl)	(((ctrl) >> 16) & 3)
 #define PARHELIA_DC_VIDEO_EN		0x0030
 #define PARHELIA_DC_DIM_EN		0x0082
 #define PARHELIA_DCT_MISC		0x000
@@ -216,6 +224,8 @@ static inline bool parhelia_pins_has(const struct parhelia_bios *bios,
 #define PARHELIA_DCT_HSYNC		0x014
 #define PARHELIA_DCT_VTOTAL		0x018
 #define PARHELIA_DCT_VTIMING		0x020
+/* live vertical scanline counter, read-only */
+#define PARHELIA_DCT_VCOUNT		0x024
 #define PARHELIA_DCT_VBLANK2		0x028
 #define PARHELIA_DCT_VTIMING2		0x02c
 #define PARHELIA_DCT_VSYNC		0x030
@@ -503,6 +513,11 @@ enum parhelia_submit_phase {
 
 struct parhelia_submit_stats {
 	atomic64_t async_flips;
+	/* vblank-latched flips, and those whose event waited another frame */
+	atomic64_t sync_flips;
+	atomic64_t flip_late_events;
+	/* asynchronous flips that first waited for their render fence */
+	atomic64_t flip_fence_waits;
 	atomic64_t async_submits;
 	atomic64_t slot_waits;
 	atomic64_t slot_wait_ns;
@@ -585,6 +600,8 @@ struct parhelia_bo {
 	u8 cpp;
 	bool host_aperture;
 	bool host_view;
+	/* has been a KMS framebuffer: keep it where the CRTC can fetch it */
+	bool scanout;
 	/* submissions holding the object; together they own one TTM pin */
 	atomic_t submit_pins;
 };
@@ -622,6 +639,13 @@ struct parhelia_device {
 	struct drm_simple_display_pipe pipe;
 	/* the simple pipe's plane helpers plus the asynchronous flip hooks */
 	struct drm_plane_helper_funcs plane_helper_funcs;
+	/* START slot last selected, and the vblank-synchronised flip's event
+	 * until that slot is taken (under drm.event_lock) */
+	u8 flip_slot;
+	struct drm_pending_vblank_event *flip_event;
+	/* scanline counter values of the active mode: the vblank interrupt
+	 * fires at vdisplay, a selected START slot latches at vtotal - 1 */
+	u32 flip_vdisplay, flip_vtotal;
 	struct parhelia_output outputs[PARHELIA_MAX_OUTPUTS];
 	u8 num_outputs;
 	/* The output the single display pipe is currently driving.  The pipe
@@ -935,6 +959,19 @@ static inline bool parhelia_original_family(const struct parhelia_device *pdev)
 	return pdev->pdev->device == PARHELIA_512 ||
 	       pdev->pdev->device == PARHELIA_8X;
 }
+
+/* VRAM the display controller can fetch, from offset 0.  The original
+ * family's START field (0x07fff800) ends below bank B's engine base
+ * 0x08000000, so only bank A is scannable there; the P690's covers both. */
+static inline u64 parhelia_display_vram_limit(const struct parhelia_device *pdev)
+{
+	if (parhelia_original_family(pdev))
+		return min_t(u64, pdev->vram_size >> 1, SZ_128M);
+	return pdev->vram_size;
+}
+
+int parhelia_vram_pin_scanout(struct parhelia_device *pdev,
+			      struct drm_gem_vram_object *gbo);
 
 bool parhelia_p690_faa(const struct parhelia_device *pdev);
 

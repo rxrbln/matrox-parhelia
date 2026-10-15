@@ -147,6 +147,11 @@ static int parhelia_submit_stats_show(struct seq_file *m, void *data)
 	seq_printf(m, "queue_high_water %lld\n",
 		   atomic64_read(&stats->queue_high_water));
 	seq_printf(m, "async_flips %lld\n", atomic64_read(&stats->async_flips));
+	seq_printf(m, "sync_flips %lld\n", atomic64_read(&stats->sync_flips));
+	seq_printf(m, "flip_late_events %lld\n",
+		   atomic64_read(&stats->flip_late_events));
+	seq_printf(m, "flip_fence_waits %lld\n",
+		   atomic64_read(&stats->flip_fence_waits));
 	seq_printf(m, "engine_irqs %lld\n", atomic64_read(&stats->engine_irqs));
 	seq_printf(m, "fence_waits %lld\n", atomic64_read(&stats->fence_waits));
 	seq_printf(m, "gpu_busy_ns %lld\n", atomic64_read(&stats->gpu_busy_ns));
@@ -2432,8 +2437,8 @@ int parhelia_window_places_init(struct parhelia_device *pdev)
 	return 0;
 }
 
-static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
-				    u64 vram_size, bool split_banks)
+static int parhelia_vram_placement_class(struct drm_gem_vram_object *bo,
+					  u64 vram_size, bool split_banks)
 {
 	struct parhelia_bo *pbo = container_of(bo, struct parhelia_bo, gbo);
 	struct parhelia_device *pdev = to_parhelia(bo->bo.base.dev);
@@ -2482,6 +2487,42 @@ static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 	    parhelia_original_family(pdev))
 		bo->placements[0].flags |= TTM_PL_FLAG_TOPDOWN;
 	return ret;
+}
+
+/* A framebuffer stays where the display controller can fetch it: windowed
+ * targets in the windows below the limit, anything else clamped to it. */
+static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
+				    u64 vram_size, bool split_banks)
+{
+	struct parhelia_bo *pbo = container_of(bo, struct parhelia_bo, gbo);
+	struct parhelia_device *pdev;
+	unsigned int i, n = 0;
+	u64 limit;
+	int ret;
+
+	ret = parhelia_vram_placement_class(bo, vram_size, split_banks);
+	if (ret || !pbo->scanout)
+		return ret;
+	pdev = to_parhelia(bo->bo.base.dev);
+	limit = parhelia_display_vram_limit(pdev) >> PAGE_SHIFT;
+	if (limit >= vram_size >> PAGE_SHIFT)
+		return 0;
+	if (bo->placement.placement == pdev->window_places) {
+		n = min_t(u32, pdev->window_count, (limit << PAGE_SHIFT) / SZ_16M);
+		bo->placement.num_placement = n;
+		return n ? 0 : -E2BIG;
+	}
+	for (i = 0; i < bo->placement.num_placement; i++) {
+		struct ttm_place place = bo->placements[i];
+
+		if (!place.lpfn || place.lpfn > limit)
+			place.lpfn = limit;
+		if (place.fpfn + PFN_UP(bo->bo.base.size) > place.lpfn)
+			continue;
+		bo->placements[n++] = place;
+	}
+	bo->placement.num_placement = n;
+	return n ? 0 : -E2BIG;
 }
 
 /* Register-list runs: later lists keep their headers, a header is never an
@@ -2700,6 +2741,35 @@ int parhelia_vram_pin(struct drm_gem_vram_object *bo)
 		return ret;
 	ret = parhelia_vram_pin_locked(bo);
 	ttm_bo_unreserve(&bo->bo);
+	return ret;
+}
+
+/* Pin a framebuffer for the display controller.  The object keeps the
+ * display range for every later placement; one found outside it is moved
+ * unless something else holds it there. */
+int parhelia_vram_pin_scanout(struct parhelia_device *pdev,
+			      struct drm_gem_vram_object *gbo)
+{
+	struct parhelia_bo *bo = container_of(gbo, struct parhelia_bo, gbo);
+	u64 limit = parhelia_display_vram_limit(pdev) >> PAGE_SHIFT;
+	struct ttm_resource *res;
+	int ret;
+
+	ret = ttm_bo_reserve(&gbo->bo, true, false, NULL);
+	if (ret)
+		return ret;
+	bo->scanout = true;
+	if (gbo->bo.pin_count) {
+		res = gbo->bo.resource;
+		if (!res || res->mem_type != TTM_PL_VRAM ||
+		    res->start + PFN_UP(gbo->bo.base.size) > limit)
+			ret = -ERANGE;
+		else
+			ttm_bo_pin(&gbo->bo);
+	} else {
+		ret = parhelia_vram_pin_locked(gbo);
+	}
+	ttm_bo_unreserve(&gbo->bo);
 	return ret;
 }
 
@@ -5250,7 +5320,10 @@ static void parhelia_move_colour_below_depth(struct parhelia_device *pdev,
 		ttm_bo_unreserve(&colour->bo);
 		return;
 	}
-	if (!colour->bo.pin_count) {
+	/* a framebuffer only follows its depth inside the display range */
+	if (!colour->bo.pin_count &&
+	    (!container_of(colour, struct parhelia_bo, gbo)->scanout ||
+	     lo + SZ_16M <= parhelia_display_vram_limit(pdev))) {
 		ret = parhelia_vram_placement_range(colour, pdev->vram_size,
 						    false, lo >> PAGE_SHIFT,
 						    (lo + SZ_16M) >> PAGE_SHIFT);
