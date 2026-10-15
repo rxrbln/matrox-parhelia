@@ -16194,11 +16194,13 @@ ph_shadow_transfer_box(struct parhelia_resource *r, unsigned level,
    return ret;
 }
 
-/* P690: an unflipped level-0 copy between 32-bit colour targets on the 2-D
- * engine, queued behind the pending stream.  Within one object only a
- * vertical move is exact, walked away from the destination (DWGCTL bit 13
+/* An unflipped level-0 copy between 32-bit colour targets on the 2-D
+ * engine, queued behind the pending stream.  P690: within one object only
+ * a vertical move is exact, walked away from the destination (DWGCTL bit 13
  * when moving down); same-row moves corrupt pixels even without overlap
- * (MEASURED, kms-ddx 0477dd01), so those keep the CPU copy. */
+ * (MEASURED, kms-ddx 0477dd01), so those keep the CPU copy.  The original
+ * family copies between distinct objects only: a same-surface BITBLT locked
+ * up its engine, and its walk direction is unmeasured. */
 static bool
 ph_copy_texture_box_engine(struct ph_context *ctx,
                            struct parhelia_resource *dr, unsigned dst_level,
@@ -16207,10 +16209,14 @@ ph_copy_texture_box_engine(struct ph_context *ctx,
                            const struct pipe_box *box,
                            int dst_width, int dst_height)
 {
+   const unsigned chip = ph_screen(ctx->base.screen)->chip_id;
+   const bool lx = ph_lx_family(chip);
+   const unsigned layout = lx ? PARHELIA_TILE_64X16_4K :
+                                PARHELIA_TILE_64X32_8K;
    const bool same = dr == sr;
    int ret;
 
-   if (!ctx->engine_copy || !ph_lx_family(ph_screen(ctx->base.screen)->chip_id) ||
+   if (!ctx->engine_copy || (!lx && !ph_original_family(chip)) ||
        src_level || dst_level || box->z || box->depth != 1 ||
        box->width <= 0 || box->height <= 0 ||
        dst_width != box->width || dst_height != box->height ||
@@ -16219,8 +16225,7 @@ ph_copy_texture_box_engine(struct ph_context *ctx,
        (int64_t)box->y + box->height > sr->base.height0 ||
        (int64_t)dstx + box->width > dr->base.width0 ||
        (int64_t)dsty + box->height > dr->base.height0 ||
-       sr->tile_layout != PARHELIA_TILE_64X16_4K ||
-       dr->tile_layout != PARHELIA_TILE_64X16_4K ||
+       sr->tile_layout != layout || dr->tile_layout != layout ||
        sr->cpp != 4 || dr->cpp != 4 || sr->surf_fmt != dr->surf_fmt ||
        !sr->handle || !dr->handle || sr->decoded || dr->decoded ||
        sr->linear_dirty || dr->linear_dirty ||
@@ -16228,7 +16233,7 @@ ph_copy_texture_box_engine(struct ph_context *ctx,
        ph_resource_uses_sampler_layout(dr) ||
        util_format_is_depth_or_stencil(sr->base.format) ||
        util_format_is_depth_or_stencil(dr->base.format) ||
-       (same && box->x != dstx)) {
+       (same && (!lx || box->x != dstx))) {
       if (ph_env("PARHELIA_TRACE_COPY"))
          fprintf(stderr, "parhelia: no engine copy: levels %u/%u layout %u/%u cpp %u/%u fmt %#x/%#x handle %u/%u linear_dirty %d/%d sampler %d/%d same %d\n",
                  src_level, dst_level, sr->tile_layout, dr->tile_layout,
@@ -17826,7 +17831,9 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       debug_get_bool_option("PARHELIA_PACKED_COLOUR", true);
    ctx->drop_repeats = debug_get_bool_option("PARHELIA_DROP_REPEATS", false);
    ctx->ring_reuse = debug_get_bool_option("PARHELIA_RING_REUSE", true);
-   ctx->engine_copy = debug_get_bool_option("PARHELIA_ENGINE_COPY", true);
+   /* the original family's engine copy is untested on hardware: opt-in */
+   ctx->engine_copy = debug_get_bool_option("PARHELIA_ENGINE_COPY",
+      ph_lx_family(ph_screen(screen)->chip_id));
    parhelia_state_cache_set_reglist_runs(ctx->state_cache,
       ph_screen(screen)->reglist_runs && !ctx->state_filter &&
       !ctx->drop_repeats);
