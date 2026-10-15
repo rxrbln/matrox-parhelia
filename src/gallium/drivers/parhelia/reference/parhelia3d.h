@@ -972,6 +972,13 @@ void	 p3d_emit_blit(struct p3d_cs *cs, const struct p3d_surface *dst,
 		       unsigned dst_type, uint32_t dst_x, uint32_t dst_y,
 		       const struct p3d_surface *src, unsigned src_type,
 		       uint32_t src_x, uint32_t src_y, uint32_t w, uint32_t h);
+#define P3D_DWGCTL_IDLE	0x707u	/* wait for the engine to go idle */
+#define P3D_DWGCTL_BLIT_BOTTOM_UP 0x2000u	/* BITBLT walks the rows upward */
+void	 p3d_emit_blit_walk(struct p3d_cs *cs, const struct p3d_surface *dst,
+			    unsigned dst_type, uint32_t dst_x, uint32_t dst_y,
+			    const struct p3d_surface *src, unsigned src_type,
+			    uint32_t src_x, uint32_t src_y, uint32_t w,
+			    uint32_t h, int bottom_up);
 void	 p3d_emit_clear_frame(struct p3d_cs *cs, const struct p3d_state *st,
 			      uint32_t colour, uint32_t depth);
 

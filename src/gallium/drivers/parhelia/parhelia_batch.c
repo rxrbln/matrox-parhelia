@@ -1068,6 +1068,41 @@ parhelia_batch_blit_format(struct parhelia_batch *batch,
 }
 
 int
+parhelia_batch_blit_walk(struct parhelia_batch *batch,
+                         uint32_t dst_handle, unsigned dst_pitch,
+                         unsigned dst_x, unsigned dst_y,
+                         uint32_t src_handle, unsigned src_pitch,
+                         unsigned src_x, unsigned src_y,
+                         unsigned format, unsigned width,
+                         unsigned height, bool bottom_up)
+{
+   struct p3d_reloc calls[PH_BATCH_PACKETS];
+   uint32_t ring[PH_BATCH_PACKETS * 5];
+   struct p3d_cs cs;
+   struct p3d_surface dst = {.pitch = dst_pitch, .fmt = format};
+   struct p3d_surface src = {.pitch = src_pitch, .fmt = format};
+
+   if (!batch || !dst_handle || !src_handle || !width || !height ||
+       !p3d_surface_format_bytes(format) ||
+       !dst_pitch || dst_pitch > 0x3fff ||
+       !src_pitch || src_pitch > 0x3fff ||
+       dst_x > dst_pitch || width > dst_pitch - dst_x ||
+       src_x > src_pitch || width > src_pitch - src_x ||
+       dst_y > 0xffff || src_y > 0xffff ||
+       height > 0xffff - dst_y || height > 0xffff - src_y)
+      return -EINVAL;
+   batch->command_count = 0;
+   batch->packet_count = 0;
+   batch->reloc_count = 0;
+   p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
+               PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
+   p3d_emit_blit_walk(&cs, &dst, 2, dst_x, dst_y, &src, 2, src_x, src_y,
+                      width, height, bottom_up);
+   return batch_finish(batch, &cs, calls, dst_handle, 0, NULL, NULL,
+                       src_handle, 0, 0, P3D_TRIANGLES, 0, 0, false, 0, false);
+}
+
+int
 parhelia_batch_triangles(struct parhelia_batch *batch,
                         uint32_t colour_handle, uint32_t warp_entry,
                         unsigned width, unsigned height, unsigned pitch,

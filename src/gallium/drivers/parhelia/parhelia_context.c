@@ -664,6 +664,7 @@ struct ph_context {
    unsigned batch_stages;	/* its vertex-program binds, with batch_calls */
    unsigned pending_call_bound;
    bool ring_reuse;		/* the lowest free ring slot, not the next */
+   bool engine_copy;		/* colour target copies on the 2-D engine */
    int pending_ring_slot;        /* -1: not in the ring */
    uint32_t pending_ring_fence;  /* last submit that read the slot */
    unsigned pending_vertex_dwords;
@@ -16193,6 +16194,78 @@ ph_shadow_transfer_box(struct parhelia_resource *r, unsigned level,
    return ret;
 }
 
+/* P690: an unflipped level-0 copy between 32-bit colour targets on the 2-D
+ * engine, queued behind the pending stream.  Within one object only a
+ * vertical move is exact, walked away from the destination (DWGCTL bit 13
+ * when moving down); same-row moves corrupt pixels even without overlap
+ * (MEASURED, kms-ddx 0477dd01), so those keep the CPU copy. */
+static bool
+ph_copy_texture_box_engine(struct ph_context *ctx,
+                           struct parhelia_resource *dr, unsigned dst_level,
+                           int dstx, int dsty,
+                           struct parhelia_resource *sr, unsigned src_level,
+                           const struct pipe_box *box,
+                           int dst_width, int dst_height)
+{
+   const bool same = dr == sr;
+   int ret;
+
+   if (!ctx->engine_copy || !ph_lx_family(ph_screen(ctx->base.screen)->chip_id) ||
+       src_level || dst_level || box->z || box->depth != 1 ||
+       box->width <= 0 || box->height <= 0 ||
+       dst_width != box->width || dst_height != box->height ||
+       box->x < 0 || box->y < 0 || dstx < 0 || dsty < 0 ||
+       (int64_t)box->x + box->width > sr->base.width0 ||
+       (int64_t)box->y + box->height > sr->base.height0 ||
+       (int64_t)dstx + box->width > dr->base.width0 ||
+       (int64_t)dsty + box->height > dr->base.height0 ||
+       sr->tile_layout != PARHELIA_TILE_64X16_4K ||
+       dr->tile_layout != PARHELIA_TILE_64X16_4K ||
+       sr->cpp != 4 || dr->cpp != 4 || sr->surf_fmt != dr->surf_fmt ||
+       !sr->handle || !dr->handle || sr->decoded || dr->decoded ||
+       sr->linear_dirty || dr->linear_dirty ||
+       ph_resource_uses_sampler_layout(sr) ||
+       ph_resource_uses_sampler_layout(dr) ||
+       util_format_is_depth_or_stencil(sr->base.format) ||
+       util_format_is_depth_or_stencil(dr->base.format) ||
+       (same && box->x != dstx)) {
+      if (ph_env("PARHELIA_TRACE_COPY"))
+         fprintf(stderr, "parhelia: no engine copy: levels %u/%u layout %u/%u cpp %u/%u fmt %#x/%#x handle %u/%u linear_dirty %d/%d sampler %d/%d same %d\n",
+                 src_level, dst_level, sr->tile_layout, dr->tile_layout,
+                 sr->cpp, dr->cpp, sr->surf_fmt, dr->surf_fmt, sr->handle,
+                 dr->handle, sr->linear_dirty, dr->linear_dirty,
+                 ph_resource_uses_sampler_layout(sr),
+                 ph_resource_uses_sampler_layout(dr), same);
+      return false;
+   }
+   if (same && box->y == dsty)
+      return true;
+   ph_submit_vertices(ctx);
+   if (ctx->aggregate_batches && ph_drain_batch(ctx))
+      return false;
+   ret = parhelia_batch_blit_walk(&ctx->build_batch, dr->handle, dr->stride,
+                                  dstx, dsty, sr->handle, sr->stride,
+                                  box->x, box->y, sr->surf_fmt, box->width,
+                                  box->height, same && dsty > box->y);
+   if (!ret)
+      ret = ph_submit_batch_now_untimed(ctx, &ctx->build_batch, NULL, 0);
+   if (ph_env("PARHELIA_TRACE_COPY"))
+      fprintf(stderr, "parhelia: engine copy %u:%d,%d -> %u:%d,%d %dx%d%s ret=%d\n",
+              sr->handle, box->x, box->y, dr->handle, dstx, dsty, box->width,
+              box->height, same && dsty > box->y ? " bottom-up" : "", ret);
+   /* A refused request falls back to the CPU copy; anything else is fatal. */
+   if (ret) {
+      if (ret != -EINVAL)
+         ctx->submit_error = ret;
+      return false;
+   }
+   /* the linear companion follows on its next resolve */
+   dr->tiled_dirty = !!dr->linear_map;
+   dr->mip_defined |= BITFIELD_BIT(0);
+   dr->content_generation++;
+   return true;
+}
+
 static bool
 ph_copy_texture_box(struct ph_context *ctx,
                     struct pipe_resource *dst, unsigned dst_level,
@@ -16225,6 +16298,12 @@ ph_copy_texture_box(struct ph_context *ctx,
        !ph_level_extent(sr, src_level, &src_w, &src_h) ||
        !ph_level_extent(dr, dst_level, &dst_w, &dst_h) ||
        (uint64_t)width * height * cpp > SIZE_MAX)
+      return false;
+
+   if (ph_copy_texture_box_engine(ctx, dr, dst_level, dstx, dsty, sr,
+                                  src_level, src_box, dst_width, dst_height))
+      return !ctx->submit_error;
+   if (ctx->submit_error)
       return false;
 
    /* This implementation copies through CPU-visible mappings.  The source
@@ -17747,6 +17826,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       debug_get_bool_option("PARHELIA_PACKED_COLOUR", true);
    ctx->drop_repeats = debug_get_bool_option("PARHELIA_DROP_REPEATS", false);
    ctx->ring_reuse = debug_get_bool_option("PARHELIA_RING_REUSE", true);
+   ctx->engine_copy = debug_get_bool_option("PARHELIA_ENGINE_COPY", true);
    parhelia_state_cache_set_reglist_runs(ctx->state_cache,
       ph_screen(screen)->reglist_runs && !ctx->state_filter &&
       !ctx->drop_repeats);

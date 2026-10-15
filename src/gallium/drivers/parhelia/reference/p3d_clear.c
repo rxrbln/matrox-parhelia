@@ -78,6 +78,37 @@ p3d_emit_blit(struct p3d_cs *cs, const struct p3d_surface *dst,
 	p3d_reglist(cs, rw, n);
 }
 
+/* The same copy after an idle DWGCTL, so it reads what earlier engine work
+ * wrote.  @bottom_up reverses the walk in Y (DWGCTL bit 13, measured on the
+ * P690): it then starts at the last row, which SRC and DSTXY name. */
+void
+p3d_emit_blit_walk(struct p3d_cs *cs, const struct p3d_surface *dst,
+		   unsigned dst_type, uint32_t dst_x, uint32_t dst_y,
+		   const struct p3d_surface *src, unsigned src_type,
+		   uint32_t src_x, uint32_t src_y, uint32_t w, uint32_t h,
+		   int bottom_up)
+{
+	const uint32_t edge = bottom_up ? h - 1 : 0;
+	struct p3d_rw rw[10];
+	size_t n = 0;
+
+	rw[n].reg = P3D_R_SURF0_BASE; rw[n].val = dst->base; n++;
+	rw[n].reg = P3D_R_SURF0_BASE + 4;
+	rw[n].val = p3d_surface_cfg_type(dst, dst_type); n++;
+	rw[n].reg = P3D_R_SURF0_BASE + 16; rw[n].val = src->base; n++;
+	rw[n].reg = P3D_R_SURF0_BASE + 20;
+	rw[n].val = p3d_surface_cfg_type(src, src_type); n++;
+	rw[n].reg = 0x1324; rw[n].val = 0xffffffffu; n++;
+	rw[n].reg = P3D_R_DWGCTL; rw[n].val = P3D_DWGCTL_IDLE; n++;
+	rw[n].reg = P3D_R_DWGCTL;
+	rw[n].val = P3D_DWGCTL_BITBLT_2_TO_0 |
+		    (bottom_up ? P3D_DWGCTL_BLIT_BOTTOM_UP : 0); n++;
+	rw[n].reg = 0x1304; rw[n].val = ((src_y + edge) << 16) | (src_x & 0xffffu); n++;
+	rw[n].reg = 0x1308; rw[n].val = ((dst_y + edge) << 16) | (dst_x & 0xffffu); n++;
+	rw[n].reg = 0x138c; rw[n].val = (h << 16) | (w & 0xffffu); n++;
+	p3d_reglist(cs, rw, n);
+}
+
 /* The vendor's Z-init sequence (mtxpserd.dll 0x9eff0/0x9f270): the value
  * register and both DWGCTL writes travel in ONE register list, so the control
  * word is consumed before anything else can run. */
