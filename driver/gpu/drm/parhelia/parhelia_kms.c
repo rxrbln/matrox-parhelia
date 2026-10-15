@@ -3,6 +3,7 @@
 #include <linux/delay.h>
 #include <linux/dma-resv.h>
 #include <linux/interrupt.h>
+#include <linux/slab.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -15,7 +16,9 @@
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_vram_helper.h>
+#include <drm/drm_modeset_helper.h>
 #include <drm/drm_modes.h>
+#include <drm/drm_plane.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_rect.h>
 #include <drm/drm_vblank.h>
@@ -1201,11 +1204,20 @@ irqreturn_t parhelia_irq_handler(int irq, void *arg)
 }
 
 /* A framebuffer's pitch is that of the CPU view or the native GPU pitch the
- * controller fetches with.  A host-view object's CPU pitch is a power of
- * two, so at widths like 1920 only the GPU pitch fits its storage. */
+ * controller fetches with. */
 static bool parhelia_fb_pitch_valid(const struct parhelia_bo *bo, u32 pitch)
 {
 	return pitch == parhelia_bo_cpu_pitch(bo) || pitch == bo->gpu_pitch;
+}
+
+/* A host-view pitch is a power of two and addresses the CPU-linear view,
+ * which can outgrow the GPU object (8192 against 7680 bytes at 1920). */
+static size_t parhelia_fb_view_size(const struct parhelia_bo *bo, u32 pitch)
+{
+	size_t size = bo->gbo.bo.base.size;
+
+	return bo->host_view && pitch == bo->host_pitch ?
+	       max(size, bo->host_size) : size;
 }
 
 static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
@@ -1426,11 +1438,15 @@ parhelia_fb_create(struct drm_device *drm, struct drm_file *file,
 	struct drm_gem_object *gem;
 	struct parhelia_bo *bo;
 	struct drm_framebuffer *fb;
+	u64 min_size;
+	int ret;
 
 	if ((info->format != DRM_FORMAT_XRGB8888 &&
 	     info->format != DRM_FORMAT_ARGB8888 &&
 	     info->format != DRM_FORMAT_RGB565 &&
-	     info->format != DRM_FORMAT_XRGB2101010) || mode_cmd->offsets[0])
+	     info->format != DRM_FORMAT_XRGB2101010) || mode_cmd->offsets[0] ||
+	    !drm_any_plane_has_format(drm, mode_cmd->pixel_format,
+				      mode_cmd->modifier[0]))
 		return ERR_PTR(-EINVAL);
 	gem = drm_gem_object_lookup(file, mode_cmd->handles[0]);
 	if (!gem)
@@ -1440,14 +1456,29 @@ parhelia_fb_create(struct drm_device *drm, struct drm_file *file,
 		goto out_put;
 	}
 	bo = to_parhelia_bo(gem);
+	min_size = (u64)(mode_cmd->height - 1) * mode_cmd->pitches[0] +
+		   drm_format_info_min_pitch(info, 0, mode_cmd->width);
 	if (!parhelia_bo_is_native(bo) ||
 	    !parhelia_fb_pitch_valid(bo, mode_cmd->pitches[0]) ||
-	    bo->width < mode_cmd->width || bo->height < mode_cmd->height) {
+	    bo->width < mode_cmd->width || bo->height < mode_cmd->height ||
+	    min_size > parhelia_fb_view_size(bo, mode_cmd->pitches[0])) {
 		fb = ERR_PTR(-EINVAL);
 		goto out_put;
 	}
-	fb = drm_gem_fb_create_with_funcs(drm, file, info, mode_cmd,
-					  &matrox_kms_fb_funcs);
+	/* drm_gem_fb_create() would check a host-view pitch against the
+	 * smaller GPU object, so the view size was checked above instead. */
+	fb = kzalloc(sizeof(*fb), GFP_KERNEL);
+	if (!fb) {
+		fb = ERR_PTR(-ENOMEM);
+		goto out_put;
+	}
+	drm_helper_mode_fill_fb_struct(drm, fb, info, mode_cmd);
+	fb->obj[0] = gem;
+	ret = drm_framebuffer_init(drm, fb, &matrox_kms_fb_funcs);
+	if (!ret)
+		return fb;
+	kfree(fb);
+	fb = ERR_PTR(ret);
 out_put:
 	drm_gem_object_put(gem);
 	return fb;
