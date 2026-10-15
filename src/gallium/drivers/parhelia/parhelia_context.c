@@ -517,6 +517,8 @@ struct ph_context {
    /* An indexed batch: this many vertices staged, then triangles * 3 u32
     * indices into them. */
    unsigned indexed_verts;
+   bool staged_index16;		/* the staged indices are 16-bit */
+   bool index16;		/* PARHELIA_INDEX16: 16-bit indices where they fit */
    unsigned batch_index_dwords;	/* the indices of the batch being submitted */
    unsigned pending_index_dwords;	/* those in the pending aggregate */
    float *deindex;
@@ -1597,6 +1599,14 @@ ph_stage_at_ring_tail(struct ph_context *ctx)
    ctx->stage_room = MIN2(left, ARRAY_SIZE(ctx->vertex_store));
 }
 
+/* Dwords the staged batch's indices take behind its vertices. */
+static inline unsigned
+ph_index_dwords(const struct ph_context *ctx)
+{
+   return ctx->staged_index16 ? (ctx->triangles * 3 + 1) / 2 :
+                                ctx->triangles * 3;
+}
+
 /* Another batch is appended while one is staged at the aggregate's tail:
  * move the staged one out of its way. */
 static void
@@ -1610,7 +1620,7 @@ ph_stage_evict(struct ph_context *ctx, const void *vertices)
     * indices behind an indexed batch's vertices */
    const size_t live = !ctx->staged_dpv ? ctx->stage_room :
       ctx->indexed_verts ?
-      (size_t)ctx->indexed_verts * ctx->staged_dpv + ctx->triangles * 3 :
+      (size_t)ctx->indexed_verts * ctx->staged_dpv + ph_index_dwords(ctx) :
       ((size_t)ctx->triangles * 3 + ctx->points + ctx->lines * 2) *
          ctx->staged_dpv;
 
@@ -5354,6 +5364,7 @@ ph_tcl_deindex(struct ph_context *ctx, unsigned dpv)
    const unsigned n = ctx->triangles * 3;
    const uint32_t *idx = (const uint32_t *)ctx->vertices +
                          (size_t)ctx->indexed_verts * dpv;
+   const uint16_t *idx16 = (const uint16_t *)idx;
 
    if (ctx->deindex_cap < n * dpv) {
       float *grown = realloc(ctx->deindex, (size_t)n * dpv * sizeof(*grown));
@@ -5365,10 +5376,13 @@ ph_tcl_deindex(struct ph_context *ctx, unsigned dpv)
    }
    for (unsigned v = 0; v < n; v++)
       memcpy(ctx->deindex + (size_t)v * dpv,
-             ctx->vertices + (size_t)idx[v] * dpv, dpv * sizeof(float));
+             ctx->vertices +
+                (size_t)(ctx->staged_index16 ? idx16[v] : idx[v]) * dpv,
+             dpv * sizeof(float));
    ctx->vertices = ctx->deindex;
    ctx->stage_room = 0;
    ctx->indexed_verts = 0;
+   ctx->staged_index16 = false;
    return true;
 }
 
@@ -5989,7 +6003,8 @@ ph_submit_vertices_staged(struct ph_context *ctx)
          }
       } else {
          state.indexed_vertices = ctx->indexed_verts;
-         ctx->batch_index_dwords = ctx->triangles * 3;
+         state.index16 = ctx->staged_index16;
+         ctx->batch_index_dwords = ph_index_dwords(ctx);
       }
    }
 	ph_trace_blend_alpha(ctx, &state, texture, sampler, texture_tiled);
@@ -6119,7 +6134,7 @@ ph_submit_vertices_staged(struct ph_context *ctx)
       ret = ph_submit_batch(ctx, batch, ctx->vertices,
                             state.indexed_vertices ?
                                state.indexed_vertices * dpv +
-                               ctx->triangles * 3 :
+                               ph_index_dwords(ctx) :
                                ctx->triangles * 3 * dpv,
                             color, depth, texture, texture1);
 submission_done:
@@ -6159,6 +6174,7 @@ out:
 	ctx->colour_alpha = false;
 	ctx->packed_colour = false;
 	ctx->indexed_verts = 0;
+	ctx->staged_index16 = false;
 	ctx->batch_index_dwords = 0;
 	ctx->line_coverage = false;
 	ctx->alpha_micro = false;
@@ -10000,6 +10016,74 @@ ph_tcl_constant_colour(struct ph_context *ctx, const struct ph_tcl_layout *lay,
    }
 }
 
+/* 16-bit indices for an indexed batch of @nverts vertices: they address
+ * 65536 vertices, and the batch builder starts every packet's list on a
+ * dword by giving each packet but the last an even triangle count. */
+static bool
+ph_tcl_index16(const struct ph_context *ctx, unsigned nverts, unsigned ntri)
+{
+   return ctx->index16 && nverts <= 65536 &&
+          (ctx->indexed_prims_per_packet >= 2 || ntri <= 1);
+}
+
+/* An indexed draw's indices rebased to its range's first vertex @lo, from
+ * the expanded elements or straight from the draw; false when one lies
+ * outside the @nverts vertices. */
+#define PH_TCL_REBASE(name, type)                                            \
+static bool                                                                  \
+name(type *idx, const struct ph_context *ctx, const uint32_t *elts,          \
+     uint32_t lo, unsigned total, unsigned nverts)                           \
+{                                                                            \
+   uint32_t outside = 0;                                                     \
+                                                                             \
+   if (elts) {                                                               \
+      for (unsigned i = 0; i < total; i++) {                                 \
+         const uint32_t v = elts[i] - lo;                                    \
+                                                                             \
+         idx[i] = v;                                                         \
+         outside |= v >= nverts;                                             \
+      }                                                                      \
+   } else {                                                                  \
+      const uint32_t base = ctx->tcl_lazy.bias - lo;                         \
+                                                                             \
+      if (ctx->tcl_lazy.size == 4) {                                         \
+         const uint32_t *in = ctx->tcl_lazy.indices;                         \
+                                                                             \
+         for (unsigned i = 0; i < total; i++) {                              \
+            const uint32_t v = in[i] + base;                                 \
+                                                                             \
+            idx[i] = v;                                                      \
+            outside |= v >= nverts;                                          \
+         }                                                                   \
+      } else if (ctx->tcl_lazy.size == 2) {                                  \
+         const uint16_t *in = ctx->tcl_lazy.indices;                         \
+                                                                             \
+         for (unsigned i = 0; i < total; i++) {                              \
+            const uint32_t v = in[i] + base;                                 \
+                                                                             \
+            idx[i] = v;                                                      \
+            outside |= v >= nverts;                                          \
+         }                                                                   \
+      } else {                                                               \
+         const uint8_t *in = ctx->tcl_lazy.indices;                          \
+                                                                             \
+         for (unsigned i = 0; i < total; i++) {                              \
+            const uint32_t v = in[i] + base;                                 \
+                                                                             \
+            idx[i] = v;                                                      \
+            outside |= v >= nverts;                                          \
+         }                                                                   \
+      }                                                                      \
+   }                                                                         \
+   /* an odd list's last dword: its high half repeats the last index */     \
+   if (sizeof(type) == 2 && (total & 1))                                     \
+      idx[total] = idx[total - 1];                                           \
+   return !outside;                                                          \
+}
+PH_TCL_REBASE(ph_tcl_rebase_u32, uint32_t)
+PH_TCL_REBASE(ph_tcl_rebase_u16, uint16_t)
+#undef PH_TCL_REBASE
+
 /* An indexed draw: the vertices of the draw's index range staged once and
  * its indices, rebased to that range, behind them, all of it one batch.
  * False when indexing would not stage less or does not fit; the caller then
@@ -10054,6 +10138,8 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
    size_t clip_cap = (size_t)ctx->tcl_vclip_cap * 4 * sizeof(float);
    size_t code_cap = ctx->tcl_vclip_cap;
    uint32_t *idx = (uint32_t *)ctx->vertices + (size_t)nverts * dpv;
+   uint16_t *idx16 = (uint16_t *)idx;
+   const bool index16 = ph_tcl_index16(ctx, nverts, ntri);
    unsigned kept = 0, crossing = 0;
    float *cross;
 
@@ -10126,9 +10212,15 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
       const uint8_t c = ctx->tcl_vcode[e[2] - lo];
 
       if (a & b & c & PH_TCL_VCODE_INSIDE) {
-         idx[kept * 3] = e[0] - lo;
-         idx[kept * 3 + 1] = e[1] - lo;
-         idx[kept * 3 + 2] = e[2] - lo;
+         if (index16) {
+            idx16[kept * 3] = e[0] - lo;
+            idx16[kept * 3 + 1] = e[1] - lo;
+            idx16[kept * 3 + 2] = e[2] - lo;
+         } else {
+            idx[kept * 3] = e[0] - lo;
+            idx[kept * 3 + 1] = e[1] - lo;
+            idx[kept * 3 + 2] = e[2] - lo;
+         }
          kept++;
       } else if (!(a & b & c & ~PH_TCL_VCODE_INSIDE & 0xff)) {
          for (unsigned v = 0; v < 3; v++) {
@@ -10149,9 +10241,12 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
       }
    }
    if (kept) {
+      if (index16 && (kept & 1))
+         idx16[kept * 3] = idx16[kept * 3 - 1];
       ctx->triangles = kept;
       ctx->staged_dpv = dpv;
       ctx->indexed_verts = nverts;
+      ctx->staged_index16 = index16;
       ph_submit_vertices(ctx);
       if (ctx->submit_error)
          return true;
@@ -10184,6 +10279,7 @@ ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
    const uint32_t lo = range[0], hi = range[1];
    uint32_t *idx;
    unsigned nverts;
+   bool index16;
    float *dst;
 
    if (lo > hi)
@@ -10237,49 +10333,16 @@ ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
    }
    ph_tcl_constant_colour(ctx, lay, dst, nverts);
    idx = (uint32_t *)dst + (size_t)nverts * lay->dpv;
-   {
-      /* indices outside the draw's declared range draw expanded */
-      const unsigned total = ntri * 3;
-      uint32_t outside = 0;
-
-      if (elts) {
-         for (unsigned i = 0; i < total; i++) {
-            idx[i] = elts[i] - lo;
-            outside |= idx[i] >= nverts;
-         }
-      } else {
-         /* rebased straight from the draw's indices, in one pass */
-         const uint32_t base = ctx->tcl_lazy.bias - lo;
-
-         if (ctx->tcl_lazy.size == 4) {
-            const uint32_t *in = ctx->tcl_lazy.indices;
-
-            for (unsigned i = 0; i < total; i++) {
-               idx[i] = in[i] + base;
-               outside |= idx[i] >= nverts;
-            }
-         } else if (ctx->tcl_lazy.size == 2) {
-            const uint16_t *in = ctx->tcl_lazy.indices;
-
-            for (unsigned i = 0; i < total; i++) {
-               idx[i] = in[i] + base;
-               outside |= idx[i] >= nverts;
-            }
-         } else {
-            const uint8_t *in = ctx->tcl_lazy.indices;
-
-            for (unsigned i = 0; i < total; i++) {
-               idx[i] = in[i] + base;
-               outside |= idx[i] >= nverts;
-            }
-         }
-      }
-      if (outside)
-         return false;
-   }
+   index16 = ph_tcl_index16(ctx, nverts, ntri);
+   /* indices outside the draw's declared range draw expanded */
+   if (index16 ? !ph_tcl_rebase_u16((uint16_t *)idx, ctx, elts, lo, ntri * 3,
+                                    nverts) :
+                 !ph_tcl_rebase_u32(idx, ctx, elts, lo, ntri * 3, nverts))
+      return false;
    ctx->triangles = ntri;
    ctx->staged_dpv = lay->dpv;
    ctx->indexed_verts = nverts;
+   ctx->staged_index16 = index16;
    ph_submit_vertices(ctx);
    return true;
 }
@@ -17558,6 +17621,10 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    }
    /* P690 0x9f packets draw up to the kernel's cap exactly
     * (--indexed-run-probe: 1-20 triangles with shared vertices). */
+   /* PARHELIA_INDEX16=1: 16-bit index lists (0x9b) where the kernel
+    * takes them and a batch's vertices fit. */
+   ctx->index16 = ph_screen(screen)->index16 &&
+                  debug_get_bool_option("PARHELIA_INDEX16", false);
    ctx->indexed_prims_per_packet =
       MIN2(ph_screen(screen)->indexed_tris,
            lx ? debug_get_num_option("PARHELIA_INDEXED_PRIMS_PER_PACKET",

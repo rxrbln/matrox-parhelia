@@ -300,6 +300,7 @@ struct parhelia_batch_replay {
    const float *mvp;
    uint32_t header, limit;
    unsigned base, stride, draws, per_packet, vertices;
+   unsigned index_bytes;         /* indexed: 2 or 4, else 0 */
    enum p3d_prim prim;
 };
 

@@ -214,6 +214,19 @@ p3d_indexpacket_u32(struct p3d_cs *cs)
 	p[2] = 0;
 }
 
+/* Mode 6, address-mode u16 index list; operands as for mode 7. */
+void
+p3d_indexpacket_u16(struct p3d_cs *cs)
+{
+	uint32_t *p = cs_packet(cs, 3, 1);
+
+	if (!p)
+		return;
+	p[0] = 0x9b000001u;
+	p[1] = 0;
+	p[2] = 0;
+}
+
 void
 p3d_bindpacket(struct p3d_cs *cs, uint32_t mode, const struct p3d_rw *rw,
 	       size_t n, int strobe_alone)

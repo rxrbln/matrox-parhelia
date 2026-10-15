@@ -1659,17 +1659,21 @@ p3d_emit_bound_ranges(struct p3d_cs *cs, const struct p3d_state *st,
 		p3d_rangepacket(cs, i * 3, i * 3 + 3);
 }
 
-/* Indexed draws (mode 7): st->indexed_vertices vertices bound as stream 0,
- * whose base the kernel relocates from the placeholder 3 (byte offset 0,
- * class 3), and @npackets 0x9f packets whose index ranges the batch
- * relocates. */
+/* Indexed draws (mode 7, or mode 6 with st->index16): st->indexed_vertices
+ * vertices bound as stream 0, whose base the kernel relocates from the
+ * placeholder 3 (byte offset 0, class 3), and @npackets 0x9f (0x9b) packets
+ * whose index ranges the batch relocates. */
 void
 p3d_emit_indexed(struct p3d_cs *cs, const struct p3d_state *st,
 		 unsigned npackets)
 {
 	p3d_emit_direct_fetch(cs, st, st->indexed_vertices, 3);
-	for (unsigned i = 0; i < npackets; i++)
-		p3d_indexpacket_u32(cs);
+	for (unsigned i = 0; i < npackets; i++) {
+		if (st->index16)
+			p3d_indexpacket_u16(cs);
+		else
+			p3d_indexpacket_u32(cs);
+	}
 	if (st->faa_raster)
 		p3d_faa_draw_sync(cs, p3d_dwgctl(st));
 }

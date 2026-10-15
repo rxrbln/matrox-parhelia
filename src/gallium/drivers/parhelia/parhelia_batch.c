@@ -113,7 +113,8 @@ static bool
 batch_multi_draw(uint32_t header, uint32_t bytes)
 {
    return split_multi_draws &&
-          bytes > 6u * ((((header >> 17) & 0x3f) + 1) * 4);
+          bytes > 6u * ((header >> 24) == 0x9b ? 2u :
+                        (((header >> 17) & 0x3f) + 1) * 4);
 }
 
 /* A draw packet the kernel keeps out of shared spans; host-vertex draws
@@ -122,8 +123,10 @@ static bool
 batch_packet_multi_draw(const uint32_t *cmd, unsigned length,
                         uint32_t reloc_bytes)
 {
-   /* an indexed packet's size field is zero: four bytes per index */
-   if ((cmd[0] >> 24) != 0x97 && (cmd[0] >> 24) != 0x9f)
+   /* an indexed packet's size field is zero: four bytes per index, two
+    * in the 16-bit form */
+   if ((cmd[0] >> 24) != 0x97 && (cmd[0] >> 24) != 0x9f &&
+       (cmd[0] >> 24) != 0x9b)
       return false;
    for (unsigned k = 0; k + 3 <= length; k += 3) {
       const uint32_t bytes = reloc_bytes ? reloc_bytes :
@@ -197,7 +200,8 @@ call_pack_step(struct call_pack *st, const struct parhelia_batch *batch,
 {
    const struct drm_parhelia_packet *packet = &batch->packets[i];
    const uint32_t *cmd = batch->commands + packet->offset;
-   const bool is_draw = (cmd[0] >> 24) == 0x97 || (cmd[0] >> 24) == 0x9f;
+   const bool is_draw = (cmd[0] >> 24) == 0x97 || (cmd[0] >> 24) == 0x9f ||
+                        (cmd[0] >> 24) == 0x9b;
    const bool multi = is_draw && batch_packet_multi_draw(
       cmd, packet->length, draw_bytes[i]);
 
@@ -557,7 +561,7 @@ static int batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
                         unsigned vertices_per_packet,
                         unsigned total_vertices,
                         bool bound_ranges,
-                        unsigned indexed_vertices);
+                        unsigned indexed_vertices, bool index16);
 
 int
 parhelia_create_render(int fd, unsigned width, unsigned height,
@@ -662,7 +666,7 @@ parhelia_batch_clear_rect_surface(struct parhelia_batch *batch,
       p3d_emit_clear(&cs, &surface, value, write_mask, x, y, width, height);
    }
    return batch_finish(batch, &cs, calls, handle, 0, NULL, NULL, 0, 0, 0,
-                       P3D_TRIANGLES, 0, 0, false, 0);
+                       P3D_TRIANGLES, 0, 0, false, 0, false);
 }
 
 int
@@ -696,7 +700,7 @@ parhelia_batch_depth_control(struct parhelia_batch *batch,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
    p3d_emit_depth_control(&cs, &surface, slot, control, load, value, resume);
    return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
-                       P3D_TRIANGLES, 0, 0, false, 0);
+                       P3D_TRIANGLES, 0, 0, false, 0, false);
 }
 
 /* The complete hardware clear: arm the surface, then load the value.  Both
@@ -732,7 +736,7 @@ batch_zclear(struct parhelia_batch *batch, uint32_t colour_handle,
    p3d_emit_depth_control(&cs, &surface, 1, load, true, value,
                           P3D_DWGCTL_SOLID);
    return batch_finish(batch, &cs, calls, colour_handle, depth_handle, NULL,
-                       NULL, 0, 0, 0, P3D_TRIANGLES, 0, 0, false, 0);
+                       NULL, 0, 0, 0, P3D_TRIANGLES, 0, 0, false, 0, false);
 }
 
 /* The vendor's FAA budget: FragSize 5.4 MiB (LX) per 1024x768 pixels or per
@@ -847,7 +851,7 @@ parhelia_batch_faa_resolve(struct parhelia_batch *batch,
    p3d_reglist(&cs, rw, 4);
    return batch_finish(batch, &cs, calls, colour_handle, depth_handle, NULL,
                        NULL, fragment_handle, 0, 0, P3D_TRIANGLES, 0, 0,
-                       false, 0);
+                       false, 0, false);
 }
 
 int
@@ -901,7 +905,7 @@ parhelia_batch_zclear_word(struct parhelia_batch *batch, uint32_t depth_handle,
    p3d_emit_depth_control(&cs, &surface, 1, word, true, value,
                           P3D_DWGCTL_SOLID);
    return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
-                       P3D_TRIANGLES, 0, 0, false, 0);
+                       P3D_TRIANGLES, 0, 0, false, 0, false);
 }
 
 int
@@ -926,7 +930,7 @@ parhelia_batch_zcontrol(struct parhelia_batch *batch, uint32_t depth_handle,
       p3d_emit_depth_control(&cs, &surface, 1, words[i], false, 0,
                              P3D_DWGCTL_SOLID);
    return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
-                       P3D_TRIANGLES, 0, 0, false, 0);
+                       P3D_TRIANGLES, 0, 0, false, 0, false);
 }
 
 /* Drop the tracked tile state after it has been written out. */
@@ -952,7 +956,7 @@ batch_zdiscard(struct parhelia_batch *batch, uint32_t depth_handle,
    p3d_emit_depth_control(&cs, &surface, 1, P3D_ZTRACK_OFF, false, 0,
                           P3D_DWGCTL_SOLID);
    return batch_finish(batch, &cs, calls, 0, depth_handle, NULL, NULL, 0, 0, 0,
-                       P3D_TRIANGLES, 0, 0, false, 0);
+                       P3D_TRIANGLES, 0, 0, false, 0, false);
 }
 
 int
@@ -1023,7 +1027,7 @@ parhelia_batch_blit_format(struct parhelia_batch *batch,
    p3d_emit_blit(&cs, &dst, dst_type, dst_x, dst_y,
                  &src, src_type, src_x, src_y, width, height);
    return batch_finish(batch, &cs, calls, dst_handle, 0, NULL, NULL,
-                       src_handle, 0, 0, P3D_TRIANGLES, 0, 0, false, 0);
+                       src_handle, 0, 0, P3D_TRIANGLES, 0, 0, false, 0, false);
 }
 
 int
@@ -1131,12 +1135,16 @@ packet_vertex_trap(enum p3d_prim prim, unsigned run)
  * primitive's vertex step that is neither longer than what is left nor a
  * trapped count. */
 static unsigned
-packet_run(enum p3d_prim prim, unsigned per_packet, unsigned left)
+packet_run(enum p3d_prim prim, unsigned per_packet, unsigned left,
+           bool pairs)
 {
    const unsigned step = packet_vertex_step(prim);
    unsigned run = left < per_packet ? left : per_packet;
 
-   while (run > step && packet_vertex_trap(prim, run))
+   /* with @pairs every run but the last holds an even number of
+    * primitives: a 16-bit index list then starts on a dword */
+   while (run > step && (packet_vertex_trap(prim, run) ||
+                         (pairs && run < left && (run / step) & 1)))
       run -= step;
    return run;
 }
@@ -1145,7 +1153,8 @@ packet_run(enum p3d_prim prim, unsigned per_packet, unsigned left)
  * into packets: strips and fans share vertices with their neighbours, so they
  * have to be consumed by a single packet. */
 static unsigned
-packet_count(enum p3d_prim prim, unsigned per_packet, unsigned vertices)
+packet_count(enum p3d_prim prim, unsigned per_packet, unsigned vertices,
+             bool pairs)
 {
    const unsigned min = p3d_minimum_vertices(prim);
    const bool shared = packet_vertex_step(prim) == 1 && min > 1;
@@ -1155,9 +1164,10 @@ packet_count(enum p3d_prim prim, unsigned per_packet, unsigned vertices)
        vertices % packet_vertex_step(prim))
       return 0;
    while (vertices) {
-      const unsigned run = packet_run(prim, per_packet, vertices);
+      const unsigned run = packet_run(prim, per_packet, vertices, pairs);
 
-      if (run < min || run > vertices || (shared && run != vertices))
+      if (run < min || run > vertices || (shared && run != vertices) ||
+          (pairs && run < vertices && (run / packet_vertex_step(prim)) & 1))
          return 0;
       vertices -= run;
       if (vertices && vertices < min)
@@ -1325,6 +1335,9 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
        (input->aux_const && input->aux_const_vec4s > 63) ||
        input->base_reg_entry ||
        (input->bound_ranges && input->prim != P3D_TRIANGLES) ||
+       /* 16-bit indices address at most 65536 vertices */
+       (input->index16 && (!input->indexed_vertices ||
+                           input->indexed_vertices > 65536)) ||
        /* The two surface slots carry independent pitches; a 16 bpp colour
         * target aligns to 128 pixels where a 32 bpp depth one aligns to 64,
         * so they need not agree. */
@@ -1346,7 +1359,8 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
    if (!vertices)
       vertices = triangle_count * per_packet;
    /* The packet count has to match the run the builder will emit. */
-   if (packet_count(input->prim, per_packet, vertices) != triangle_count)
+   if (packet_count(input->prim, per_packet, vertices,
+                    !!input->index16) != triangle_count)
       return -EINVAL;
    state = *input;
    state.fence = 0; /* global counter and final drain remain kernel-owned */
@@ -1373,7 +1387,7 @@ batch_state(struct parhelia_batch *batch, uint32_t colour_handle,
                       state.faa_raster ? state.faa_fragment : 0,
                       triangle_count, state.dw_per_vertex, state.prim,
                       per_packet, vertices, !!state.bound_ranges,
-                      state.indexed_vertices);
+                      state.indexed_vertices, !!state.index16);
    /* Transform batches compact too (PARHELIA_COMPACT_TRANSFORM=0 keeps
     * their exact packet cadence for diagnosis). */
    if (!ret && (!state.transform || compact_transform_packets()) &&
@@ -1409,7 +1423,8 @@ parhelia_batch_state_run_units(struct parhelia_batch *batch,
    if (!per_packet || !vertices)
       return -EINVAL;
    return batch_state(batch, colour_handle, depth_handle, texture_handles,
-                      state, packet_count(state->prim, per_packet, vertices),
+                      state, packet_count(state->prim, per_packet, vertices,
+                                          !!state->index16),
                       vertices);
 }
 
@@ -2269,9 +2284,10 @@ reg_shadow_filter(const struct parhelia_reg_shadow *shadow, uint32_t *out,
  * provided the rest is exactly @draws DRAW-relocated draw packets. */
 static struct state_cache_entry *
 state_cache_capture(const struct parhelia_batch *batch, unsigned draws,
-                    bool indexed)
+                    const struct p3d_state *state)
 {
-   const uint32_t opcode = indexed ? 0x9f : 0x97;
+   const uint32_t opcode = !state->indexed_vertices ? 0x97 :
+                           state->index16 ? 0x9b : 0x9f;
    struct state_cache_entry *e;
    unsigned first, relocs = 0;
 
@@ -2407,13 +2423,15 @@ state_cache_replay_init(struct parhelia_batch_replay *r,
    *r = (struct parhelia_batch_replay) {
       .entry = e,
       .mvp = state->mvp,
-      .header = state->indexed_vertices ? 0x9f000001u :
+      .header = state->indexed_vertices ?
+                (state->index16 ? 0x9b000001u : 0x9f000001u) :
                 0x97000000u |
                 (((state->dw_per_vertex - 1) & 0x3f) << 17) | 1u,
       .limit = state->indexed_vertices,
       /* indices follow the batch's vertices */
       .base = state->indexed_vertices * state->dw_per_vertex,
       .stride = state->indexed_vertices ? 1 : state->dw_per_vertex,
+      .index_bytes = state->indexed_vertices ? (state->index16 ? 2 : 4) : 0,
       .draws = draws,
       .per_packet = per_packet,
       .vertices = vertices,
@@ -2527,7 +2545,8 @@ state_cache_replay_at(struct parhelia_batch *dst,
    }
    for (unsigned k = 0; k < r->draws; k++) {
       const unsigned run = packet_run(r->prim, r->per_packet,
-                                      r->vertices - consumed);
+                                      r->vertices - consumed,
+                                      r->index_bytes == 2);
       uint32_t *cmd = dst->commands + dst->command_count;
 
       cmd[0] = r->header;
@@ -2538,8 +2557,9 @@ state_cache_replay_at(struct parhelia_batch *dst,
       };
       dst->relocs[dst->reloc_count++] = (struct drm_parhelia_reloc) {
          .packet = dst->packet_count,
-         .dword = (vertex_base + r->base + consumed * r->stride) * 4,
-         .delta = run * r->stride * 4,
+         .dword = (vertex_base + r->base) * 4 +
+                  consumed * (r->index_bytes ? r->index_bytes : r->stride * 4),
+         .delta = run * (r->index_bytes ? r->index_bytes : r->stride * 4),
          .type = PARHELIA_RELOC_DRAW,
       };
       dst->packet_count++;
@@ -2588,7 +2608,9 @@ parhelia_batch_append_replay_limited(struct parhelia_batch *dst,
        src_vertex_dwords > limits->vertex_dwords - vertex_base)
       return -E2BIG;
    /* the draws' ranges must lie in the appended vertices */
-   if (r->base + r->vertices * r->stride > src_vertex_dwords)
+   if ((uint64_t)r->base * 4 + (uint64_t)r->vertices *
+       (r->index_bytes ? r->index_bytes : r->stride * 4) >
+       (uint64_t)src_vertex_dwords * 4)
       return -EINVAL;
    if (call_boundary)
       dst->relocs[dst->reloc_count++] = (struct drm_parhelia_reloc) {
@@ -2641,7 +2663,7 @@ parhelia_batch_state_run_units_deferred(struct parhelia_state_cache *cache,
                 p3d_vertices_per_primitive(state->prim);
    if (!per_packet || !vertices || !state->dw_per_vertex)
       return -EINVAL;
-   draws = packet_count(state->prim, per_packet, vertices);
+   draws = packet_count(state->prim, per_packet, vertices, !!state->index16);
    if ((cache->count + 1) * 2 > cache->cap && !state_cache_grow(cache))
       return parhelia_batch_state_run_units(batch, colour_handle, depth_handle,
                                             texture_handles, state, vertices);
@@ -2708,7 +2730,7 @@ parhelia_batch_state_run_units_deferred(struct parhelia_state_cache *cache,
       state_cache_flush(cache);
       slot = state_cache_find(cache, hash);
    }
-   e = state_cache_capture(batch, draws, state->indexed_vertices);
+   e = state_cache_capture(batch, draws, state);
    if (!e)
       return 0;
    e->id = cache->next_id++;
@@ -3169,7 +3191,7 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
              unsigned vertices_per_packet,
              unsigned total_vertices,
              bool bound_ranges,
-             unsigned indexed_vertices)
+             unsigned indexed_vertices, bool index16)
 {
    unsigned draws = 0, consumed = 0, texture_units = 0, selected_unit = 0;
    unsigned stream_packet = UINT32_MAX;
@@ -3186,15 +3208,18 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
          if (indexed_vertices) {
             /* indices follow the batch's vertices, in packet order */
             const unsigned run = packet_run(prim, vertices_per_packet,
-                                            total_vertices - consumed);
+                                            total_vertices - consumed,
+                                            index16);
 
-            if (call->sec_len != 3 || cmd[0] != 0x9f000001u || cmd[1] ||
+            if (call->sec_len != 3 ||
+                cmd[0] != (index16 ? 0x9b000001u : 0x9f000001u) || cmd[1] ||
                 cmd[2] || consumed >= total_vertices)
                return -EINVAL;
             batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
                .packet = i,
-               .dword = (indexed_vertices * vertex_dwords + consumed) * 4,
-               .delta = run * 4,
+               .dword = indexed_vertices * vertex_dwords * 4 +
+                        consumed * (index16 ? 2 : 4),
+               .delta = run * (index16 ? 2 : 4),
                .type = PARHELIA_RELOC_DRAW,
             };
             consumed += run;
@@ -3213,7 +3238,7 @@ batch_finish(struct parhelia_batch *batch, const struct p3d_cs *cs,
             return -EINVAL;
          /* The last packet of a run may be shorter than the rest. */
          const unsigned run = packet_run(prim, vertices_per_packet,
-                                         total_vertices - consumed);
+                                         total_vertices - consumed, false);
 
          batch->relocs[batch->reloc_count++] = (struct drm_parhelia_reloc) {
             .packet = i,
@@ -3473,9 +3498,12 @@ parhelia_batch_append_limited(struct parhelia_batch *dst,
       out->packet += packet_base;
       if (reloc->type == PARHELIA_RELOC_DRAW) {
          uint64_t end = (uint64_t)reloc->dword + reloc->delta;
+         /* a 16-bit index list may end mid-dword */
+         const uint32_t odd = (src->commands[src->packets[reloc->packet].offset] >>
+                               24) == 0x9b ? 1 : 3;
 
          if (reloc->handle || (reloc->dword & 3) || !reloc->delta ||
-             (reloc->delta & 3) ||
+             (reloc->delta & odd) ||
              reloc->delta > PH_BATCH_MAX_DRAW_DWORDS * sizeof(uint32_t) ||
              end > (uint64_t)src_vertex_dwords * 4)
             return -EINVAL;
@@ -4064,7 +4092,7 @@ parhelia_batch_drop_repeats(struct parhelia_batch *dst,
       else if (!length || !(cmd[0] >> 24))
          memset(known, 0, sizeof(known));
       else if (length && (cmd[0] >> 24) != 0x97 && (cmd[0] >> 24) != 0x8f &&
-               (cmd[0] >> 24) != 0x9f &&
+               (cmd[0] >> 24) != 0x9f && (cmd[0] >> 24) != 0x9b &&
                /* block-file loads: no MMIO register */
                (cmd[0] >> 24) != 0x41)
          memset(known, 0, sizeof(known));
@@ -4269,13 +4297,15 @@ parhelia_batch_submit_ranges_async(
          continue;
       }
       if (src->handle || (src->dword & 3) || !src->delta ||
-          (src->delta & 3) ||
           src->delta > PH_BATCH_MAX_DRAW_DWORDS * sizeof(uint32_t) ||
           (uint64_t)src->dword + src->delta > bytes ||
           src->packet >= batch->packet_count ||
           batch->packets[src->packet].length != 3)
          return -EINVAL;
       cmd = batch->commands + batch->packets[src->packet].offset;
+      /* a 16-bit index list may end mid-dword */
+      if (src->delta & ((cmd[0] >> 24) == 0x9b ? 1 : 3))
+         return -EINVAL;
       cmd[1] = src->dword;
       cmd[2] = src->dword + src->delta;
       draw[src->packet] = true;

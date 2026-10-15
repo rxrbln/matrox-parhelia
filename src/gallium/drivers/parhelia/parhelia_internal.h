@@ -77,6 +77,8 @@ struct parhelia_screen {
    bool split_multi_draws;	/* large draws get CALL spans of their own */
    /* Triangles per indexed (0x9f) packet, 0 without indexed draws. */
    unsigned indexed_tris;
+   /* The kernel takes 16-bit index lists (0x9b) as well. */
+   bool index16;
    /* Native 8- and 16-bit sampler storage. */
    bool narrow_formats;
    /* Native R5G6B5 colour and D16 depth render targets: the measured 128x16

@@ -1763,6 +1763,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param indexed = {
       .param = PARHELIA_PARAM_INDEXED_DRAWS,
    };
+   struct drm_parhelia_get_param index16 = {
+      .param = PARHELIA_PARAM_INDEX16,
+   };
    struct drm_parhelia_get_param draw_runs = {
       .param = PARHELIA_PARAM_DRAW_RUNS,
    };
@@ -1891,6 +1894,10 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
                             s->chip_id == 0x2539) &&
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &indexed) ?
       (unsigned)indexed.value : 0;
+   /* an older kernel refuses the parameter */
+   s->index16 = s->indexed_tris &&
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &index16) &&
+      index16.value == 1;
    /* Native 8- and 16-bit sampler storage is on where its texel order has
     * been measured: parhelia-drm-test --texture-format-probe reproduces every
     * texel of L8, A1R5G5B5, R5G6B5 and A4R4G4B4 over two tile rows and two

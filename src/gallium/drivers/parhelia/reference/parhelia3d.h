@@ -180,6 +180,7 @@ void	 p3d_rangepacket2(struct p3d_cs *cs,
  * zero until the guarded kernel INDEX_VRAM relocation supplies a local-VRAM
  * range; callers cannot encode a raw address through this builder. */
 void	 p3d_indexpacket_u32(struct p3d_cs *cs);
+void	 p3d_indexpacket_u16(struct p3d_cs *cs);
 void	 p3d_bindpacket(struct p3d_cs *cs, uint32_t mode,
 			const struct p3d_rw *rw, size_t n, int strobe_alone);
 
@@ -931,6 +932,8 @@ struct p3d_state {
 	/* Indexed draws (mode 7): this many vertices bound as stream 0; zero
 	 * for the copied 0x97 ranges. */
 	unsigned	   indexed_vertices;
+	/* its indices are 16-bit (mode 6, 0x9b) instead of 32-bit */
+	int		   index16;
 	/* Vertices consumed by one draw packet.  Zero keeps one primitive per
 	 * packet (three vertices for a triangle list).  A larger count draws
 	 * several primitives, or a strip, fan or quad run, from one packet. */

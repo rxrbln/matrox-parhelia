@@ -227,6 +227,10 @@ struct drm_parhelia_upload_render {
  * kernel-countered FAA sync packets are accepted.  Zero unless the module
  * was loaded with p690_faa=1. */
 #define PARHELIA_PARAM_FAA		42
+/* An indexed draw may also be the 16-bit 0x9b packet: its operands are the
+ * byte range of its u16 indices inside the vertex range, starting on a dword,
+ * three per triangle; otherwise as PARHELIA_PARAM_INDEXED_DRAWS. */
+#define PARHELIA_PARAM_INDEX16		43
 /* Number of requests the kernel can retain in its ordered async queue. */
 #define PARHELIA_PARAM_ASYNC_SLOTS	23
 /* Retired unsafe generic packing capability; kernels report zero. */
