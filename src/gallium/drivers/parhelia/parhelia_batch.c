@@ -1418,7 +1418,19 @@ parhelia_batch_state_run_units(struct parhelia_batch *batch,
  * ioquake3 re-emits a few hundred distinct states per frame.  Build each
  * once: a hit copies the prefix and appends the draw packets and their
  * DRAW relocations exactly as batch_finish() does.  The key is the state
- * with every pointer replaced by the data it points at, compared in full. */
+ * with every pointer replaced by the data it points at, compared in full.
+ *
+ * Invariants:
+ * - Entries live until state_cache_flush() frees them all at once, so the
+ *   entry pointers in prev and trans[].from never dangle.
+ * - A transition (trans[].t/tw, owned by @to) is @to's prefix without the
+ *   groups @from wrote with the same values; it is valid only right after
+ *   @from's replay in the same submit.  Every chain break (drain, uncached
+ *   batch, other writer) calls parhelia_state_cache_break().
+ * - prev is the full entry even when its filtered transition was replayed:
+ *   the dropped groups equal what the hardware already holds.
+ * - tw also drops the WARP unit, only when the replayed matrix equals
+ *   prev_mvp. */
 struct state_cache_entry {
    uint64_t hash;
    uint8_t *key;
