@@ -66,6 +66,9 @@ struct parhelia_screen {
    bool native_rt_classes;
    bool window_pairs;
    bool reglist_runs;	/* 0x00 packets may join register lists */
+   /* P690 fragment antialiasing: the kernel offers it and PARHELIA_FAA=1
+    * asked for it */
+   bool faa;
    unsigned index_dwords;        /* indices one async submit carries */
    uint64_t vertex_bo_max;       /* largest CREATE_VERTEX object */
    bool render_transfer;
@@ -196,6 +199,8 @@ struct parhelia_resource {
     * @zinit_colour is the render target the resolve rectangle draws into with
     * its colour writes masked off. */
    bool zinit_pending;
+   /* the application cleared or tested its stencil: bit 0 is not FAA's */
+   bool stencil_live;
    uint32_t zinit_value;
    struct pipe_resource *zinit_colour;
    /* Levels the hardware storage does not hold (the render classes keep

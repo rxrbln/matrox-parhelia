@@ -1751,6 +1751,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    struct drm_parhelia_get_param reglist_runs = {
       .param = PARHELIA_PARAM_REGLIST_RUNS,
    };
+   struct drm_parhelia_get_param faa = {
+      .param = PARHELIA_PARAM_FAA,
+   };
    struct drm_parhelia_get_param render_transfer = {
       .param = PARHELIA_PARAM_RENDER_TRANSFER,
    };
@@ -1859,6 +1862,9 @@ parhelia_screen_create(int fd, const struct pipe_screen_config *config)
    s->render_transfer =
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &render_transfer) &&
       render_transfer.value == 1;
+   s->faa = s->chip_id == 0x2539 &&
+      debug_get_bool_option("PARHELIA_FAA", false) &&
+      !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &faa) && faa.value == 1;
    s->draw_ranges = s->async_submit &&
       debug_get_bool_option("PARHELIA_DRAW_RANGES", true) &&
       !ioctl(s->fd, DRM_IOCTL_PARHELIA_GET_PARAM, &draw_ranges) &&
