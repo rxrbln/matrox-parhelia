@@ -1908,6 +1908,7 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
    ctx->pending_submit_count = 0;
    ctx->pending_call_bound = 2;
    parhelia_call_counter_reset(&ctx->call_counter);
+   parhelia_state_cache_break(ctx->state_cache);
    ctx->pending_stage_calls = 0;
    ctx->pending_mark_count = 0;
    /* the next submit may follow another client's: it starts unfiltered */
@@ -1981,6 +1982,7 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
    unsigned calls, stage_calls, batch_packets = batch->packet_count;
    unsigned replay_commands, replay_relocs;
    const struct parhelia_batch_replay replay_entry = ctx->replay;
+   struct parhelia_batch_replay replay_use;
    const bool replay = ctx->replay.entry && ctx->aggregate_batches &&
                        ctx->aggregate_state_stream;
 
@@ -2005,8 +2007,10 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
     * keeps every complete state and DRAW sequence while sharing one terminal
     * EOB/DWGSYNC.  The older stateful experiment instead retains the one
     * internal fence boundary supported by the current kernel ABI. */
-   if (!ctx->aggregate_batches)
+   if (!ctx->aggregate_batches) {
+      parhelia_state_cache_break(ctx->state_cache);
       return ph_submit_batch_now(ctx, batch, vertices, vertex_dwords);
+   }
    if (vertex_dwords)
       ph_stage_evict(ctx, vertices);
    if (vertex_dwords && (const float *)vertices == ctx->vertices &&
@@ -2091,10 +2095,13 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
    }
    if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx, true)))
       return ret;
+   replay_use = replay_entry;
+   if (replay)
+      parhelia_state_cache_transition(ctx->state_cache, &replay_use);
    ret = replay ?
       parhelia_batch_append_replay_limited(
          &ctx->pending_batch, ctx->pending_vertices,
-         &ctx->pending_vertex_dwords, &replay_entry, vertices, vertex_dwords,
+         &ctx->pending_vertex_dwords, &replay_use, vertices, vertex_dwords,
          &ctx->batch_limits, ctx->pack_adjacent_packets,
          ctx->state_filter && ctx->reg_shadow.groups ? &ctx->reg_shadow : NULL) :
       ctx->aggregate_state_stream ?
@@ -2115,10 +2122,14 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
          return ret;
       if (vertex_dwords && (ret = ph_pending_ring_acquire(ctx, true)))
          return ret;
+      /* the drain broke the chain: the whole prefix goes */
+      replay_use = replay_entry;
+      if (replay)
+         parhelia_state_cache_transition(ctx->state_cache, &replay_use);
       ret = replay ?
          parhelia_batch_append_replay_limited(
             &ctx->pending_batch, ctx->pending_vertices,
-            &ctx->pending_vertex_dwords, &replay_entry, vertices,
+            &ctx->pending_vertex_dwords, &replay_use, vertices,
             vertex_dwords, &ctx->batch_limits, ctx->pack_adjacent_packets,
             ctx->state_filter && ctx->reg_shadow.groups ? &ctx->reg_shadow : NULL) :
          ctx->aggregate_state_stream ?
@@ -2133,11 +2144,17 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
             &ctx->pending_vertex_dwords, batch, vertices, vertex_dwords,
             &ctx->batch_limits);
    }
-   if (ret)
+   if (ret) {
+      parhelia_state_cache_break(ctx->state_cache);
       return ret;
+   }
    /* the shadow does not know what an untracked batch wrote */
    if (!replay)
       parhelia_reg_shadow_reset(&ctx->reg_shadow);
+   if (replay)
+      parhelia_state_cache_appended(ctx->state_cache, &replay_entry);
+   else
+      parhelia_state_cache_break(ctx->state_cache);
    /* The stream's exact packed CALLs, stepped over the appended packets
     * only.  Summing the batches' own counts took each one's opening fence
     * and missed the runs joining across batches: q3 drained at ~100 of the
@@ -17077,6 +17094,11 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    parhelia_state_cache_set_reglist_runs(ctx->state_cache,
       ph_screen(screen)->reglist_runs && !ctx->state_filter &&
       !ctx->drop_repeats);
+   /* the vendor leaves out register groups whose values repeat */
+   parhelia_state_cache_set_transitions(ctx->state_cache,
+      ph_screen(screen)->chip_id,
+      !ctx->state_filter && !ctx->drop_repeats &&
+      debug_get_bool_option("PARHELIA_STATE_TRANSITIONS", true));
    /* Bounding positions inside the fetch sees every index where the
     * separate scan sees each vertex once: slower on nano (11.21 -> 11.37 ms
     * CPU per ioquake3 frame), faster on the Alpha's EV56 (12.4 -> 13.6 fps),

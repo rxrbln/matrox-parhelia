@@ -239,6 +239,22 @@ int parhelia_batch_state_run_units(struct parhelia_batch *batch,
  * is byte-identical to parhelia_batch_state_run_units(). */
 struct parhelia_state_cache;
 struct parhelia_state_cache *parhelia_state_cache_create(void);
+struct parhelia_batch_replay;
+
+/* Transitions (original family, vendor register groups): a replay right
+ * after another one in the same stream leaves out the groups the previous
+ * prefix wrote with the same values, filtered once per pair of entries.
+ * The caller breaks the chain at every drain and at every batch that is no
+ * replay, picks the transition right before appending a replay, and passes
+ * the replay as looked up (not as transitioned) once it was appended. */
+void parhelia_state_cache_set_transitions(struct parhelia_state_cache *cache,
+                                          uint32_t chip_id, bool enable);
+void parhelia_state_cache_break(struct parhelia_state_cache *cache);
+void parhelia_state_cache_transition(struct parhelia_state_cache *cache,
+                                     struct parhelia_batch_replay *replay);
+void parhelia_state_cache_appended(struct parhelia_state_cache *cache,
+                                   const struct parhelia_batch_replay *replay);
+
 /* Join each cached prefix's register lists into runs, for a kernel with
  * PARHELIA_PARAM_REGLIST_RUNS. */
 void parhelia_state_cache_set_reglist_runs(struct parhelia_state_cache *cache,
