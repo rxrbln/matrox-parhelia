@@ -630,6 +630,7 @@ struct ph_context {
    int batch_calls;
    unsigned batch_stages;	/* its vertex-program binds, with batch_calls */
    unsigned pending_call_bound;
+   struct parhelia_call_counter call_counter;	/* the pending stream's CALLs */
    int pending_ring_slot;        /* -1: not in the ring */
    uint32_t pending_ring_fence;  /* last submit that read the slot */
    unsigned pending_vertex_dwords;
@@ -1906,6 +1907,7 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
    ctx->pending_index_dwords = 0;
    ctx->pending_submit_count = 0;
    ctx->pending_call_bound = 2;
+   parhelia_call_counter_reset(&ctx->call_counter);
    ctx->pending_stage_calls = 0;
    ctx->pending_mark_count = 0;
    /* the next submit may follow another client's: it starts unfiltered */
@@ -2136,12 +2138,15 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
    /* the shadow does not know what an untracked batch wrote */
    if (!replay)
       parhelia_reg_shadow_reset(&ctx->reg_shadow);
-   /* packing across batches only joins runs, so the batches' counts bound
-    * the stream's; each counts the stream's final EOB and drain itself */
+   /* The stream's exact packed CALLs, stepped over the appended packets
+    * only.  Summing the batches' own counts took each one's opening fence
+    * and missed the runs joining across batches: q3 drained at ~100 of the
+    * 224 CALLs. */
    ctx->pending_call_bound =
-      batch_calls < 2 || !ctx->pack_adjacent_packets ||
-      ctx->pending_call_bound == UINT_MAX ? UINT_MAX :
-      ctx->pending_call_bound + (unsigned)batch_calls - 2;
+      !ctx->pack_adjacent_packets || ctx->pending_call_bound == UINT_MAX ||
+      parhelia_call_counter_update(&ctx->call_counter,
+                                   &ctx->pending_batch) ? UINT_MAX :
+      parhelia_call_counter_calls(&ctx->call_counter);
    ctx->pending_submit_count++;
    ctx->pending_stage_calls += stage_calls;
    if (ctx->aggregate_state_stream) {
@@ -17082,6 +17087,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
                             ph_original_family(ph_screen(screen)->chip_id));
    ctx->batch_calls = -1;
    ctx->pending_call_bound = 2;
+   parhelia_call_counter_reset(&ctx->call_counter);
    ctx->viewport.scale[0] = ctx->viewport.scale[1] = 1.0f;
    ctx->async_submit = ph_screen(screen)->async_submit;
    ctx->stats_sync = getenv("PARHELIA_STATS") &&
