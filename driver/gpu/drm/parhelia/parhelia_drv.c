@@ -306,6 +306,7 @@ static const struct drm_driver parhelia_driver = {
 	.ioctls = parhelia_ioctls,
 	.num_ioctls = ARRAY_SIZE(parhelia_ioctls),
 	.gem_create_object = parhelia_gem_create_object,
+	.gem_prime_import = parhelia_gem_prime_import,
 	.debugfs_init = parhelia_debugfs_init,
 	.dumb_create = parhelia_traced_dumb_create,
 	.dumb_map_offset = parhelia_traced_dumb_map_offset,

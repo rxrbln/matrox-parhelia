@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2026 René Rebe <rene@exactco.de> */
+#include <linux/dma-buf.h>
 #include <linux/dma-resv.h>
 #include <linux/highmem.h>
 #include <linux/io.h>
@@ -12,11 +13,13 @@
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 
+#include <drm/drm_drv.h>
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_ttm_helper.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_prime.h>
 #include <drm/drm_vma_manager.h>
 #include <drm/ttm/ttm_tt.h>
 
@@ -1313,8 +1316,50 @@ static void parhelia_view_object_vunmap(struct drm_gem_object *gem,
 	ttm_bo_unpin(&bo->gbo.bo);
 }
 
+static const struct dma_buf_ops parhelia_view_dmabuf_ops = {
+	.attach = drm_gem_map_attach,
+	.detach = drm_gem_map_detach,
+	.map_dma_buf = drm_gem_map_dma_buf,
+	.unmap_dma_buf = drm_gem_unmap_dma_buf,
+	.release = drm_gem_dmabuf_release,
+	.mmap = drm_gem_dmabuf_mmap,
+	.vmap = drm_gem_dmabuf_vmap,
+	.vunmap = drm_gem_dmabuf_vunmap,
+};
+
+/* Clients pass the CPU-linear view's power-of-two pitch as the dma-buf stride,
+ * so the dma-buf spans the view, which can outgrow the object. */
+static struct dma_buf *parhelia_view_object_export(struct drm_gem_object *gem,
+						   int flags)
+{
+	struct dma_buf_export_info exp_info = {
+		.exp_name = KBUILD_MODNAME,
+		.owner = gem->dev->driver->fops->owner,
+		.ops = &parhelia_view_dmabuf_ops,
+		.size = max(gem->size, to_parhelia_bo(gem)->host_size),
+		.flags = flags,
+		.priv = gem,
+		.resv = gem->resv,
+	};
+
+	return drm_gem_dmabuf_export(gem->dev, &exp_info);
+}
+
+struct drm_gem_object *parhelia_gem_prime_import(struct drm_device *drm,
+						 struct dma_buf *dma_buf)
+{
+	struct drm_gem_object *gem = dma_buf->priv;
+
+	if (dma_buf->ops == &parhelia_view_dmabuf_ops && gem->dev == drm) {
+		drm_gem_object_get(gem);
+		return gem;
+	}
+	return drm_gem_prime_import(drm, dma_buf);
+}
+
 static const struct drm_gem_object_funcs parhelia_view_object_funcs = {
 	.free = parhelia_view_object_free,
+	.export = parhelia_view_object_export,
 	.vmap = parhelia_view_object_vmap,
 	.vunmap = parhelia_view_object_vunmap,
 	.mmap = parhelia_view_object_mmap,

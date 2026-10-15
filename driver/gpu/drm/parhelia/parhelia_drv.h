@@ -913,6 +913,9 @@ u32 parhelia_bo_cpu_pitch(const struct parhelia_bo *bo);
 bool parhelia_texture_upload_enabled(void);
 bool parhelia_bo_is_native(const struct parhelia_bo *bo);
 bool parhelia_gem_is_owned(const struct drm_gem_object *gem);
+struct dma_buf;
+struct drm_gem_object *parhelia_gem_prime_import(struct drm_device *drm,
+						 struct dma_buf *dma_buf);
 void parhelia_root_trace_check(struct parhelia_device *pdev,
 			       const char *event, u64 arg0, u64 arg1, u64 arg2);
 void parhelia_host_aperture_fini(struct parhelia_device *pdev);
