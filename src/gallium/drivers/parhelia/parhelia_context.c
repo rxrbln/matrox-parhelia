@@ -634,6 +634,7 @@ struct ph_context {
    int batch_calls;
    unsigned batch_stages;	/* its vertex-program binds, with batch_calls */
    unsigned pending_call_bound;
+   bool ring_reuse;		/* the lowest free ring slot, not the next */
    int pending_ring_slot;        /* -1: not in the ring */
    uint32_t pending_ring_fence;  /* last submit that read the slot */
    unsigned pending_vertex_dwords;
@@ -1458,6 +1459,19 @@ ph_submit_batch_now(struct ph_context *ctx, struct parhelia_batch *batch,
 /* The aggregate's vertices are written straight into the ring slot they are
  * submitted from: wait for that slot's previous reader once, when the first
  * vertices arrive, instead of copying the whole aggregate at submit. */
+/* Whether ring slot @slot holds the batch being staged. */
+static bool
+ph_ring_slot_staged(const struct ph_context *ctx, unsigned slot)
+{
+   return ctx->stage_room && (ctx->triangles || ctx->points || ctx->lines) &&
+          (const uint32_t *)ctx->vertices >=
+             (const uint32_t *)ctx->vram_vertices +
+             (size_t)slot * ctx->vram_vertex_slot_dwords &&
+          (const uint32_t *)ctx->vertices <
+             (const uint32_t *)ctx->vram_vertices +
+             (size_t)(slot + 1) * ctx->vram_vertex_slot_dwords;
+}
+
 static int
 ph_pending_ring_acquire(struct ph_context *ctx, bool block)
 {
@@ -1468,15 +1482,25 @@ ph_pending_ring_acquire(struct ph_context *ctx, bool block)
        ph_pending_vertex_limit(ctx) > ctx->vram_vertex_slot_dwords)
       return 0;
    slot = ctx->vram_vertex_slot;
+   /* Reuse the lowest free slot: its lines are likely still in the board
+    * cache, where a round-robin slot's have long been evicted and every
+    * write first reads its line from memory. */
+   if (ctx->ring_reuse) {
+      for (unsigned s = 0; s < ctx->vram_vertex_slot_count; s++) {
+         if (ph_ring_slot_staged(ctx, s))
+            continue;
+         if (ctx->vram_vertex_fence[s] &&
+             parhelia_wait_fence(ph_screen(ctx->base.screen)->fd,
+                                 ctx->vram_vertex_fence[s], 0, NULL))
+            continue;
+         ctx->vram_vertex_fence[s] = 0;
+         slot = ctx->vram_vertex_slot = s;
+         break;
+      }
+   }
    /* a drain inside a batch's submission leaves that batch staged in the
     * slot just released, until it is appended */
-   if (ctx->stage_room && (ctx->triangles || ctx->points || ctx->lines) &&
-       (const uint32_t *)ctx->vertices >=
-          (const uint32_t *)ctx->vram_vertices +
-          (size_t)slot * ctx->vram_vertex_slot_dwords &&
-       (const uint32_t *)ctx->vertices <
-          (const uint32_t *)ctx->vram_vertices +
-          (size_t)(slot + 1) * ctx->vram_vertex_slot_dwords)
+   if (ph_ring_slot_staged(ctx, slot))
       slot = ctx->vram_vertex_slot = (slot + 1) % ctx->vram_vertex_slot_count;
    if (ctx->vram_vertex_fence[slot]) {
       int ret = block ?
@@ -17092,6 +17116,7 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
        ph_original_family(ph_screen(screen)->chip_id)) &&
       debug_get_bool_option("PARHELIA_PACKED_COLOUR", true);
    ctx->drop_repeats = debug_get_bool_option("PARHELIA_DROP_REPEATS", false);
+   ctx->ring_reuse = debug_get_bool_option("PARHELIA_RING_REUSE", true);
    parhelia_state_cache_set_reglist_runs(ctx->state_cache,
       ph_screen(screen)->reglist_runs && !ctx->state_filter &&
       !ctx->drop_repeats);
