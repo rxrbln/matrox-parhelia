@@ -8469,16 +8469,6 @@ ph_tcl_program_constants(struct ph_context *ctx, const struct ph_vs *vs,
    return true;
 }
 
-/* Zero, or normal and below 2^60: products of two such values neither
- * overflow nor take a denormal, NaN or infinity operand. */
-static inline bool
-ph_fp_clean(uint32_t bits)
-{
-   const uint32_t mag = bits & 0x7fffffffu;
-
-   return !mag || mag - 0x00800000u < 0x5d800000u - 0x00800000u;
-}
-
 /* The shader's matrix rows are the rows of the transposed matrix, so
  * ubo_row[k][i] scales input component k into output component i.  WARP
  * computes r2.i = dot(v, c_i), so c_i[k] = ubo_row[k][i]. */
@@ -8504,10 +8494,6 @@ ph_tcl_matrix(struct ph_context *ctx, float mvp[16])
    for (unsigned i = 0; i < 4; i++)
       for (unsigned k = 0; k < 4; k++)
          mvp[i * 4 + k] = rows[k * 4 + i];
-   /* the transform and clip tests take only clean factors */
-   for (unsigned i = 0; i < 16; i++)
-      if (!ph_fp_clean(fui(mvp[i])))
-         return false;
    return true;
 }
 
@@ -8682,20 +8668,6 @@ struct ph_tcl_run {
    float cx, cy;                /* the clipper's x and y planes */
 };
 
-/* The transform and clip tests check their positions and matrix clean
- * (ph_fp_clean()) first: on the Alpha they run without -mieee's software
- * completion and the trap barrier it puts on every float instruction. */
-#ifdef __alpha__
-#define PH_FAST_FP_BEGIN \
-   _Pragma("GCC push_options") _Pragma("GCC target(\"no-ieee\")")
-#define PH_FAST_FP_END _Pragma("GCC pop_options")
-#else
-#define PH_FAST_FP_BEGIN
-#define PH_FAST_FP_END
-#endif
-
-PH_FAST_FP_BEGIN
-
 static float
 ph_tcl_plane_distance(unsigned plane, const float c[4], float gx, float gy)
 {
@@ -8719,8 +8691,6 @@ ph_tcl_clip_coords(const float *m, const float *p, float c[4])
       c[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] +
              m[r * 4 + 3];
 }
-
-PH_FAST_FP_END
 
 /* Append one object-space triangle to the transforming batch, publishing a
  * full batch first; a submit clears the batch's program state. */
@@ -8773,8 +8743,7 @@ ph_packed_colour_lerp(uint32_t a, uint32_t b, float t)
 /* Sutherland-Hodgman against the transform's planes; the intersection is
  * always taken from the inside vertex, so an edge two triangles share is cut
  * at the same point in both. */
-/* Not inlined: it interpolates attributes no one checked clean. */
-static bool __attribute__((noinline))
+static bool
 ph_tcl_clip_tri(struct ph_context *ctx, const struct ph_tcl_run *r,
                 const float *const tri[3], const float tri_clip[3][4])
 {
@@ -8875,8 +8844,6 @@ ph_tcl_clip_evacuate(struct ph_context *ctx, struct ph_tcl_clip_src *s,
  * the triangles that fit as they are and clip the others, all on the
  * hardware transform.  Appends overwrite the staged chunk in order, so only
  * triangles an append is about to overtake are moved aside first. */
-PH_FAST_FP_BEGIN
-
 static bool
 ph_tcl_clip_chunk(struct ph_context *ctx, const struct ph_tcl_run *r,
                   const float *staged, unsigned ntri)
@@ -8887,17 +8854,6 @@ ph_tcl_clip_chunk(struct ph_context *ctx, const struct ph_tcl_run *r,
    const unsigned start = ctx->triangles;
    const size_t bytes = (size_t)ntri * src.tri_floats * sizeof(float);
    bool staged_live = true;
-   uint32_t clean = 1;
-
-   /* the positions lead each vertex; nothing is appended before this */
-   for (unsigned v = 0; v < ntri * 3; v++) {
-      const float *p = staged + (size_t)v * r->dpv;
-
-      clean &= ph_fp_clean(fui(p[0])) & ph_fp_clean(fui(p[1])) &
-               ph_fp_clean(fui(p[2]));
-   }
-   if (!clean)
-      return false;
 
    /* sized up front: nothing is appended when this fails */
    if (ctx->tcl_clip_cap < bytes) {
@@ -8953,8 +8909,6 @@ ph_tcl_clip_chunk(struct ph_context *ctx, const struct ph_tcl_run *r,
    return true;
 }
 
-PH_FAST_FP_END
-
 /* An integer whose signed order is the order of the float @bits (NaN aside):
  * min/max without float compares, which carry a trap barrier each on Alpha. */
 static inline int32_t
@@ -8972,14 +8926,14 @@ ph_float_from_order_key(int32_t key)
 }
 
 /* Min/max of @comps float components over vertices [lo, hi]; false if any is
- * not ph_fp_clean(), which makes the box unusable. */
+ * NaN, which makes the box unusable. */
 static bool
 ph_tcl_box_scan(const uint8_t *base, unsigned stride, unsigned lo,
                 unsigned hi, unsigned comps, float lo_out[3], float hi_out[3])
 {
    int32_t kmin[3] = { INT32_MAX, INT32_MAX, INT32_MAX };
    int32_t kmax[3] = { INT32_MIN, INT32_MIN, INT32_MIN };
-   uint32_t bad = 0;
+   uint32_t nan = 0;
 
    for (unsigned v = lo; v <= hi; v++) {
       const uint8_t *src = base + (size_t)v * stride;
@@ -8989,13 +8943,13 @@ ph_tcl_box_scan(const uint8_t *base, unsigned stride, unsigned lo,
          int32_t key;
 
          memcpy(&bits, src + c * 4, 4);
-         bad |= !ph_fp_clean(bits);
+         nan |= (bits & 0x7fffffffu) > 0x7f800000u;
          key = ph_float_order_key(bits);
          kmin[c] = key < kmin[c] ? key : kmin[c];
          kmax[c] = key > kmax[c] ? key : kmax[c];
       }
    }
-   if (bad)
+   if (nan)
       return false;
    for (unsigned c = 0; c < 3; c++) {
       lo_out[c] = c < comps ? ph_float_from_order_key(kmin[c]) : 0.0f;
@@ -9611,7 +9565,7 @@ ph_tcl_software_tail(struct ph_context *ctx, const uint32_t *elts,
 /* Order keys of the positions a fetch copied (ph_float_order_key). */
 struct ph_tcl_box {
    int32_t lo[3], hi[3];
-   uint32_t bad;                 /* a position not ph_fp_clean() */
+   uint32_t nan;
 };
 
 struct ph_tcl_fetch_elem {
@@ -9699,7 +9653,7 @@ ph_tcl_fetch_position_box_n(const struct ph_tcl_fetch_elem *e,
 {
    int32_t lo0 = box->lo[0], lo1 = box->lo[1], lo2 = box->lo[2];
    int32_t hi0 = box->hi[0], hi1 = box->hi[1], hi2 = box->hi[2];
-   uint32_t bad = box->bad;
+   uint32_t nan = box->nan;
 
    for (unsigned v = 0; v < count; v++, d += dpv) {
       const uint32_t *s = (const uint32_t *)ph_tcl_vertex_src(e, elts[v], pow2);
@@ -9710,7 +9664,9 @@ ph_tcl_fetch_position_box_n(const struct ph_tcl_fetch_elem *e,
       d[0] = x;
       d[1] = y;
       d[2] = z;
-      bad |= !(ph_fp_clean(x) & ph_fp_clean(y) & ph_fp_clean(z));
+      nan |= ((x & 0x7fffffffu) > 0x7f800000u) |
+             ((y & 0x7fffffffu) > 0x7f800000u) |
+             ((z & 0x7fffffffu) > 0x7f800000u);
       lo0 = kx < lo0 ? kx : lo0;
       hi0 = kx > hi0 ? kx : hi0;
       lo1 = ky < lo1 ? ky : lo1;
@@ -9720,7 +9676,7 @@ ph_tcl_fetch_position_box_n(const struct ph_tcl_fetch_elem *e,
    }
    box->lo[0] = lo0; box->lo[1] = lo1; box->lo[2] = lo2;
    box->hi[0] = hi0; box->hi[1] = hi1; box->hi[2] = hi2;
-   box->bad = bad;
+   box->nan = nan;
 }
 
 static void
@@ -9891,14 +9847,14 @@ ph_tcl_fetch_run_boxed(const struct ph_context *ctx,
             box.lo[c] = MIN2(box.lo[c], own->lo[c]);
             box.hi[c] = MAX2(box.hi[c], own->hi[c]);
          }
-         box.bad |= own->bad;
+         box.nan |= own->nan;
       } else {
          ph_tcl_fetch_position_box(&f->e[f->box_elem], elts + b, n,
                                    d + f->e[f->box_elem].out, dpv, &box);
       }
       ph_tcl_fetch_elements_but(f, f->box_elem, elts + b, n, d, dpv);
    }
-   if (box.bad)
+   if (box.nan)
       return false;
    for (unsigned c = 0; c < 3; c++) {
       lo[c] = ph_float_from_order_key(box.lo[c]);
@@ -9938,8 +9894,6 @@ ph_tcl_constant_colour(struct ph_context *ctx, const struct ph_tcl_layout *lay,
 /* Outcode bits of a clip-space vertex: inside the guard band volume, and
  * one per clipper plane it lies outside of. */
 #define PH_TCL_VCODE_INSIDE 0x80u
-
-PH_FAST_FP_BEGIN
 
 static inline uint8_t
 ph_tcl_vertex_code(const struct ph_tcl_run *r, const float c[4])
@@ -10002,10 +9956,6 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
    for (unsigned i = 0; i < ntri * 3; i++)
       if (elts[i] - lo >= nverts)
          return false;
-   /* a position not ph_fp_clean() keeps the draw off this path */
-   for (unsigned b = 0; b < nverts; b += PH_TCL_FETCH_BLOCK)
-      if (ctx->tcl_block_box[b / PH_TCL_FETCH_BLOCK].bad)
-         return false;
    /* a block whose box fits holds only inside vertices: no transform */
    for (unsigned b = 0; b < nverts; b += PH_TCL_FETCH_BLOCK) {
       const unsigned n = MIN2(nverts - b, PH_TCL_FETCH_BLOCK);
@@ -10017,7 +9967,7 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
          blo[c] = ph_float_from_order_key(box->lo[c]);
          bhi[c] = ph_float_from_order_key(box->hi[c]);
       }
-      if (ph_tcl_box_fits(ctx, ctx->mvp, NULL, blo, bhi)) {
+      if (!box->nan && ph_tcl_box_fits(ctx, ctx->mvp, NULL, blo, bhi)) {
          memset(ctx->tcl_vcode + b, PH_TCL_VCODE_INSIDE, n);
          memset(ctx->tcl_vhave + b, 0, n);
          continue;
@@ -10026,7 +9976,8 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
          float planes[7][4];
 
          ctx->tcl_classified += n;
-         ctx->tcl_plane_blocks[!ph_tcl_inside_planes(ctx, ctx->mvp, planes) ?
+         ctx->tcl_plane_blocks[box->nan ||
+                               !ph_tcl_inside_planes(ctx, ctx->mvp, planes) ?
                                0x7f :
                                ph_tcl_box_plane_mask(planes, blo, bhi)]++;
       }
@@ -10108,8 +10059,6 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
    }
    return true;
 }
-
-PH_FAST_FP_END
 
 static bool
 ph_tcl_draw_indexed(struct ph_context *ctx, const struct ph_tcl_layout *lay,
