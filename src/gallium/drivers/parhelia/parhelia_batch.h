@@ -231,8 +231,11 @@ struct parhelia_batch_replay;
  * The caller breaks the chain at every drain and at every batch that is no
  * replay, picks the transition right before appending a replay, and passes
  * the replay as looked up (not as transitioned) once it was appended. */
+/* @units also leaves out the vendor's WARP group as one unit when it
+ * repeats with the same matrix, and repeated render surfaces. */
 void parhelia_state_cache_set_transitions(struct parhelia_state_cache *cache,
-                                          uint32_t chip_id, bool enable);
+                                          uint32_t chip_id, bool enable,
+                                          bool units);
 void parhelia_state_cache_break(struct parhelia_state_cache *cache);
 void parhelia_state_cache_transition(struct parhelia_state_cache *cache,
                                      struct parhelia_batch_replay *replay);

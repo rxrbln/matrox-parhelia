@@ -4,6 +4,7 @@
  * CALLs are metadata only; the kernel constructs the executable primary span.
  */
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1282,15 +1283,24 @@ struct state_cache_entry {
    uint8_t *packet_flags;        /* STATE_PACKET_* per prefix packet */
    unsigned stages;              /* its vertex-program binds (stage CALLs) */
    unsigned long hits;
+   unsigned id;                  /* capture order, for the profile */
    /* the packets before register-list runs joined them, for transitions */
    struct drm_parhelia_packet *raw_packets;
    struct drm_parhelia_reloc *raw_relocs;
    uint8_t *raw_flags;
    unsigned raw_packet_count;
+   /* the vendor's WARP group as raw packets [warp_first, warp_last]:
+    * loader preamble, binds, constant loads, stage entries, descriptors;
+    * -1 when the prefix has none that can go as a unit */
+   int warp_first, warp_last;
+   bool warp_mvp;                        /* the matrix is loaded in it */
+   uint32_t warp_regs[8], rest_regs[8];  /* written in it, and after it */
+   bool rest_constants;                  /* a constant load after it */
    /* this prefix filtered against each predecessor's writes */
    struct state_transition {
       const struct state_cache_entry *from;
       struct state_cache_entry *t;      /* NULL: nothing to drop */
+      struct state_cache_entry *tw;     /* also without the WARP unit */
    } *trans;
    unsigned trans_count, trans_cap;
 };
@@ -1306,7 +1316,12 @@ struct parhelia_state_cache {
     * with the same values (original family) */
    struct parhelia_reg_shadow tshadow;
    const struct state_cache_entry *prev;
+   bool units;                   /* WARP unit and surfaces go too */
+   float prev_mvp[16];           /* the matrix the previous replay loaded */
+   bool prev_mvp_valid;
    FILE *profile;                /* PARHELIA_STATE_CACHE_PROFILE output */
+   FILE *sequence;               /* PARHELIA_STATE_CACHE_SEQUENCE output */
+   unsigned next_id;
    unsigned long hits, misses;
    int last_calls;               /* the last batch's entry calls, or -1 */
    unsigned last_stages;
@@ -1325,11 +1340,15 @@ state_cache_profile(struct parhelia_state_cache *c)
 
       if (!e)
          continue;
-      fprintf(c->profile, "E %lu %u %u\n", e->hits + 1, e->command_count,
-              e->packet_count);
+      fprintf(c->profile, "E %lu %u %u %u %d\n", e->hits + 1,
+              e->command_count, e->packet_count, e->id, e->mvp_offset);
       for (unsigned p = 0; p < e->packet_count; p++)
          fprintf(c->profile, "P %u %u\n", e->packets[p].offset,
                  e->packets[p].length);
+      for (unsigned r = 0; r < e->reloc_count; r++)
+         fprintf(c->profile, "L %u %u %u %u %u\n", e->relocs[r].packet,
+                 e->relocs[r].dword, e->relocs[r].type, e->relocs[r].handle,
+                 e->relocs[r].delta);
       fprintf(c->profile, "C");
       for (unsigned d = 0; d < e->command_count; d++)
          fprintf(c->profile, " %08x", e->commands[d]);
@@ -1358,9 +1377,14 @@ parhelia_state_cache_create(void)
    struct parhelia_state_cache *c = calloc(1, sizeof(*c));
    const char *verify = getenv("PARHELIA_STATE_CACHE_VERIFY");
    const char *profile = getenv("PARHELIA_STATE_CACHE_PROFILE");
+   const char *sequence = getenv("PARHELIA_STATE_CACHE_SEQUENCE");
 
    if (c) {
       c->verify = verify && strcmp(verify, "0");
+      /* PARHELIA_STATE_CACHE_SEQUENCE=file: the replays in stream order,
+       * each with its matrix, and every break of the chain */
+      if (sequence)
+         c->sequence = fopen(sequence, "w");
       if (profile && !state_cache_profiled &&
           (c->profile = fopen(profile, "w"))) {
          state_cache_profiled = c;
@@ -1384,8 +1408,10 @@ state_cache_entry_free(struct state_cache_entry *e)
    free(e->raw_packets);
    free(e->raw_relocs);
    free(e->raw_flags);
-   for (unsigned i = 0; i < e->trans_count; i++)
+   for (unsigned i = 0; i < e->trans_count; i++) {
       state_cache_entry_free(e->trans[i].t);
+      state_cache_entry_free(e->trans[i].tw);
+   }
    free(e->trans);
    free(e);
 }
@@ -1413,6 +1439,8 @@ parhelia_state_cache_destroy(struct parhelia_state_cache *c)
    state_cache_flush(c);
    if (c->profile)
       fclose(c->profile);
+   if (c->sequence)
+      fclose(c->sequence);
    if (state_cache_profiled == c)
       state_cache_profiled = NULL;
    parhelia_reg_shadow_fini(&c->tshadow);
@@ -1676,6 +1704,161 @@ state_cache_join_runs(struct state_cache_entry *e)
    return 0;
 }
 
+/* The vendor's WARP group (0528 MTXPARD dirty groups): binds, stage
+ * entries, vertex format and descriptor burst, emitted as one unit, with
+ * their 0x41 constant loads; the registers allowed alongside are the
+ * loader preamble's (stream, stride, primitive word, vertex limits) and
+ * the strobe. */
+static bool
+reg_in_warp_unit(unsigned index, bool *warp)
+{
+   static const uint8_t allowed[] = { 0x00, 0x10, 0x18, 0x19, 0x2c, 0x41,
+                                      0xdd };
+
+   *warp = index == 0x2d || index == 0x2e || (index >= 0x30 && index <= 0x36) ||
+           index == 0x3c || index == 0x3e || index == 0x40 ||
+           (index >= 0x44 && index <= 0x4c) || index == 0x51;
+   for (unsigned i = 0; !*warp && i < sizeof(allowed); i++)
+      if (index == allowed[i])
+         return true;
+   return *warp;
+}
+
+/* Registers a plain list writes, into @regs (256 bits); false when it is
+ * not a single plain register list. */
+static bool
+state_list_regs(const uint32_t *cmd, unsigned length, uint32_t *regs)
+{
+   unsigned pos = 1;
+
+   if (length < 2 || (cmd[0] >> 16) || (cmd[0] & 0xffffu) + 2u != length)
+      return false;
+   while (pos < length) {
+      const uint32_t tag = cmd[pos++];
+
+      for (unsigned s = 0; s < 4 && pos < length; s++, pos++) {
+         const unsigned index = (tag >> (s * 8)) & 0xff;
+
+         if (index == 0x21)
+            break;
+         regs[index / 32] |= 1u << (index % 32);
+      }
+   }
+   return true;
+}
+
+/* Where the prefix's WARP unit lies, and what is written after it.  The
+ * unit is the run of raw packets from the first one holding a WARP group
+ * write or a constant load to the last before the direct-fetch tail,
+ * extended back over the loader preamble; every packet in it holds only
+ * WARP-unit registers or constant loads and no relocation. */
+static void
+state_cache_warp_unit(struct state_cache_entry *e)
+{
+   const unsigned n = e->raw_packet_count;
+   unsigned tail = n, first = n, last = 0;
+   bool *reloc = calloc(n + 1, sizeof(*reloc));
+
+   e->warp_first = e->warp_last = -1;
+   e->rest_constants = false;
+   memset(e->warp_regs, 0, sizeof(e->warp_regs));
+   memset(e->rest_regs, 0, sizeof(e->rest_regs));
+   if (!reloc)
+      return;
+   for (unsigned r = 0; r < e->reloc_count; r++) {
+      const unsigned p = e->raw_relocs[r].packet;
+
+      if (p >= n)
+         continue;
+      reloc[p] = true;
+      if (e->raw_relocs[r].type != PARHELIA_RELOC_VRAM && p < tail)
+         tail = p;
+   }
+   for (unsigned k = 0; k < tail; k++) {
+      const uint32_t *cmd = e->commands + e->raw_packets[k].offset;
+      uint32_t regs[8] = { 0 };
+      bool any_warp = (cmd[0] >> 24) == 0x41;
+
+      if (!any_warp &&
+          !(cmd[0] >> 24) && state_list_regs(cmd, e->raw_packets[k].length,
+                                             regs))
+         for (unsigned i = 0; i < 256; i++) {
+            bool warp;
+
+            if (regs[i / 32] & 1u << (i % 32) && reg_in_warp_unit(i, &warp) &&
+                warp)
+               any_warp = true;
+         }
+      if (any_warp) {
+         if (k < first)
+            first = k;
+         last = k;
+      }
+   }
+   if (first == n)
+      goto out;
+   /* the loader preamble right before belongs to the unit */
+   while (first > 0) {
+      const uint32_t *cmd = e->commands + e->raw_packets[first - 1].offset;
+      uint32_t regs[8] = { 0 };
+      bool only = !reloc[first - 1] && !(cmd[0] >> 24) &&
+                  state_list_regs(cmd, e->raw_packets[first - 1].length,
+                                  regs);
+
+      for (unsigned i = 0; only && i < 256; i++) {
+         bool warp;
+
+         if (regs[i / 32] & 1u << (i % 32) && !reg_in_warp_unit(i, &warp))
+            only = false;
+      }
+      if (!only)
+         break;
+      first--;
+   }
+   for (unsigned k = first; k <= last; k++) {
+      const struct drm_parhelia_packet pk = e->raw_packets[k];
+      const uint32_t *cmd = e->commands + pk.offset;
+      uint32_t regs[8] = { 0 };
+
+      if (reloc[k] || (k > first && pk.offset !=
+                       e->raw_packets[k - 1].offset +
+                       e->raw_packets[k - 1].length))
+         goto out;
+      if ((cmd[0] >> 24) == 0x41)
+         continue;
+      if ((cmd[0] >> 24) || !state_list_regs(cmd, pk.length, regs))
+         goto out;
+      for (unsigned i = 0; i < 256; i++) {
+         bool warp;
+
+         if (regs[i / 32] & 1u << (i % 32) && !reg_in_warp_unit(i, &warp))
+            goto out;
+      }
+      for (unsigned j = 0; j < 8; j++)
+         e->warp_regs[j] |= regs[j];
+   }
+   /* what the rest of the prefix writes after the unit */
+   for (unsigned k = last + 1; k < n; k++) {
+      const uint32_t *cmd = e->commands + e->raw_packets[k].offset;
+      uint32_t regs[8] = { 0 };
+
+      if ((cmd[0] >> 24) == 0x41)
+         e->rest_constants = true;
+      else if ((cmd[0] >> 24) ||
+               !state_list_regs(cmd, e->raw_packets[k].length, regs))
+         memset(regs, 0xff, sizeof(regs));
+      for (unsigned j = 0; j < 8; j++)
+         e->rest_regs[j] |= regs[j];
+   }
+   e->warp_first = first;
+   e->warp_last = last;
+   e->warp_mvp = e->mvp_offset >= (int)e->raw_packets[first].offset &&
+                 e->mvp_offset < (int)(e->raw_packets[last].offset +
+                                       e->raw_packets[last].length);
+out:
+   free(reloc);
+}
+
 /* The prefix's packets as captured, before register-list runs join them:
  * transitions filter list by list. */
 static int
@@ -1690,6 +1873,7 @@ state_cache_keep_raw(struct state_cache_entry *e)
    memcpy(e->raw_relocs, e->relocs, e->reloc_count * sizeof(*e->relocs));
    memcpy(e->raw_flags, e->packet_flags, e->packet_count);
    e->raw_packet_count = e->packet_count;
+   state_cache_warp_unit(e);
    return 0;
 }
 
@@ -1732,6 +1916,8 @@ static const uint8_t reg_groups_original[][11] = {
    { 0xc9 },
    { 0xbd },
    { 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1 },
+   /* surfaces: relocated, so only judged with their relocations */
+   { 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d },
 };
 
 int
@@ -1794,7 +1980,8 @@ static void
 reg_shadow_judge(struct parhelia_reg_shadow *shadow, const uint32_t *commands,
                  const struct drm_parhelia_packet *packets,
                  const uint8_t *packet_flags, unsigned packet_count,
-                 int limit_offset, uint32_t limit)
+                 int limit_offset, uint32_t limit,
+                 const struct drm_parhelia_reloc *const *reloc_at)
 {
    bool parsed = true;
 
@@ -1821,18 +2008,25 @@ reg_shadow_judge(struct parhelia_reg_shadow *shadow, const uint32_t *commands,
          for (unsigned s = 0; s < 4 && pos < len; s++) {
             const unsigned index = (tag >> (s * 8)) & 0xff;
             const unsigned g = shadow->group_of[index];
+            const unsigned at = packets[i].offset + pos;
+            const struct drm_parhelia_reloc *r = reloc_at ? reloc_at[at] : NULL;
             const uint32_t value =
-               limit && (int)(packets[i].offset + pos) == limit_offset ?
-               limit : cmd[pos];
+               limit && (int)at == limit_offset ? limit : cmd[pos];
 
             if (index == 0x21)
                break;
             pos++;
             if (!g)
                continue;
-            if (flags != STATE_PACKET_REGLIST)
+            /* a relocated operand is its object and offset */
+            if (flags & STATE_PACKET_EXACT ||
+                (flags != STATE_PACKET_REGLIST && !reloc_at) ||
+                (r && r->type != PARHELIA_RELOC_VRAM))
                shadow->group[g].droppable = false;
-            if (!reg_group_push(&shadow->group[g], index, value)) {
+            if (!(r ? reg_group_push(&shadow->group[g], index, r->handle) &&
+                      reg_group_push(&shadow->group[g], index | 0x100,
+                                     r->delta) :
+                      reg_group_push(&shadow->group[g], index, value))) {
                shadow->group[g].droppable = false;
                shadow->group[g].valid = false;
             }
@@ -1864,7 +2058,7 @@ reg_shadow_judge(struct parhelia_reg_shadow *shadow, const uint32_t *commands,
 static unsigned
 reg_shadow_filter(const struct parhelia_reg_shadow *shadow, uint32_t *out,
                   const uint32_t *cmd, unsigned length, int limit_pos,
-                  uint32_t limit, int *limit_out)
+                  uint32_t limit, int *limit_out, int *pos_out)
 {
    unsigned pos = 1, w = 1, tag_at = 0, slot = 4;
 
@@ -1880,8 +2074,11 @@ reg_shadow_filter(const struct parhelia_reg_shadow *shadow, uint32_t *out,
             break;
          value = (int)pos == limit_pos ? limit : cmd[pos];
          pos++;
-         if (g && shadow->group[g].drop)
+         if (g && shadow->group[g].drop) {
+            if (pos_out)
+               pos_out[pos - 1] = -1;
             continue;
+         }
          if (slot == 4) {
             tag_at = w++;
             out[tag_at] = 0x21212121u;
@@ -1892,6 +2089,8 @@ reg_shadow_filter(const struct parhelia_reg_shadow *shadow, uint32_t *out,
          slot++;
          if (limit_out && (int)pos - 1 == limit_pos)
             *limit_out = (int)w;
+         if (pos_out)
+            pos_out[pos - 1] = (int)w;
          out[w++] = value;
       }
    }
@@ -2115,7 +2314,7 @@ state_cache_replay_at(struct parhelia_batch *dst,
       unsigned packets = packet_base;
 
       reg_shadow_judge(shadow, e->commands, e->packets, e->packet_flags,
-                       e->packet_count, e->limit_offset, r->limit);
+                       e->packet_count, e->limit_offset, r->limit, NULL);
 
       for (unsigned i = 0; i < e->packet_count; i++) {
          const uint32_t *cmd = e->commands + e->packets[i].offset;
@@ -2130,7 +2329,7 @@ state_cache_replay_at(struct parhelia_batch *dst,
             written = reg_shadow_filter(shadow, out, cmd, len,
                                         r->limit && at > 0 &&
                                            at < (int)len ? at : -1,
-                                        r->limit, NULL);
+                                        r->limit, NULL, NULL);
             if (!written)
                continue;
          } else {
@@ -2347,6 +2546,7 @@ parhelia_batch_state_run_units_deferred(struct parhelia_state_cache *cache,
    e = state_cache_capture(batch, draws, state->indexed_vertices);
    if (!e)
       return 0;
+   e->id = cache->next_id++;
    if (state->indexed_vertices) {
       e->limit_offset = state_cache_find_limit(e);
       if (e->limit_offset < 0 ||
@@ -2405,33 +2605,109 @@ parhelia_batch_state_run_units_deferred(struct parhelia_state_cache *cache,
  * Only what @from itself wrote counts: the stream holds @from's replay
  * right before, and neither its draws nor the kernel's stage and fence
  * CALLs write these groups.  NULL with *dropped false: nothing repeats. */
+/* Each command dword of @e's raw packets that a relocation patches. */
+static const struct drm_parhelia_reloc **
+state_cache_reloc_map(const struct state_cache_entry *e)
+{
+   const struct drm_parhelia_reloc **at =
+      calloc(e->command_count + 1, sizeof(*at));
+
+   for (unsigned r = 0; at && r < e->reloc_count; r++) {
+      const struct drm_parhelia_reloc *reloc = &e->raw_relocs[r];
+
+      /* every relocation but draws and boundaries patches an operand */
+      if (reloc->packet < e->raw_packet_count &&
+          reloc->type != PARHELIA_RELOC_DRAW &&
+          reloc->type != PARHELIA_RELOC_DRAW_RANGES &&
+          reloc->type != PARHELIA_RELOC_BATCH_BOUNDARY &&
+          reloc->type != PARHELIA_RELOC_CALL_BOUNDARY &&
+          e->raw_packets[reloc->packet].offset + reloc->dword <
+             e->command_count)
+         at[e->raw_packets[reloc->packet].offset + reloc->dword] = reloc;
+   }
+   return at;
+}
+
+/* Whether @to's WARP unit may be left out after @from's when both load
+ * the same matrix: the same bytes apart from the matrix at the same place,
+ * and nothing it writes and @to does not rewrite after it is changed by
+ * @from after @from's unit. */
+static bool
+state_cache_warp_same(const struct state_cache_entry *from,
+                      const struct state_cache_entry *to)
+{
+   unsigned fs, ts, len;
+   int fm, tm;
+
+   if (from->warp_first < 0 || to->warp_first < 0)
+      return false;
+   fs = from->raw_packets[from->warp_first].offset;
+   ts = to->raw_packets[to->warp_first].offset;
+   len = to->raw_packets[to->warp_last].offset +
+         to->raw_packets[to->warp_last].length - ts;
+   if (from->raw_packets[from->warp_last].offset +
+       from->raw_packets[from->warp_last].length - fs != len ||
+       to->warp_last - to->warp_first != from->warp_last - from->warp_first)
+      return false;
+   fm = from->mvp_offset >= (int)fs && from->mvp_offset < (int)(fs + len) ?
+        from->mvp_offset - (int)fs : -1;
+   tm = to->mvp_offset >= (int)ts && to->mvp_offset < (int)(ts + len) ?
+        to->mvp_offset - (int)ts : -1;
+   if (fm != tm || (tm >= 0 && (unsigned)tm + 16 > len))
+      return false;
+   for (unsigned k = 0; k <= (unsigned)(to->warp_last - to->warp_first); k++)
+      if (to->raw_packets[to->warp_first + k].length !=
+          from->raw_packets[from->warp_first + k].length)
+         return false;
+   for (unsigned d = 0; d < len; d++)
+      if ((tm < 0 || d < (unsigned)tm || d >= (unsigned)tm + 16) &&
+          to->commands[ts + d] != from->commands[fs + d])
+         return false;
+   if (from->rest_constants)
+      return false;
+   for (unsigned j = 0; j < 8; j++)
+      if (to->warp_regs[j] & ~to->rest_regs[j] & from->rest_regs[j])
+         return false;
+   return true;
+}
+
 static struct state_cache_entry *
 state_cache_transition_build(struct parhelia_state_cache *c,
                              const struct state_cache_entry *from,
                              const struct state_cache_entry *to,
-                             bool *dropped)
+                             bool warp_drop, bool *dropped)
 {
    struct parhelia_reg_shadow *sh = &c->tshadow;
-   struct state_cache_entry *t;
-   unsigned *map, w = 0, np = 0, nr = 0;
-   bool any = false;
+   const struct drm_parhelia_reloc **from_at = state_cache_reloc_map(from);
+   const struct drm_parhelia_reloc **to_at = state_cache_reloc_map(to);
+   const bool units = c->units;
+   struct state_cache_entry *t = NULL;
+   unsigned *map = NULL, w = 0, np = 0, nr = 0;
+   int *pos = NULL;
+   bool any = warp_drop;
 
    *dropped = false;
+   if (!from_at || !to_at)
+      goto fail;
    for (unsigned g = 1; g <= sh->groups; g++) {
       sh->group[g].len = 0;
       sh->group[g].valid = false;
    }
    reg_shadow_judge(sh, from->commands, from->raw_packets, from->raw_flags,
-                    from->raw_packet_count, -1, 0);
+                    from->raw_packet_count, -1, 0, units ? from_at : NULL);
    reg_shadow_judge(sh, to->commands, to->raw_packets, to->raw_flags,
-                    to->raw_packet_count, -1, 0);
+                    to->raw_packet_count, -1, 0, units ? to_at : NULL);
    for (unsigned g = 1; g <= sh->groups; g++)
       any |= sh->group[g].drop;
-   if (!any)
+   if (!any) {
+      free(from_at);
+      free(to_at);
       return NULL;
+   }
    t = calloc(1, sizeof(*t));
    map = malloc((to->raw_packet_count + 1) * sizeof(*map));
-   if (!t || !map)
+   pos = malloc((to->command_count + 1) * sizeof(*pos));
+   if (!t || !map || !pos)
       goto fail;
    t->commands = malloc((to->command_count + 1) * sizeof(uint32_t));
    t->odd_storage = malloc((to->command_count + 2) * sizeof(uint32_t));
@@ -2448,19 +2724,33 @@ state_cache_transition_build(struct parhelia_state_cache *c,
       const uint8_t flags = to->raw_flags[i];
       const int at = to->limit_offset - (int)pk.offset;
       const bool limit_here = at > 0 && at < (int)pk.length;
+      bool vram_only = units &&
+                       flags == (STATE_PACKET_REGLIST | STATE_PACKET_RELOC);
       unsigned written;
 
-      if (flags == STATE_PACKET_REGLIST) {
+      map[i] = UINT_MAX;
+      if (warp_drop && (int)i >= to->warp_first && (int)i <= to->warp_last)
+         continue;
+      for (unsigned d = 0; vram_only && d < pk.length; d++)
+         if (to_at[pk.offset + d] &&
+             to_at[pk.offset + d]->type != PARHELIA_RELOC_VRAM)
+            vram_only = false;
+      if (flags == STATE_PACKET_REGLIST || vram_only) {
          int limit_out = -1;
 
+         for (unsigned d = 0; d < pk.length; d++)
+            pos[pk.offset + d] = -1;
          written = reg_shadow_filter(sh, t->commands + w, cmd, pk.length,
                                      limit_here ? at : -1,
-                                     limit_here ? cmd[at] : 0, &limit_out);
+                                     limit_here ? cmd[at] : 0, &limit_out,
+                                     pos + pk.offset);
          if (!written)
             continue;
          if (limit_out >= 0)
             t->limit_offset = (int)w + limit_out;
       } else {
+         for (unsigned d = 0; d < pk.length; d++)
+            pos[pk.offset + d] = (int)d;
          memcpy(t->commands + w, cmd, pk.length * sizeof(uint32_t));
          if (to->mvp_offset >= (int)pk.offset &&
              to->mvp_offset < (int)(pk.offset + pk.length))
@@ -2476,13 +2766,31 @@ state_cache_transition_build(struct parhelia_state_cache *c,
       t->packet_flags[np++] = flags;
       w += written;
    }
-   /* a dropped list carried no relocation */
+   /* a dropped write takes its relocation along; the WARP unit has none */
    for (unsigned r = 0; r < to->reloc_count; r++) {
-      t->relocs[nr] = to->raw_relocs[r];
-      t->relocs[nr++].packet = map[to->raw_relocs[r].packet];
+      const struct drm_parhelia_reloc *reloc = &to->raw_relocs[r];
+      const unsigned p = reloc->packet;
+      int moved;
+
+      if (p >= to->raw_packet_count || map[p] == UINT_MAX) {
+         if (p < to->raw_packet_count && (int)p >= to->warp_first &&
+             (int)p <= to->warp_last && warp_drop)
+            goto fail;
+         continue;
+      }
+      moved = to->raw_packets[p].offset + reloc->dword < to->command_count ?
+              pos[to->raw_packets[p].offset + reloc->dword] : -1;
+      if (moved < 0) {
+         if (reloc->type != PARHELIA_RELOC_VRAM)
+            goto fail;
+         continue;
+      }
+      t->relocs[nr] = *reloc;
+      t->relocs[nr].packet = map[p];
+      t->relocs[nr++].dword = (unsigned)moved;
    }
    if ((to->limit_offset >= 0) != (t->limit_offset >= 0) ||
-       (to->mvp_offset >= 0) != (t->mvp_offset >= 0))
+       (!warp_drop && (to->mvp_offset >= 0) != (t->mvp_offset >= 0)))
       goto fail;
    t->command_count = w;
    t->packet_count = np;
@@ -2496,20 +2804,28 @@ state_cache_transition_build(struct parhelia_state_cache *c,
                        7) ? 0 : 1);
    memcpy(t->commands_odd, t->commands, w * sizeof(uint32_t));
    free(map);
+   free(pos);
+   free(from_at);
+   free(to_at);
    *dropped = true;
    return t;
 fail:
    free(map);
+   free(pos);
+   free(from_at);
+   free(to_at);
    state_cache_entry_free(t);
    return NULL;
 }
 
 void
 parhelia_state_cache_set_transitions(struct parhelia_state_cache *cache,
-                                     uint32_t chip_id, bool enable)
+                                     uint32_t chip_id, bool enable,
+                                     bool units)
 {
    if (!cache)
       return;
+   cache->units = units;
    parhelia_reg_shadow_fini(&cache->tshadow);
    if (enable)
       parhelia_reg_shadow_init(&cache->tshadow, chip_id);
@@ -2519,8 +2835,29 @@ parhelia_state_cache_set_transitions(struct parhelia_state_cache *cache,
 void
 parhelia_state_cache_break(struct parhelia_state_cache *cache)
 {
-   if (cache)
+   if (cache && cache->sequence && cache->prev)
+      fputs("B\n", cache->sequence);
+   if (cache) {
       cache->prev = NULL;
+      cache->prev_mvp_valid = false;
+   }
+}
+
+/* The WARP unit goes too when the matrix it loads is the one the previous
+ * replay loaded. */
+static void
+state_cache_transition_pick(const struct parhelia_state_cache *cache,
+                            const struct state_transition *tr,
+                            const struct state_cache_entry *to,
+                            struct parhelia_batch_replay *replay)
+{
+   if (tr->tw && (!to->warp_mvp ||
+                  (cache->prev_mvp_valid && replay->mvp &&
+                   !memcmp(cache->prev_mvp, replay->mvp,
+                           sizeof(cache->prev_mvp)))))
+      replay->entry = tr->tw;
+   else if (tr->t)
+      replay->entry = tr->t;
 }
 
 void
@@ -2532,14 +2869,17 @@ parhelia_state_cache_transition(struct parhelia_state_cache *cache,
    struct state_cache_entry *t;
    bool dropped;
 
+   struct state_transition *tr = NULL;
+
    if (!from || !to || !to->raw_packets || !from->raw_packets)
       return;
-   for (unsigned i = 0; i < to->trans_count; i++)
-      if (to->trans[i].from == from) {
-         if (to->trans[i].t)
-            replay->entry = to->trans[i].t;
-         return;
-      }
+   for (unsigned i = 0; !tr && i < to->trans_count; i++)
+      if (to->trans[i].from == from)
+         tr = &to->trans[i];
+   if (tr) {
+      state_cache_transition_pick(cache, tr, to, replay);
+      return;
+   }
    if (to->trans_count == to->trans_cap) {
       const unsigned cap = to->trans_cap ? to->trans_cap * 2 : 2;
       struct state_transition *grown =
@@ -2550,22 +2890,38 @@ parhelia_state_cache_transition(struct parhelia_state_cache *cache,
       to->trans = grown;
       to->trans_cap = cap;
    }
-   t = state_cache_transition_build(cache, from, to, &dropped);
-   if (!t && dropped)
-      return;
-   to->trans[to->trans_count++] = (struct state_transition) {
+   t = state_cache_transition_build(cache, from, to, false, &dropped);
+   tr = &to->trans[to->trans_count++];
+   *tr = (struct state_transition) {
       .from = from, .t = t,
+      .tw = cache->units && state_cache_warp_same(from, to) ?
+            state_cache_transition_build(cache, from, to, true, &dropped) :
+            NULL,
    };
-   if (t)
-      replay->entry = t;
+   state_cache_transition_pick(cache, tr, to, replay);
 }
 
 void
 parhelia_state_cache_appended(struct parhelia_state_cache *cache,
                               const struct parhelia_batch_replay *replay)
 {
-   if (cache)
-      cache->prev = replay ? replay->entry : NULL;
+   if (cache && cache->sequence && replay && replay->entry) {
+      fprintf(cache->sequence, "R %u", replay->entry->id);
+      for (unsigned i = 0; replay->mvp && replay->entry->mvp_offset >= 0 &&
+                           i < 16; i++) {
+         uint32_t bits;
+
+         memcpy(&bits, &replay->mvp[i], sizeof(bits));
+         fprintf(cache->sequence, " %08x", bits);
+      }
+      fputc('\n', cache->sequence);
+   }
+   if (!cache)
+      return;
+   cache->prev = replay ? replay->entry : NULL;
+   cache->prev_mvp_valid = replay && replay->mvp;
+   if (cache->prev_mvp_valid)
+      memcpy(cache->prev_mvp, replay->mvp, sizeof(cache->prev_mvp));
 }
 
 void

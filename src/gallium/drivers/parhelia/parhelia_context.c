@@ -17052,7 +17052,8 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    parhelia_state_cache_set_transitions(ctx->state_cache,
       ph_screen(screen)->chip_id,
       !ctx->state_filter && !ctx->drop_repeats &&
-      debug_get_bool_option("PARHELIA_STATE_TRANSITIONS", true));
+      debug_get_bool_option("PARHELIA_STATE_TRANSITIONS", true),
+      debug_get_bool_option("PARHELIA_STATE_UNITS", true));
    /* Bounding positions inside the fetch sees every index where the
     * separate scan sees each vertex once: slower on nano (11.21 -> 11.37 ms
     * CPU per ioquake3 frame), faster on the Alpha's EV56 (12.4 -> 13.6 fps),
