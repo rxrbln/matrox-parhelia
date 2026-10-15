@@ -17621,10 +17621,11 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    }
    /* P690 0x9f packets draw up to the kernel's cap exactly
     * (--indexed-run-probe: 1-20 triangles with shared vertices). */
-   /* PARHELIA_INDEX16=1: 16-bit index lists (0x9b) where the kernel
-    * takes them and a batch's vertices fit. */
+   /* 16-bit index lists (0x9b) where the kernel takes them and a batch's
+    * vertices fit: q3 on the Alpha 26.85 -> 27.65 fps; PARHELIA_INDEX16=0
+    * keeps 32-bit lists. */
    ctx->index16 = ph_screen(screen)->index16 &&
-                  debug_get_bool_option("PARHELIA_INDEX16", false);
+                  debug_get_bool_option("PARHELIA_INDEX16", true);
    ctx->indexed_prims_per_packet =
       MIN2(ph_screen(screen)->indexed_tris,
            lx ? debug_get_num_option("PARHELIA_INDEXED_PRIMS_PER_PACKET",
