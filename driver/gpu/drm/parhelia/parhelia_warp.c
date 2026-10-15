@@ -290,10 +290,12 @@ static int warp_gate_ready(struct parhelia_device *pdev)
 {
 	unsigned int i;
 
+	u32 bm = 0, a = 0, b = 0;
+
 	for (i = 0; i < 200000; i++) {
-		u32 bm = parhelia_read(pdev, 0x08f0);
-		u32 a = parhelia_read(pdev, 0x0908);
-		u32 b = parhelia_read(pdev, 0x0924);
+		bm = parhelia_read(pdev, 0x08f0);
+		a = parhelia_read(pdev, 0x0908);
+		b = parhelia_read(pdev, 0x0924);
 
 		/* Bring-up section 1.9: do not overwrite a busy instruction store.
 		 * No driver submission exists yet, so there is no 0x450 tag to wait for.
@@ -303,10 +305,14 @@ static int warp_gate_ready(struct parhelia_device *pdev)
 			return 0;
 		udelay(1);
 	}
+	/* name each condition that kept the gate closed */
 	dev_err(&pdev->pdev->dev,
-		"WARP store busy: BM=%08x 908=%08x 924=%08x\n",
-		parhelia_read(pdev, 0x08f0), parhelia_read(pdev, 0x0908),
-		parhelia_read(pdev, 0x0924));
+		"WARP load gate not ready:%s%s%s%s BM=%08x 908=%08x 924=%08x\n",
+		!(bm & BIT(17)) ? " drawing engine busy (0x8f0 bit 17 clear)" : "",
+		bm & 0x03000000 ? " 0x8f0 bits 25:24 set" : "",
+		(a & 0xfff7ffbf) != 0x63a78001 ? " WARP not idle (0x908)" : "",
+		(b & 0xfff) != 0x100 ? " WARP store busy (0x924)" : "",
+		bm, a, b);
 	return -ETIMEDOUT;
 }
 

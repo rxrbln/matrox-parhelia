@@ -3336,7 +3336,7 @@ static void parhelia_retire_locked(struct parhelia_device *pdev)
 		if (!time_after_eq(jiffies, start + oldest->budget))
 			return;
 		dev_err(&pdev->pdev->dev,
-			"asynchronous submit fence %08x made no progress for %u ms (done %08x); wedged\n",
+			"asynchronous submit fence %08x made no progress for %u ms (done %08x); locked up\n",
 			slot->fence, jiffies_to_msecs(jiffies - start), done);
 		dev_err(&pdev->pdev->dev,
 			"BM=%08x prim=%08x/%08x sec=%08x/%08x 41c=%08x status450=%08x writeback=%08x DWGCTL=%08x 908=%08x 924=%08x\n",
@@ -3422,19 +3422,45 @@ int parhelia_submit_idle_lock(struct parhelia_device *pdev)
  * held, so replacing its heap cannot invalidate an engine-visible address. */
 /* The stalled request's CALLs and the leading dwords of each secondary span;
  * @get is the primary fetcher's bus address at the stall. */
+/* Full contents of one CALL span, eight dwords a line, at most
+ * PARHELIA_DUMP_SPAN_DWORDS of it. */
+#define PARHELIA_DUMP_SPAN_DWORDS	512
+
+static void parhelia_dump_span(struct parhelia_device *pdev, const char *what,
+			       u32 call, const u32 *span, u32 words)
+{
+	u32 n, i;
+
+	dev_err(&pdev->pdev->dev, "%s call %u: %u dwords%s\n", what, call, words,
+		words > PARHELIA_DUMP_SPAN_DWORDS ? ", first 512 shown" : "");
+	words = min_t(u32, words, PARHELIA_DUMP_SPAN_DWORDS);
+	for (n = 0; n < words; n += 8) {
+		char line[8 * 9 + 1];
+		int len = 0;
+
+		for (i = n; i < words && i < n + 8; i++)
+			len += scnprintf(line + len, sizeof(line) - len, " %08x", span[i]);
+		dev_err(&pdev->pdev->dev, "  %04x:%s\n", n, line);
+	}
+}
+
 static void parhelia_dump_slot_calls(struct parhelia_device *pdev,
 				     const struct parhelia_submit_slot *slot,
 				     u32 get)
 {
+	static DEFINE_RATELIMIT_STATE(full_dump, 60 * HZ, 1);
 	const u32 *primary = pdev->async_primary_cpu;
 	const u64 sec_bus = slot->secondary_bus;
 	const u64 sec_end = sec_bus + (u64)slot->secondary_dwords * sizeof(u32);
 	u32 get_dword = ((get & ~3u) - lower_32_bits(pdev->async_primary_bus)) / 4;
+	const u32 *prev_span = NULL, *stalled_span = NULL;
+	u32 prev_words = 0, stalled_words = 0, stalled_call = 0;
 	u32 pos, call = 0;
 
 	for (pos = slot->primary_begin; pos + PARHELIA_CALL_DWORDS <= slot->primary_end; pos++) {
 		u32 start, end, words, n;
 		const u32 *span;
+		bool stalled;
 		char line[96];
 		int len = 0;
 
@@ -3449,11 +3475,29 @@ static void parhelia_dump_slot_calls(struct parhelia_device *pdev,
 			span = (const u32 *)slot->secondary_cpu + (start - sec_bus) / 4;
 		for (n = 0; span && n < min(words, 6u); n++)
 			len += scnprintf(line + len, sizeof(line) - len, " %08x", span[n]);
+		stalled = get_dword >= pos && get_dword < pos + PARHELIA_CALL_DWORDS;
 		dev_err(&pdev->pdev->dev, "%s call %u primary %u span %08x-%08x %u dwords:%s\n",
-			get_dword >= pos && get_dword < pos + PARHELIA_CALL_DWORDS ? "->" : "  ",
-			call++, pos, start, end, words, span ? line : " (not in the slot heap)");
+			stalled ? "->" : "  ",
+			call, pos, start, end, words, span ? line : " (not in the slot heap)");
+		if (stalled && !stalled_span) {
+			stalled_span = span;
+			stalled_words = words;
+			stalled_call = call;
+		} else if (!stalled_span) {
+			prev_span = span;
+			prev_words = words;
+		}
+		call++;
 		pos += PARHELIA_CALL_DWORDS - 1;
 	}
+	/* the span the fetcher stopped in and the one before it, in full */
+	if (!stalled_span || !__ratelimit(&full_dump))
+		return;
+	if (prev_span && stalled_call)
+		parhelia_dump_span(pdev, "previous", stalled_call - 1, prev_span,
+				   prev_words);
+	parhelia_dump_span(pdev, "stalled", stalled_call, stalled_span,
+			   stalled_words);
 }
 
 /* A spare max-size command heap, if one is free. */
@@ -6966,7 +7010,7 @@ retry_slot:
 
 timeout:
 	dev_err(&pdev->pdev->dev,
-		"submit timeout at CALL %u/%u: BM=%08x prim=%08x/%08x sec=%08x/%08x fence=%08x want=%08x; wedged\n",
+		"submit timeout at CALL %u/%u: BM=%08x prim=%08x/%08x sec=%08x/%08x fence=%08x want=%08x; locked up\n",
 		i, total_calls, parhelia_read(pdev, 0x08f0),
 		parhelia_read(pdev, 0x0404), parhelia_read(pdev, 0x0408),
 		parhelia_read(pdev, 0x10a0), parhelia_read(pdev, 0x10a4),
