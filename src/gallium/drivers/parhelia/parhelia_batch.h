@@ -74,22 +74,6 @@ int parhelia_batch_packed_call_count(const struct parhelia_batch *batch,
                                      bool pack_adjacent_packets,
                                      unsigned *calls);
 
-/* The exact packed CALL count of a growing stream, stepped over the packets
- * appended since the last update only (adjacent-packet packing). */
-struct parhelia_call_counter {
-   unsigned first, opening, count, previous, run_words, run_draws;
-   bool active, run_multi, opening_seen;
-   unsigned packets, relocs;     /* the stream prefix already counted */
-   bool boundary[PH_BATCH_PACKETS];
-   uint32_t draw_bytes[PH_BATCH_PACKETS];
-};
-
-void parhelia_call_counter_reset(struct parhelia_call_counter *c);
-int parhelia_call_counter_update(struct parhelia_call_counter *c,
-                                 const struct parhelia_batch *batch);
-/* including the stream's EOB and terminal drain */
-unsigned parhelia_call_counter_calls(const struct parhelia_call_counter *c);
-
 /* The longest run of marks from @first_mark whose packets, submitted as
  * one, stay within @limit CALLs (at least one mark), as repeated
  * parhelia_batch_packed_call_count() calls would find it, in one pass. */
