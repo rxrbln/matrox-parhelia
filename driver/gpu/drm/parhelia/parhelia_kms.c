@@ -1200,6 +1200,14 @@ irqreturn_t parhelia_irq_handler(int irq, void *arg)
 	return IRQ_HANDLED;
 }
 
+/* A framebuffer's pitch is that of the CPU view or the native GPU pitch the
+ * controller fetches with.  A host-view object's CPU pitch is a power of
+ * two, so at widths like 1920 only the GPU pitch fits its storage. */
+static bool parhelia_fb_pitch_valid(const struct parhelia_bo *bo, u32 pitch)
+{
+	return pitch == parhelia_bo_cpu_pitch(bo) || pitch == bo->gpu_pitch;
+}
+
 static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 			       struct drm_plane_state *plane_state,
 			       struct drm_crtc_state *crtc_state)
@@ -1207,7 +1215,7 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	struct drm_framebuffer *fb = plane_state->fb;
 	struct drm_gem_object *gem;
 	struct parhelia_bo *bo;
-	u32 cpp, pitch_pixels;
+	u32 cpp;
 	int ret;
 
 	ret = matrox_kms_plane_geometry_check(plane_state, crtc_state);
@@ -1235,8 +1243,7 @@ static int parhelia_pipe_check(struct drm_simple_display_pipe *pipe,
 	/* A 16 bpp surface tiles 128 pixels wide; 32 bpp tiles 64. */
 	if ((cpp != 4 && cpp != 2) || fb->pitches[0] % cpp)
 		return -EINVAL;
-	pitch_pixels = fb->pitches[0] / cpp;
-	if (pitch_pixels != parhelia_bo_cpu_pitch(bo) / cpp ||
+	if (!parhelia_fb_pitch_valid(bo, fb->pitches[0]) ||
 	    bo->gpu_pitch / cpp != ALIGN(fb->width, 64 * 4 / cpp) ||
 	    bo->gpu_pitch / cpp > 0x3fff)
 		return -EINVAL;
@@ -1434,8 +1441,7 @@ parhelia_fb_create(struct drm_device *drm, struct drm_file *file,
 	}
 	bo = to_parhelia_bo(gem);
 	if (!parhelia_bo_is_native(bo) ||
-	    parhelia_bo_cpu_pitch(bo) !=
-		mode_cmd->pitches[0] ||
+	    !parhelia_fb_pitch_valid(bo, mode_cmd->pitches[0]) ||
 	    bo->width < mode_cmd->width || bo->height < mode_cmd->height) {
 		fb = ERR_PTR(-EINVAL);
 		goto out_put;
