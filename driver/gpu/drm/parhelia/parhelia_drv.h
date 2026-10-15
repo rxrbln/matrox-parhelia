@@ -561,6 +561,8 @@ enum parhelia_placement_class {
 	PARHELIA_PLACEMENT_NATIVE_OFFSCREEN,
 	/* anywhere wholly inside one 16 MiB window (original family) */
 	PARHELIA_PLACEMENT_WINDOWED,
+	/* P690 FAA fragment buffer: the bank opposite native depth */
+	PARHELIA_PLACEMENT_FAA_FRAGMENT,
 };
 
 struct parhelia_bo {
@@ -933,6 +935,8 @@ static inline bool parhelia_original_family(const struct parhelia_device *pdev)
 	return pdev->pdev->device == PARHELIA_512 ||
 	       pdev->pdev->device == PARHELIA_8X;
 }
+
+bool parhelia_p690_faa(const struct parhelia_device *pdev);
 
 /* A descriptor's VRAM address drops its low five bits on the P690 and its
  * low six on the 0528 (MEASURED, partial transfers at 32-byte steps). */

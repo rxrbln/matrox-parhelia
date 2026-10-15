@@ -495,6 +495,18 @@ module_param(vram_vertex, bool, 0400);
 MODULE_PARM_DESC(vram_vertex,
 		 "Enable dedicated DMA32 vertex buffers (default true)");
 
+static bool p690_faa;
+module_param(p690_faa, bool, 0400);
+MODULE_PARM_DESC(p690_faa, "P690 fragment antialiasing: FAA fragment buffers and FAA sync packets (default off)");
+
+/* FAA needs the raw aperture for its buffers and a second 64 MiB bank to
+ * keep the fragment buffer apart from native depth. */
+bool parhelia_p690_faa(const struct parhelia_device *pdev)
+{
+	return p690_faa && pdev->pdev->device == PARHELIA_P690 &&
+	       pdev->raw_aperture_owned && pdev->vram_size >= SZ_128M;
+}
+
 /* A dedicated DMA32 vertex object is the same class-3 source the kernel's own
  * vertex slots are: on the P690 and on the original family, whose draws
  * fetch their ranges from those slots today. */
@@ -1751,6 +1763,7 @@ struct parhelia_validate_state {
 	unsigned long *vram_ops;	/* command dwords that are VRAM operands */
 	struct parhelia_indexed_draw *indexed;	/* one per 0x9f packet */
 	u32 indexed_count, indexed_cap;
+	u32 faa_fences, faa_first;	/* P690 FAA sync packets, the first one */
 };
 
 static void parhelia_rebind_apply(struct parhelia_device *pdev, u32 *commands,
@@ -1887,6 +1900,144 @@ static int parhelia_validate_reglist(struct parhelia_device *pdev,
 	return pos == length ? 0 : -EINVAL;
 }
 
+/* Sync operations the P690 vendor driver brackets with a counter pair while
+ * FAA is armed (mtxpserd FAA arm, resolve stamps and fragment flush): plain
+ * 4, the 0x400 flush and the 0x100/0x200/0x300 pixel-pipe drains. */
+static bool parhelia_faa_sync_op(u32 value)
+{
+	return value == 0x004 || value == 0x107 || value == 0x207 ||
+	       value == 0x307 || value == 0x407;
+}
+
+/* A P690 FAA sync packet: one register list of sync DWGCTL writes, a 0x12bc
+ * counter pair the kernel fills (both placeholders zero), then at most one
+ * DWGCTL resume or MemLevels write.  @tags receives the dword offsets of the
+ * two counters, @resume that of the resume write or 0. */
+static bool parhelia_faa_fence_form(const u32 *cmd, u32 length, u32 tags[2],
+				    u32 *resume)
+{
+	u32 pos = 1, end, writes = 0, counters = 0, after = 0;
+	bool prev_counter = false;
+
+	*resume = 0;
+	if (length < 4 || cmd[0] >> 16 || (cmd[0] & 0xffff) + 2 != length)
+		return false;
+	end = length;
+	while (pos < end) {
+		u32 tag = cmd[pos++], slot;
+
+		for (slot = 0; slot < 4; slot++) {
+			u32 index = (tag >> (slot * 8)) & 0xff;
+
+			if (index == 0x21)
+				break;
+			if (pos >= end)
+				return false;
+			if (index == 0xaf) {
+				/* the pair is adjacent and preceded by a sync */
+				if (cmd[pos] || counters == 2 || !writes ||
+				    (counters && !prev_counter))
+					return false;
+				tags[counters++] = pos;
+			} else if (counters == 2) {
+				if ((index != 0xc0 && index != 0xac) || after++)
+					return false;
+				if (index == 0xc0)
+					*resume = pos;
+			} else if (index != 0xc0 || counters ||
+				   !parhelia_faa_sync_op(cmd[pos])) {
+				return false;
+			}
+			if (index != 0xaf)
+				writes++;
+			prev_counter = index == 0xaf;
+			pos++;
+		}
+	}
+	return counters == 2;
+}
+
+/* With replay fences the opening leaves begin + 8 completed, and a status
+ * page tag T|1 reads as T + 8 completed.  FAA sync k arms begin + 8 + 8k,
+ * each armed tag at most 8 ahead of the completed one (the 0528's measured
+ * limit), and the drain pads with up to two counter pairs so that it arms
+ * finish - 8: the request's fence then stays on the 24-tag cadence of
+ * waitable fences and is what the status page reports. */
+static u32 parhelia_faa_fence_pads(u32 faa_fences)
+{
+	return (3 - faa_fences % 3) % 3;
+}
+
+static u32 parhelia_faa_fence_step(u32 faa_fences)
+{
+	return 16 + 8 * (faa_fences + parhelia_faa_fence_pads(faa_fences));
+}
+
+/* The drain words for @faa_fences sync packets, at most 11. */
+static u32 parhelia_faa_drain_words(u32 faa_fences)
+{
+	u32 writes = 4 + 2 * parhelia_faa_fence_pads(faa_fences);
+
+	return 1 + DIV_ROUND_UP(writes, 4) + writes;
+}
+
+static void parhelia_faa_patch_fences(u32 *commands,
+				      const struct drm_parhelia_packet *packets,
+				      u32 count, u32 begin)
+{
+	u32 i, k = 0, tags[2], resume;
+
+	for (i = 0; i < count; i++) {
+		u32 *cmd = commands + packets[i].offset;
+		u32 tag = begin + 8 + 8 * k;
+
+		if ((cmd[0] >> 24) ||
+		    !parhelia_faa_fence_form(cmd, packets[i].length, tags,
+					     &resume))
+			continue;
+		cmd[tags[0]] = tag | 1;
+		cmd[tags[1]] = tag;
+		k++;
+	}
+}
+
+/* DWGSYNC, the padding pairs, then the drain's own armed tag and finish. */
+static void parhelia_faa_drain(u32 *drain, u32 begin, u32 faa_fences,
+			       u32 dwgctl)
+{
+	const u32 pads = parhelia_faa_fence_pads(faa_fences);
+	const u32 finish = begin + parhelia_faa_fence_step(faa_fences);
+	u32 values[8], writes = 0, pos = 1, i, j;
+	u8 regs[8];
+
+	regs[writes] = 0xc0;
+	values[writes++] = 0x307;
+	for (i = 0; i < pads; i++) {
+		u32 tag = begin + 8 + 8 * (faa_fences + i);
+
+		regs[writes] = 0xaf;
+		values[writes++] = tag | 1;
+		regs[writes] = 0xaf;
+		values[writes++] = tag;
+	}
+	regs[writes] = 0xaf;
+	values[writes++] = (finish - 8) | 1;
+	regs[writes] = 0xaf;
+	values[writes++] = finish;
+	regs[writes] = 0xc0;
+	values[writes++] = dwgctl;
+	drain[0] = parhelia_faa_drain_words(faa_fences) - 2;
+	for (i = 0; i < writes; i += 4) {
+		u32 tag = 0x21212121;
+
+		for (j = 0; j < 4 && i + j < writes; j++)
+			tag = (tag & ~(0xffu << (8 * j))) | (u32)regs[i + j] << (8 * j);
+		drain[pos++] = tag;
+		for (j = 0; j < 4 && i + j < writes; j++)
+			drain[pos++] = values[i + j];
+	}
+}
+
 /* A draw packet: note whether its bound textured entry has a colour fetch. */
 static void parhelia_rebind_draw(struct parhelia_rebind *rb)
 {
@@ -2014,9 +2165,25 @@ static int parhelia_validate_packet(struct parhelia_device *pdev,
 		return -EINVAL;
 
 	switch (header >> 24) {
-	case 0x00:
+	case 0x00: {
+		const u32 *c = cmd + packet->offset;
+		u32 tags[2], resume;
+
+		if (pdev && parhelia_p690_faa(pdev) &&
+		    parhelia_faa_fence_form(c, packet->length, tags, &resume)) {
+			if (!vs->faa_fences++)
+				vs->faa_first = vs->packet;
+			/* only a resume is drawing state for the drain to keep */
+			if (resume) {
+				vs->dwgctl = c[resume];
+				vs->dwgctl_packet = vs->packet;
+				vs->dwgctl_seen = true;
+			}
+			return 0;
+		}
 		return parhelia_validate_reglist(pdev, file, cmd, packet->offset,
 						 packet->length, vs);
+	}
 	case 0x97:
 		if (words != 3)
 			return -EINVAL;
@@ -2204,6 +2371,18 @@ static int parhelia_vram_placement(struct drm_gem_vram_object *bo,
 	if (pbo->placement_class == PARHELIA_PLACEMENT_NATIVE_SCANOUT)
 		return parhelia_vram_placement_range(bo, vram_size, false,
 						     2 * band_pages, 3 * band_pages);
+	/* The fragment buffer needs a 32 MiB band of its own: sharing native
+	 * colour's (band 1) or depth's (band 3) corrupted both on the P690,
+	 * bands 0 and 2 resolved cleanly (MEASURED, FAA fixture); the vendor
+	 * keeps all three apart too.  Band 0 is also the bank opposite depth,
+	 * the 0528's rule.  Top-down leaves its bottom to other objects. */
+	if (pbo->placement_class == PARHELIA_PLACEMENT_FAA_FRAGMENT) {
+		ret = parhelia_vram_placement_range(bo, vram_size, false, 0,
+						    band_pages);
+		if (!ret)
+			bo->placements[0].flags |= TTM_PL_FLAG_TOPDOWN;
+		return ret;
+	}
 	/* Bank A first: TTM takes free room in either place before it evicts. */
 	if (pbo->placement_class == PARHELIA_PLACEMENT_NATIVE_OFFSCREEN)
 		return parhelia_vram_placement_range(bo, vram_size, true, 0, 0);
@@ -2244,6 +2423,98 @@ static int parhelia_reglist_run_static_selftest(void)
 	packet.length = 4;
 	if (parhelia_validate_packet(NULL, NULL, run, &packet, &vs) != -EINVAL)
 		return -EINVAL;
+	return 0;
+}
+
+/* The FAA sync forms the P690 FAA path uses, their counter offsets and the
+ * forms that must stay refused. */
+static int parhelia_faa_fence_static_selftest(void)
+{
+	static const struct {
+		u32 cmd[8], length, tag0, tag1, resume;
+	} good[] = {
+		{ { 4, 0xc0afafc0, 0x207, 0, 0, 0x2000c4 }, 6, 3, 4, 5 },
+		{ { 4, 0xacafafc0, 0x307, 0, 0, 0x3ffe0842 }, 6, 3, 4, 0 },
+		{ { 4, 0xafafc0c0, 0x004, 0x407, 0, 0 }, 6, 4, 5, 0 },
+		{ { 6, 0x21afc0c0, 0x004, 0x407, 0, 0x2121c0af, 0, 0x960ec4 },
+		  8, 4, 6, 7 },
+	};
+	static const struct {
+		u32 cmd[8], length;
+	} bad[] = {
+		/* a client counter value */
+		{ { 4, 0xc0afafc0, 0x207, 5, 0, 0x2000c4 }, 6 },
+		/* not a sync operation before the pair */
+		{ { 4, 0xc0afafc0, 0x20a, 0, 0, 0x2000c4 }, 6 },
+		/* no sync before the pair */
+		{ { 3, 0x21c0afaf, 0, 0, 0x2000c4 }, 5 },
+		/* split pair */
+		{ { 4, 0xafc0afc0, 0x207, 0, 0x307, 0 }, 6 },
+		/* two writes after the pair */
+		{ { 5, 0x21c0c0af, 0x307, 0, 0, 1, 2 }, 7 },
+		/* another register after the pair */
+		{ { 4, 0x88afafc0, 0x207, 0, 0, 0 }, 6 },
+		/* a single counter */
+		{ { 3, 0x21c0afc0, 0x207, 0, 0x2000c4 }, 5 },
+		/* a register-list run */
+		{ { 4, 0xc0afafc0, 0x207, 0, 0, 0x2000c4, 0, 0 }, 8 },
+	};
+	u32 commands[6], tags[2], resume, i;
+	struct drm_parhelia_packet packet = { .length = 6 };
+
+	for (i = 0; i < ARRAY_SIZE(good); i++)
+		if (!parhelia_faa_fence_form(good[i].cmd, good[i].length, tags,
+					     &resume) ||
+		    tags[0] != good[i].tag0 || tags[1] != good[i].tag1 ||
+		    resume != good[i].resume)
+			return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(bad); i++)
+		if (parhelia_faa_fence_form(bad[i].cmd, bad[i].length, tags,
+					    &resume))
+			return -EINVAL;
+	/* counters step by 8, pads keep the finish on the 24-tag cadence */
+	memcpy(commands, good[0].cmd, sizeof(commands));
+	parhelia_faa_patch_fences(commands, &packet, 1, 0x100);
+	if (commands[3] != 0x109 || commands[4] != 0x108 ||
+	    parhelia_faa_fence_step(0) != 16)
+		return -EINVAL;
+	for (i = 1; i <= 7; i++) {
+		u32 drain[11], seq[8], regs[8], n = 0, pos = 1, slot;
+		u32 step = parhelia_faa_fence_step(i);
+		u32 words = parhelia_faa_drain_words(i);
+		u32 last = 0x100 + 8 * i + 8;	/* completed after the syncs */
+
+		parhelia_faa_drain(drain, 0x100, i, 0x960ec4);
+		if ((step - 16) % 24 || step < 16 + 8 * i || words > 11 ||
+		    drain[0] != words - 2)
+			return -EINVAL;
+		while (pos < words) {
+			u32 tag = drain[pos++];
+
+			for (slot = 0; slot < 4; slot++) {
+				u32 reg = (tag >> (8 * slot)) & 0xff;
+
+				if (reg == 0x21)
+					break;
+				if (pos >= words || n == 8)
+					return -EINVAL;
+				regs[n] = reg;
+				seq[n++] = drain[pos++];
+			}
+		}
+		if (n < 4 || regs[0] != 0xc0 || seq[0] != 0x307 ||
+		    regs[n - 1] != 0xc0 || seq[n - 1] != 0x960ec4 ||
+		    seq[n - 2] != 0x100 + step ||
+		    seq[n - 3] != ((0x100 + step - 8) | 1))
+			return -EINVAL;
+		/* every armed tag at most 8 ahead of the completed one */
+		for (slot = 1; slot + 1 < n; slot += 2) {
+			if (regs[slot] != 0xaf || regs[slot + 1] != 0xaf ||
+			    !(seq[slot] & 1) || (seq[slot] & ~7u) > last)
+				return -EINVAL;
+			last = (seq[slot] & ~7u) + 8;
+		}
+	}
 	return 0;
 }
 
@@ -3319,6 +3590,8 @@ int parhelia_submit_init(struct parhelia_device *pdev)
 		ret = parhelia_range_call_static_selftest();
 	if (!ret)
 		ret = parhelia_large_range_call_static_selftest();
+	if (!ret)
+		ret = parhelia_faa_fence_static_selftest();
 	if (ret) {
 		dev_err(&pdev->pdev->dev, "submit static selftest failed\n");
 		return ret;
@@ -4325,7 +4598,8 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 			    PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
 			    PARHELIA_CREATE_RENDER_NATIVE_SCANOUT |
 			    PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN |
-			    PARHELIA_CREATE_RENDER_WINDOW_PAIR) ||
+			    PARHELIA_CREATE_RENDER_WINDOW_PAIR |
+			    PARHELIA_CREATE_RENDER_FAA_FRAGMENT) ||
 	    hweight32(args->flags) > 1 || (args->cpp && args->cpp != 4 &&
 					   args->cpp != 2) ||
 	    args->handle || args->pitch || args->size || args->mmap_offset)
@@ -4347,6 +4621,9 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	if ((args->flags & PARHELIA_CREATE_RENDER_WINDOW_PAIR) &&
 	    !parhelia_original_family(pdev))
 		return -EOPNOTSUPP;
+	if ((args->flags & PARHELIA_CREATE_RENDER_FAA_FRAGMENT) &&
+	    (!parhelia_p690_faa(pdev) || cpp != 4))
+		return -EOPNOTSUPP;
 	pair = args->flags & PARHELIA_CREATE_RENDER_WINDOW_PAIR;
 	plain = !(args->flags & ~PARHELIA_CREATE_RENDER_WINDOW_PAIR);
 	/* Legacy flags=0 retains the exact-anchor policy.  Explicit P690 colour
@@ -4354,6 +4631,7 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	 * hardware-verified 8 KiB in-band surface alignment. */
 	align_pages = pdev->pdev->device == PARHELIA_P690 &&
 		      !(args->flags & (PARHELIA_CREATE_RENDER_LINEAR |
+				       PARHELIA_CREATE_RENDER_FAA_FRAGMENT |
 				       PARHELIA_CREATE_RENDER_TEXTURE |
 				       PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 				       PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
@@ -4364,7 +4642,8 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	/* Tiled surfaces occupy complete hardware tile rows.  Rounding only the
 	 * final byte count underallocates a partial row whenever pitch spans more
 	 * than one tile (300x300 on P690 was one 4 KiB tile short). */
-	if (args->flags & PARHELIA_CREATE_RENDER_LINEAR)
+	if (args->flags & (PARHELIA_CREATE_RENDER_LINEAR |
+			   PARHELIA_CREATE_RENDER_FAA_FRAGMENT))
 		allocation_height = args->height;
 	else if (args->flags & PARHELIA_CREATE_RENDER_TEXTURE)
 		allocation_height = ALIGN(args->height, 16);
@@ -4410,7 +4689,8 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	bo = drm_gem_vram_create(drm, bo_size, align_pages);
 	if (IS_ERR(bo))
 		return PTR_ERR(bo);
-	if (args->flags & PARHELIA_CREATE_RENDER_LINEAR)
+	if (args->flags & (PARHELIA_CREATE_RENDER_LINEAR |
+			   PARHELIA_CREATE_RENDER_FAA_FRAGMENT))
 		layout = PARHELIA_BO_LAYOUT_LINEAR;
 	else if (args->flags & PARHELIA_CREATE_RENDER_TEXTURE)
 		layout = PARHELIA_BO_LAYOUT_TEXTURE;
@@ -4431,11 +4711,16 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	else if (args->flags & PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN)
 		parhelia_bo_set_placement_class(bo,
 			PARHELIA_PLACEMENT_NATIVE_OFFSCREEN);
+	else if (args->flags & PARHELIA_CREATE_RENDER_FAA_FRAGMENT)
+		parhelia_bo_set_placement_class(bo,
+			PARHELIA_PLACEMENT_FAA_FRAGMENT);
 	else if (plain && parhelia_original_family(pdev) && bo_size <= SZ_16M)
 		parhelia_bo_set_placement_class(bo, PARHELIA_PLACEMENT_WINDOWED);
 	else
 		pair = 0;
-	if (layout == PARHELIA_BO_LAYOUT_TEXTURE) {
+	if (args->flags & PARHELIA_CREATE_RENDER_FAA_FRAGMENT) {
+		parhelia_bo_force_unmappable(bo);
+	} else if (layout == PARHELIA_BO_LAYOUT_TEXTURE) {
 		parhelia_bo_make_unmappable(bo);
 	} else if (args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
 				  PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
@@ -4473,6 +4758,7 @@ int parhelia_create_render_ioctl(struct drm_device *drm, void *data,
 	}
 	ret = drm_gem_handle_create(file, &bo->bo.base, &handle);
 	if (!ret && !(args->flags & (PARHELIA_CREATE_RENDER_NATIVE_COLOR |
+				  PARHELIA_CREATE_RENDER_FAA_FRAGMENT |
 				  PARHELIA_CREATE_RENDER_NATIVE_DEPTH |
 				  PARHELIA_CREATE_RENDER_NATIVE_SCANOUT |
 				  PARHELIA_CREATE_RENDER_NATIVE_OFFSCREEN)) &&
@@ -4625,6 +4911,9 @@ int parhelia_get_param_ioctl(struct drm_device *drm, void *data,
 		break;
 	case PARHELIA_PARAM_REGLIST_RUNS:
 		args->value = 1;
+		break;
+	case PARHELIA_PARAM_FAA:
+		args->value = parhelia_p690_faa(pdev);
 		break;
 	case PARHELIA_PARAM_WARP_PROGRAM_SLOTS:
 		args->value = pdev->warp_user_cpu ?
@@ -5371,6 +5660,9 @@ static int parhelia_submit_run(struct parhelia_device *pdev,
 	} else {
 		opening_slot = parhelia_opening_fence_slot_range(commands, packets,
 			0, args->packet_count);
+		/* FAA sync counters follow the opening fence */
+		if (validate.faa_fences && validate.faa_first < opening_slot)
+			opening_slot = 0;
 		ret = parhelia_plan_calls(plan, args->packet_count, opening_slot,
 			full_sync);
 	}
@@ -6038,6 +6330,16 @@ retry_slot:
 		total_calls = plan->count;
 	}
 	parhelia_phase(&phase_t, PARHELIA_PHASE_PACK, stats);
+	/* In-stream FAA sync packets take counters between the opening fence
+	 * and the drain: one section, replay cadence. */
+	if (validate.faa_fences) {
+		if (plan->sync_sections != 1 || full_sync || !replay_fences ||
+		    validate.faa_first < opening_slot) {
+			ret = -EINVAL;
+			goto out_unpin;
+		}
+		fence_step = parhelia_faa_fence_step(validate.faa_fences);
+	}
 	fence_span = plan->sync_sections * fence_step +
 		(plan->sync_sections - 1) * 8;
 
@@ -6056,7 +6358,8 @@ retry_slot:
 		else if (sync_index % 3 == 1)
 			words = post_draw_wb && sync_index == 1 ? 7 : 3;
 		else
-			words = 6;
+			words = validate.faa_fences ?
+				parhelia_faa_drain_words(validate.faa_fences) : 6;
 
 		if (async)
 			ret = parhelia_async_block_assign(async_slot, block, words);
@@ -6105,6 +6408,12 @@ retry_slot:
 					parhelia_read(pdev, PARHELIA_R_DWGCTL));
 			parhelia_emit_fences(blocks, args->packet_count + i * 3,
 				fence, fence + fence_step, dwgctl);
+			if (validate.faa_fences) {
+				parhelia_faa_patch_fences(commands, packets,
+					args->packet_count, fence);
+				parhelia_faa_drain(blocks[args->packet_count + i * 3 + 2].cpu,
+					fence, validate.faa_fences, dwgctl);
+			}
 			fence += fence_step;
 			if (i + 1 < plan->sync_sections)
 				fence += 8;
@@ -6255,7 +6564,9 @@ retry_slot:
 
 			words = sync_index % 3 == 0 ? 5 :
 				sync_index % 3 == 1 ?
-					(post_draw_wb && sync_index == 1 ? 7 : 3) : 6;
+					(post_draw_wb && sync_index == 1 ? 7 : 3) :
+				validate.faa_fences ?
+					parhelia_faa_drain_words(validate.faa_fences) : 6;
 		}
 		start = block->bus + inline_used * sizeof(u32);
 		finish = block->bus + words * sizeof(u32);
