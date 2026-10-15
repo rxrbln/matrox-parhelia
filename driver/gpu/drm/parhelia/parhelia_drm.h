@@ -245,6 +245,10 @@ struct drm_parhelia_upload_render {
  * kernel-countered FAA sync packets (parhelia_faa_fence_form()) are
  * accepted.  Zero unless the module was loaded with p690_faa=1. */
 #define PARHELIA_PARAM_FAA		42
+/* An indexed draw may also be the 16-bit 0x9b packet: its operands are the
+ * byte range of its u16 indices inside the vertex range, starting on a dword,
+ * three per triangle; otherwise as PARHELIA_PARAM_INDEXED_DRAWS. */
+#define PARHELIA_PARAM_INDEX16		43
 
 #define PARHELIA_TEXTURE_PIPES_PAIRED	0
 #define PARHELIA_TEXTURE_PIPES_SINGLE	1
