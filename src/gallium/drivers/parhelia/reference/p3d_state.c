@@ -589,6 +589,24 @@ p3d_attr_present(const struct p3d_rw *desc, size_t n)
  * immediately disarmed, 0x41c reads back the last tag that RETIRED, and the
  * capture steps it by 8 every sync.  0x1374 is the strobe the vendor writes
  * between the opcode and the pair. */
+/* Both vendor drivers raise MemLevels for targets above 250,000 pixels.
+ * Q3's 640x480 buffer crosses that exact threshold. */
+static uint32_t
+p3d_memlevels(const struct p3d_state *st)
+{
+	return (uint64_t)st->screen_w * st->screen_h > 250000u ?
+	       0x3fff9084u : 0x3fff8842u;
+}
+
+/* MemLevels while FAA is armed: the P690's from the vendor default, the
+ * original family's from the draw's own word (MTXPARD sub_9AB30). */
+uint32_t
+p3d_faa_memlevels(const struct p3d_state *st)
+{
+	return st->faa_original ?
+	       (p3d_memlevels(st) & ~0x18000u) | 0xe0000u : P3D_FAA_MEMLEVELS;
+}
+
 /* FAA masks colour writes in the blender and leaves the plane mask all
  * ones: masked channels take source ZERO, destination ONE, ADD (faaemu
  * P690: RGB-only writes as 0x01802003).  Only the masks p3d_faa_mask_ok()
@@ -600,7 +618,7 @@ p3d_faa_blendctl(const struct p3d_state *st)
 	const uint32_t mask = p3d_colour_mask(st);
 	const uint32_t keep = 1u << 13;	/* src ZERO, dst ONE */
 
-	if (!st->faa_raster || mask == 0xffffffffu)
+	if (!st->faa_raster || st->faa_original || mask == 0xffffffffu)
 		return word;
 	if (!mask)
 		return (word & ~0x007fffffu) | 1u | keep | 1u << 5;
@@ -1193,27 +1211,26 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	rw[0].reg = 0x1318; rw[0].val = 0;
 	rw[1].reg = P3D_R_FCOL; rw[1].val = 0;
 	rw[2].reg = P3D_R_COLMASK;
-	rw[2].val = st->faa_raster ? 0xffffffffu : p3d_colour_mask(st);
+	rw[2].val = st->faa_raster && !st->faa_original ? 0xffffffffu :
+		    p3d_colour_mask(st);
 	p3d_reglist(cs, rw, 3);
 
 	/* -- the batch fence, then the draw arm ---------------------------- */
 	if (st->fence)
 		p3d_fence_block(cs, st->fence);
 
-	/* Both vendor drivers raise MemLevels for targets above 250,000 pixels.
-	 * Q3's 640x480 buffer crosses that exact threshold. */
-	if (st->faa_raster) {
+	if (st->faa_raster && (!st->faa_original || st->faa_arm)) {
 		/* armed behind a drained pixel pipe; the kernel fills the
 		 * counters */
 		rw[0].reg = P3D_R_DWGCTL;    rw[0].val = P3D_DWGCTL_SYNC;
 		rw[1].reg = P3D_R_FENCE;     rw[1].val = 0;
 		rw[2].reg = P3D_R_FENCE;     rw[2].val = 0;
-		rw[3].reg = P3D_R_WATERMARK; rw[3].val = P3D_FAA_MEMLEVELS;
+		rw[3].reg = P3D_R_WATERMARK; rw[3].val = p3d_faa_memlevels(st);
 		p3d_reglist(cs, rw, 4);
 	} else {
 		rw[0].reg = P3D_R_WATERMARK;
-		rw[0].val = (uint64_t)st->screen_w * st->screen_h > 250000u ?
-			    0x3fff9084u : 0x3fff8842u;
+		rw[0].val = st->faa_raster ? p3d_faa_memlevels(st) :
+			    p3d_memlevels(st);
 		p3d_reglist(cs, rw, 1);
 	}
 	rw[0].reg = P3D_R_DWGCTL; rw[0].val = dwgctl;
@@ -1223,7 +1240,7 @@ p3d_emit_state(struct p3d_cs *cs, const struct p3d_state *st)
 	 * (KRN mtx2572, emitted by mtx2393). */
 	rw[0].reg = P3D_R_GUARDBAND;
 	/* 16.0f with three or more P690 units (KRN mtx958). */
-	rw[0].val = st->faa_raster ? P3D_FAA_DRAW_GUARD :
+	rw[0].val = st->faa_raster && !st->faa_original ? P3D_FAA_DRAW_GUARD :
 		    st->guard_band_bits ? st->guard_band_bits :
 		    st->single_texture_pipe && p3d_state_units(st) > 2 ?
 		    0x41800000u :
@@ -1565,7 +1582,7 @@ p3d_emit_draws(struct p3d_cs *cs, const struct p3d_state *st, unsigned nprim)
 		p3d_drawpacket(cs, st->dw_per_vertex);
 	}
 	/* the vendor syncs after each draw call, whatever its packets */
-	if (st->faa_raster)
+	if (st->faa_raster && !st->faa_original)
 		p3d_faa_draw_sync(cs, p3d_dwgctl(st));
 
 	/* End of batch, then the NEXT fence.  Without this the 3D pipeline
@@ -1674,7 +1691,7 @@ p3d_emit_indexed(struct p3d_cs *cs, const struct p3d_state *st,
 		else
 			p3d_indexpacket_u32(cs);
 	}
-	if (st->faa_raster)
+	if (st->faa_raster && !st->faa_original)
 		p3d_faa_draw_sync(cs, p3d_dwgctl(st));
 }
 

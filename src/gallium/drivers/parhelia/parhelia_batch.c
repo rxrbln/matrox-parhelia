@@ -758,17 +758,34 @@ parhelia_faa_budget(unsigned width, unsigned height, uint64_t limit)
 }
 
 /* The armed 0x12fc: [31:14] the budget / 256, [1:0] = 3 and bit 2 of the
- * ordinary word; bits 3 and 6:5 are the 0528's only. */
+ * ordinary word; the original family keeps its [13:2] as well, bits 3 and
+ * 6:5 being its own (MTXPARD capture 0x04868027). */
 uint32_t
-parhelia_faa_raster(uint64_t bytes)
+parhelia_faa_raster(uint64_t bytes, bool original)
 {
-   return (uint32_t)(bytes >> 8) << 14 | (0x0bb80024u & 0x4u) | 3u;
+   return (uint32_t)(bytes >> 8) << 14 |
+          (0x0bb80024u & (original ? 0x3ffcu : 0x4u)) | 3u;
+}
+
+/* "DWGCTL = @op" in a counter pair the kernel fills, then DWGCTL @resume */
+static void
+batch_faa_sync(struct p3d_cs *cs, uint32_t op, uint32_t resume)
+{
+   const struct p3d_rw rw[4] = {
+      {P3D_R_DWGCTL, op}, {P3D_R_FENCE, 0}, {P3D_R_FENCE, 0},
+      {P3D_R_DWGCTL, resume},
+   };
+
+   p3d_reglist(cs, rw, 4);
 }
 
 /* Merge the fragment buffer into the colour target and disarm: the P690
  * vendor's resolve (mtxpserd 0x9fe10 with the LX helper 0x2f960, the twin
  * of MTXPARD sub_9E860), stream for stream as faaemu captured it.  The
- * counters of its stamps and of the disarm are the kernel's. */
+ * counters of its stamps and of the disarm are the kernel's.  The original
+ * family's is the measured 2026-10-04 form: a 0x307 drain first, PRIMWORD
+ * after the slots, resume DWGCTL 0xc4, no guard band, and the vendor's
+ * hand-over (0x307, "4, 0x407", 0x12fc = 0, 0x207) as the disarm. */
 int
 parhelia_batch_faa_resolve(struct parhelia_batch *batch,
                            uint32_t colour_handle, uint32_t depth_handle,
@@ -788,6 +805,8 @@ parhelia_batch_faa_resolve(struct parhelia_batch *batch,
    struct p3d_rw rw[28];
    struct p3d_cs cs;
 
+   const uint32_t resume = s && s->original ? 0xc4u : P3D_FAA_RESOLVE_DWGCTL;
+
    if (!batch || !s || !colour_handle || !depth_handle || !fragment_handle ||
        !(s->raster & 3))
       return -EINVAL;
@@ -799,13 +818,17 @@ parhelia_batch_faa_resolve(struct parhelia_batch *batch,
 
    /* the state the last FAA draw left: primitive, our class-3 stream with
     * every other stream cleared, slots 0, 2 and 1 */
-   rw[0] = (struct p3d_rw){P3D_R_PRIMWORD, s->primword};
-   p3d_reglist(&cs, rw, 1);
-   for (unsigned i = 0; i < 8; i++)
-      rw[i] = (struct p3d_rw){P3D_R_STREAM0 + 4 * i, i ? 0 : 3};
-   for (unsigned i = 0; i < 4; i++)
-      rw[8 + i] = (struct p3d_rw){P3D_R_STRIDE0 + 4 * i, i ? 0 : 4};
-   p3d_reglist(&cs, rw, 12);
+   if (s->original) {
+      batch_faa_sync(&cs, P3D_DWGCTL_SYNC, resume);
+   } else {
+      rw[0] = (struct p3d_rw){P3D_R_PRIMWORD, s->primword};
+      p3d_reglist(&cs, rw, 1);
+      for (unsigned i = 0; i < 8; i++)
+         rw[i] = (struct p3d_rw){P3D_R_STREAM0 + 4 * i, i ? 0 : 3};
+      for (unsigned i = 0; i < 4; i++)
+         rw[8 + i] = (struct p3d_rw){P3D_R_STRIDE0 + 4 * i, i ? 0 : 4};
+      p3d_reglist(&cs, rw, 12);
+   }
    rw[0] = (struct p3d_rw){P3D_R_SURF0_BASE, 0};
    rw[1] = (struct p3d_rw){P3D_R_SURF0_BASE + 4, p3d_surface_cfg(&s->colour)};
    rw[2] = (struct p3d_rw){P3D_R_SURF0_BASE + 16, 0};
@@ -813,42 +836,56 @@ parhelia_batch_faa_resolve(struct parhelia_batch *batch,
    rw[4] = (struct p3d_rw){P3D_R_SURF0_BASE + 8, 0};
    rw[5] = (struct p3d_rw){P3D_R_SURF0_BASE + 12, p3d_surface_cfg(&s->depth)};
    p3d_reglist(&cs, rw, 6);
+   /* PRIMWORD bit 18 clear: the planes are then not per-vertex writes */
+   if (s->original) {
+      rw[0] = (struct p3d_rw){P3D_R_PRIMWORD, s->primword & ~0x00040000u};
+      p3d_reglist(&cs, rw, 1);
+   }
 
    rw[0] = (struct p3d_rw){P3D_R_COLMASK, 0xffffffffu};
    rw[1] = (struct p3d_rw){P3D_R_STENCIL_REF, s->zs[1]};
    rw[2] = (struct p3d_rw){P3D_R_ZWRITE, s->zs[2]};
    p3d_reglist(&cs, rw, 3);
-   rw[0] = (struct p3d_rw){P3D_R_DWGCTL, P3D_FAA_RESOLVE_DWGCTL};
+   rw[0] = (struct p3d_rw){P3D_R_DWGCTL, resume};
    rw[1] = (struct p3d_rw){P3D_R_SCISSOR_MAX, 0x0fff0fffu};
    rw[2] = (struct p3d_rw){P3D_R_SCISSOR_MIN, 0};
    rw[3] = (struct p3d_rw){P3D_R_ZFUNC, s->zs[0]};
    rw[4] = (struct p3d_rw){P3D_R_RASTERMODE, s->raster};
    rw[5] = (struct p3d_rw){P3D_R_GUARDBAND, P3D_FAA_RESOLVE_GUARD};
-   p3d_reglist(&cs, rw, 6);
+   p3d_reglist(&cs, rw, s->original ? 5 : 6);
    for (unsigned i = 0; i < 28; i++)
       rw[i] = (struct p3d_rw){planes[i], (i == 8 || i == 10) ?
                                          0x3d800000u : 0};
    p3d_reglist(&cs, rw, 28);
 
    rw[0] = (struct p3d_rw){P3D_R_DWGCTL, P3D_FAA_RESOLVE};
-   rw[1] = (struct p3d_rw){P3D_R_DWGCTL, P3D_FAA_RESOLVE_DWGCTL};
+   rw[1] = (struct p3d_rw){P3D_R_DWGCTL, resume};
    p3d_reglist(&cs, rw, 2);
    /* the colour and depth stamps */
-   for (unsigned i = 1; i <= 2; i++) {
-      rw[0] = (struct p3d_rw){P3D_R_DWGCTL, 0x007u | i << 8};
+   for (unsigned i = 1; i <= 2; i++)
+      batch_faa_sync(&cs, 0x007u | i << 8, resume);
+   if (s->original) {
+      batch_faa_sync(&cs, P3D_DWGCTL_SYNC, resume);
+      rw[0] = (struct p3d_rw){P3D_R_DWGCTL, 0x004u};
+      rw[1] = (struct p3d_rw){P3D_R_DWGCTL, 0x407u};
+      rw[2] = (struct p3d_rw){P3D_R_FENCE, 0};
+      rw[3] = (struct p3d_rw){P3D_R_FENCE, 0};
+      p3d_reglist(&cs, rw, 4);
+      rw[0] = (struct p3d_rw){P3D_R_DWGCTL, resume};
+      p3d_reglist(&cs, rw, 1);
+      rw[0] = (struct p3d_rw){P3D_R_RASTERMODE, 0};
+      p3d_reglist(&cs, rw, 1);
+      batch_faa_sync(&cs, 0x207u, resume);
+   } else {
+      /* disarm: mode bits off, MemLevels back behind a drained pixel pipe */
+      rw[0] = (struct p3d_rw){P3D_R_RASTERMODE, s->raster & ~3u};
+      p3d_reglist(&cs, rw, 1);
+      rw[0] = (struct p3d_rw){P3D_R_DWGCTL, P3D_DWGCTL_SYNC};
       rw[1] = (struct p3d_rw){P3D_R_FENCE, 0};
       rw[2] = (struct p3d_rw){P3D_R_FENCE, 0};
-      rw[3] = (struct p3d_rw){P3D_R_DWGCTL, P3D_FAA_RESOLVE_DWGCTL};
+      rw[3] = (struct p3d_rw){P3D_R_WATERMARK, 0x3fff8842u};
       p3d_reglist(&cs, rw, 4);
    }
-   /* disarm: mode bits off, MemLevels back behind a drained pixel pipe */
-   rw[0] = (struct p3d_rw){P3D_R_RASTERMODE, s->raster & ~3u};
-   p3d_reglist(&cs, rw, 1);
-   rw[0] = (struct p3d_rw){P3D_R_DWGCTL, P3D_DWGCTL_SYNC};
-   rw[1] = (struct p3d_rw){P3D_R_FENCE, 0};
-   rw[2] = (struct p3d_rw){P3D_R_FENCE, 0};
-   rw[3] = (struct p3d_rw){P3D_R_WATERMARK, 0x3fff8842u};
-   p3d_reglist(&cs, rw, 4);
    return batch_finish(batch, &cs, calls, colour_handle, depth_handle, NULL,
                        NULL, fragment_handle, 0, 0, P3D_TRIANGLES, 0, 0,
                        false, 0, false);

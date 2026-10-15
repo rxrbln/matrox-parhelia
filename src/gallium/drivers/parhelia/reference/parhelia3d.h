@@ -828,6 +828,13 @@ struct p3d_state {
 	 * (faaemu P690 capture, campaign/results/faa-p690-faaemu-20261015.md). */
 	uint32_t	   faa_raster;
 	uint32_t	   faa_fragment;	/* its GEM handle (batch builder) */
+	/* The original family's form (0527/0528, MEASURED 2026-10-04): the
+	 * plane mask and blender as without FAA, the ordinary guard band, no
+	 * sync after the draw, MemLevels (own & ~0x18000) | 0xe0000, armed in
+	 * the counter-bracketed 0x307 only when faa_arm (an epoch's first
+	 * draw) and written plainly otherwise. */
+	int		   faa_original;
+	int		   faa_arm;
 	/* A depth-bound RGBA stream has a different descriptor and source stride.
 	 * The batch validator accepts it only for the verified one-texture,
 	 * MODULATE, source-alpha, depth-test shape. */
@@ -1110,6 +1117,7 @@ uint32_t p3d_dwgctl(const struct p3d_state *st);
 void	 p3d_depth_words(const struct p3d_state *st, uint32_t zs[3]);
 uint32_t p3d_colour_mask(const struct p3d_state *st);
 uint32_t p3d_faa_blendctl(const struct p3d_state *st);
+uint32_t p3d_faa_memlevels(const struct p3d_state *st);
 int	 p3d_faa_mask_ok(const struct p3d_state *st);
 /* DWGCTL nibble 6/7 is the DWGSYNC family; 0x307 drains the pixel pipeline */
 #define P3D_DWGCTL_SYNC	0x00000307u

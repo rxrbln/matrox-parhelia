@@ -123,16 +123,17 @@ int parhelia_batch_depth_control(struct parhelia_batch *batch,
  * first access; parhelia_batch_zdiscard() drops what is left. */
 int parhelia_batch_zclear(struct parhelia_batch *batch, uint32_t depth_handle,
                           unsigned pitch, unsigned format, uint32_t value);
-/* The P690 FAA epoch's surfaces and armed words, as its last draw wrote
- * them: the resolve re-establishes exactly this state. */
+/* The FAA epoch's surfaces and armed words, as its last draw wrote them:
+ * the resolve re-establishes exactly this state. */
 struct parhelia_faa_snapshot {
    struct p3d_surface colour, depth;
    uint32_t zs[3];               /* 0x12c8, 0x12cc, 0x12d0 */
    uint32_t raster;              /* the armed 0x12fc */
    uint32_t primword;
+   bool original;                /* the 0527/0528 resolve and hand-over */
 };
 uint64_t parhelia_faa_budget(unsigned width, unsigned height, uint64_t limit);
-uint32_t parhelia_faa_raster(uint64_t bytes);
+uint32_t parhelia_faa_raster(uint64_t bytes, bool original);
 int parhelia_batch_faa_resolve(struct parhelia_batch *batch,
                                uint32_t colour_handle, uint32_t depth_handle,
                                uint32_t fragment_handle,

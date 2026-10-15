@@ -4721,7 +4721,7 @@ ph_faa_prepare(struct ph_context *ctx, struct p3d_state *st,
       ph_faa_resolve(ctx);
    if (!ph_faa_fragment(ctx, colour->width0, colour->height0))
       return;
-   st->faa_raster = parhelia_faa_raster(ctx->faa.bytes);
+   st->faa_raster = parhelia_faa_raster(ctx->faa.bytes, false);
    st->faa_fragment = ctx->faa.handle;
    ctx->faa.snap = (struct parhelia_faa_snapshot){
       .colour = st->colour, .depth = st->depth,
