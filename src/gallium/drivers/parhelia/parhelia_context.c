@@ -631,7 +631,6 @@ struct ph_context {
    unsigned batch_stages;	/* its vertex-program binds, with batch_calls */
    unsigned pending_call_bound;
    struct parhelia_call_counter call_counter;	/* the pending stream's CALLs */
-   bool pending_has_draw;	/* the pending stream holds a draw */
    int pending_ring_slot;        /* -1: not in the ring */
    uint32_t pending_ring_fence;  /* last submit that read the slot */
    unsigned pending_vertex_dwords;
@@ -1903,7 +1902,6 @@ ph_drain_batch_at(struct ph_context *ctx, unsigned line)
    ph_pending_ring_release(ctx);
    ctx->pending_batch.command_count = 0;
    ctx->pending_batch.packet_count = 0;
-   ctx->pending_has_draw = false;
    ctx->pending_batch.reloc_count = 0;
    ctx->pending_vertex_dwords = 0;
    ctx->pending_index_dwords = 0;
@@ -2029,7 +2027,7 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
    stage_calls = cached ? ctx->batch_stages : ph_batch_stage_calls(batch);
    draw_batch = replay || ph_batch_has_draw(batch);
    if (ctx->aggregate_state_stream && ctx->pending_batch.packet_count &&
-       ctx->pending_has_draw && !draw_batch) {
+       ph_batch_has_draw(&ctx->pending_batch) && !draw_batch) {
       /* A clear/blit after rendering must observe the preceding pixel-pipe
        * drain.  In the other direction p3d_emit_state() explicitly rebinds
        * the surfaces and 3D engine, so leading colour/depth clears can share
@@ -2043,7 +2041,8 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
     * finished pixels); the vendor drains after every fill. */
    if (ctx->aggregate_state_stream && draw_batch &&
        ph_original_family(ph_screen(ctx->base.screen)->chip_id) &&
-       ctx->pending_batch.packet_count && !ctx->pending_has_draw) {
+       ctx->pending_batch.packet_count &&
+       !ph_batch_has_draw(&ctx->pending_batch)) {
       ret = ph_drain_batch(ctx);
       if (ret)
          return ret;
@@ -2156,18 +2155,14 @@ ph_submit_batch(struct ph_context *ctx, struct parhelia_batch *batch,
       parhelia_state_cache_appended(ctx->state_cache, &replay_entry);
    else
       parhelia_state_cache_break(ctx->state_cache);
-   ctx->pending_has_draw |= draw_batch;
    /* The stream's exact packed CALLs, stepped over the appended packets
     * only.  Summing the batches' own counts took each one's opening fence
     * and missed the runs joining across batches: q3 drained at ~100 of the
     * 224 CALLs. */
    ctx->pending_call_bound =
       !ctx->pack_adjacent_packets || ctx->pending_call_bound == UINT_MAX ||
-      (replay && !ctx->state_filter ?
-       parhelia_call_counter_update_replay(&ctx->call_counter,
-                                           &ctx->pending_batch, &replay_use) :
-       parhelia_call_counter_update(&ctx->call_counter,
-                                    &ctx->pending_batch)) ? UINT_MAX :
+      parhelia_call_counter_update(&ctx->call_counter,
+                                   &ctx->pending_batch) ? UINT_MAX :
       parhelia_call_counter_calls(&ctx->call_counter);
    ctx->pending_submit_count++;
    ctx->pending_stage_calls += stage_calls;

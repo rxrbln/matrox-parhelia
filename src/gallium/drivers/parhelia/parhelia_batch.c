@@ -4,7 +4,6 @@
  * CALLs are metadata only; the kernel constructs the executable primary span.
  */
 #include <errno.h>
-#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,13 +164,12 @@ struct call_pack {
 };
 
 static void
-call_pack_step_packets(struct call_pack *st,
-                       const struct drm_parhelia_packet *packets,
-                       const uint32_t *commands, unsigned i,
-                       const bool *call_boundaries, const uint32_t *draw_bytes)
+call_pack_step(struct call_pack *st, const struct parhelia_batch *batch,
+               unsigned i, const bool *call_boundaries,
+               const uint32_t *draw_bytes)
 {
-   const struct drm_parhelia_packet *packet = &packets[i];
-   const uint32_t *cmd = commands + packet->offset;
+   const struct drm_parhelia_packet *packet = &batch->packets[i];
+   const uint32_t *cmd = batch->commands + packet->offset;
    const bool is_draw = (cmd[0] >> 24) == 0x97 || (cmd[0] >> 24) == 0x9f;
    const bool multi = is_draw && batch_packet_multi_draw(
       cmd, packet->length, draw_bytes[i]);
@@ -199,8 +197,8 @@ call_pack_step_packets(struct call_pack *st,
       st->run_words = 0;
       st->count++; /* Kernel-owned opening fence CALL. */
    }
-   if (st->active && packets[st->previous].offset +
-                        packets[st->previous].length ==
+   if (st->active && batch->packets[st->previous].offset +
+                        batch->packets[st->previous].length ==
                         packet->offset &&
        packet->length <= PH_BATCH_MAX_DRAW_DWORDS - st->run_words) {
       st->run_words += packet->length;
@@ -220,15 +218,6 @@ call_pack_step_packets(struct call_pack *st,
       st->active = false;
       st->run_words = 0;
    }
-}
-
-static void
-call_pack_step(struct call_pack *st, const struct parhelia_batch *batch,
-               unsigned i, const bool *call_boundaries,
-               const uint32_t *draw_bytes)
-{
-   call_pack_step_packets(st, batch->packets, batch->commands, i,
-                          call_boundaries, draw_bytes);
 }
 
 /* EOB and terminal drain close the plan. */
@@ -1371,10 +1360,6 @@ struct state_cache_entry {
    struct drm_parhelia_reloc *raw_relocs;
    uint8_t *raw_flags;
    unsigned raw_packet_count;
-   /* the prefix stepped through the kernel's packing on its own, from a
-    * CALL boundary: CALLs it closes, and the run it leaves open */
-   unsigned call_closed, call_run_words;
-   bool call_run_open, call_summary, call_watermark;
    /* this prefix filtered against each predecessor's writes */
    struct state_transition {
       const struct state_cache_entry *from;
@@ -1762,39 +1747,6 @@ state_cache_join_runs(struct state_cache_entry *e)
    e->packet_count = out;
    free(map);
    return 0;
-}
-
-/* The packing summary of the prefix as replayed: every replay starts at a
- * CALL boundary and its prefix packets never change. */
-static void
-state_cache_call_summary(struct state_cache_entry *e)
-{
-   const unsigned n = e->packet_count;
-   struct call_pack st = { .first = 0, .opening = UINT_MAX };
-   bool *boundary = calloc(n + 1, sizeof(*boundary));
-   uint32_t *draw_bytes = calloc(n + 1, sizeof(*draw_bytes));
-
-   e->call_summary = false;
-   if (!boundary || !draw_bytes)
-      goto out;
-   for (unsigned r = 0; r < e->reloc_count; r++)
-      if (e->relocs[r].type == PARHELIA_RELOC_CALL_BOUNDARY &&
-          e->relocs[r].packet < n)
-         boundary[e->relocs[r].packet] = true;
-   e->call_watermark = false;
-   for (unsigned i = 0; i < n; i++) {
-      e->call_watermark |= batch_packet_is_opening_watermark(
-         e->commands + e->packets[i].offset, e->packets[i].length);
-      call_pack_step_packets(&st, e->packets, e->commands, i, boundary,
-                             draw_bytes);
-   }
-   e->call_closed = st.count;
-   e->call_run_open = st.active;
-   e->call_run_words = st.run_words;
-   e->call_summary = true;
-out:
-   free(boundary);
-   free(draw_bytes);
 }
 
 /* The prefix's packets as captured, before register-list runs join them:
@@ -2493,7 +2445,6 @@ parhelia_batch_state_run_units_deferred(struct parhelia_state_cache *cache,
       state_cache_entry_free(e);
       return 0;
    }
-   state_cache_call_summary(e);
    /* a longer draw run may take one more CALL than the captured one */
    {
       unsigned calls;
@@ -2613,7 +2564,6 @@ state_cache_transition_build(struct parhelia_state_cache *c,
    t->stages = to->stages;
    if (c->reglist_runs && state_cache_join_runs(t))
       goto fail;
-   state_cache_call_summary(t);
    t->commands_odd = t->odd_storage +
                      ((((uintptr_t)t->commands ^ (uintptr_t)t->odd_storage) &
                        7) ? 0 : 1);
@@ -2625,65 +2575,6 @@ fail:
    free(map);
    state_cache_entry_free(t);
    return NULL;
-}
-
-int
-parhelia_call_counter_update_replay(struct parhelia_call_counter *c,
-                                    const struct parhelia_batch *batch,
-                                    const struct parhelia_batch_replay *r)
-{
-   const struct state_cache_entry *e = r->entry;
-   const unsigned first = c->packets;
-   struct call_pack st = {
-      .first = c->first, .opening = c->opening, .count = c->count,
-      .previous = c->previous, .run_words = c->run_words,
-      .run_draws = c->run_draws, .active = c->active,
-      .run_multi = c->run_multi,
-   };
-
-   /* a first watermark moves the opening fence: the generic path */
-   if (!e || !e->call_summary || (!c->opening_seen && e->call_watermark) ||
-       !first ||
-       batch->packet_count < first + e->packet_count ||
-       batch->packet_count > PH_BATCH_PACKETS)
-      return parhelia_call_counter_update(c, batch);
-   for (unsigned i = first; i < batch->packet_count; i++) {
-      c->boundary[i] = false;
-      c->draw_bytes[i] = 0;
-   }
-   for (unsigned k = c->relocs; k < batch->reloc_count; k++) {
-      const struct drm_parhelia_reloc *reloc = &batch->relocs[k];
-
-      if (reloc->packet < first || reloc->packet >= batch->packet_count)
-         continue;
-      if (reloc->type == PARHELIA_RELOC_CALL_BOUNDARY)
-         c->boundary[reloc->packet] = true;
-      else if (reloc->type == PARHELIA_RELOC_DRAW)
-         c->draw_bytes[reloc->packet] = reloc->delta;
-   }
-   if (!c->boundary[first])
-      return parhelia_call_counter_update(c, batch);
-   /* the boundary closes the open run, then the prefix as summarized */
-   st.count += st.active + e->call_closed;
-   st.active = e->call_run_open;
-   st.run_words = e->call_run_words;
-   st.run_draws = 0;
-   st.run_multi = false;
-   st.previous = first + e->packet_count - 1;
-   for (unsigned i = first + e->packet_count; i < batch->packet_count; i++) {
-      if (!call_count_packet_valid(batch, i))
-         return -EINVAL;
-      call_pack_step(&st, batch, i, c->boundary, c->draw_bytes);
-   }
-   c->count = st.count;
-   c->previous = st.previous;
-   c->run_words = st.run_words;
-   c->run_draws = st.run_draws;
-   c->active = st.active;
-   c->run_multi = st.run_multi;
-   c->packets = batch->packet_count;
-   c->relocs = batch->reloc_count;
-   return 0;
 }
 
 void
