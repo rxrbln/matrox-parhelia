@@ -587,6 +587,10 @@ struct ph_context {
    unsigned tcl_reason[PH_TCL_REASONS];
    uint64_t tcl_reason_verts[PH_TCL_REASONS];
    uint64_t tcl_verts, tcl_clip_verts;
+   /* PARHELIA_STATS: vertices of blocks the box did not clear, and those
+    * blocks by the guard band volume planes their box crosses */
+   uint64_t tcl_classified;
+   unsigned tcl_plane_blocks[128];
    uint64_t tcl_range_verts;    /* vertices the draws' index ranges span */
    unsigned tcl_clip_why[4];	/* w <= 0, guard band, near, far */
    unsigned tcl_clipped_tris;   /* clipped on the CPU, kept transforming */
@@ -1049,6 +1053,16 @@ ph_stats_frame(struct ph_context *ctx)
    memset(ctx->tcl_reason, 0, sizeof(ctx->tcl_reason));
    memset(ctx->tcl_reason_verts, 0, sizeof(ctx->tcl_reason_verts));
    memset(ctx->tcl_clip_why, 0, sizeof(ctx->tcl_clip_why));
+   if (ctx->stat.start_ns && ctx->tcl_classified) {
+      fprintf(stderr, "  clip classification: %.0f vertices transformed; blocks by crossed planes (w,x+,x-,y+,y-,near,far):",
+              ctx->tcl_classified / n);
+      for (unsigned m = 1; m < 128; m++)
+         if (ctx->tcl_plane_blocks[m])
+            fprintf(stderr, " %02x:%.1f", m, ctx->tcl_plane_blocks[m] / n);
+      fputc('\n', stderr);
+   }
+   ctx->tcl_classified = 0;
+   memset(ctx->tcl_plane_blocks, 0, sizeof(ctx->tcl_plane_blocks));
    ctx->tcl_verts = ctx->tcl_clip_verts = ctx->tcl_range_verts = 0;
    ctx->tcl_clipped_tris = 0;
    ctx->tcl_draws = ctx->tcl_fallbacks = ctx->tcl_clip_fallbacks = 0;
@@ -8808,6 +8822,58 @@ ph_tcl_position_box(struct ph_context *ctx, const uint32_t range[2],
 /* Whether every vertex inside the box lies within the clip volume and guard
  * band: the bounds are linear in the position, so the eight corners decide
  * it, and the draw then needs no per-vertex test at all. */
+/* The guard band volume's seven planes through the matrix: w above zero,
+ * x and y within the guard band, z within -w..w.  False when the viewport
+ * leaves no guard band. */
+static bool
+ph_tcl_inside_planes(const struct ph_context *ctx, const float *m,
+                     float planes[7][4])
+{
+   const float gx = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[0])) /
+                    MAX2(fabsf(ctx->viewport.scale[0]), 1e-6f);
+   const float gy = (PH_TCL_GUARD_BAND - fabsf(ctx->viewport.translate[1])) /
+                    MAX2(fabsf(ctx->viewport.scale[1]), 1e-6f);
+   const float *rx = m, *ry = m + 4, *rz = m + 8, *rw = m + 12;
+
+   if (gx <= 1.0f || gy <= 1.0f)
+      return false;
+   for (unsigned k = 0; k < 4; k++) {
+      planes[0][k] = k == 3 ? rw[3] - 1e-6f : rw[k];
+      planes[1][k] = gx * rw[k] - rx[k];
+      planes[2][k] = gx * rw[k] + rx[k];
+      planes[3][k] = gy * rw[k] - ry[k];
+      planes[4][k] = gy * rw[k] + ry[k];
+      planes[5][k] = rw[k] + rz[k];
+      planes[6][k] = rw[k] - rz[k];
+   }
+   return true;
+}
+
+/* The planes some point of the box [lo, hi] lies outside of: each is linear
+ * in the position, so its minimum over the box is f(centre) - |f| . the
+ * half-extent.  w must stay strictly positive, the others at or above 0. */
+static unsigned
+ph_tcl_box_plane_mask(const float planes[7][4], const float lo[3],
+                      const float hi[3])
+{
+   const float c[3] = { (lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f,
+                        (lo[2] + hi[2]) * 0.5f };
+   const float e[3] = { (hi[0] - lo[0]) * 0.5f, (hi[1] - lo[1]) * 0.5f,
+                        (hi[2] - lo[2]) * 0.5f };
+   unsigned mask = 0;
+
+   for (unsigned i = 0; i < 7; i++) {
+      const float *f = planes[i];
+      const float lowest = f[0] * c[0] + f[1] * c[1] + f[2] * c[2] + f[3] -
+                           (fabsf(f[0]) * e[0] + fabsf(f[1]) * e[1] +
+                            fabsf(f[2]) * e[2]);
+
+      if (i ? !(lowest >= 0.0f) : !(lowest > 0.0f))
+         mask |= 1u << i;
+   }
+   return mask;
+}
+
 static bool
 ph_tcl_box_fits(const struct ph_context *ctx, const float *m,
                 struct ph_slice *slice, const float lo[3], const float hi[3])
@@ -8834,39 +8900,11 @@ ph_tcl_box_fits(const struct ph_context *ctx, const float *m,
       }
    }
    if (!slice) {
-      /* Each condition is linear in the position, so its minimum over the
-       * box is f(centre) - |f| . half-extent: seven planes instead of
-       * eight transformed corners. */
-      const float c[3] = { (lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f,
-                           (lo[2] + hi[2]) * 0.5f };
-      const float e[3] = { (hi[0] - lo[0]) * 0.5f, (hi[1] - lo[1]) * 0.5f,
-                           (hi[2] - lo[2]) * 0.5f };
-      const float *rx = m, *ry = m + 4, *rz = m + 8, *rw = m + 12;
-      const float planes[7][4] = {
-         { rw[0], rw[1], rw[2], rw[3] - 1e-6f },
-         { gx * rw[0] - rx[0], gx * rw[1] - rx[1], gx * rw[2] - rx[2],
-           gx * rw[3] - rx[3] },
-         { gx * rw[0] + rx[0], gx * rw[1] + rx[1], gx * rw[2] + rx[2],
-           gx * rw[3] + rx[3] },
-         { gy * rw[0] - ry[0], gy * rw[1] - ry[1], gy * rw[2] - ry[2],
-           gy * rw[3] - ry[3] },
-         { gy * rw[0] + ry[0], gy * rw[1] + ry[1], gy * rw[2] + ry[2],
-           gy * rw[3] + ry[3] },
-         { rw[0] + rz[0], rw[1] + rz[1], rw[2] + rz[2], rw[3] + rz[3] },
-         { rw[0] - rz[0], rw[1] - rz[1], rw[2] - rz[2], rw[3] - rz[3] },
-      };
+      /* seven planes instead of eight transformed corners */
+      float planes[7][4];
 
-      for (unsigned i = 0; i < 7; i++) {
-         const float *f = planes[i];
-         const float lowest = f[0] * c[0] + f[1] * c[1] + f[2] * c[2] + f[3] -
-                              (fabsf(f[0]) * e[0] + fabsf(f[1]) * e[1] +
-                               fabsf(f[2]) * e[2]);
-
-         /* w strictly positive, the others at or above zero */
-         if (i ? !(lowest >= 0.0f) : !(lowest > 0.0f))
-            return false;
-      }
-      return true;
+      return ph_tcl_inside_planes(ctx, m, planes) &&
+             !ph_tcl_box_plane_mask(planes, lo, hi);
    }
    for (unsigned k = 0; k < 8; k++) {
       const float p[3] = { k & 1 ? hi[0] : lo[0], k & 2 ? hi[1] : lo[1],
@@ -9692,6 +9730,15 @@ ph_tcl_draw_indexed_clipped(struct ph_context *ctx,
          memset(ctx->tcl_vcode + b, PH_TCL_VCODE_INSIDE, n);
          memset(ctx->tcl_vhave + b, 0, n);
          continue;
+      }
+      if (ctx->stats) {
+         float planes[7][4];
+
+         ctx->tcl_classified += n;
+         ctx->tcl_plane_blocks[box->nan ||
+                               !ph_tcl_inside_planes(ctx, ctx->mvp, planes) ?
+                               0x7f :
+                               ph_tcl_box_plane_mask(planes, blo, bhi)]++;
       }
       for (unsigned v = b; v < b + n; v++) {
          float *c = ctx->tcl_vclip + (size_t)v * 4;
