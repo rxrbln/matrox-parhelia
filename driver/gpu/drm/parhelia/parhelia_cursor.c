@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/* Copyright 2026 René Rebe <rene@exactco.de> */
 /* Matrox Parhelia 64x64 palette/alpha hardware cursor. */
 #include <linux/iopoll.h>
 #include <linux/slab.h>
@@ -230,16 +231,21 @@ static void parhelia_cursor_atomic_update(struct drm_plane *plane,
 	struct parhelia_cursor *cursor = to_parhelia_cursor(plane);
 	struct drm_plane_state *state =
 		drm_atomic_get_new_plane_state(commit, plane);
+	struct drm_plane_state *old =
+		drm_atomic_get_old_plane_state(commit, plane);
 	struct parhelia_device *pdev = cursor->pdev;
 	unsigned int head = parhelia_cursor_head(pdev);
 	int x = max_t(int, state->crtc_x, -PARHELIA_CURSOR_WIDTH) + 64;
 	int y = max_t(int, state->crtc_y, -PARHELIA_CURSOR_HEIGHT) + 64;
 	u32 dc, enable;
 
-	/* The legacy cursor ioctl reuses one framebuffer and changes its pixels
-	 * in place, so a framebuffer pointer comparison cannot detect updates.
-	 */
-	parhelia_cursor_upload(cursor, state);
+	/* A new image comes in a new framebuffer: the legacy cursor ioctl wraps
+	 * its buffer in one for every image, created while the old one is still
+	 * bound, and keeps the bound one for a move.  A move (a pointer warp on
+	 * every game frame) only repositions. */
+	if (!old || !old->visible || old->fb != state->fb ||
+	    old->crtc != state->crtc)
+		parhelia_cursor_upload(cursor, state);
 
 	parhelia_cursor_wait_ready(cursor);
 	parhelia_write(pdev, parhelia_cursor_reg(cursor, PARHELIA_CURSOR_POS),
