@@ -187,3 +187,26 @@ objdump -d --no-show-raw-insn $sys | sed -n '/53b72:/,/53bd2:/p'                
 PInS fields and the P690 PCI capabilities: `xf86-video-parhelia/tools/p690.rom`,
 `vbios-matrox-parhelia`, `captures/p690-identity/config.bin` (the Python
 used is in the 2026-10-16 session; offsets as in the tables above).
+
+## Result on the hardware (2026-10-16, Alpha EB164 + 0528, kernel a8bb194)
+
+Recovery by reload works on the original family. **MEASURED:**
+
+1. **Healthy chip, `recover=2`.** Chip reset, synthesisers 0/1 locked at 250087/550000 kHz (PInS targets
+   250/550 MHz), four memory banks without phase error.  Two findings fixed in a8bb194: the bring-up's final
+   `parhelia_post_state()` test failed because the 3-D state block reads one constant (`0xc0`) until engine
+   initialisation enables it, and a freshly reset chip reports `0x08f0 = 01020000` (the un-POSTed value), so
+   neither is a valid check before engine init.  Engine initialisation then brought `0x08f0` to `00020000`,
+   all 9 WARP images verified, the warm-up draws clean, copy test (1280x720) and RTT test byte exact,
+   console on the scanout.
+2. **Locked-up chip.** Wedged with the old 3-D-view engine copy (`PARHELIA_ENGINE_COPY_2D_VIEW=0`, bench):
+   `0x08f0 = 00000000`, `DWGCTL = 0x307`, same signature as before (the third stall of that form; the
+   vendor 2-D view, now the default, never stalled).  The `0x0920` bit-31 strobe changed nothing (as predicted
+   for a DMA-side hang).  `rmmod` worked ("engine NOT idle, 16 queued").  `insmod recover=1`: chip reset,
+   clocks, memory, clock select verified, engine `00000000 -> 01020000`, normal engine initialisation,
+   WARP gate passed, `0x08f0 = 00020000`, warm-up draws clean; then copy test and RTT test byte exact and
+   the 20-copy bench at 1.95 ms per copy.  **No reboot needed.**
+
+Not yet done (stopped on request): X and q3 on a recovered chip (the attempt was aborted by the scripts'
+"wedged" log check matching a session marker, not by the hardware), the display on the monitor, making
+`recover=1` the default, and the P690 sequence (SNX reset + S90 clocks/memory, decoded above).
