@@ -474,7 +474,10 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	int ret;
 
 	posted = parhelia_firmware_initialized(pci);
-	if (!posted && !bind_uninitialized)
+	/* A P690 whose locked-up engine was unloaded comes back with decode off
+	 * and its MMIO reading all ones; the chip reset needs only the
+	 * configuration space, so recover= gets to try it. */
+	if (!posted && !bind_uninitialized && !recover)
 		return dev_err_probe(&pci->dev, -ENODEV,
 			"firmware left this device uninitialized (PCI memory decode off): its memory controller and clocks are unprogrammed and any frame-buffer access resets the machine, so cold bring-up is required; override with bind_uninitialized=1\n");
 
@@ -539,17 +542,16 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 	pdev->mmio = pcim_iomap(pci, mmio_bar, 0);
 	if (!pdev->vram || !pdev->mmio)
 		return dev_err_probe(&pci->dev, -ENOMEM, "cannot map BARs\n");
-	if (posted) {
-		ret = parhelia_chip_alive(pdev);
-		if (ret)
-			return ret;
-	}
+	ret = posted ? parhelia_chip_alive(pdev) : -ENODEV;
+	if (ret && !recover)
+		return ret;
 	/* firmware's descriptor bank, before a reset clears it */
-	ret = parhelia_host_aperture_snapshot(pdev);
+	ret = posted && !ret ? parhelia_host_aperture_snapshot(pdev) : 0;
 	if (ret)
 		return ret;
-	if (posted && (recover == 2 ||
-		       (recover == 1 && parhelia_engine_latched(pdev)))) {
+	if (!pdev->fw_aperture)
+		dev_warn(&pci->dev, "no live descriptor bank to keep for unload\n");
+	if (recover == 2 || (recover == 1 && parhelia_engine_latched(pdev))) {
 		ret = parhelia_recover(pdev);
 		if (ret)
 			return dev_err_probe(&pci->dev, ret,

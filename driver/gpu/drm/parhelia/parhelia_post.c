@@ -778,23 +778,34 @@ static int parhelia_s90_mc_wait_idle(struct parhelia_device *pdev)
  * cfg 0x84/0x8c, the PM D3hot -> D0 strobe with 10 ms per half, the dwords
  * restored except MGAINDEX/MGADATA (0x44/0x48, an MMIO window), COMMAND
  * last - our own, as for the original family. */
+static u32 parhelia_s90_select300(struct parhelia_device *pdev, const u32 *cfg)
+{
+	u32 v = (parhelia_read(pdev, 0x0300) & 0xf888fff8u) |
+		(cfg[0x84 / 4] & 7) |
+		((cfg[0x84 / 4] >> 6) & 7) << 16 |
+		((cfg[0x84 / 4] >> 9) & 7) << 20 |
+		((cfg[0x8c / 4] >> 12) & 7) << 24 | 0x600;
+
+	/* bit 8 on every part but the first SUNEX subvariant */
+	if (pdev->pdev->device == PARHELIA_P690)
+		v |= 0x100;
+	return v;
+}
+
 static int parhelia_s90_chip_reset(struct parhelia_device *pdev)
 {
 	struct pci_dev *pci = pdev->pdev;
-	u32 cfg[64], select300;
+	/* a chip whose MMIO reads all ones gets 0x0300 after the reset only */
+	bool live = parhelia_read(pdev, 0x0300) != ~0u;
+	u32 cfg[64], select300 = 0;
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(cfg); i++)
 		pci_read_config_dword(pci, i * 4, &cfg[i]);
-	select300 = (parhelia_read(pdev, 0x0300) & 0xf888fff8u) |
-		    (cfg[0x84 / 4] & 7) |
-		    ((cfg[0x84 / 4] >> 6) & 7) << 16 |
-		    ((cfg[0x84 / 4] >> 9) & 7) << 20 |
-		    ((cfg[0x8c / 4] >> 12) & 7) << 24 | 0x600;
-	/* bit 8 on every part but the first SUNEX subvariant */
-	if (pci->device == PARHELIA_P690)
-		select300 |= 0x100;
-	parhelia_write(pdev, 0x0300, select300);
+	if (live) {
+		select300 = parhelia_s90_select300(pdev, cfg);
+		parhelia_write(pdev, 0x0300, select300);
+	}
 
 	pci_write_config_dword(pci, 0xe0, 3);
 	msleep(10);
@@ -808,7 +819,13 @@ static int parhelia_s90_chip_reset(struct parhelia_device *pdev)
 	}
 	pci_write_config_dword(pci, PCI_COMMAND,
 			       cfg[PCI_COMMAND / 4] | PCI_COMMAND_MEMORY);
+	if (!live)
+		select300 = parhelia_s90_select300(pdev, cfg);
 	parhelia_write(pdev, 0x0300, select300);
+	if (parhelia_read(pdev, 0x0300) == ~0u) {
+		dev_err(&pci->dev, "MMIO still reads all ones after the chip reset\n");
+		return -EIO;
+	}
 	return 0;
 }
 
