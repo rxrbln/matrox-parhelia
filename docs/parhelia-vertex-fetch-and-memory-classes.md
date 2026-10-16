@@ -265,6 +265,20 @@ GL meaning needs the ICD side, not reached this session) as parameters:
 `0x83c00000` is the kernel's own one-attribute `xyzw` declaration, used by
 its prime/self-test draws and by `mtx1814`'s internal draws **[BIN]**.
 
+### 3.1 Packed colour: kind 5, format 6 **[HW, P690]**
+
+The vendor D3D driver (faaemu `faa-default`) declares its diffuse colour as
+one dword: `0x00456040` = offset 4, kind 5, bits `[15:12]` = 6, mask
+`[25:22]` = 1.  `parhelia-drm-test --packed-colour-probe` (2026-10-13, P690)
+draws an x,y + one-dword stream with `0x80456020`: a flat `0xc0804010` reads
+back as exactly `0xc0804010` from an ARGB8888 target, and per-vertex
+`0xff0000ff` / `0xff00ff00` / `0xffff0000` interpolate to blue, green and red
+corners.  Format 6 is therefore D3DCOLOR, `0xAARRGGBB` with blue in byte 0,
+unpacked to v5 as four channels including alpha.  GL RGBA8 bytes need R and B
+swapped.  Mesa's transform path uses it on both families.  The full format
+table (bits [15:12]: 8/16-bit, normalized and integer) is in
+`parhelia-vertex-fetch-formats.md`.
+
 ## 4. The WARP program heap — the pointer class the replay missed
 
 This is outside the five questions asked, but it is the finding that changes

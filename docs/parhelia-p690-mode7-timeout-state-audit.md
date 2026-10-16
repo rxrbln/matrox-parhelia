@@ -195,3 +195,39 @@ Consequently this path emits triangle `PRIMWORD=0x0002305c`, while the two
 failed diagnostics used the copied-path `0x0006305c`.  The guarded builder now
 uses `0x0002305c`.  No hardware result exists for that corrected experiment
 yet, and normal Mesa remains on `0x97`.
+
+## One triangle per packet draws (2026-10-14)
+
+`MODE7_TRIANGLES=1 parhelia-drm-test --mode7-screen-test` (module loaded with
+`mode7_screen_test=1`, kernel 34aa7cb) draws one triangle through a
+three-index `0x9f000001` packet: pixel-exact against the `0x97` reference and
+retired, 20 of 20 runs with the VRAM index snapshot and 3 of 3 with the
+class-3 DMA transport.  The two-triangle packet of the earlier attempts now
+retires as well but draws wrongly (36864 pixels differ) instead of stalling.
+So the P690's indexed fetch, like mode 3 (`parhelia-p690-bound-range-probe.md`),
+takes one primitive per packet; the stalls were the multi-primitive packet,
+not the indexed fetch itself.
+
+## Several triangles per packet through draw ranges (2026-10-14 evening)
+
+`parhelia-drm-test --indexed-run-probe` draws through the production path
+(vertex object, draw ranges, kernel index copy) and compares every triangle
+with the same triangle in its own 0x97 packet.  On nano:
+
+| triangles per 0x9f packet | shared vertices | packets drawn | result |
+|---|---|---|---|
+| 1 | quads split across packets | 100 x 128 | exact |
+| 2, 4, 8 | quads | up to 20 x 64 | exact |
+| 3 | quads, every other split | 100 x 64 | exact |
+| 20 | quads | 50 x 12 | exact |
+| 21 | none | 50 x 12 | exact |
+| 21 | quads, split across packets | 1 x 12 | stall at packet 4; again at packet 5 with 256-byte aligned index starts |
+
+So the "one primitive per packet" reading of the isolated screen test does
+not hold for the production path; the two-triangle screen-test failure is a
+property of that test's state, not of 0x9f.  The kernel now allows eight
+triangles per indexed packet on the P690 (`p690_indexed_triangles`,
+runtime-writable).  ioquake3 720p with `PARHELIA_INDEXED=1` at 8 and 20
+triangles per packet: no stall, frames correct, 35.8-36.7 fps against
+35.5-36.2 without, CPU 10.0 against 9.6 ms per frame (indexed batches now use
+the state cache).  It stays opt-in on the P690.

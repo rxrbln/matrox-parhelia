@@ -244,3 +244,26 @@ still need a P690 run before enabling the extension by default:
 * Verify BC1 RGB versus RGBA with blocks on both sides of the `color0 <= color1`
   endpoint condition.  The descriptor code is shared, so correctness depends
   on the hardware following standard BC1 punch-through semantics.
+
+## Hardware result (P690, 2026-10-14)
+
+Measured with `parhelia-drm-test --texture-dxt-probe` (PROBE_MAP,
+PROBE_LINEAR, PROBE_LEVELS, PROBE_PIN); Mesa abe15f1 implements it.
+
+* The 32x16 macrotile above holds for DXT3/5 only within one 32-row band.
+  Storage is 64x32-texel tiles: 1 KiB of DXT1, 2 KiB of DXT3/5, made of
+  512-byte units 32 texels wide (8x8 DXT1 blocks, 8x4 DXT3/5 blocks, blocks
+  row-major inside a unit), units left-right then top-down inside a tile.
+  Tile rows advance by pitch/64 tiles - at a 32-texel pitch two 32-row bands
+  share one tile - and every odd tile row swaps the unit columns (texel x
+  bit 5 ^ texel y bit 5), as in the uncompressed texture order.
+* Mip chains (16x16 to 512x512, 8:1 rectangles, both block sizes, exact):
+  levels follow one another at pitch max(32, next power of two of the
+  width), each taking its 32-row bands of tiles; the first level no larger
+  than 16x16 starts a tail 512 bytes into the previous level's tile (texel
+  x 32), or at 0 as the base; later levels at (+16,0), (+24,0), (+16,+8),
+  (+24,+8) of it.
+* Non-power-of-two bases are addressed exactly at the next power-of-two
+  pitch (48x48 .. 200x24).  Their chains place levels by the unit columns
+  the previous level occupies (96x32: level 1 at 1.5 tiles); not modelled
+  yet, so Mesa samples such chains through a decoded copy.

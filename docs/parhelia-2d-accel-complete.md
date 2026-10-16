@@ -352,6 +352,19 @@ The temp surface is allocated by `Surface2d::AllocTmp` with format code
 > surface, GXcopy in, real BOP out) or split the copy into non-overlapping
 > bands.  If the direction bits are to be tried, they must be validated on
 > hardware first.
+>
+> **Hardware result (P690, 2026-10-14/16).**  Bits 12/13 reverse the BITBLT
+> walk in X/Y, starting at the right/bottom edge, so SRC and DSTXY name that
+> edge.  Copies within one object are exact only as vertical moves (dx = 0)
+> walked away from the destination:
+> * kms-ddx 0477dd01: 12000 random cases;
+> * Mesa: `tools/parhelia-gl-copy-test`, overlapping moves of 1 and 7 rows
+>   byte exact at 256x128 and 1920x1080, while the same moves without bit 13
+>   left 14592 and 29393 of 32768 pixels wrong.
+>
+> Same-row moves within one object corrupt pixels even without overlap, so
+> they stay staged.  The original family (0528) is unmeasured: a same-surface
+> BITBLT locked up its engine, so it stages every same-object copy.
 
 ## Op 5 — Clipping (scissor)  [CONF `SetClippingRectangle @0x535E0`, `DisableClipping @0x53660`]
 

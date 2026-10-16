@@ -1405,3 +1405,31 @@ remains the control. No standard sample-mask/MSAA contract is claimed.
 See captures/faa-perf-20261004/report.md and the current
 [feature/TODO audit](parhelia-hw-gl-feature-audit.md). Shared Mesa 9369ebc and
 DRM f288453 do not contain this isolated FAA implementation.
+
+### 14.8 Port to master (2026-10-15)
+
+The 14.5–14.7 implementation is ported onto the current trees, off by default:
+
+| repo | commit | switch |
+|---|---|---|
+| kernel | d677729 | module parameter `original_faa=1` |
+| Mesa | 62d7387, 8de626d | `PARHELIA_FAA=1` |
+
+**What the port keeps (from the 0528 path):**
+- The P690 epoch structure, with 0528-specific forms only where they were measured: 0x12fc low bits, MemLevels arm, resolve and hand-over.
+- The 16 MiB fragment buffer, kept in the bank opposite depth.
+- The 0x707 drain for batches that leave FAA armed.
+
+**What the port drops:**
+- Diagnostic knobs: `faa_boundary`, bank variants and stream traces.
+- Unused command forms: the 0xc07 and 0x106 flushes, and the 18-bit pointer words.
+- Parameter 33. The capability is `PARHELIA_PARAM_FAA` (42) for both families.
+- Private Z24 depth for colour-only windows.
+- CPU save and restore of stencil bit 0. A depth buffer whose stencil the application uses never takes FAA, as on the P690.
+
+**Host evidence:**
+- **Selftests:** 152 Mesa selftests pass, including the new 0528 FAA test.
+- **FAA-off identity:** 22481 batches from randomised states are byte-identical to master.
+- **Kernel FAA selftest:** passes.
+
+**Not yet run on the 0528.** In particular, DWGCTL bit 20 and the −0.5 px vertex bias were dropped together. That rests on the P690 measurement that bit 20 selects D3D integer pixel centres (inference for the 0528). The plan is `campaign/agents/faa0528-port/TEST-PLAN.md`; step 2 decides the pixel centres.

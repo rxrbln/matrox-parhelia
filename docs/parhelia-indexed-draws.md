@@ -667,15 +667,43 @@ single item — the four-case 16-bit index `start`/`end` table of §2.3,
 reproduced instruction for instruction at a different VMA in a different
 compiler's output. See §9.
 
+**PROVEN [HW] — 16-bit address-mode index lists (mode 6, `0x9b`), 2026-10-15**
+
+`parhelia-drm-test --indexed-run-probe INDEX16=1` tested mode 6 on the P690 (nano) and the 0528 (Alpha) through the production draw-range path.
+
+* **Operands.** The kernel builds them from its own copy of the list, placed on a dword A, with n indices:
+  * `start = A | (n & 1)`;
+  * `end = (A + 4*ceil(n/2)) | 3`.
+* **Probe.** Each packet's render is compared against an expanded non-indexed render of the same triangles. Covered:
+  * 1, 3, 7 and 8 triangles per packet;
+  * up to 32 packets;
+  * shared and unshared vertices;
+  * white decoy vertices ahead of the drawn ones, so the indices run up to 65535.
+* **Result:** every case draws exactly, with 0 differing pixels.
+  * The odd-count form, with start bit 0 set and the high half of the last dword padded, draws only its n indices.
+  * An index past the range is refused by the kernel (EINVAL).
+* **ioquake3:** with 16-bit lists (Mesa `PARHELIA_INDEX16=1`), a frozen bench frame is byte-identical to the 32-bit one, and piglit core is unchanged.
+* **0528 (Alpha), same probe, all exact:**
+  * 1, 3 and 7 triangles in one packet;
+  * 2x8, 8x8 (3 requests), 16x4 and 64x2 packets;
+  * indices up to 65535;
+  * out-of-range index refused.
+* **ioquake3 on the Alpha (bench demo, 1280x720), same-binary A/B:**
+  * fps 26.85 → 27.65;
+  * process CPU -0.85 ms/frame;
+  * vertex+index dwords per frame -14%.
+
 **STILL OPEN AFTER BOTH DRIVERS**
 
 * Whether the descriptor's dword offset is per-stream or global across
   concatenated streams when more than one stream is bound (§3.4). The two
   drivers appear to disagree; only hardware can settle it.
-* Whether a packed-ubyte4 (or any non-float) attribute format exists (§8,
-  §10.5). The ICD has a 4-byte packed-colour format code and the Windows FVF
-  decoder a matching component-count table, but neither could be traced into
-  a descriptor. **One capture of a `glColor4ub` app settles it.**
+* ~~Whether a packed-ubyte4 attribute format exists~~ — settled on the P690
+  (2026-10-13): descriptor bits [15:12] = 6 with mask 1 fetches one dword as
+  D3DCOLOR `0xAARRGGBB` (faaemu `faa-default` 0x00456040, then
+  `parhelia-drm-test --packed-colour-probe`; see
+  `parhelia-vertex-fetch-and-memory-classes.md` §3.1).  §8's "probably
+  absent" reading is refuted: bits [15:12] are a format field.
 * The meaning of header bit 30. All three stacks derive it from the vertex
   declaration/layout and none reveals what the hardware does with it.
 * Mode 4 (`0x13`): no stack emits it.
@@ -815,6 +843,16 @@ promotes §2.3 from "the arithmetic says so" to settled. **[BIN]×2**
   per-stream first fetchable index, running min of `(size-offset)/stride`)
   and marks dirty bit 9. They can be set once per binding, not per draw.
   **[BIN]**
+  They do **not** bound the fetch. On both the 0528 (Alpha) and the P690
+  (nano), an index moved after validation to the 0x1060 count, or up to 4
+  past it, fetches the vertex stored there. A white decoy vertex below the
+  last triangle stretched it over 1188 pixels, and the run without the move
+  matched the reference exactly. **[HW]** (2026-10-15,
+  `campaign/patches/index-limit-probe-20261015.diff`: the kernel
+  `index_limit_probe=N` parameter and `INDEXED_DECOYS` in
+  `--indexed-run-probe`.)
+  The kernel's copy and range check of every index therefore stays: indices
+  cannot be fetched in place from client-writable memory.
 * **Descriptor packing** from a source dword `S` (`0x12dd00`):
   `dst[2:0] = S[10:8]` (stream), `dst[11:4] = S[7:0]` (dword offset),
   `dst[19:12] = S[18:11]`, `dst[29:22] = S[26:19]`, `dst[31]` set explicitly

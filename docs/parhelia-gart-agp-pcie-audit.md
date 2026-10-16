@@ -212,3 +212,16 @@ which current P690 captures show.
 4. Reserve any AGP implementation or test for an actual AGP Parhelia host.
    On this target, verify that any attempted AGP capability query returns
    unsupported rather than silently retagging class-3 DMA as class 2.
+
+## 2026-10-14: the P690 vendor path uses a class-2 page table
+
+The emulated vendor P690 driver (faaemu `--chip 2539`, mtxpserd.dll) puts its
+command buffers in memory class 2 (`0x1000 = 2` before every draw) and
+translates class-2 addresses through a page table it builds itself:
+`0x360 = table | 1`, `0x364` = last table page, 32768 entries of
+`PFN << 12 | (PFN >> 16 & 0xff0) | flag << 3` (unused entries `0xb`), with
+setup writes to `0x330`..`0x354` and a pulse on `0x368`.  This contradicts the
+"no PCIe GART" statement above for the P690.  It is PROVEN from the vendor
+instructions and emulated stream only; the hardware behaviour of
+`0x330`..`0x368` and the meaning of entry bit 3 are not established.  Source:
+`campaign/results/faaemu-p690-20261014.md`, captures/faaemu-p690-20261014/.

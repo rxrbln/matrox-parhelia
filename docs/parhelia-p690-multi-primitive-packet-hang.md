@@ -261,3 +261,182 @@ upload/submit14.5→5.0ms. An opt-in doubled mapped capacity test retained small
 commands but four ring slots, yielded32.6FPS/9submits/9.6ms upload, and stays
 opt-in. Correct improvements remain retained; defaults use the faster measured
 path. Main evidence is in mesa-driver/tests/p690-swap.
+
+## 2026-10-14: stress reproducer, vertex source, per-draw rebind, vendor span layout
+
+### Reproducer
+
+`parhelia-drm-test --multi-prim-stress` (Mesa parhelia_drm_test.c) repeats one
+request of `STRESS_PACKETS` triangle-list packets of `STRESS_VERTS` vertices
+(5-dword pass-through vertices, 256x256 target, colour per triangle) for
+`STRESS_SUBMITS` requests and compares the target against two triangles per
+packet every `STRESS_CHECK` requests.  `STRESS_REBIND=1` sets
+`p3d_state.stream_bind_per_draw`: `0x1000 = 3`, `0x1040 = 4` before every
+0x97 packet.  Host script: `tools/parhelia-nano-stress.sh`.
+
+| setup (one boot each, nano P690) | result |
+|---|---|
+| 32 x 12 vertices, host class-3 vertices | stall at request 29 |
+| 64 x 12 vertices, local-VRAM class-0 vertices (module `local_vertex_draws=1`) | stall at request 1 |
+| 32 x 12 vertices, rebind before every packet | 300 requests pass, pixel-exact |
+| rebind: 16 x 24, 8 x 60, 32 x 12, 8 x 63, 24 x 15 vertices | 500 requests each pass |
+| rebind: 20 x 18 vertices | stall at request 1 (one sample) |
+
+The class-0 path draws pixel-identically to the class-3 one at two triangles
+per packet (hash 8ac6f3c5), so the vertex source is not the cause.  The
+per-draw stream rebind is the first change that moves the behaviour, but it
+is not sufficient on its own.
+
+### Vendor P690 packet loop (mtxpserd.dll, PROVEN from instructions)
+
+Per packet, loop `0x13732f`..`0x137854`:
+
+1. `0x13748d`: `[2][0x21211000][class][4]` at the cursor (0x1000/0x1040).
+2. `0x1374c5`..`0x1374f1`: `0xc1530(bus(mark), bus(cursor), 2, class)`
+   publishes the span from the previous mark up to and including that
+   rebind: it appends the primary CALL
+   `[0x20292820][0][start|2][end|class][0]` and advances the primary put
+   (`[esi+0x6c]`), i.e. kicks it.  `0x1148` = 0/1 around the kick only with
+   `OGL.FastContextSwitching` (option `+0x3c0`).
+3. `0x137506`: mark = cursor; `start` = bus(cursor) (`0x13752b`).
+4. `0x1376d2`/`0x137723`: the vertices are copied to the cursor.
+5. `0x1377eb`: mark = cursor (past the vertices); `0x1377fb`: `end` =
+   bus(cursor); `0x137835`: header `0x17000001 | (dw-1)<<17 | layout` at the
+   cursor - the header opens the next span.
+
+So every executable CALL span is `0x97 header ... state ... 0x1000/0x1040
+rebind`, the vertex bytes lie between spans and are never fetched as
+commands, and no two draw packets share a span.  The only bound on vertices
+per packet is the room left in the command buffer (`(limit - cursor)/4 - 7`
+dwords, rounded to the primitive at `0x1373c5`).
+
+The 0x0528 vendor captures (236 files, 37024 0x97 ranges) cross a 4 KiB
+boundary 780 times, so range alignment is not part of the vendor contract.
+
+Our stream differs in three ways: vertices in a separate buffer, many draw
+packets per CALL span, and (before this test) no per-packet rebind.  Next
+step: the vendor span layout in the kernel's CALL planner, behind an option.
+
+### Correction: the rebind runs also split the CALL spans
+
+The stress probe submits without `PARHELIA_SUBMIT_CALL_BOUNDARIES`, so the
+only packer is `parhelia_coalesce_draw_calls()` (`pack_draw_packets`), which
+merges *adjacent* 0x97 packets into one CALL.  Without the rebind the 32 draws
+were adjacent and shared one CALL span; with it a register packet separated
+every draw, so every 0x97 got its own CALL.  The 2026-09 bisect turned off
+`pack_adjacent_packets` but never `pack_draw_packets`, so one draw per CALL had
+not been tried before.
+
+| setup (nano, 4 x 5-dword triangles per packet unless noted) | result |
+|---|---|
+| draws share CALL spans, no rebind | stall at request 29 |
+| `pack_draw_packets=0` (one CALL per 0x97), no rebind | 500 x 32 packets pass, pixel-exact |
+| `pack_draw_packets=0`, 18-vertex packets, 20 per request | stall at request 1, twice |
+| `pack_draw_packets=0`, 18-vertex packets, 1 per request | requests 1-2 retire, stall at request 3 |
+
+**Stall 1 (probabilistic, any count above six vertices): several multi-
+primitive draw packets in one CALL span.**  One draw per CALL span removes
+it - the vendor never puts two draws in one span.  The per-draw rebind is not
+needed for it.
+
+**Stall 2 (count-dependent): 18-vertex packets of 5-dword vertices** (and the
+long-known nine-vertex trap) stall with or without the rebind and with one
+draw per CALL.  A single packet per request retired twice and stalled on the
+third identical request (same commands, same vertex address), so it is a high
+per-packet stall probability, not a function of the bytes or the address.
+6, 12, 15, 24, 60 and 63 vertices ran thousands of packets clean.  The stall
+report CALL listing (kernel 604efb8) shows the primary fetcher a few CALLs
+past the first 18-vertex draws, secondary registers zero.  Open: whether the
+vendor's inline vertex placement (end == header) avoids it - the one layout
+difference left - and what the count dependence is.
+
+### Production (kernel 9db97cb, Mesa 59fd188)
+
+On the P690 the kernel keeps every 0x97 draw of more than six vertices out of
+shared CALL spans (both packers; a DRAW_RANGES run may not carry one) and
+reports it as `PARHELIA_PARAM_SPLIT_MULTI_DRAWS`.  Mesa mirrors the rule in
+its CALL accounting, traps 18-vertex packets next to nine, and then defaults
+to 21 triangles per packet: ioquake3 720p CPU per frame 11.67 -> 9.70 ms on
+nano, frames unchanged, no stall.  The vendor capture (faaemu, P690 PSER path)
+shows the same span structure with whole draws per packet, vertices inline
+in a class-2 command buffer, PRIMWORD bit 18 clear, DWGCTL `0x00960ec4` and
+`0x1060` = the draw's vertex count; which of these explains the 9/18-vertex
+stall is open.
+
+## 2026-10-14 evening: inline vertices, vendor draw values, unbounded packets
+
+Measured on nano (kernel 9dddacd + p690-todo 8f227c8, Mesa p690-todo),
+power-cycled after every stall.
+
+**Vendor inline layout in class-3 memory does not retire.**  Kernel option
+`p690_inline_draws` (default off) builds a span that opens with a 0x97 draw
+the PSER way: the draw's vertices copied into the command block, the header
+right behind them, `end` = the header's address, the CALL starting at the
+header so the vertex bytes are in no CALL.  The kernel's own T2 prime (one
+24-vertex draw, synchronous) timed out with it; on the asynchronous path the
+first inline draws stalled (the listing of that request shows unexpected
+dwords at the stalled span's start, not understood).  The same draws in their
+separate vertex buffer retire on every module load.  The vendor runs this
+layout through class 2, the `0x330..0x368` page-table aperture, which this
+driver never programs; that is the remaining structural difference.
+
+**The vendor PSER draw values do not explain the 18-vertex stall.**
+PRIMWORD bit 18 clear, DWGCTL `0x00960ec4` and guard band 16.0 together:
+`--multi-prim-stress` with 20 x 18-vertex packets still stalls at request 1,
+as without them.  DWGCTL bit 20 (set by the D3D driver) changes rasterisation:
+each 12-pixel right triangle covers 78 instead of 66 pixels, i.e. integer
+pixel centres (D3D9), not GL's half-pixel centres, so it is not a value for
+this GL driver.  Bit 21 (cleared on the LX family) shows no pixel difference.
+
+**Packets as large as the vertex layout allows stall the P690.**  Mesa
+9ff1dba raised the P690 default from 21 triangles (63 vertices) to the 4096-
+dword layout bound.  piglit `gl-1.0-beginend-coverage` then stalls the engine
+on its third test, on one 135-vertex packet of seven-dword vertices in a span
+of its own; with `PARHELIA_PRIMS_PER_PACKET=21` or `2` it passes.
+
+**63 vertices is not safe either, and the bad counts are no simple rule.**
+With packets capped at 21 triangles, Mesa's context prime (one 63-vertex,
+five-dword packet on a 64x16 target) stalled the engine at
+`gl-1.0-drawbuffer-modes` in two of two piglit runs, although 63-vertex
+stress packets had passed thousands of times.  `--multi-prim-stress` with
+about 800 vertices per request, 200 requests: 30 vertices clean, 33 stalls
+at request 1.  Counts that stall: 9, 18, 33, 63, 135 (seven-dword); clean:
+6, 12, 15, 24, 30, 60.  Not multiples of 9 (33), not byte or 64-byte
+boundaries.
+
+**Overlapping triangles inside a large packet are a second trigger.**  The
+prime's triangles wrap at x = 60, so a packet of more than 15 of them
+overlaps itself; with the 60 + 3 split it still stalled (`gl-1.0-blend-func`).
+`--multi-prim-stress STRESS_OVERLAP=n` (grid cells reused every n triangles):
+
+| vertices/packet | overlap inside the packet | packets | result |
+|---|---|---|---|
+| 6 | both triangles on one cell | 26000 | clean |
+| 12 | every 2nd triangle | 19500 | clean |
+| 24 | every 4th | 9900 | clean |
+| 30 | every 5th | 7800 | clean |
+| 60 | every 15th | 39 | stall at request 3 |
+| 60 | none | thousands (earlier) | clean |
+
+**The lockup is a state left behind, not the stalling packet's shape.**
+Every fix on the stalling request only moved the lockup: Mesa's context
+prime stalled at `gl-1.0-drawbuffer-modes` with packets of 63, 60+3,
+30+30+3 and 24+24+15 vertices, with its triangles kept apart, with them
+kept in the left half of its 64x16 target, and finally with the prime at two
+triangles (one 6-vertex packet) while the application draws of the earlier
+tests still used packets of up to 24 vertices.  `drawbuffer-modes` alone
+passes.  With two triangles per packet everywhere
+(`PARHELIA_PRIMS_PER_PACKET=2`) the full core list matches the previous
+day's run test for test (276 pass), twice.  So packets larger than two
+triangles leave the P690 engine in a state that locks up a later draw; the
+stress probe, which draws one shape repeatedly, does not show this.
+
+Consequences (Mesa p690-todo 63cf691): the P690 default is two triangles
+per packet again (ioquake3 720p on nano 35.8-36.1 fps against 35.5-36.2,
+CPU 11.6 against 9.6 ms per frame; the frame is GPU-bound).
+`PARHELIA_PRIMS_PER_PACKET` still selects larger packets, which then take
+only the stress-measured counts 3, 6, 12, 15 and 24 vertices; the original
+family keeps the layout bound measured on the 0528.  What state the larger
+packets leave behind is open; the WARP T2 per-slot latch (the reason for
+the kernel's eight-slot and Mesa's per-context prime) is the first suspect,
+not tested.

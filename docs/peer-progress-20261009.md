@@ -8,8 +8,8 @@ alone does not prove an agent is still running.
 
 | Tree | HEAD | Inspection |
 | --- | --- | --- |
-| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `3142d3d` | Grouped record-mask, VS and queued-presentation proof complete; advanced-game floor remains wrong |
-| `src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/drivers/gpu/drm` | `b1b3cf2` | Coherent command backing and ownership comment; behavior matches tested candidate |
+| `src.mesa.x86-64-desktop.260909.123648.3741772/mesa-26.2.2/src/gallium/drivers/m9x` | `6460f3f` | Complete GPU proof through `3142d3d`; FAA state/coordinate-lane candidate in the next batch |
+| `src.linux.x86-64-desktop.260909.123559.3725172/linux-7.2/drivers/gpu/drm` | `a13b7f0` | Scanout pin retirement and failure-atomic FAA shadow fixes integrated; target batch in progress |
 | `xf86-video-parhelia` | `0701f90f` | Vendor record-mask proof and independent varied floor references integrated |
 
 ## Peer work remaining to reconcile
@@ -90,7 +90,7 @@ Grouped `9906bee` GPU proof: texturebias4/5failed→0/5, defaultunset sRGB24phas
 
 Mesa3ba6624 is now GPU-qualified; source/rawview/layout fixes and boundedLOD support are retained. All10LOD,5bias,24sRGBphasespass, all15fixturePPMsunchanged, ordinary40.1FPSvs40.2flat. AdvancedQ3 completes387frameswithzero dropped/refused/skipped draws; armourHUDfixed, floororangequadpersists, so itsFPSremainsunqualified. SelectedPiglit5PASS/19FAIL/0TIMEOUT andcore8PASS/1existingFAILunchanged. Boot56289a98…/moduleca1 unchanged, healthyfullyretired. Exactscope/screenshots/runner/hashes: [grouped proof](../tests/m9-layout-lod-hardware-20261010/README.md). Activeagents: finalvendorlow-pairmask, selected-outputinputpruning, aggregationowner/pixel/performancequalification.
 
-## 2026-10-10 02:03 — record masks and actual aggregation qualified
+## 2026-10-10 01:57 — record masks and actual aggregation qualified
 
 Mesa `3142d3d` passes the same selected 24 shader tests, previously 5 PASS /
 19 FAIL. All five matrix controls and three varied floor fixtures match software
