@@ -224,3 +224,15 @@ first; this board gets 350000 kHz exactly (M1 56, M2 25, P1 27, P2 2, word `0x1d
 search (M2 capped at 16) would give 348750 kHz.  **Not run on hardware yet** (nano is off): test plan as for
 the 0528 - `recover=2` on a healthy P690 first, then a wedged one, then `--native-transfer-probe` and
 `--masked-clear-probe`, the two probes that showed the `reset_on_probe` VRAM corruption.
+
+## P690 result (2026-10-16, nano)
+
+**MEASURED, P690 recovery by reload works.**  Healthy chip with `recover=2`: FS0 locked at exactly 350000 kHz
+(word `0x0001d637`), memory controller initialised, oscillator `0x60000000`, normal engine initialisation;
+`--native-transfer-probe` and `--masked-clear-probe` 0 mismatches (they read 65536/65536 wrong after the old
+plain PCI reset), `--render`/`--texture` pass.  Wedged chip (`--multi-prim-stress`, 20 x 18 vertices: `0x08f0 =
+03000000`, the WARP busy pair latched): `rmmod` (decode stayed on, no PCIe error), `insmod recover=1`: reset,
+clocks, memory, engine `03000000 -> 01020000 -> 00020000`, WARP gate passed, both probes exact, render/texture
+pass, X up, glxgears on the P690 at 60 fps.  No power cycle.  Both families now recover; `recover` still
+defaults to 0.  Open: the decode-off/all-ones state some earlier rmmods left (handled in code, not reproduced
+today), making `recover=1` the default, live recovery without a reload.
