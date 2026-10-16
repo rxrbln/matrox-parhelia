@@ -858,6 +858,7 @@ struct parhelia_fs_limits {
 
 enum parhelia_post_state parhelia_post_state(struct parhelia_device *pdev);
 int parhelia_post_cold_bringup(struct parhelia_device *pdev);
+int parhelia_post_sun90_bringup(struct parhelia_device *pdev);
 bool parhelia_fs_solve(u32 target_khz, const struct parhelia_fs_limits *lim,
 		       u32 *word, u32 *achieved_khz);
 bool parhelia_fs_locked(struct parhelia_device *pdev, u32 reg,

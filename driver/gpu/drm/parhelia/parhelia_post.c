@@ -682,3 +682,394 @@ int parhelia_post_cold_bringup(struct parhelia_device *pdev)
 		 parhelia_read(pdev, PARHELIA_CLOCK_SELECT));
 	return 0;
 }
+
+/* ---- P690 (SUN90): the vendor's chip reset and clock/memory bring-up -----
+ *
+ * HSLSNXHardwareReset, HSLS90InitMemClk, HWS90InitializeSystemClock and
+ * HWS90InitializeMemoryController (mtx_drv.so; the Windows miniport carries
+ * the same code), as decoded in xf86-video-parhelia/docs/
+ * parhelia-p690-engine-reset-re.md and parhelia-runtime-reset-review.md.
+ */
+#define PARHELIA_S90_MC_SELECT		0x0ffc
+#define PARHELIA_S90_MC_CONTROL		0x0ff4
+#define PARHELIA_S90_MC_STATUS		0x0ff8
+#define PARHELIA_S90_FS(i)		(0x0e30 + 4 * (i))
+#define PARHELIA_S90_OSC		0x0e24
+#define PARHELIA_S90_FS_LOCK		BIT(24)
+#define PARHELIA_S90_FS_STROBES		(BIT(31) | BIT(21))
+#define PARHELIA_S90_REF_KHZ		27000u
+
+/* PInS offset, memory-controller register and bank mask of each of the 44
+ * dwords HWS90InitializeMemoryController writes, in its order (the table
+ * pinsDatasConvertor; byte-identical in the Windows miniport). */
+static const struct {
+	u16 pins, reg;
+	u8 bank;
+} parhelia_s90_mc_table[] = {
+	{ 0x210, 0x0f00, 3 }, { 0x214, 0x0f04, 3 },
+	{ 0x218, 0x0f08, 3 }, { 0x21c, 0x0f10, 3 },
+	{ 0x220, 0x0f1c, 3 }, { 0x224, 0x0f20, 3 },
+	{ 0x228, 0x0f24, 3 }, { 0x22c, 0x0f28, 3 },
+	{ 0x230, 0x0f2c, 3 }, { 0x234, 0x0f44, 3 },
+	{ 0x238, 0x0f94, 3 }, { 0x23c, 0x0f98, 3 },
+	{ 0x240, 0x0f9c, 3 }, { 0x244, 0x0fa0, 3 },
+	{ 0x248, 0x0fc0, 3 }, { 0x24c, 0x0fc4, 3 },
+	{ 0x250, 0x0fc8, 3 }, { 0x254, 0x0fcc, 3 },
+	{ 0x258, 0x0ff0, 3 }, { 0x25c, 0x0ff8, 3 },
+	{ 0x260, 0x0f14, 1 }, { 0x264, 0x0f18, 1 },
+	{ 0x268, 0x0f48, 1 }, { 0x26c, 0x0f4c, 1 },
+	{ 0x270, 0x0f58, 1 }, { 0x274, 0x0f5c, 1 },
+	{ 0x278, 0x0f68, 1 }, { 0x27c, 0x0f6c, 1 },
+	{ 0x280, 0x0f70, 1 }, { 0x284, 0x0f74, 1 },
+	{ 0x288, 0x0f8c, 1 }, { 0x28c, 0x0f90, 1 },
+	{ 0x290, 0x0f14, 2 }, { 0x294, 0x0f18, 2 },
+	{ 0x298, 0x0f48, 2 }, { 0x29c, 0x0f4c, 2 },
+	{ 0x2a0, 0x0f58, 2 }, { 0x2a4, 0x0f5c, 2 },
+	{ 0x2a8, 0x0f68, 2 }, { 0x2ac, 0x0f6c, 2 },
+	{ 0x2b0, 0x0f70, 2 }, { 0x2b4, 0x0f74, 2 },
+	{ 0x2b8, 0x0f8c, 2 }, { 0x2bc, 0x0f90, 2 },
+};
+
+/* Write/ReadS90MemoryControllerDword: select the bank(s) through 0x0ffc and
+ * put the old selection back if the access changed it. */
+static void parhelia_s90_mc_write(struct parhelia_device *pdev, u32 reg,
+				  u32 bank, u32 value)
+{
+	u32 saved = parhelia_read(pdev, PARHELIA_S90_MC_SELECT);
+
+	parhelia_write(pdev, PARHELIA_S90_MC_SELECT, bank & 3);
+	parhelia_write(pdev, reg, value);
+	if (parhelia_read(pdev, PARHELIA_S90_MC_SELECT) != saved)
+		parhelia_write(pdev, PARHELIA_S90_MC_SELECT, saved);
+}
+
+static u32 parhelia_s90_mc_read(struct parhelia_device *pdev, u32 reg,
+				u32 bank)
+{
+	u32 saved = parhelia_read(pdev, PARHELIA_S90_MC_SELECT);
+	u32 value;
+
+	parhelia_write(pdev, PARHELIA_S90_MC_SELECT, bank & 3);
+	value = parhelia_read(pdev, reg);
+	if (parhelia_read(pdev, PARHELIA_S90_MC_SELECT) != saved)
+		parhelia_write(pdev, PARHELIA_S90_MC_SELECT, saved);
+	return value;
+}
+
+/* WaitForS90MemoryIdle: bank 1's 0x0ff8 has bits 9 and 10 both set while
+ * the controller is busy; the vendor bound is 100000 reads. */
+static int parhelia_s90_mc_wait_idle(struct parhelia_device *pdev)
+{
+	u32 saved = parhelia_read(pdev, PARHELIA_S90_MC_SELECT);
+	unsigned int i;
+	int ret = -ETIMEDOUT;
+
+	for (i = 0; i < 100000; i++)
+		if ((parhelia_s90_mc_read(pdev, PARHELIA_S90_MC_STATUS, 1) &
+		     0x0600) != 0x0600) {
+			ret = 0;
+			break;
+		}
+	parhelia_write(pdev, PARHELIA_S90_MC_SELECT, saved);
+	return ret;
+}
+
+/* HSLSNXHardwareReset: all 64 configuration dwords saved, 0x0300 rebuilt from
+ * cfg 0x84/0x8c, the PM D3hot -> D0 strobe with 10 ms per half, the dwords
+ * restored except MGAINDEX/MGADATA (0x44/0x48, an MMIO window), COMMAND
+ * last - our own, as for the original family. */
+static int parhelia_s90_chip_reset(struct parhelia_device *pdev)
+{
+	struct pci_dev *pci = pdev->pdev;
+	u32 cfg[64], select300;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cfg); i++)
+		pci_read_config_dword(pci, i * 4, &cfg[i]);
+	select300 = (parhelia_read(pdev, 0x0300) & 0xf888fff8u) |
+		    (cfg[0x84 / 4] & 7) |
+		    ((cfg[0x84 / 4] >> 6) & 7) << 16 |
+		    ((cfg[0x84 / 4] >> 9) & 7) << 20 |
+		    ((cfg[0x8c / 4] >> 12) & 7) << 24 | 0x600;
+	/* bit 8 on every part but the first SUNEX subvariant */
+	if (pci->device == PARHELIA_P690)
+		select300 |= 0x100;
+	parhelia_write(pdev, 0x0300, select300);
+
+	pci_write_config_dword(pci, 0xe0, 3);
+	msleep(10);
+	pci_write_config_dword(pci, 0xe0, 0);
+	msleep(10);
+
+	for (i = 0; i < ARRAY_SIZE(cfg); i++) {
+		if (i * 4 == PCI_COMMAND || i * 4 == 0x44 || i * 4 == 0x48)
+			continue;
+		pci_write_config_dword(pci, i * 4, cfg[i]);
+	}
+	pci_write_config_dword(pci, PCI_COMMAND,
+			       cfg[PCI_COMMAND / 4] | PCI_COMMAND_MEMORY);
+	parhelia_write(pdev, 0x0300, select300);
+	return 0;
+}
+
+/* IsScUseFS_SUN90: synthesiser @fs feeds a domain whose select field
+ * (bits 4:1) is fs + 1, 8 + 2 fs or 9 + 2 fs; domain 0 only counts for
+ * FS0. */
+static bool parhelia_s90_fs_in_use(const u32 *sel, unsigned int fs)
+{
+	unsigned int d;
+
+	for (d = fs ? 1 : 0; d < 3; d++) {
+		u32 f = (sel[d] >> 1) & 0xf;
+
+		if (f == fs + 1 || f == 8 + 2 * fs || f == 9 + 2 * fs)
+			return true;
+	}
+	return false;
+}
+
+/* The SUN90 divider word nearest @target within the PInS windows:
+ * VCO1 = 27 MHz * M1, tap = VCO1 / P1, VCO2 = tap * M2, out = VCO2 / 2 P2,
+ * fields M1-1 [5:0], M2-1 [10:6], P1-1 [15:11], P2-1 [19:16] (the vendor's
+ * format and ranges; its tie-break between equally close words is not
+ * decoded, so the first of them is taken). */
+static bool parhelia_s90_fs_solve(u32 target, const struct parhelia_fs_limits *lim,
+				  u32 *word, u32 *achieved)
+{
+	const u32 ref = PARHELIA_S90_REF_KHZ;
+	u32 best_err = U32_MAX, m1, m2, p1, p2;
+
+	for (m1 = 1; m1 <= 64; m1++) {
+		u32 vco1 = ref * m1;
+
+		if (vco1 < lim->vco_min || vco1 > lim->vco_max)
+			continue;
+		for (p1 = 1; p1 <= 32; p1++) {
+			u32 tap = vco1 / p1;
+
+			if (tap < lim->out_min || tap > lim->out_max)
+				continue;
+			for (m2 = 1; m2 <= 32; m2++) {
+				u32 vco2 = div_u64((u64)vco1 * m2, p1);
+
+				if (vco2 < lim->vco2_min || vco2 > lim->vco2_max)
+					continue;
+				for (p2 = 1; p2 <= 16; p2++) {
+					u32 out = vco2 / (2 * p2);
+					u32 err = abs_diff(out, target);
+
+					if (err >= best_err)
+						continue;
+					best_err = err;
+					*achieved = out;
+					*word = (m1 - 1) | (m2 - 1) << 6 |
+						(p1 - 1) << 11 | (p2 - 1) << 16;
+				}
+			}
+		}
+	}
+	/* within 0.5 %, the bound the pixel-clock search also accepts */
+	return best_err != U32_MAX && (u64)best_err * 200 <= target;
+}
+
+/* sun90pllHwOscOn: the synthesiser oscillator on 0x0e24, bit 30 on and
+ * bit 31 off. */
+static void parhelia_s90_osc_on(struct parhelia_device *pdev)
+{
+	u32 v = parhelia_read(pdev, PARHELIA_S90_OSC);
+
+	if (!(v & BIT(31)) && (v & BIT(30)))
+		return;
+	v &= ~BIT(31);
+	parhelia_write(pdev, PARHELIA_S90_OSC, v);
+	parhelia_post_delay(pdev, 1000);
+	v |= BIT(30);
+	parhelia_write(pdev, PARHELIA_S90_OSC, v);
+	parhelia_post_delay(pdev, 1000);
+}
+
+/* sun90pllHwInit's two-write strobe, then the lock bit: up to 100 polls,
+ * and all of 100 further samples locked. */
+static int parhelia_s90_fs_load(struct parhelia_device *pdev, unsigned int fs,
+				u32 word)
+{
+	u32 reg = PARHELIA_S90_FS(fs);
+	unsigned int i;
+
+	parhelia_write(pdev, reg, word | PARHELIA_S90_FS_STROBES);
+	parhelia_write(pdev, reg, word);
+	parhelia_post_delay(pdev, 10);
+	for (i = 0; i < 100; i++)
+		if (parhelia_read(pdev, reg) & PARHELIA_S90_FS_LOCK)
+			break;
+	if (i == 100)
+		return -ETIMEDOUT;
+	for (i = 0; i < 100; i++)
+		if (!(parhelia_read(pdev, reg) & PARHELIA_S90_FS_LOCK))
+			return -EIO;
+	return 0;
+}
+
+/* HWS90InitializeSystemClock: three domain selects at 0x0e00/04/08 parked
+ * on the reference, each synthesiser in use loaded from its PInS record (a
+ * ready divider word is strobed in as given, otherwise solved for the target
+ * through HWS90InitialiseFSController), the selects restored, then 0x0e24
+ * from PInS. */
+static int parhelia_s90_clock_init(struct parhelia_device *pdev)
+{
+	static const u32 select_reg[3] = { 0x0e00, 0x0e04, 0x0e08 };
+	u32 sel[3];
+	unsigned int i, fs;
+	int ret;
+
+	for (i = 0; i < 3; i++)
+		sel[i] = parhelia_pins_u32(&pdev->bios, 0x200 + 4 * i);
+	if (!sel[0]) {
+		dev_err(&pdev->pdev->dev, "PInS carries no SUN90 clock selection\n");
+		return -ENODATA;
+	}
+	for (i = 0; i < 3; i++)
+		parhelia_write(pdev, select_reg[i],
+			       parhelia_read(pdev, select_reg[i]) | 1);
+	for (i = 0; i < 3; i++)
+		parhelia_write(pdev, select_reg[i], 1);
+	for (i = 0; i < 3; i++)
+		parhelia_write(pdev, select_reg[i], 0);
+	parhelia_post_delay(pdev, 1000);
+
+	for (fs = 0; fs < 4; fs++) {
+		unsigned int rec = 0x24 + 0x14 * fs;
+		struct parhelia_fs_limits lim;
+		u32 target, divider, word = 0, achieved = 0;
+
+		if (!parhelia_s90_fs_in_use(sel, fs))
+			continue;
+		if (!parhelia_pins_has(&pdev->bios, rec, 0x14))
+			return -ENODATA;
+		target = parhelia_pins_u32(&pdev->bios, rec);
+		divider = parhelia_pins_u32(&pdev->bios, rec + 4);
+		if (divider) {
+			parhelia_write(pdev, PARHELIA_S90_FS(fs), divider | BIT(31));
+			parhelia_post_delay(pdev, 100);
+			parhelia_write(pdev, PARHELIA_S90_FS(fs), divider);
+			continue;
+		}
+		lim.vco_min = parhelia_pins_u16(&pdev->bios, rec + 0x08) * 1000u;
+		lim.vco_max = parhelia_pins_u16(&pdev->bios, rec + 0x0a) * 1000u;
+		lim.vco2_min = parhelia_pins_u16(&pdev->bios, rec + 0x0c) * 1000u;
+		lim.vco2_max = parhelia_pins_u16(&pdev->bios, rec + 0x0e) * 1000u;
+		lim.out_min = parhelia_pins_u16(&pdev->bios, rec + 0x10) * 1000u;
+		lim.out_max = parhelia_pins_u16(&pdev->bios, rec + 0x12) * 1000u;
+		if (!parhelia_s90_fs_solve(target, &lim, &word, &achieved)) {
+			dev_err(&pdev->pdev->dev,
+				"no SUN90 divider for synthesiser %u at %u kHz\n",
+				fs, target);
+			return -ERANGE;
+		}
+		parhelia_s90_osc_on(pdev);
+		ret = parhelia_s90_fs_load(pdev, fs, word);
+		if (ret) {
+			dev_err(&pdev->pdev->dev,
+				"synthesiser %u did not lock at %u kHz (word %#010x)\n",
+				fs, achieved, word);
+			return ret;
+		}
+		dev_info(&pdev->pdev->dev,
+			 "synthesiser %u locked at %u kHz for a %u kHz target (word %#010x)\n",
+			 fs, achieved, target, word);
+	}
+	parhelia_post_delay(pdev, 10000);
+
+	for (i = 0; i < 3; i++)
+		parhelia_write(pdev, select_reg[i], 1);
+	for (i = 0; i < 3; i++)
+		parhelia_write(pdev, select_reg[i], sel[i] | 1);
+	for (i = 0; i < 3; i++)
+		parhelia_write(pdev, select_reg[i], sel[i]);
+	parhelia_write(pdev, PARHELIA_S90_OSC,
+		       parhelia_pins_u32(&pdev->bios, 0x20c));
+	return 0;
+}
+
+/* HWS90InitializeMemoryController.  The vendor's start word is an
+ * uninitialised variable or'ed with 1 in both its builds, so only bit 0
+ * (start) is significant. */
+static int parhelia_s90_memory_init(struct parhelia_device *pdev)
+{
+	static const u16 tune_reg[4] = { 0x0f48, 0x0f4c, 0x0f58, 0x0f5c };
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(parhelia_s90_mc_table); i++)
+		parhelia_s90_mc_write(pdev, parhelia_s90_mc_table[i].reg,
+				      parhelia_s90_mc_table[i].bank,
+				      parhelia_pins_u32(&pdev->bios,
+						parhelia_s90_mc_table[i].pins));
+	parhelia_s90_mc_write(pdev, PARHELIA_S90_MC_CONTROL, 3, 1);
+	parhelia_post_delay(pdev, 5);
+	ret = parhelia_s90_mc_wait_idle(pdev);
+	if (ret)
+		return ret;
+	parhelia_s90_mc_write(pdev, 0x0f00, 3,
+			      parhelia_s90_mc_read(pdev, 0x0f00, 1) | BIT(30));
+	ret = parhelia_s90_mc_wait_idle(pdev);
+	if (ret)
+		return ret;
+	parhelia_s90_mc_write(pdev, PARHELIA_S90_MC_CONTROL, 3, 0);
+	/* the tuning words again, bank 1 from PInS 0x268, bank 2 from 0x298 */
+	for (i = 0; i < ARRAY_SIZE(tune_reg); i++)
+		parhelia_s90_mc_write(pdev, tune_reg[i], 1,
+				      parhelia_pins_u32(&pdev->bios, 0x268 + 4 * i));
+	for (i = 0; i < ARRAY_SIZE(tune_reg); i++)
+		parhelia_s90_mc_write(pdev, tune_reg[i], 2,
+				      parhelia_pins_u32(&pdev->bios, 0x298 + 4 * i));
+	parhelia_s90_mc_write(pdev, PARHELIA_S90_MC_CONTROL, 3, 1);
+	parhelia_post_delay(pdev, 5);
+	return parhelia_s90_mc_wait_idle(pdev);
+}
+
+/* The P690 recovery: chip reset, then HSLS90InitMemClk under the engine and
+ * display holds.  The caller must not touch BAR0 before it returns. */
+int parhelia_post_sun90_bringup(struct parhelia_device *pdev)
+{
+	struct parhelia_post_hold hold;
+	unsigned int i;
+	int ret;
+
+	if (pdev->chip->mc_family != PARHELIA_MC_SUN90 ||
+	    pdev->chip->clock_family != PARHELIA_CLOCK_SUN90)
+		return -EOPNOTSUPP;
+	if (!parhelia_pins_has(&pdev->bios, 0x200, 0xc0)) {
+		dev_err(&pdev->pdev->dev,
+			"SUN90 bring-up needs PInS up to 0x2c0\n");
+		return -ENODATA;
+	}
+	dev_info(&pdev->pdev->dev,
+		 "SUN90 bring-up: resetting the chip, the system clock and the memory controller\n");
+	ret = parhelia_s90_chip_reset(pdev);
+	if (ret)
+		return ret;
+
+	parhelia_post_hold_engine(pdev, &hold);
+	parhelia_s90_mc_write(pdev, PARHELIA_S90_MC_CONTROL, 3, 0);
+	ret = parhelia_s90_clock_init(pdev);
+	if (!ret)
+		ret = parhelia_s90_memory_init(pdev);
+	parhelia_post_release_engine(pdev, &hold);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < 3; i++) {
+		u32 want = parhelia_pins_u32(&pdev->bios, 0x200 + 4 * i);
+
+		if (parhelia_read(pdev, 0x0e00 + 4 * i) != want) {
+			dev_err(&pdev->pdev->dev,
+				"clock select %u reads %#010x after bring-up, PInS names %#010x\n",
+				i, parhelia_read(pdev, 0x0e00 + 4 * i), want);
+			return -EIO;
+		}
+	}
+	dev_info(&pdev->pdev->dev, "SUN90 bring-up completed: oscillator %#010x\n",
+		 parhelia_read(pdev, PARHELIA_S90_OSC));
+	return 0;
+}

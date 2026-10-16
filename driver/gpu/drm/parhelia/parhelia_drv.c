@@ -139,7 +139,7 @@ MODULE_PARM_DESC(reset_on_probe, "Reset PCI function before initialization (brin
 static int recover;
 module_param(recover, int, 0400);
 MODULE_PARM_DESC(recover,
-		 "Chip reset and clock/memory re-initialisation at load: 0 never, 1 when the engine reads locked up, 2 always (original family; default 0)");
+		 "Chip reset and clock/memory re-initialisation at load: 0 never, 1 when the engine reads locked up, 2 always (default 0)");
 
 static bool bind_uninitialized;
 module_param(bind_uninitialized, bool, 0400);
@@ -215,16 +215,20 @@ static int parhelia_recover(struct parhelia_device *pdev)
 	u32 before = parhelia_read(pdev, 0x08f0);
 	int ret;
 
-	if (pdev->chip->mc_family != PARHELIA_MC_HSLPAR) {
+	/* The LX parts mix the two: 0x2538 resets like the P690 but clocks like
+	 * the original, and both carry an LX memory sub-branch not recovered. */
+	if (pdev->chip->device != PARHELIA_P690 && !parhelia_original_family(pdev)) {
 		dev_err(&pdev->pdev->dev,
-			"engine status %08x: recovery is implemented for the original family only, a reboot is required\n",
+			"engine status %08x: no recovery sequence for this part, a reboot is required\n",
 			before);
 		return -EOPNOTSUPP;
 	}
 	dev_warn(&pdev->pdev->dev,
 		 "engine status %08x: resetting the chip and re-initialising clocks and memory\n",
 		 before);
-	ret = parhelia_post_cold_bringup(pdev);
+	ret = pdev->chip->mc_family == PARHELIA_MC_SUN90 ?
+	      parhelia_post_sun90_bringup(pdev) :
+	      parhelia_post_cold_bringup(pdev);
 	if (ret)
 		return ret;
 	/* A reset chip reports the WARP busy bit (01020000, as un-POSTed) until
