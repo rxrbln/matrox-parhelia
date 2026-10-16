@@ -1074,7 +1074,7 @@ parhelia_batch_blit_walk(struct parhelia_batch *batch,
                          uint32_t src_handle, unsigned src_pitch,
                          unsigned src_x, unsigned src_y,
                          unsigned format, unsigned width,
-                         unsigned height, bool bottom_up)
+                         unsigned height, bool bottom_up, bool view_2d)
 {
    struct p3d_reloc calls[PH_BATCH_PACKETS];
    uint32_t ring[PH_BATCH_PACKETS * 5];
@@ -1096,8 +1096,17 @@ parhelia_batch_blit_walk(struct parhelia_batch *batch,
    batch->reloc_count = 0;
    p3d_cs_init(&cs, batch->commands, PH_BATCH_LEGACY_DWORDS, ring,
                PH_BATCH_PACKETS * 5, calls, PH_BATCH_PACKETS);
-   p3d_emit_blit_walk(&cs, &dst, 2, dst_x, dst_y, &src, 2, src_x, src_y,
-                      width, height, bottom_up);
+   if (view_2d) {
+      /* the same bytes through the 2-D/display view, 32-bit only */
+      if (bottom_up || p3d_surface_format_bytes(format) != 4)
+         return -EINVAL;
+      dst.fmt = src.fmt = 0x30;
+      p3d_emit_blit(&cs, &dst, 3, dst_x, dst_y, &src, 3, src_x, src_y,
+                    width, height);
+   } else {
+      p3d_emit_blit_walk(&cs, &dst, 2, dst_x, dst_y, &src, 2, src_x, src_y,
+                         width, height, bottom_up);
+   }
    return batch_finish(batch, &cs, calls, dst_handle, 0, NULL, NULL,
                        src_handle, 0, 0, P3D_TRIANGLES, 0, 0, false, 0, false);
 }

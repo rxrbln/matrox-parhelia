@@ -182,14 +182,16 @@ int parhelia_batch_blit_format(struct parhelia_batch *batch,
                                unsigned src_x, unsigned src_y,
                                unsigned width, unsigned height);
 /* A copy between two tiled targets of one surface format after an idle
- * DWGCTL; @bottom_up walks the rows upward, for a same-object move down. */
+ * DWGCTL; @bottom_up walks the rows upward, for a same-object move down.
+ * @view_2d binds both through the vendor's 2-D view instead (format 0x30,
+ * type 3, no idle write): the packet the vendor and the DDX blit with. */
 int parhelia_batch_blit_walk(struct parhelia_batch *batch,
                              uint32_t dst_handle, unsigned dst_pitch,
                              unsigned dst_x, unsigned dst_y,
                              uint32_t src_handle, unsigned src_pitch,
                              unsigned src_x, unsigned src_y,
                              unsigned format, unsigned width,
-                             unsigned height, bool bottom_up);
+                             unsigned height, bool bottom_up, bool view_2d);
 int parhelia_batch_triangles(struct parhelia_batch *batch,
                             uint32_t colour_handle, uint32_t warp_entry,
                             unsigned width, unsigned height, unsigned pitch,

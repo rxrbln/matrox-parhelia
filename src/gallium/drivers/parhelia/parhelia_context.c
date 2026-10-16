@@ -665,6 +665,7 @@ struct ph_context {
    unsigned pending_call_bound;
    bool ring_reuse;		/* the lowest free ring slot, not the next */
    bool engine_copy;		/* colour target copies on the 2-D engine */
+   bool engine_copy_view_2d;	/* ... through the vendor's 2-D view */
    int pending_ring_slot;        /* -1: not in the ring */
    uint32_t pending_ring_fence;  /* last submit that read the slot */
    unsigned pending_vertex_dwords;
@@ -16251,7 +16252,8 @@ ph_copy_texture_box_engine(struct ph_context *ctx,
    ret = parhelia_batch_blit_walk(&ctx->build_batch, dr->handle, dr->stride,
                                   dstx, dsty, sr->handle, sr->stride,
                                   box->x, box->y, sr->surf_fmt, box->width,
-                                  box->height, same && dsty > box->y);
+                                  box->height, same && dsty > box->y,
+                                  ctx->engine_copy_view_2d);
    if (!ret)
       ret = ph_submit_batch_now_untimed(ctx, &ctx->build_batch, NULL, 0);
    if (ph_env("PARHELIA_TRACE_COPY"))
@@ -17834,6 +17836,12 @@ ph_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    /* the original family's engine copy is untested on hardware: opt-in */
    ctx->engine_copy = debug_get_bool_option("PARHELIA_ENGINE_COPY",
       ph_lx_family(ph_screen(screen)->chip_id));
+   /* The 0528 locked up on a 3-D-view BITBLT (engine-copy bench, twice);
+    * the vendor and the DDX blit through the 2-D view.  The P690 keeps its
+    * measured 3-D-view walk. */
+   ctx->engine_copy_view_2d = debug_get_bool_option(
+      "PARHELIA_ENGINE_COPY_2D_VIEW",
+      ph_original_family(ph_screen(screen)->chip_id));
    parhelia_state_cache_set_reglist_runs(ctx->state_cache,
       ph_screen(screen)->reglist_runs && !ctx->state_filter &&
       !ctx->drop_repeats);
