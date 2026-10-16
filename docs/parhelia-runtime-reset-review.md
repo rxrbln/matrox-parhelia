@@ -210,3 +210,17 @@ Recovery by reload works on the original family. **MEASURED:**
 Not yet done (stopped on request): X and q3 on a recovered chip (the attempt was aborted by the scripts'
 "wedged" log check matching a session marker, not by the hardware), the display on the monitor, making
 `recover=1` the default, and the P690 sequence (SNX reset + S90 clocks/memory, decoded above).
+
+## P690 implementation (2026-10-16, kernel after a8bb194)
+
+`parhelia_post_sun90_bringup()` implements the sequence above for the P690 and `recover=` dispatches to it by
+family; the LX parts (0x2537/0x2538) refuse recovery.  Details settled while writing it, all PROVEN from
+`mtx_drv.so`: `SelectS90MemoryController` writes `0x0ffc = bank & 3`; the banked write/read restore `0x0ffc`
+only when the access changed it; `WaitForS90MemoryIdle` polls bank 1 `0x0ff8` while bits 9 and 10 are both
+set, at most 100000 times, then restores `0x0ffc` unconditionally; `IsScUseFS_SUN90` counts select fields
+(bits 4:1) `fs + 1`, `8 + 2 fs` and `9 + 2 fs`, domain 0 only for FS0.  The system clock (FS0, 350000 kHz,
+no ready divider on this board) is solved over the full hardware ranges inside the PInS windows, nearest
+first; this board gets 350000 kHz exactly (M1 56, M2 25, P1 27, P2 2, word `0x1d637`), where the KMS pixel
+search (M2 capped at 16) would give 348750 kHz.  **Not run on hardware yet** (nano is off): test plan as for
+the 0528 - `recover=2` on a healthy P690 first, then a wedged one, then `--native-transfer-probe` and
+`--masked-clear-probe`, the two probes that showed the `reset_on_probe` VRAM corruption.
