@@ -665,10 +665,16 @@ int parhelia_post_cold_bringup(struct parhelia_device *pdev)
 
 	if (!parhelia_mc_healthy(pdev, half))
 		return -EIO;
-	if (parhelia_post_state(pdev) != PARHELIA_POST_DONE) {
+	/* Only the clock selection can be checked here: the 3-D state block
+	 * still reads one constant (0xc0, MEASURED after the reset) until
+	 * engine initialisation enables it, so parhelia_post_state()'s
+	 * unclocked test does not apply yet. */
+	if (parhelia_read(pdev, PARHELIA_CLOCK_SELECT) !=
+	    parhelia_pins_u32(&pdev->bios, PARHELIA_PINS_CLOCK_SELECT)) {
 		dev_err(&pdev->pdev->dev,
-			"clocks still read cold after bring-up (%#010x)\n",
-			parhelia_read(pdev, PARHELIA_CLOCK_SELECT));
+			"clock select reads %#010x after bring-up, PInS names %#010x\n",
+			parhelia_read(pdev, PARHELIA_CLOCK_SELECT),
+			parhelia_pins_u32(&pdev->bios, PARHELIA_PINS_CLOCK_SELECT));
 		return -EIO;
 	}
 	dev_info(&pdev->pdev->dev,

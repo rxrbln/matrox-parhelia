@@ -136,6 +136,11 @@ static bool reset_on_probe;
 module_param(reset_on_probe, bool, 0400);
 MODULE_PARM_DESC(reset_on_probe, "Reset PCI function before initialization (bring-up only)");
 
+static int recover;
+module_param(recover, int, 0400);
+MODULE_PARM_DESC(recover,
+		 "Chip reset and clock/memory re-initialisation at load: 0 never, 1 when the engine reads locked up, 2 always (original family; default 0)");
+
 static bool bind_uninitialized;
 module_param(bind_uninitialized, bool, 0400);
 MODULE_PARM_DESC(bind_uninitialized,
@@ -189,6 +194,44 @@ static int parhelia_chip_alive(struct parhelia_device *pdev)
 			reg, v);
 		return -ENODEV;
 	}
+	return 0;
+}
+
+/* An engine a previous load left locked up: the primary DMA never went idle
+ * (0x08f0 bit 17 clear) or the WARP busy pair is latched (bits 24/25).  Only
+ * the chip reset clears either; the WARP gate needs both. */
+static bool parhelia_engine_latched(struct parhelia_device *pdev)
+{
+	u32 v = parhelia_read(pdev, 0x08f0);
+
+	return !(v & BIT(17)) || (v & 0x03000000u);
+}
+
+/* Run-time recovery by reload: the vendor's chip reset followed by its clock
+ * and memory-controller bring-up from PInS (parhelia_post.c), before the
+ * engine is touched.  VRAM contents do not survive the retraining. */
+static int parhelia_recover(struct parhelia_device *pdev)
+{
+	u32 before = parhelia_read(pdev, 0x08f0);
+	int ret;
+
+	if (pdev->chip->mc_family != PARHELIA_MC_HSLPAR) {
+		dev_err(&pdev->pdev->dev,
+			"engine status %08x: recovery is implemented for the original family only, a reboot is required\n",
+			before);
+		return -EOPNOTSUPP;
+	}
+	dev_warn(&pdev->pdev->dev,
+		 "engine status %08x: resetting the chip and re-initialising clocks and memory\n",
+		 before);
+	ret = parhelia_post_cold_bringup(pdev);
+	if (ret)
+		return ret;
+	/* A reset chip reports the WARP busy bit (01020000, as un-POSTed) until
+	 * engine initialisation, whose WARP gate is the real check. */
+	dev_info(&pdev->pdev->dev,
+		 "chip reset: engine status %08x -> %08x, engine initialisation follows\n",
+		 before, parhelia_read(pdev, 0x08f0));
 	return 0;
 }
 
@@ -497,9 +540,17 @@ static int parhelia_pci_probe(struct pci_dev *pci,
 		if (ret)
 			return ret;
 	}
+	/* firmware's descriptor bank, before a reset clears it */
 	ret = parhelia_host_aperture_snapshot(pdev);
 	if (ret)
 		return ret;
+	if (posted && (recover == 2 ||
+		       (recover == 1 && parhelia_engine_latched(pdev)))) {
+		ret = parhelia_recover(pdev);
+		if (ret)
+			return dev_err_probe(&pci->dev, ret,
+					     "run-time recovery failed\n");
+	}
 	dev_info(&pci->dev,
 		 "%s: mapped %pa-byte VRAM BAR0 and MMIO BAR%u, tile layout %u, "
 		 "MC %s, clock %s, output %u, reset %s\n",
