@@ -59,3 +59,13 @@ apply the `mesa-*.patch` files, and configure with
   the command builder (`parhelia_batch.*`, `parhelia_reference.c`) are
   GPL-2.0-only. `reference/`, taken from the xf86-video-parhelia DDX, keeps
   its GPL-2.0 licence.
+
+## Keeping it in sync
+
+`tools/parhelia-sync-repos.sh export` (workspace tool, mirrored in
+xf86-video-parhelia/workspace/tools) replays the kernel and Mesa driver
+commits made since the heads in `.sync-heads`, in commit-date order, each
+with its original message, author and dates; the host test harness
+(`parhelia_drm_test.c`, `*_selftest.c` and their meson executable) stays
+out as before. Work branches (`alacritty-fs`, `lazy-pins-wip`) are mirrored
+on top of master.
